@@ -1,0 +1,28 @@
+{
+  "date_local": "2026-10-28",
+  "timezone": "Asia/Hong_Kong",
+  "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "host_target": "x86_64-pc-windows-gnu",
+  "unit_tests_passed": 30,
+  "explicit_localhost_tests_passed": 3,
+  "clippy_all_targets_deny_warnings": "passed",
+  "apple_silicon_all_targets_type_check": "passed; not linked or run on Mac",
+  "loopback": {
+    "run_id": "loopback-20261028-003922-593",
+    "source_duration_seconds": 3,
+    "source_mode": "synthetic",
+    "receiver_mode": "dry_run",
+    "sent_frames": 2317,
+    "applied_movement_groups": 2271,
+    "source_processing_p95_ms": 1.0446,
+    "receiver_processing_p95_ms": 0.0084,
+    "log_dropped_records": 0,
+    "expected_terminal_disconnects": 1,
+    "actual_os_injection": false
+  },
+  "mac_visible_smoothness": "NOT_TESTED",
+  "sharemouse_comparison": "NOT_TESTED",
+  "end_to_end_physical_latency": "NOT_MEASURED",
+  "one_way_network_latency": "NOT_MEASURED",
+  "acceptance_status": "stage 0 incomplete"
+}

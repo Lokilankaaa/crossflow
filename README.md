@@ -1,0 +1,103 @@
+# Crossflow
+
+跨设备键鼠共享系统。各端使用同一个 **Rust 核心**，平台适配层负责系统输入接口；客户端将使用统一设计语言与共享组件。当前是阶段 0 的 **Windows → Mac 鼠标移动实验**，不是完整 KVM 产品。
+
+## 当前可以做什么
+
+- Windows Raw Input 采集相对鼠标移动；全局快捷键明确开启和停止共享。
+- 同一套 Rust 协议、身份认证、加密传输、控制会话、日志代码运行于 Windows 和 macOS。
+- Mac 使用 CoreGraphics 注入光标移动，并记录接收和注入调用耗时。
+- 显式离线配对、双方固定公钥认证、每次连接建立新的加密会话。
+- 有界移动合并、短期接收许可、断线停止、重新连接后保持暂停。
+- 不操作系统光标的加密回环测试、采集日志和统计摘要。
+
+当前**只发送鼠标移动**。不发送按钮、滚轮、键盘或剪贴板；不抑制 Windows 本地光标；Mac 只使用主显示器，按线性增益映射 Raw Input 位移，尚未复现 macOS 原生加速曲线。不能据此宣称完成双向控制、游戏保护、多屏穿越或 ShareMouse 替代。
+
+## 构建
+
+需要 Rust 工具链。Windows 的本项目便携工具位于 `.tools/`，不会进入 Git，也不修改系统 PATH：
+
+```powershell
+./scripts/cargo-local.ps1 build --release
+./scripts/cargo-local.ps1 test
+```
+
+在已有标准 Rust 工具链的 Windows、Mac 或 Linux 上使用：
+
+```sh
+cargo build --release --locked
+cargo test --locked
+```
+
+Mac 需要 Xcode Command Line Tools 提供系统框架链接能力。Windows GNU 便携工具只用于本机开发，不是产品分发依赖；生成的 Windows 程序可单独测试。`Cargo.lock` 固定依赖版本。
+
+## 首次配对
+
+```powershell
+./target/release/crossflow.exe pair --out .pairing
+```
+
+只会输出公钥及配对标识。通过可信的本地方式把 `.pairing/mac/` 交给 Mac，Windows 保留 `.pairing/windows/`。每个目录内的 `identity.json` 包含该设备私钥，不能提交 Git、发到公开聊天或放在公共下载地址。Mac 设置目录权限 `700`、文件权限 `600`。已存在的配对目录不会被覆盖。重新配对时双方都替换为新的一对身份，原身份不再被对方接受。
+
+阶段 0 采用 `Noise_KK_25519_ChaChaPoly_BLAKE2s` 固定公钥认证与加密，运行于 `TCP_NODELAY` 连接；使用 `snow` 的纯 Rust 算法实现，不自创加密协议。配对包交换是最小实验流程，正式的双端确认界面属于后续产品工作。
+
+## 先做不注入的连接检查
+
+Mac 终端运行，`MAC_LAN_IP` 替换为 Mac 的实际局域网地址：
+
+```sh
+./target/release/crossflow environment
+./target/release/crossflow receive --bind MAC_LAN_IP:24800 --identity .pairing/mac --log runs/mac-dry-01.jsonl --seconds 60
+```
+
+Windows 运行人工合成输入测试，此模式不会采集实际鼠标：
+
+```powershell
+./target/release/crossflow.exe send --host MAC_LAN_IP:24800 --identity .pairing/windows --log runs/windows-dry-01.jsonl --seconds 5 --synthetic
+```
+
+接收端默认只累加数据，**没有 `--inject` 就不向系统注入输入**。本机完整回环检查可以运行 `./scripts/smoke-loopback.ps1`。
+
+## Windows 鼠标控制 Mac
+
+Mac 本地终端先确认命令所属应用具备“辅助功能”和“输入监控”权限。程序只检查权限，不会自动授予；失败时按提示在系统设置中授权后重新启动。
+
+```sh
+./target/release/crossflow receive --bind MAC_LAN_IP:24800 --identity .pairing/mac --log runs/mac-input-01.jsonl --seconds 60 --inject --gain 1
+```
+
+Windows 运行：
+
+```powershell
+./target/release/crossflow.exe send --host MAC_LAN_IP:24800 --identity .pairing/windows --log runs/windows-input-01.jsonl --seconds 60 --max-hz 1000
+```
+
+- 连接成功后仍是暂停状态。按 **Ctrl+Alt+F8** 开启或暂停远端移动。
+- Windows 按 **Ctrl+Alt+F9** 结束发送；Mac 按 **Escape** 结束接收。两个命令默认最多运行 60 秒，Ctrl+C 也可退出。
+- 重新连接必须再次手动开启，避免无意抢回控制。显示器变化、休眠、权限或注入错误会终止接收运行。
+- 开启时 Mac 光标需位于主显示器；每次开启从当前位置建立基线。
+- 本版不发送点击：Mac 光标移动时，Windows 本地鼠标仍可移动和点击，测试时注意自己正在操作哪一台设备。
+
+`--max-hz` 是发送上限，**不是实际输入频率或流畅度保证**。原型不插入平滑缓冲；积压超过设定界限会停止该会话，保留错误证据。
+
+## 记录和评估
+
+```powershell
+./target/release/crossflow.exe capture --log runs/local-capture-01.jsonl --seconds 10
+./target/release/crossflow.exe summarize runs/windows-input-01.jsonl
+./target/release/crossflow.exe summarize runs/mac-input-01.jsonl
+```
+
+日志文件名每轮必须不同，已有日志不会被覆盖。日志不含键盘字符、剪贴板或私钥。摘要给出本机各段耗时的 P50、P95、P99 和最大值、样本量、错误与日志完整性；输入间隔会单独列出大于 50 ms 的空闲间隔。它们是软件观测数据，不能替代外部录像里的可见光标更新。
+
+在同一 Mac 显示器上分别对比本地鼠标、ShareMouse、Crossflow；保持 DPI、显示模式、网络和任务一致。按照 V0.2 计划每组预热 2 分钟、至少 5 轮，每轮 60 秒。没有可靠物理触发时间和录像误差分析时，不报告精确端到端延迟；两机单调时钟不能直接相减。
+
+## 项目结构与状态
+
+- `src/`：共享核心和 CLI；`src/platform/`：平台输入适配。
+- `docs/architecture.md`：统一核心、客户端一致性与平台边界。
+- `docs/phase0-status.md`：实际验证记录和仍需完成的项目。
+- `docs/reference/`：V0.2 需求和验收计划原文。
+- `CONTRIBUTING.md`：分支、审查、测试和多人协作约定。
+
+阶段 0 尚未完成。尤其是 Mac 实机光标效果、ShareMouse 对照与高刷新率验证，必须在目标机器上取得证据。

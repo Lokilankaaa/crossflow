@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tools/
+.pairing/
+pairing/
+*.key
+*.pem
+identity.json
+runs/
+dist/
+.DS_Store
+.pytest_cache/
+*.log
+target/
+*.secret
