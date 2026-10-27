@@ -74,7 +74,17 @@ enum Command {
     Environment,
 }
 fn metadata(mode: &str) -> serde_json::Value {
-    json!({"mode":mode,"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"transport":"Noise_KK_25519_ChaChaPoly_BLAKE2s over TCP_NODELAY","movement_only":true,"visible_metrics":"not measured by software timestamps"})
+    json!({
+        "mode":mode,"version":env!("CARGO_PKG_VERSION"),
+        "os":std::env::consts::OS,"arch":std::env::consts::ARCH,
+        "build_revision":env!("CROSSFLOW_BUILD_REVISION"),
+        "build_dirty":env!("CROSSFLOW_BUILD_DIRTY"),
+        "build_compiler":env!("CROSSFLOW_BUILD_COMPILER"),
+        "build_unix_seconds":env!("CROSSFLOW_BUILD_UNIX_SECONDS"),
+        "run_started_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d|d.as_millis()),
+        "transport":"Noise_KK_25519_ChaChaPoly_BLAKE2s over TCP_NODELAY",
+        "movement_only":true,"visible_metrics":"not measured by software timestamps"
+    })
 }
 fn valid_duration(seconds: f64) -> Result<()> {
     ensure!(
@@ -125,16 +135,13 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&summarize(&path)?)?)
         }
         Command::Environment => {
+            #[allow(unused_mut)]
+            let mut info = metadata("environment");
             #[cfg(target_os = "macos")]
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&crossflow::platform::macos::environment())?
-            );
-            #[cfg(not(target_os = "macos"))]
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&metadata("environment"))?
-            );
+            {
+                info["platform"] = crossflow::platform::macos::environment();
+            }
+            println!("{}", serde_json::to_string_pretty(&info)?);
         }
         Command::Receive {
             bind,
@@ -200,7 +207,7 @@ fn main() -> Result<()> {
                 );
                 r
             };
-            writer.finish();
+            writer.finish()?;
             result?;
         }
         Command::Send {
@@ -253,7 +260,7 @@ fn main() -> Result<()> {
             let result = worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("sender thread panicked"))?;
-            writer.finish();
+            writer.finish()?;
             capture_result?;
             result?;
         }
@@ -267,7 +274,7 @@ fn main() -> Result<()> {
                 seconds,
                 true,
             );
-            writer.finish();
+            writer.finish()?;
             result?;
         }
     }

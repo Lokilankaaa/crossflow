@@ -598,7 +598,7 @@ mod tests {
         assert!(!process_received_batch(frames, &mut state, &mut sink, &writer.log).unwrap());
         assert_eq!(sink.moves, vec![(3., 0.), (2., 0.), (1., 0.)]);
         assert_eq!(sink.resets, 2);
-        writer.finish();
+        writer.finish().unwrap();
         std::fs::remove_file(path).unwrap();
     }
     #[test]
@@ -613,7 +613,7 @@ mod tests {
         ];
         assert!(process_received_batch(frames, &mut state, &mut sink, &writer.log).is_err());
         assert!(sink.moves.is_empty());
-        writer.finish();
+        writer.finish().unwrap();
         std::fs::remove_file(path).unwrap();
     }
     #[test]
@@ -634,7 +634,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.downcast_ref::<TerminalReceiverFailure>().is_some());
-            writer.finish();
+            writer.finish().unwrap();
             std::fs::remove_file(path).unwrap();
         }
     }
@@ -660,7 +660,7 @@ mod tests {
                 .emergency
         );
         assert!(sink.moves.is_empty());
-        writer.finish();
+        writer.finish().unwrap();
         std::fs::remove_file(path).unwrap();
     }
     #[test]

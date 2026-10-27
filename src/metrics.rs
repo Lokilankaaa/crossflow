@@ -1,13 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::{SyncSender, sync_channel},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
     time::Instant,
@@ -21,15 +21,16 @@ enum Message {
 pub struct Log {
     tx: SyncSender<Message>,
     dropped: Arc<AtomicU64>,
+    closed: Arc<Mutex<bool>>,
     clock: Instant,
 }
 pub struct LogWriter {
     pub log: Log,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<Result<()>>>,
 }
 impl LogWriter {
     pub fn new(path: &Path, metadata: Value) -> Result<Self> {
-        if let Some(p) = path.parent() {
+        if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(p)?;
         }
         let file = OpenOptions::new()
@@ -40,41 +41,59 @@ impl LogWriter {
         let (tx, rx) = sync_channel::<Message>(8192);
         let dropped = Arc::new(AtomicU64::new(0));
         let count = dropped.clone();
-        let worker = thread::spawn(move || {
-            let mut w = BufWriter::new(file);
-            let _ = writeln!(w, "{}", json!({"event":"metadata","data":metadata}));
-            for msg in rx {
-                match msg {
-                    Message::Event(v) => {
-                        if writeln!(w, "{v}").is_err() {
-                            count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Message::Close => break,
-                }
-            }
-            let _ = writeln!(
-                w,
-                "{}",
-                json!({"event":"log_summary","dropped_records":count.load(Ordering::Relaxed)})
-            );
-            let _ = w.flush();
-        });
+        let worker = thread::spawn(move || write_log(BufWriter::new(file), rx, &count, metadata));
         Ok(Self {
             log: Log {
                 tx,
                 dropped,
+                closed: Arc::new(Mutex::new(false)),
                 clock: Instant::now(),
             },
             worker: Some(worker),
         })
     }
-    pub fn finish(mut self) {
-        let _ = self.log.tx.send(Message::Close);
+    /// Stop accepting new events, drain all accepted events, and surface every
+    /// metadata/event/trailer/flush error. Clones remain valid but become no-ops.
+    pub fn finish(mut self) -> Result<()> {
+        // Serialize the close marker with try_send so a concurrent producer
+        // cannot enqueue an accepted event behind the terminal summary.
+        *self.log.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        let sent = self.log.tx.send(Message::Close);
         if let Some(w) = self.worker.take() {
-            let _ = w.join();
+            w.join()
+                .map_err(|_| anyhow::anyhow!("Performance log writer panicked"))??;
+        }
+        sent.context("Performance log writer stopped before finalization")?;
+        Ok(())
+    }
+}
+
+fn write_log(
+    mut output: impl Write,
+    events: Receiver<Message>,
+    dropped: &AtomicU64,
+    metadata: Value,
+) -> Result<()> {
+    writeln!(output, "{}", json!({"event":"metadata","data":metadata}))
+        .context("Cannot write performance log metadata")?;
+    for event in events {
+        match event {
+            Message::Event(value) => {
+                writeln!(output, "{value}").context("Cannot write performance log event")?;
+            }
+            Message::Close => {
+                writeln!(
+                    output,
+                    "{}",
+                    json!({"event":"log_summary","dropped_records":dropped.load(Ordering::Relaxed)})
+                )
+                .context("Cannot write performance log trailer")?;
+                output.flush().context("Cannot flush performance log")?;
+                return Ok(());
+            }
         }
     }
+    bail!("Performance log was not explicitly finalized")
 }
 impl Log {
     pub fn ns(&self) -> u64 {
@@ -84,6 +103,10 @@ impl Log {
         t.saturating_duration_since(self.clock).as_nanos() as u64
     }
     pub fn write(&self, event: &str, mut data: Value) {
+        let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
+        if *closed {
+            return;
+        }
         if let Some(o) = data.as_object_mut() {
             o.insert("event".into(), event.into());
             o.insert("local_ns".into(), self.ns().into());
@@ -110,56 +133,80 @@ pub fn summarize(path: &Path) -> Result<Value> {
     let mut src = vec![];
     let mut recv = vec![];
     let mut inject = vec![];
-    let mut cadence = vec![];
+    let mut cadence_raw = vec![];
+    let mut cadence_bursts = vec![];
     let mut last = None;
     let mut events = 0;
     let mut rejected = 0;
     let mut dropped = 0;
     let mut malformed = 0;
-    let mut complete = false;
-    let mut idle_gaps = 0;
-    for line in BufReader::new(File::open(path)?).lines() {
-        let line = line?;
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
+    let mut last_is_terminal = false;
+    let mut terminal_summaries = 0;
+    let mut unterminated = 0;
+    let mut long_gaps = 0;
+    let mut issues = TimingIssues::default();
+    let mut last_local_ns = None;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        last_is_terminal = false;
+        let newline_terminated = line.ends_with(b"\n");
+        if !newline_terminated {
+            unterminated += 1;
+        }
+        let parsed = serde_json::from_slice::<Value>(&line);
+        line.clear();
+        let v = match parsed {
+            Ok(v) if v.is_object() && v["event"].is_string() => v,
             Err(_) => {
+                malformed += 1;
+                continue;
+            }
+            _ => {
                 malformed += 1;
                 continue;
             }
         };
         events += 1;
-        let delta = |a: &str, b: &str| -> Option<f64> {
-            let a = v[a].as_u64()?;
-            let b = v[b].as_u64()?;
-            b.checked_sub(a).map(|d| d as f64 / 1e6)
-        };
+        if v.get("local_ns").is_some() {
+            if let Some(now) = timestamp(&v, "local_ns", &mut issues) {
+                if last_local_ns.is_some_and(|last| now < last) {
+                    issues.nonmonotonic_local_timestamps += 1;
+                } else {
+                    last_local_ns = Some(now);
+                }
+            }
+        }
         if v["event"] == "sent" {
-            if let Some(d) = delta("t0_ns", "t1_ns") {
+            if let Some(d) = timing_delta(&v, "t0_ns", "t1_ns", &mut issues) {
                 src.push(d)
             }
         }
-        if let Some(d) = delta("t2_ns", "t3_ns") {
-            recv.push(d)
+        if v["event"] == "received" {
+            if let Some(d) = timing_delta(&v, "t2_ns", "t3_ns", &mut issues) {
+                recv.push(d)
+            }
+            if let Some(d) = timing_delta(&v, "t3_ns", "t4_ns", &mut issues) {
+                inject.push(d)
+            }
         }
-        if let Some(d) = delta("t3_ns", "t4_ns") {
-            inject.push(d)
-        }
-        if matches!(
-            v["event"].as_str(),
-            Some("connected" | "toggle" | "error" | "control")
-        ) {
+        if is_capture_boundary(&v) {
             last = None;
         }
         if v["event"] == "capture" {
-            if let Some(t) = v["t0_ns"].as_u64() {
+            if let Some(t) = timestamp(&v, "t0_ns", &mut issues) {
                 if let Some(previous) = last {
                     if t >= previous {
                         let gap = (t - previous) as f64 / 1e6;
+                        cadence_raw.push(gap);
                         if gap <= 50.0 {
-                            cadence.push(gap)
+                            cadence_bursts.push(gap)
                         } else {
-                            idle_gaps += 1;
+                            long_gaps += 1;
                         }
+                    } else {
+                        issues.nonmonotonic_capture_timestamps += 1;
+                        continue;
                     }
                 }
                 last = Some(t)
@@ -169,19 +216,256 @@ pub fn summarize(path: &Path) -> Result<Value> {
             rejected += 1
         }
         if v["event"] == "log_summary" {
-            complete = true;
+            terminal_summaries += 1;
             if let Some(d) = v["dropped_records"].as_u64() {
-                dropped += d;
+                dropped = d;
+                last_is_terminal = newline_terminated;
+            } else {
+                malformed += 1;
             }
         }
     }
-    Ok(
-        json!({"events":events,"errors":rejected,"malformed_lines":malformed,"complete_log":complete,"dropped_log_records":if complete{json!(dropped)}else{Value::Null},"capture_idle_gaps_over_50ms":idle_gaps,"capture_interval_within_motion_bursts":distribution(cadence),"source_processing":distribution(src),"receiver_processing":distribution(recv),"injection_call":distribution(inject),"visible_smoothness":"NOT_MEASURED","one_way_network_latency":"NOT_MEASURED: clocks are not synchronized"}),
-    )
+    let complete =
+        last_is_terminal && terminal_summaries == 1 && malformed == 0 && unterminated == 0;
+    Ok(json!({
+        "events":events,"errors":rejected,"malformed_lines":malformed,
+        "unterminated_records":unterminated,"terminal_summaries":terminal_summaries,
+        "complete_log":complete,"dropped_log_records":if complete{json!(dropped)}else{Value::Null},
+        "capture_interval_all_in_session":distribution(cadence_raw),
+        "capture_interval_within_motion_bursts":distribution(cadence_bursts),
+        "capture_gap_over_50ms_count":long_gaps,
+        "capture_idle_gaps_over_50ms":long_gaps,
+        "capture_interval_filter":{
+            "motion_burst_max_gap_ms":50.0,
+            "raw_includes_long_gaps":true,
+            "heartbeat_resets_cadence":false,
+            "warning":"Cannot distinguish voluntary idle from input stalls without independent motion ground truth. The legacy capture_idle_gaps_over_50ms field does not establish that these gaps were idle."
+        },
+        "timing_issues":issues,
+        "source_processing":distribution(src),"receiver_processing":distribution(recv),
+        "injection_call":distribution(inject),"visible_smoothness":"NOT_MEASURED",
+        "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized"
+    }))
+}
+
+#[derive(Default, serde::Serialize)]
+struct TimingIssues {
+    missing_values: u64,
+    malformed_values: u64,
+    invalid_order: u64,
+    nonmonotonic_capture_timestamps: u64,
+    nonmonotonic_local_timestamps: u64,
+}
+
+fn timestamp(value: &Value, name: &str, issues: &mut TimingIssues) -> Option<u64> {
+    match value.get(name) {
+        None => {
+            issues.missing_values += 1;
+            None
+        }
+        Some(v) => match v.as_u64() {
+            Some(t) => Some(t),
+            None => {
+                issues.malformed_values += 1;
+                None
+            }
+        },
+    }
+}
+
+fn timing_delta(value: &Value, start: &str, end: &str, issues: &mut TimingIssues) -> Option<f64> {
+    let a = timestamp(value, start, issues);
+    let b = timestamp(value, end, issues);
+    match (a, b) {
+        (Some(a), Some(b)) if b >= a => Some((b - a) as f64 / 1e6),
+        (Some(_), Some(_)) => {
+            issues.invalid_order += 1;
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_capture_boundary(record: &Value) -> bool {
+    matches!(
+        record["event"].as_str(),
+        Some("connected" | "disconnected" | "toggle" | "error" | "emergency_stop")
+    ) || (record["event"] == "control"
+        && matches!(
+            record["kind"].as_str(),
+            Some("Arm" | "Pause" | "Stop" | "arm" | "pause" | "stop")
+        ))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summarize_text(text: &str) -> Value {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "crossflow-summary-{}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        drop(file);
+        let result = summarize(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn raw_capture_intervals_preserve_long_gaps() {
+        let result = summarize_text(concat!(
+            "{\"event\":\"capture\",\"t0_ns\":1000000}\n",
+            "{\"event\":\"capture\",\"t0_ns\":81000000}\n",
+            "{\"event\":\"capture\",\"t0_ns\":82000000}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n"
+        ));
+        assert_eq!(result["capture_interval_all_in_session"]["samples"], 2);
+        assert_eq!(result["capture_interval_all_in_session"]["max_ms"], 80.0);
+        assert_eq!(
+            result["capture_interval_within_motion_bursts"]["samples"],
+            1
+        );
+        assert_eq!(
+            result["capture_interval_within_motion_bursts"]["max_ms"],
+            1.0
+        );
+        assert_eq!(result["capture_gap_over_50ms_count"], 1);
+        assert_eq!(result["visible_smoothness"], "NOT_MEASURED");
+    }
+
+    #[test]
+    fn heartbeat_does_not_reset_capture_cadence() {
+        let result = summarize_text(concat!(
+            "{\"event\":\"capture\",\"t0_ns\":1}\n",
+            "{\"event\":\"control\",\"kind\":\"Heartbeat\"}\n",
+            "{\"event\":\"capture\",\"t0_ns\":1000001}\n",
+            "{\"event\":\"control\",\"kind\":\"Pause\"}\n",
+            "{\"event\":\"capture\",\"t0_ns\":90000001}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n"
+        ));
+        assert_eq!(result["capture_interval_all_in_session"]["samples"], 1);
+        assert_eq!(result["capture_interval_all_in_session"]["max_ms"], 1.0);
+    }
+
+    #[test]
+    fn corruption_after_trailer_is_incomplete() {
+        let result = summarize_text("{\"event\":\"log_summary\",\"dropped_records\":0}\n{corrupt");
+        assert_eq!(result["complete_log"], false);
+        assert_eq!(result["malformed_lines"], 1);
+        assert_eq!(result["unterminated_records"], 1);
+        assert!(result["dropped_log_records"].is_null());
+    }
+
+    #[test]
+    fn only_a_single_valid_newline_terminated_final_trailer_is_complete() {
+        for text in [
+            "{\"event\":\"log_summary\",\"dropped_records\":0}",
+            "{\"event\":\"log_summary\"}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":-1}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n{\"event\":\"capture\",\"t0_ns\":1}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n{\"event\":\"log_summary\",\"dropped_records\":0}\n",
+            "not-json\n{\"event\":\"log_summary\",\"dropped_records\":0}\n",
+        ] {
+            assert_eq!(
+                summarize_text(text)["complete_log"],
+                false,
+                "Accepted incomplete log: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_order_and_nonmonotonic_timing_are_counted() {
+        let result = summarize_text(concat!(
+            "{\"event\":\"sent\",\"t0_ns\":20,\"t1_ns\":10}\n",
+            "{\"event\":\"received\",\"t2_ns\":100,\"t3_ns\":99,\"t4_ns\":98}\n",
+            "{\"event\":\"capture\",\"t0_ns\":10,\"local_ns\":20}\n",
+            "{\"event\":\"capture\",\"t0_ns\":9,\"local_ns\":19}\n",
+            "{\"event\":\"capture\",\"t0_ns\":\"bad\"}\n",
+            "{\"event\":\"sent\",\"t1_ns\":10}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n"
+        ));
+        assert_eq!(result["timing_issues"]["invalid_order"], 3);
+        assert_eq!(
+            result["timing_issues"]["nonmonotonic_capture_timestamps"],
+            1
+        );
+        assert_eq!(result["timing_issues"]["nonmonotonic_local_timestamps"], 1);
+        assert_eq!(result["timing_issues"]["malformed_values"], 1);
+        assert_eq!(result["timing_issues"]["missing_values"], 1);
+        assert!(result["source_processing"].is_null());
+        assert!(result["receiver_processing"].is_null());
+        assert!(result["injection_call"].is_null());
+    }
+
+    #[test]
+    fn metadata_and_flush_write_errors_are_reported() {
+        struct FailingOutput {
+            fail_write: bool,
+        }
+        impl Write for FailingOutput {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                if self.fail_write {
+                    Err(std::io::Error::other("test write failure"))
+                } else {
+                    Ok(buffer.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("test flush failure"))
+            }
+        }
+        for fail_write in [true, false] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(Message::Close).unwrap();
+            let error = write_log(
+                FailingOutput { fail_write },
+                rx,
+                &AtomicU64::new(0),
+                json!({}),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(if fail_write { "metadata" } else { "flush" })
+            );
+        }
+    }
+
+    #[test]
+    fn finish_surfaces_worker_failure() {
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        let writer = LogWriter {
+            log: Log {
+                tx,
+                dropped: Arc::new(AtomicU64::new(0)),
+                closed: Arc::new(Mutex::new(false)),
+                clock: Instant::now(),
+            },
+            worker: Some(thread::spawn(|| bail!("test writer failure"))),
+        };
+        assert!(
+            writer
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("test writer failure")
+        );
+    }
     #[test]
     fn nearest_rank() {
         let d = distribution(vec![1., 2., 3., 4., 5.]);
@@ -203,7 +487,7 @@ mod tests {
         let writer = LogWriter::new(&path, json!({"test":true})).unwrap();
         let clone = writer.log.clone();
         clone.write("sent", json!({"t0_ns":100,"t1_ns":1100}));
-        writer.finish();
+        writer.finish().unwrap();
         let result = summarize(&path).unwrap();
         assert_eq!(result["complete_log"], true);
         assert_eq!(result["source_processing"]["samples"], 1);

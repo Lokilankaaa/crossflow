@@ -3,8 +3,20 @@
   "timezone": "Asia/Hong_Kong",
   "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "host_target": "x86_64-pc-windows-gnu",
-  "unit_tests_passed": 30,
-  "explicit_localhost_tests_passed": 3,
+  "unit_tests_passed": 37,
+  "explicit_localhost_tests_passed": 5,
+  "recovery_tests": {
+    "authenticated_reconnect_requires_rearm_no_old_motion_replay": "passed",
+    "expired_movement_lease_rejected_while_session_has_fresh_heartbeats": "passed",
+    "actual_os_injection": false
+  },
+  "measurement_integrity": {
+    "raw_capture_distribution_retains_80ms_gap": "passed",
+    "heartbeat_does_not_reset_cadence": "passed",
+    "damaged_trailer_invalidates_log_completeness": "passed",
+    "writer_failures_surface_to_caller": "passed",
+    "build_provenance": "verified on release environment output"
+  },
   "clippy_all_targets_deny_warnings": "passed",
   "apple_silicon_all_targets_type_check": "passed; not linked or run on Mac",
   "loopback": {
