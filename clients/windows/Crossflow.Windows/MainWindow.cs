@@ -19,6 +19,12 @@ internal sealed class MainWindow : Window
     private readonly Grid workspace = new();
     private readonly ScrollViewer workspaceScroll = new();
     private readonly StackPanel sidebar;
+    private readonly ScrollViewer sidebarScroll = new() { HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+    private readonly StackPanel deviceList = new() { Spacing = 12 };
+    private readonly TextBlock sidebarState = new() { TextWrapping = TextWrapping.Wrap };
+    private readonly Button sidebarPrimary = new(), sidebarStop = new();
+    private readonly Dictionary<string, Button> navigationButtons = new();
+    private string activePage = "layout";
     private readonly StackPanel compactNavigation = new();
     private Grid? editorGrid;
     private Border? screenBoard, propertiesPanel;
@@ -31,6 +37,12 @@ internal sealed class MainWindow : Window
     private readonly InfoBar notice = new() { IsOpen = true, IsClosable = false };
     private readonly TextBlock status = new();
     private TextBlock? connectionStatus;
+    private TextBlock? sessionDetail;
+    private Button? connectSession, armSession, pauseSession, stopSession, identityPicker;
+    private TextBox? hostInput, identityInput;
+    private readonly SessionController session = new();
+    private string targetHost = "", identityDirectory = "";
+    private bool sessionAction, closing, allowClose;
     private readonly Button export = new();
     private LayoutDocument layout = new([]);
     private string? selected;
@@ -45,6 +57,7 @@ internal sealed class MainWindow : Window
     internal MainWindow(Theme theme)
     {
         this.theme = theme;
+        session.Changed += _ => DispatcherQueue.TryEnqueue(UpdateSessionUi);
         Title = "Crossflow";
         root.RequestedTheme = ElementTheme.Light;
         root.Background = theme.Brush("background");
@@ -52,14 +65,32 @@ internal sealed class MainWindow : Window
         root.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
         root.ColumnDefinitions.Add(new() { Width = new GridLength(theme.Number("window", "sidebar_width")) });
         root.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
-        sidebar = new StackPanel { Spacing = theme.Number("spacing", "medium"), Padding = new Thickness(20, 28, 20, 20), Background = theme.Brush("surface") };
-        sidebar.Children.Add(Text("Crossflow", "section"));
-        sidebar.Children.Add(Text("跨设备，自然流动", "caption", true));
-        sidebar.Children.Add(new Border { Height = 24 });
-        sidebar.Children.Add(Action(theme.Copy("layout_title"), "nav-layout", () => ShowLayout()));
-        sidebar.Children.Add(Action(theme.Copy("input_title"), "nav-input", () => ShowInput()));
-        sidebar.Children.Add(Action(theme.Copy("connection_title"), "nav-connection", () => ShowConnection()));
-        Grid.SetRowSpan(sidebar, 2); root.Children.Add(sidebar);
+        sidebar = new StackPanel { Spacing = 6, Padding = new Thickness(18, 26, 18, 20), Background = theme.Brush("surface") };
+        var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Margin = new Thickness(8, 0, 0, 22) };
+        brand.Children.Add(new FontIcon { Glyph = "\uE71B", FontSize = 26, Foreground = theme.Brush("accent") });
+        brand.Children.Add(new TextBlock { Text = "Crossflow", FontSize = 23, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = theme.Brush("text") });
+        sidebar.Children.Add(brand);
+        sidebar.Children.Add(Navigation("工作台", "\uE7F4", "layout", ShowLayout));
+        sidebar.Children.Add(Navigation("设备", "\uE772", "connection", ShowConnection));
+        sidebar.Children.Add(Navigation("输入", "\uE765", "input", ShowInput));
+        sidebar.Children.Add(Navigation("设置", "\uE713", "settings", ShowSettings));
+        sidebar.Children.Add(Divider());
+        sidebarState.FontSize = 13; sidebarState.Foreground = theme.Brush("text"); sidebarState.Margin = new Thickness(8, 2, 0, 8);
+        sidebar.Children.Add(sidebarState);
+        sidebarPrimary.Background = theme.Brush("accent"); sidebarPrimary.Foreground = new SolidColorBrush(Microsoft.UI.Colors.White);
+        sidebarPrimary.BorderThickness = new Thickness(0); sidebarPrimary.CornerRadius = new CornerRadius(10); sidebarPrimary.Padding = new Thickness(12, 10, 12, 10); sidebarPrimary.HorizontalAlignment = HorizontalAlignment.Stretch;
+        AutomationProperties.SetAutomationId(sidebarPrimary, "sidebar-session-primary");
+        sidebarPrimary.Click += (_, _) => { var snapshot = session.Snapshot; if (!snapshot.ProcessRunning) ShowConnection(); else RunSessionAction(snapshot.State == "sharing" ? session.PauseAsync : session.ArmAsync); };
+        sidebar.Children.Add(sidebarPrimary);
+        sidebarStop.Content = "停止连接"; sidebarStop.Background = theme.Brush("surface"); sidebarStop.BorderThickness = new Thickness(0); sidebarStop.HorizontalAlignment = HorizontalAlignment.Stretch;
+        AutomationProperties.SetAutomationId(sidebarStop, "sidebar-session-stop");
+        sidebarStop.Click += (_, _) => RunSessionAction(async () => { if (!await session.StopAsync()) throw new InvalidOperationException("共享内核尚未退出，请再次停止。"); });
+        sidebar.Children.Add(sidebarStop);
+        sidebar.Children.Add(Divider());
+        sidebar.Children.Add(Text("设备与屏幕", "caption", true)); sidebar.Children.Add(deviceList);
+        sidebarScroll.Content = sidebar;
+        var sidebarBorder = new Border { Child = sidebarScroll, BorderThickness = new Thickness(0, 0, 1, 0), BorderBrush = theme.Brush("border"), Background = theme.Brush("surface") };
+        Grid.SetRowSpan(sidebarBorder, 2); root.Children.Add(sidebarBorder);
         compactNavigation.Orientation = Orientation.Horizontal;
         compactNavigation.Spacing = theme.Number("spacing", "large");
         compactNavigation.Padding = new Thickness(16, 12, 16, 12);
@@ -67,9 +98,10 @@ internal sealed class MainWindow : Window
         compactNavigation.Visibility = Visibility.Collapsed;
         var menu = new MenuFlyout();
         foreach (var (title, id, open) in new (string, string, Action)[] {
-            (theme.Copy("layout_title"), "compact-nav-layout", ShowLayout),
-            (theme.Copy("input_title"), "compact-nav-input", ShowInput),
-            (theme.Copy("connection_title"), "compact-nav-connection", ShowConnection) })
+            ("工作台", "compact-nav-layout", ShowLayout),
+            ("输入", "compact-nav-input", ShowInput),
+            ("设备", "compact-nav-connection", ShowConnection),
+            ("设置", "compact-nav-settings", ShowSettings) })
         {
             var item = new MenuFlyoutItem { Text = title };
             AutomationProperties.SetAutomationId(item, id);
@@ -90,7 +122,7 @@ internal sealed class MainWindow : Window
         AppWindow.Resize(new global::Windows.Graphics.SizeInt32((int)theme.Number("window", "width"), (int)theme.Number("window", "height")));
         AutomationProperties.SetAutomationId(canvas, "layout-canvas");
         AutomationProperties.SetName(canvas, "屏幕排列画布");
-        canvas.Background = theme.Brush("surface_subtle");
+        canvas.Background = theme.Brush("background");
         canvas.SizeChanged += (_, _) => { if (dragOriginal is null) Draw(); };
         canvas.PointerMoved += DragMove;
         canvas.PointerReleased += DragEnd;
@@ -114,9 +146,64 @@ internal sealed class MainWindow : Window
             int minimumWidth = Math.Min(work.Width, (int)(theme.Number("window", "minimum_width") * density)), minimumHeight = Math.Min(work.Height, (int)(theme.Number("window", "minimum_height") * density));
             if (AppWindow.Size.Width < minimumWidth || AppWindow.Size.Height < minimumHeight) AppWindow.Resize(new global::Windows.Graphics.SizeInt32(Math.Max(minimumWidth, AppWindow.Size.Width), Math.Max(minimumHeight, AppWindow.Size.Height)));
         };
+        AppWindow.Closing += async (_, args) =>
+        {
+            if (allowClose) return;
+            args.Cancel = true;
+            if (closing) return;
+            closing = true; UpdateSessionUi();
+            try
+            {
+                if (await session.StopAsync()) { allowClose = true; Close(); return; }
+                ShowConnection();
+                if (sessionDetail is not null) sessionDetail.Text = "共享内核尚未退出。请再次停止连接，确认后再关闭窗口。";
+            }
+            catch { ShowConnection(); if (sessionDetail is not null) sessionDetail.Text = "未能确认共享停止，请重试停止连接。"; }
+            closing = false; UpdateSessionUi();
+        };
     }
 
     private TextBlock Text(string value, string size = "body", bool secondary = false) => new() { Text = value, FontSize = theme.Number("typography", size), Foreground = theme.Brush(secondary ? "text_secondary" : "text"), TextWrapping = TextWrapping.Wrap };
+    private static string DeviceName(string id) => id switch { "windows-workstation" => "Windows 台式机", "macbook-air" => "MacBook Air", _ => id };
+    private static string ScreenName(string id) => id switch { "windows-main" => "主显示器", "windows-portrait" => "竖屏", "mac-external" => "外接显示器", "mac-built-in" => "内建显示器", _ => id };
+    private Border Divider() => new() { Height = 1, Background = theme.Brush("border"), Margin = new Thickness(0, 16, 0, 16) };
+    private Button Navigation(string title, string glyph, string page, Action open)
+    {
+        var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 14 };
+        content.Children.Add(new FontIcon { Glyph = glyph, FontSize = 18 }); content.Children.Add(Text(title));
+        var button = Action("", "nav-" + page, open); button.Content = content;
+        button.HorizontalContentAlignment = HorizontalAlignment.Left; button.BorderThickness = new Thickness(0); button.CornerRadius = new CornerRadius(10); button.Padding = new Thickness(12, 11, 12, 11);
+        navigationButtons[page] = button; return button;
+    }
+    private void SelectPage(string name)
+    {
+        activePage = name;
+        foreach (var entry in navigationButtons) entry.Value.Background = theme.Brush(entry.Key == name ? "accent_subtle" : "surface");
+    }
+    private void RefreshDevices()
+    {
+        deviceList.Children.Clear();
+        if (layout.Screens.Count == 0) { deviceList.Children.Add(Text("添加屏幕后，会按所属设备分组。", "caption", true)); return; }
+        deviceList.Children.Add(Text(sample ? "示例设备 · 尚未发现" : "布局中的设备 · 非连接状态", "caption", true));
+        int groupIndex = 0;
+        foreach (var group in layout.Screens.GroupBy(screen => screen.DeviceId))
+        {
+            var color = theme.Brush(groupIndex++ % 2 == 0 ? "accent" : "device_secondary");
+            var groupPanel = new StackPanel { Spacing = 4 };
+            var heading = Text($"{DeviceName(group.Key)} · {group.Count()} 块屏幕", "caption"); heading.MaxWidth = Math.Max(80, theme.Number("window", "sidebar_width") - 42); heading.Foreground = color; heading.Margin = new Thickness(6, 8, 0, 4); groupPanel.Children.Add(heading);
+            foreach (var screen in group)
+            {
+                var select = Action(ScreenName(screen.Id), "device-screen-" + screen.Id, () => { selected = screen.Id; ShowLayout(); });
+                select.HorizontalContentAlignment = HorizontalAlignment.Left; select.BorderThickness = new Thickness(0); select.Padding = new Thickness(12, 8, 8, 8); select.CornerRadius = new CornerRadius(8);
+                select.Background = theme.Brush(selected == screen.Id ? "accent_subtle" : "surface");
+                var line = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+                line.Children.Add(new FontIcon { Glyph = screen.Height > screen.Width ? "\uE8EA" : "\uE7F4", FontSize = 16, Foreground = color });
+                var label = Text(ScreenName(screen.Id), "caption"); label.MaxWidth = Math.Max(60, theme.Number("window", "sidebar_width") - 82); label.TextWrapping = TextWrapping.NoWrap; label.TextTrimming = TextTrimming.CharacterEllipsis;
+                line.Children.Add(label); select.Content = line; groupPanel.Children.Add(select);
+            }
+            deviceList.Children.Add(groupPanel);
+        }
+    }
     private Button Action(string title, string id, Action run)
     {
         var button = new Button { Content = title, HorizontalAlignment = HorizontalAlignment.Stretch, FontSize = theme.Number("typography", "body") };
@@ -126,34 +213,116 @@ internal sealed class MainWindow : Window
     }
     private StackPanel Page(string title, string subtitle)
     {
+        ResetWorkspace();
         connectionStatus = null;
-        editorGrid = null; screenBoard = null; propertiesPanel = null; propertiesScroll = null; layoutToolbar = null; toolbarScroll = null;
-        workspace.Children.Clear(); workspace.RowDefinitions.Clear();
+        sessionDetail = null; connectSession = null; armSession = null; pauseSession = null; stopSession = null; identityPicker = null; hostInput = null; identityInput = null;
         var page = new StackPanel { Spacing = theme.Number("spacing", "large") };
         page.Children.Add(Text(title, "title")); page.Children.Add(Text(subtitle, secondary: true));
-        workspace.Children.Add(page); return page;
+        workspace.Children.Add(page); ApplyAdaptiveLayout(); return page;
+    }
+    private void ResetWorkspace()
+    {
+        if (dragOriginal is not null) CancelDrag();
+        // A disconnected WinUI element's Parent may be null while its old
+        // container still owns it. Release via the containers we created,
+        // before clearing those references or detaching the page tree.
+        layoutToolbar?.Children.Clear();
+        if (screenBoard is not null) screenBoard.Child = null;
+        if (propertiesScroll is not null) propertiesScroll.Content = null;
+        if (workspace.Children.IndexOf(notice) >= 0) workspace.Children.Remove(notice);
+        if (workspace.Children.IndexOf(status) >= 0) workspace.Children.Remove(status);
+        workspace.Children.Clear(); workspace.RowDefinitions.Clear();
+        editorGrid = null; screenBoard = null; propertiesPanel = null;
+        propertiesScroll = null; layoutToolbar = null; toolbarScroll = null;
     }
     private void ShowConnection()
     {
-        var page = Page(theme.Copy("connection_title"), theme.Copy("session_unavailable"));
-        connectionStatus = Text(coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable"), "section");
+        SelectPage("connection");
+        var page = Page(theme.Copy("connection_title"), "连接配对设备后，手动开始鼠标共享。本轮最多运行一小时。");
+        connectionStatus = Text("尚未连接", "section");
         page.Children.Add(connectionStatus);
-        page.Children.Add(Text("此客户端目前用于编辑屏幕布局。设备发现、连接控制与实时状态将在接入共享会话后显示。", secondary: true));
+        hostInput = new TextBox { Header = "目标 IP 和端口", PlaceholderText = "192.168.1.20:24800", Text = targetHost, MaxLength = 128 };
+        AutomationProperties.SetAutomationId(hostInput, "session-host");
+        hostInput.TextChanged += (sender, _) => targetHost = ((TextBox)sender).Text;
+        page.Children.Add(hostInput);
+        identityInput = new TextBox { Header = "配对身份文件夹", Text = identityDirectory, PlaceholderText = "选择现有配对文件夹" };
+        AutomationProperties.SetAutomationId(identityInput, "session-identity");
+        identityInput.TextChanged += (sender, _) => identityDirectory = ((TextBox)sender).Text;
+        page.Children.Add(identityInput);
+        identityPicker = Action("选择身份文件夹", "session-pick-identity", async () =>
+        {
+            var picker = new FolderPicker(); picker.FileTypeFilter.Add("*");
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
+            try { var folder = await picker.PickSingleFolderAsync(); if (folder is not null) { identityDirectory = folder.Path; if (identityInput is not null) identityInput.Text = identityDirectory; } }
+            catch { if (sessionDetail is not null) sessionDetail.Text = "无法选择文件夹，请粘贴现有配对文件夹路径。"; }
+        });
+        page.Children.Add(identityPicker);
+        var controls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        connectSession = Action("连接", "session-connect", () => RunSessionAction(() => session.ConnectAsync(targetHost, identityDirectory)));
+        armSession = Action("开始共享", "session-arm", () => RunSessionAction(session.ArmAsync));
+        pauseSession = Action("暂停", "session-pause", () => RunSessionAction(session.PauseAsync));
+        stopSession = Action("停止连接", "session-stop", () => RunSessionAction(async () => { if (!await session.StopAsync()) throw new InvalidOperationException("共享内核尚未退出，请重试停止连接。"); }));
+        foreach (var button in new[] { connectSession, armSession, pauseSession, stopSession }) controls.Children.Add(button);
+        page.Children.Add(controls);
+        sessionDetail = Text("打开客户端不会自动连接或启动输入。", secondary: true); page.Children.Add(sessionDetail);
+        page.Children.Add(Text("当前真实共享仅支持鼠标移动。键盘、鼠标点击、滚轮与屏幕边缘自动切换尚未接入此入口。布局编辑仍是草稿，不会改变当前共享。", secondary: true));
+        UpdateSessionUi();
+    }
+    private async void RunSessionAction(Func<Task> operation)
+    {
+        if (sessionAction || closing) return;
+        sessionAction = true; UpdateSessionUi();
+        string? error = null;
+        try { await operation(); }
+        catch (Exception failure) { error = failure is InvalidOperationException ? failure.Message : "无法完成连接操作，请检查地址与身份文件夹。"; }
+        finally { sessionAction = false; UpdateSessionUi(); if (error is not null && sessionDetail is not null) sessionDetail.Text = error; }
+    }
+    private void UpdateSessionUi()
+    {
+        var state = session.Snapshot;
+        string title = state.State switch { "starting" => "正在启动", "connecting" => "正在连接或重连", "paused" => "已连接 · 已暂停", "sharing" => "鼠标共享中", "stopping" => "正在停止", "stopped" => "已停止", "error" => "连接出现错误", _ => "尚未连接" };
+        if (connectionStatus is not null) connectionStatus.Text = title;
+        sidebarState.Text = title;
+        sidebarPrimary.Content = !state.ProcessRunning ? "连接设备" : state.State == "sharing" ? "暂停共享" : state.CanArm ? "开始共享" : "等待就绪";
+        sidebarPrimary.IsEnabled = !sessionAction && !closing && (!state.ProcessRunning || state.CanArm || (state.State == "sharing" && !state.CommandPending && !state.StopRequested));
+        sidebarStop.IsEnabled = state.ProcessRunning && !sessionAction && !closing;
+        sidebarStop.Visibility = state.ProcessRunning ? Visibility.Visible : Visibility.Collapsed;
+        if (connectSession is not null) connectSession.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
+        if (armSession is not null) armSession.IsEnabled = state.CanArm && !sessionAction && !closing;
+        if (pauseSession is not null) pauseSession.IsEnabled = state.State == "sharing" && !state.CommandPending && !state.StopRequested && !sessionAction && !closing;
+        if (stopSession is not null) stopSession.IsEnabled = state.ProcessRunning && !sessionAction && !closing;
+        if (hostInput is not null) hostInput.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
+        if (identityInput is not null) identityInput.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
+        if (identityPicker is not null) identityPicker.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
+        if (sessionDetail is not null)
+            sessionDetail.Text = state.StopRequested ? "已请求停止，正在等待内核退出确认。" : state.Error is not null ? (state.State == "error" ? state.Error : "内核拒绝了本次操作，状态已更新。请确认就绪后再试。") :
+                state.State == "paused" ? (state.CaptureReady ? "已就绪。点击“开始共享”才会转发鼠标移动；重连后也需要手动开始。" : "已连接，正在准备鼠标输入。") :
+                state.State == "sharing" ? "正在转发鼠标移动。点击“暂停”可立即请求暂停；关闭窗口会停止连接。" :
+                state.ProcessRunning ? "正在等待共享内核报告状态。" : "打开客户端不会自动连接或启动输入。";
+        status.Text = $"{(coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable"))}  ·  {title}  ·  布局尚未应用运行时";
     }
     private void ShowInput()
     {
-        var page = Page(theme.Copy("input_title"), "输入设置尚未接入此客户端。");
+        SelectPage("input");
+        var page = Page(theme.Copy("input_title"), "当前连接入口仅共享鼠标移动，其余输入设置尚未接入。");
         page.Children.Add(new ToggleSwitch { Header = "Ctrl / Cmd 映射", IsEnabled = false });
         page.Children.Add(new ToggleSwitch { Header = "边缘阻尼", IsEnabled = false });
         page.Children.Add(Text("打开此窗口不会启动键鼠共享，也不会改变系统输入。", secondary: true));
     }
+    private void ShowSettings()
+    {
+        SelectPage("settings");
+        var page = Page("设置", "本地运行，无需账号。共享状态由统一 Rust 内核提供。");
+        page.Children.Add(Text("每轮会话最长一小时。连接恢复后保持暂停，需要你手动开始共享。", secondary: true));
+        page.Children.Add(Text("会话日志保存在当前用户的本地应用数据目录 / Crossflow / Logs。身份文件仅交给内核读取。", secondary: true));
+        page.Children.Add(Text("屏幕布局可独立编辑与导出，目前尚未应用到实际鼠标共享。", secondary: true));
+    }
     private void ShowLayout()
     {
+        SelectPage("layout");
+        ResetWorkspace();
         connectionStatus = null;
-        if (canvas.Parent is Border oldBoard) oldBoard.Child = null;
-        if (inspector.Parent is ScrollViewer oldScroll) oldScroll.Content = null;
-        if (export.Parent is Panel oldToolbar) oldToolbar.Children.Remove(export);
-        workspace.Children.Clear(); workspace.RowDefinitions.Clear();
+        sessionDetail = null; connectSession = null; armSession = null; pauseSession = null; stopSession = null; identityPicker = null; hostInput = null; identityInput = null;
         foreach (var length in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto }) workspace.RowDefinitions.Add(new() { Height = length });
         var heading = new StackPanel { Spacing = 8, Margin = new Thickness(0, 0, 0, 20) };
         heading.Children.Add(Text(theme.Copy("layout_title"), "title")); heading.Children.Add(Text(theme.Copy("layout_subtitle"), secondary: true));
@@ -175,19 +344,19 @@ internal sealed class MainWindow : Window
         editorGrid = editor;
         editor.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
         editor.ColumnDefinitions.Add(new() { Width = new GridLength(theme.Number("window", "inspector_width")) });
-        var board = new Border { Background = theme.Brush("surface_subtle"), CornerRadius = new CornerRadius(theme.Number("radii", "panel")), Child = canvas };
+        var board = new Border { Background = theme.Brush("background"), Child = canvas };
         screenBoard = board;
         editor.Children.Add(board);
         inspector.Spacing = 12; inspector.Padding = new Thickness(16);
         var scroll = new ScrollViewer { Content = inspector, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         propertiesScroll = scroll;
-        var properties = new Border { Child = scroll, Background = theme.Brush("surface"), CornerRadius = new CornerRadius(theme.Number("radii", "panel")) };
+        var properties = new Border { Child = scroll, Background = theme.Brush("surface"), BorderThickness = new Thickness(1, 0, 0, 0), BorderBrush = theme.Brush("border") };
         propertiesPanel = properties;
         Grid.SetColumn(properties, 1); editor.Children.Add(properties);
         Grid.SetRow(editor, 3); workspace.Children.Add(editor);
         status.FontSize = theme.Number("typography", "caption"); status.Foreground = theme.Brush("text_secondary"); status.Margin = new Thickness(0, 16, 0, 0); status.TextWrapping = TextWrapping.Wrap;
         Grid.SetRow(status, 4); workspace.Children.Add(status);
-        ApplyAdaptiveLayout(); UpdateStatus(); Draw(); Inspect();
+        ApplyAdaptiveLayout(); UpdateStatus(); Draw(); Inspect(); RefreshDevices();
     }
     private void ApplyAdaptiveLayout()
     {
@@ -198,10 +367,11 @@ internal sealed class MainWindow : Window
         compact = nextCompact;
         root.ColumnDefinitions[0].Width = new GridLength(compact ? 0 : theme.Number("window", "sidebar_width"));
         sidebar.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
+        sidebarScroll.Visibility = compact ? Visibility.Collapsed : Visibility.Visible;
         compactNavigation.Visibility = compact ? Visibility.Visible : Visibility.Collapsed;
         workspace.Margin = new Thickness(theme.Number("spacing", compact ? "large" : "section"));
-        workspaceScroll.VerticalScrollBarVisibility = compact ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled;
-        workspaceScroll.VerticalScrollMode = compact ? ScrollMode.Enabled : ScrollMode.Disabled;
+        workspaceScroll.VerticalScrollBarVisibility = compact || activePage != "layout" ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled;
+        workspaceScroll.VerticalScrollMode = compact || activePage != "layout" ? ScrollMode.Enabled : ScrollMode.Disabled;
         if (layoutToolbar is not null) layoutToolbar.Orientation = Orientation.Horizontal;
         if (toolbarScroll is not null) toolbarScroll.HorizontalScrollBarVisibility = compact ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled;
         if (editorGrid is null || screenBoard is null || propertiesPanel is null || propertiesScroll is null) return;
@@ -222,10 +392,8 @@ internal sealed class MainWindow : Window
     }
     private void UpdateStatus()
     {
-        if (connectionStatus is not null)
-            connectionStatus.Text = coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable");
+        UpdateSessionUi();
         export.IsEnabled = coreReady && !busy && layout.Screens.Count > 0;
-        status.Text = $"{(coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable"))}  ·  {theme.Copy("session_unavailable")}";
         Message(theme.Copy("apply_unavailable") + (sample ? " " + theme.Copy("sample_notice") : ""));
     }
     private void Message(string text, bool error = false)
@@ -246,7 +414,7 @@ internal sealed class MainWindow : Window
             return true;
         }
         catch (Exception error) { Message(Friendly(error), true); return false; }
-        finally { busy = false; export.IsEnabled = coreReady && layout.Screens.Count > 0; Draw(); Inspect(); }
+        finally { busy = false; export.IsEnabled = coreReady && layout.Screens.Count > 0; Draw(); Inspect(); RefreshDevices(); }
     }
     private static string Friendly(Exception error) => error is InvalidOperationException ? error.Message : "无法完成操作，请检查布局文件或输入内容后重试。";
     private void Draw()
@@ -270,18 +438,26 @@ internal sealed class MainWindow : Window
         var devices = layout.Screens.Select(s => s.DeviceId).Distinct().ToList();
         foreach (var screen in layout.Screens)
         {
-            var label = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
-            label.Children.Add(Text(screen.Id, "section")); label.Children.Add(Text(screen.DeviceId, "caption", true));
-            label.Children.Add(Text($"{screen.Width:g} × {screen.Height:g}", "caption", true));
-            var button = new Button { Content = label, Padding = new Thickness(12), HorizontalContentAlignment = HorizontalAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center, Background = theme.Brush("surface"), BorderThickness = new Thickness(0) };
+            bool smallTile = screen.Height * scale <= 100;
+            double padding = smallTile ? 8 : 12;
+            double textWidth = Math.Max(1, screen.Width * scale - padding * 2 - 4);
+            var label = new StackPanel { Spacing = smallTile ? 4 : 6, VerticalAlignment = VerticalAlignment.Center };
+            var screenLabel = Text(ScreenName(screen.Id), "section"); screenLabel.FontSize = smallTile ? 14 : theme.Number("typography", "section"); screenLabel.MaxWidth = textWidth; screenLabel.TextTrimming = TextTrimming.CharacterEllipsis; screenLabel.TextWrapping = TextWrapping.NoWrap;
+            var deviceLabel = Text(DeviceName(screen.DeviceId), "caption", true); deviceLabel.FontSize = smallTile ? 10 : theme.Number("typography", "caption"); deviceLabel.MaxWidth = textWidth; deviceLabel.TextTrimming = TextTrimming.CharacterEllipsis; deviceLabel.TextWrapping = TextWrapping.NoWrap;
+            label.Children.Add(screenLabel); label.Children.Add(deviceLabel);
+            var resolution = Text($"{screen.Width:g} × {screen.Height:g}", "caption", true); resolution.FontSize = smallTile ? 10 : theme.Number("typography", "caption"); resolution.MaxWidth = textWidth; resolution.TextWrapping = TextWrapping.NoWrap;
+            label.Children.Add(resolution);
+            var color = theme.Brush(devices.IndexOf(screen.DeviceId) % 2 == 0 ? "accent" : "device_secondary").Color;
+            var tint = new SolidColorBrush(global::Windows.UI.Color.FromArgb(22, color.R, color.G, color.B));
+            var button = new Button { Content = label, Padding = new Thickness(padding), HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center, Background = tint, BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(9) };
             AutomationProperties.SetName(button, $"屏幕 {screen.Id}，设备 {screen.DeviceId}。使用方向键移动。");
             AutomationProperties.SetAutomationId(button, "screen-" + screen.Id);
-            var tile = new Border { Width = screen.Width * scale, Height = screen.Height * scale, Child = button, CornerRadius = new CornerRadius(theme.Number("radii", "control")), BorderThickness = new Thickness(selected == screen.Id ? 3 : 1), BorderBrush = theme.Brush(devices.IndexOf(screen.DeviceId) % 2 == 0 ? "accent" : "device_secondary") };
+            var tile = new Border { Width = screen.Width * scale, Height = screen.Height * scale, Child = button, CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(selected == screen.Id ? 2 : 1), BorderBrush = new SolidColorBrush(color) };
             Canvas.SetLeft(tile, screen.X * scale + offsetX); Canvas.SetTop(tile, screen.Y * scale + offsetY); canvas.Children.Add(tile);
             button.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
             {
                 if (busy || !coreReady || !e.GetCurrentPoint(canvas).Properties.IsLeftButtonPressed) return;
-                selected = screen.Id; Inspect(); button.Focus(FocusState.Pointer);
+                selected = screen.Id; Inspect(); RefreshDevices(); button.Focus(FocusState.Pointer);
                 dragOriginal = screen; dragPreview = screen; dragVisual = tile; dragStart = e.GetCurrentPoint(canvas).Position;
                 canvas.CapturePointer(e.Pointer); e.Handled = true;
             }), true);
@@ -319,11 +495,11 @@ internal sealed class MainWindow : Window
     private void CancelDrag() { dragOriginal = null; dragPreview = null; dragVisual = null; canvas.ReleasePointerCaptures(); Draw(); }
     private void Inspect()
     {
-        inspector.Children.Clear(); inspector.Children.Add(Text("屏幕属性", "section"));
         var screen = layout.Screens.FirstOrDefault(s => s.Id == selected);
+        inspector.Children.Clear(); inspector.Children.Add(Text(screen is null ? "屏幕属性" : ScreenName(screen.Id), "section"));
         if (screen is null) { inspector.Children.Add(Text("选择一块屏幕，编辑位置与尺寸。", secondary: true)); return; }
-        var id = new TextBox { Header = "屏幕名称", Text = screen.Id };
-        var device = new TextBox { Header = "所属设备", Text = screen.DeviceId };
+        var id = new TextBox { Header = "屏幕标识", Text = screen.Id };
+        var device = new TextBox { Header = "所属设备标识", Text = screen.DeviceId };
         AutomationProperties.SetAutomationId(id, "property-id"); AutomationProperties.SetAutomationId(device, "property-device");
         inspector.Children.Add(id); inspector.Children.Add(device);
         NumberBox Number(string title, string aid, double value)
@@ -338,7 +514,7 @@ internal sealed class MainWindow : Window
         inspector.Children.Add(Action("移除屏幕", "remove-screen", async () =>
         {
             var candidate = new LayoutDocument(layout.Screens.Where(s => s.Id != screen.Id).ToList());
-            if (candidate.Screens.Count == 0) { layout = candidate; selected = null; sample = false; ++revision; UpdateStatus(); Draw(); Inspect(); }
+            if (candidate.Screens.Count == 0) { layout = candidate; selected = null; sample = false; ++revision; UpdateStatus(); Draw(); Inspect(); RefreshDevices(); }
             else if (await Commit(candidate, sample)) UpdateStatus();
         }));
         inspector.Children.Add(Text("穿越预览", "section"));
@@ -356,7 +532,7 @@ internal sealed class MainWindow : Window
     private async void AddScreen()
     {
         var id = new TextBox { Header = "屏幕名称", Text = "屏幕 " + (layout.Screens.Count + 1) };
-        var device = new TextBox { Header = "所属设备", Text = "我的设备" };
+        var device = new ComboBox { Header = "所属设备（可新增）", IsEditable = true, ItemsSource = layout.Screens.Select(screen => screen.DeviceId).Distinct().ToList(), Text = layout.Screens.FirstOrDefault()?.DeviceId ?? "我的设备", HorizontalAlignment = HorizontalAlignment.Stretch };
         var fields = new StackPanel { Spacing = 12 }; fields.Children.Add(id); fields.Children.Add(device);
         var dialog = new ContentDialog { XamlRoot = root.XamlRoot, Title = "添加屏幕", Content = fields, PrimaryButtonText = "添加", CloseButtonText = "取消", DefaultButton = ContentDialogButton.Primary };
         if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;

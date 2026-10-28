@@ -2,15 +2,15 @@
   "schema_version": 1,
   "product_name": "Crossflow",
   "colors": {
-    "background": "#F7F8FC",
+    "background": "#F8F8F5",
     "surface": "#FFFFFF",
-    "surface_subtle": "#F0F2F8",
-    "text": "#1D2333",
-    "text_secondary": "#596174",
-    "border": "#DCE0EA",
-    "accent": "#5260D9",
-    "accent_subtle": "#ECEEFD",
-    "device_secondary": "#157B75",
+    "surface_subtle": "#F1F2EF",
+    "text": "#282A2E",
+    "text_secondary": "#696D75",
+    "border": "#E3E5E1",
+    "accent": "#5264D9",
+    "accent_subtle": "#EEF0FA",
+    "device_secondary": "#4F847C",
     "success": "#187345",
     "warning": "#805900",
     "danger": "#B72D42"
@@ -29,14 +29,14 @@
   },
   "radii": {
     "control": 8,
-    "panel": 14
+    "panel": 10
   },
   "window": {
     "width": 1180,
     "height": 760,
     "minimum_width": 880,
     "minimum_height": 600,
-    "sidebar_width": 200,
+    "sidebar_width": 236,
     "inspector_width": 260
   },
   "copy": {

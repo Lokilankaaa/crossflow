@@ -1,0 +1,98 @@
+Window: "Crossflow", App: Crossflow.Windows.exe.
+	0 窗口 Crossflow Secondary Actions: Raise
+		1 窗格
+			2 窗格
+				3 窗格
+					4 文本 Crossflow
+					5 按钮 ID: nav-layout
+						6 文本 工作台
+					7 按钮 ID: nav-connection
+						8 文本 设备
+					9 按钮 ID: nav-input
+						10 文本 输入
+					11 按钮 ID: nav-settings
+						12 文本 设置
+					13 文本 尚未连接
+					14 按钮 连接设备 ID: sidebar-session-primary
+					15 文本 设备与屏幕
+					236 文本 示例设备 · 尚未发现
+					237 文本 Windows 台式机 · 2 块屏幕
+					238 按钮 ID: device-screen-windows-main
+						239 文本 主显示器
+					240 按钮 ID: device-screen-windows-portrait
+						241 文本 竖屏
+					242 文本 MacBook Air · 2 块屏幕
+					243 按钮 ID: device-screen-mac-external
+						244 文本 外接显示器
+					245 按钮 ID: device-screen-mac-built-in
+						246 文本 内建显示器
+				17 窗格
+					247 文本 屏幕排列
+					248 文本 拖动屏幕，匹配你的桌面布局。
+					249 窗格
+						250 按钮 添加屏幕 ID: add-screen
+						251 按钮 导入布局 ID: import-layout
+						123 按钮 导出布局 ID: export-layout
+						252 按钮 显示示例 ID: load-sample
+						253 按钮 适应画布 ID: fit-layout
+					126 状态栏
+						127 文本 信息图标 ID: StandardIcon
+						128 文本 布局草稿 ID: Title
+						129 文本 当前可编辑与导出布局，尚未应用到键鼠共享。 示例屏幕，不代表已发现的设备。 ID: Message
+					130 组 屏幕排列画布 ID: layout-canvas
+						254 按钮 屏幕 windows-main，设备 windows-workstation。使用方向键移动。 ID: screen-windows-main
+							255 文本 主显示器
+							256 文本 Windows 台式机
+							257 文本 2560 × 1440
+						258 按钮 屏幕 windows-portrait，设备 windows-workstation。使用方向键移动。 ID: screen-windows-portrait
+							259 文本 竖屏
+							260 文本 Windows 台式机
+							261 文本 1080 × 1920
+						262 按钮 屏幕 mac-external，设备 macbook-air。使用方向键移动。 ID: screen-mac-external
+							263 文本 外接显示器
+							264 文本 MacBook Air
+							265 文本 2560 × 1440
+						266 按钮 屏幕 mac-built-in，设备 macbook-air。使用方向键移动。 ID: screen-mac-built-in
+							267 文本 内建显示器
+							268 文本 MacBook Air
+							269 文本 1470 × 956
+					270 窗格
+						271 文本 主显示器
+						272 编辑 (settable, string) 屏幕标识 Value: windows-main ID: property-id
+							273 文本 屏幕标识
+						274 编辑 (settable, string) 所属设备标识 Value: windows-workstation ID: property-device
+							275 文本 所属设备标识
+						276 沙网 (settable, float) 水平位置 Value: 0 ID: property-x
+							277 文本 水平位置
+							278 编辑 (settable, string) 水平位置 Value: 0 ID: InputBox
+						279 沙网 (settable, float) 垂直位置 Value: 0 ID: property-y
+							280 文本 垂直位置
+							281 编辑 (settable, string) 垂直位置 Value: 0 ID: InputBox
+						282 沙网 (settable, float) 宽度 Value: 2560 ID: property-width
+							283 文本 宽度
+							284 编辑 (settable, string) 宽度 Value: 2560 ID: InputBox
+						285 沙网 (settable, float) 高度 Value: 1440 ID: property-height
+							286 文本 高度
+							287 编辑 (settable, string) 高度 Value: 1440 ID: InputBox
+						288 按钮 保存属性 ID: save-properties
+						289 按钮 移除屏幕 ID: remove-screen
+						290 文本 穿越预览
+						291 文本 从屏幕中心穿过所选边缘，仅预览布局。
+						292 组合框 ID: crossing-direction
+						293 按钮 预览穿越 ID: preview-crossing
+						294 滚动条 (settable, float) 垂直 Value: 0 ID: VerticalScrollBar
+							295 按钮 垂直小幅下降 ID: VerticalSmallDecrease
+							296 按钮 垂直大幅下降 ID: VerticalLargeDecrease
+							297 按钮 垂直大幅增长 ID: VerticalLargeIncrease
+							298 按钮 垂直小幅增长 ID: VerticalSmallIncrease
+					172 文本 布局内核已就绪 · 尚未连接 · 布局尚未应用运行时
+		36 标题栏 (settable, string) Value: Crossflow
+			37 菜单栏 系统 ID: MenuBar
+				38 菜单项 系统
+			39 按钮 最小化
+			40 按钮 最大化
+			41 按钮 关闭
+
+Document text: ```
+1440
+```

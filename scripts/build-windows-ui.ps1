@@ -17,19 +17,20 @@ $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $env:DOTNET_NOLOGO = '1'
 $env:NUGET_PACKAGES = Join-Path $projectRoot '.tools/nuget'
-if (-not $SkipBridge) {
-    Push-Location $projectRoot
-    try {
-        if (Test-Path -LiteralPath (Join-Path $projectRoot '.tools/cargo/bin/cargo.exe')) {
-            & (Join-Path $PSScriptRoot 'cargo-local.ps1') -CargoArgs @('build', '--release', '--locked', '--package', 'crossflow-bridge')
-        } else {
-            & cargo build --release --locked --package crossflow-bridge
-        }
-        if ($LASTEXITCODE -ne 0) { throw 'Rust bridge build failed.' }
+Push-Location $projectRoot
+try {
+    $coreArguments = @('build', '--release', '--locked', '--package', 'crossflow')
+    if (-not $SkipBridge) { $coreArguments += @('--package', 'crossflow-bridge') }
+    if (Test-Path -LiteralPath (Join-Path $projectRoot '.tools/cargo/bin/cargo.exe')) {
+        & (Join-Path $PSScriptRoot 'cargo-local.ps1') -CargoArgs $coreArguments
+    } else {
+        & cargo @coreArguments
     }
-    finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw 'Rust core/bridge build failed.' }
 }
+finally { Pop-Location }
 if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'target/release/crossflow_bridge.dll'))) { throw 'Rust bridge DLL is missing. Build crossflow-bridge before the native client.' }
+if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'target/release/crossflow.exe'))) { throw 'Rust sender is missing. Build the crossflow release binary before the native client.' }
 $project = Join-Path $projectRoot 'clients/windows/Crossflow.Windows/Crossflow.Windows.csproj'
 $arguments = @('build', $project, '-c', $Configuration, '-p:Platform=x64')
 if ($NoRestore) { $arguments += '--no-restore' }
