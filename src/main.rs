@@ -73,6 +73,12 @@ enum Command {
         inject_actions: bool,
         #[arg(long, default_value_t = 1.0)]
         gain: f64,
+        /// Advertise this bound receiver on the LAN. Discovery does not grant trust.
+        #[arg(long)]
+        discoverable: bool,
+        /// Public discovery label; defaults to a generic platform name.
+        #[arg(long, requires = "discoverable")]
+        device_name: Option<String>,
     },
     /// Capture Windows Raw Input; Ctrl+Alt+Space arms, Ctrl+Alt+Esc exits.
     Send {
@@ -337,6 +343,8 @@ fn main() -> Result<()> {
             inject,
             inject_actions,
             gain,
+            discoverable,
+            device_name,
         } => {
             valid_duration(seconds)?;
             ensure!(
@@ -348,6 +356,9 @@ fn main() -> Result<()> {
             } else {
                 "receiver_dry_run"
             });
+            let discovery_options =
+                discoverable.then_some(session::ReceiveDiscoveryOptions { device_name });
+            meta["discoverable_requested"] = json!(discoverable);
             meta["gain"] = json!(gain);
             meta["bind"] = json!(bind);
             meta["duration_seconds"] = json!(seconds);
@@ -384,20 +395,25 @@ fn main() -> Result<()> {
                             let mut sink =
                                 crossflow::injection_worker::WorkerProxy::spawn(&mut command)?;
                             sink.attach_failure_log(writer.log.clone());
-                            let result = session::receive_with_stop(
+                            let result = session::receive_with_discovery(
                                 &bind,
                                 &identity,
                                 &mut sink,
                                 writer.log.clone(),
                                 seconds,
                                 &stop,
+                                discovery_options.as_ref(),
                             );
-                            // A normal receiver exit must also confirm the
-                            // input owner's cleanup ACK and actual process exit.
-                            if result.is_ok() {
-                                sink.shutdown()?;
+                            // Discovery failure must not skip the input owner's
+                            // explicit cleanup ACK and process-exit attempt.
+                            let cleanup = sink.shutdown();
+                            if let Err(error) = &cleanup {
+                                writer.log.write("error", json!({"stage":"input_worker_shutdown","message":format!("{error:#}"),"receiver_error":result.as_ref().err().map(|e|format!("{e:#}"))}));
                             }
-                            return result;
+                            return match (result, cleanup) {
+                                (Err(error), _) => Err(error),
+                                (Ok(()), cleanup) => cleanup,
+                            };
                         }
                         struct Native(crossflow::platform::macos::MacMouseSink, bool);
                         impl session::MouseSink for Native {
@@ -451,13 +467,14 @@ fn main() -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                             inject_actions,
                         );
-                        session::receive_with_stop(
+                        session::receive_with_discovery(
                             &bind,
                             &identity,
                             &mut sink,
                             writer.log.clone(),
                             seconds,
                             &stop,
+                            discovery_options.as_ref(),
                         )
                     })()
                 }
@@ -469,13 +486,14 @@ fn main() -> Result<()> {
                 }
             } else {
                 let mut sink = session::DrySink::default();
-                let r = session::receive_with_stop(
+                let r = session::receive_with_discovery(
                     &bind,
                     &identity,
                     &mut sink,
                     writer.log.clone(),
                     seconds,
                     &stop,
+                    discovery_options.as_ref(),
                 );
                 eprintln!(
                     "Dry run: {} movements, final cumulative ({:.2}, {:.2})",
@@ -774,5 +792,39 @@ fn run_capture(
         anyhow::bail!(
             "physical capture currently requires Windows; --synthetic is available for diagnostics"
         )
+    }
+}
+
+#[cfg(test)]
+mod discovery_cli_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_is_explicit_and_name_cannot_enable_it_implicitly() {
+        let base = [
+            "crossflow",
+            "receive",
+            "--identity",
+            "identity",
+            "--log",
+            "run.jsonl",
+        ];
+        let parsed = Args::try_parse_from(base).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Receive {
+                discoverable: false,
+                device_name: None,
+                ..
+            }
+        ));
+        let mut named = base.to_vec();
+        named.extend(["--device-name", "Public device"]);
+        assert!(Args::try_parse_from(&named).is_err());
+        named.push("--discoverable");
+        let parsed = Args::try_parse_from(named).unwrap();
+        assert!(
+            matches!(parsed.command, Command::Receive { discoverable: true, device_name: Some(name), .. } if name == "Public device")
+        );
     }
 }

@@ -1,4 +1,5 @@
 use crate::{
+    discovery::{self, Advertisement, DiscoveryConfig, DiscoveryHandle, DiscoveryState},
     input::{Button, InputAction, SourceInputQueue},
     metrics::Log,
     protocol::{Frame, Kind},
@@ -961,24 +962,129 @@ pub fn receive_with_stop(
     seconds: f64,
     stop: &AtomicBool,
 ) -> Result<()> {
+    receive_with_discovery(address, bundle, sink, log, seconds, stop, None)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReceiveDiscoveryOptions {
+    /// Explicit public label. None uses a platform label, never an OS hostname.
+    pub device_name: Option<String>,
+}
+
+impl ReceiveDiscoveryOptions {
+    fn advertisement(&self, bound: SocketAddr) -> Result<Advertisement> {
+        Ok(Advertisement {
+            device_id: discovery::new_public_id()?,
+            friendly_name: self
+                .device_name
+                .clone()
+                .unwrap_or_else(|| discovery::default_device_name().into()),
+            platform: std::env::consts::OS.into(),
+            protocol: u16::from(crate::protocol::WIRE_VERSION),
+            port: bound.port(),
+            listen_ip: bound.ip(),
+        })
+    }
+}
+
+/// Optional unauthenticated advertisement belongs to this bound listener only.
+/// Existing session callers remain undiscoverable unless they explicitly opt in.
+pub fn receive_with_discovery(
+    address: &str,
+    bundle: &Path,
+    sink: &mut dyn MouseSink,
+    log: Log,
+    seconds: f64,
+    stop: &AtomicBool,
+    options: Option<&ReceiveDiscoveryOptions>,
+) -> Result<()> {
     let identity = Identity::load(bundle)?;
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
+    let bound = listener.local_addr()?;
     eprintln!(
         "Listening on {}. Press Escape on Mac to stop input; Ctrl+C exits.",
-        listener.local_addr()?
+        bound
     );
-    log.write(
-        "listening",
-        json!({"address":listener.local_addr()?.to_string()}),
+    log.write("listening", json!({"address":bound.to_string()}));
+    let mut discovery = if let Some(options) = options.filter(|_| !stop.load(Ordering::Acquire)) {
+        let ad = options.advertisement(bound)?;
+        let handle = DiscoveryHandle::start(DiscoveryConfig {
+            local_device_id: Some(ad.device_id.clone()),
+            compatible_protocol: u16::from(crate::protocol::WIRE_VERSION),
+            advertisement: Some(ad.clone()),
+        })
+        .context("Start receiver discovery")?;
+        log.write("discovery_started", json!({"device_id":ad.device_id,"listen_address":bound.to_string(),"trusted":false,"status":"startup_requested"}));
+        Some(handle)
+    } else {
+        None
+    };
+
+    // All loop exits, including local stop and failed input cleanup, reach the
+    // explicit bounded mDNS teardown before dropping the bound listener.
+    let result = receive_listener_loop(
+        &listener,
+        &identity,
+        sink,
+        log.clone(),
+        seconds,
+        stop,
+        discovery.as_ref(),
     );
+    let cleanup = if let Some(handle) = &mut discovery {
+        let stopped = handle.wait_stopped(Duration::from_secs(3));
+        match &stopped {
+            Ok(()) => log.write("discovery_stopped", json!({})),
+            Err(error) => log.write(
+                "error",
+                json!({"stage":"receiver_discovery_cleanup","message":format!("{error:#}"),"receiver_error":result.as_ref().err().map(|e|format!("{e:#}"))}),
+            ),
+        }
+        stopped.context("Stop receiver discovery")
+    } else {
+        Ok(())
+    };
+    match (result, cleanup) {
+        // Cleanup failures are separately logged; preserve the input/receiver
+        // error itself (including its concrete type and outermost context).
+        (Err(error), _) => Err(error),
+        (Ok(()), result) => result,
+    }
+}
+
+fn check_discovery(discovery: Option<&DiscoveryHandle>) -> Result<()> {
+    if let Some(snapshot) = discovery.and_then(DiscoveryHandle::try_snapshot) {
+        ensure!(
+            !matches!(
+                snapshot.state,
+                DiscoveryState::Error | DiscoveryState::Stopped
+            ),
+            "Receiver discovery stopped unexpectedly: {}",
+            snapshot.error.as_deref().unwrap_or("stopped")
+        );
+    }
+    Ok(())
+}
+
+fn receive_listener_loop(
+    listener: &TcpListener,
+    identity: &Identity,
+    sink: &mut dyn MouseSink,
+    log: Log,
+    seconds: f64,
+    stop: &AtomicBool,
+    discovery: Option<&DiscoveryHandle>,
+) -> Result<()> {
     let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut discovery_check = Instant::now();
     let mut attempt_id = 0u64;
     while Instant::now() < end {
         if stop.load(Ordering::Acquire) || sink.emergency_pressed() {
             log.write("emergency_stop", json!({}));
             return Ok(());
         }
+        check_discovery(discovery)?;
         sink.maintain().map_err(terminal_sink_failure)?;
         let (mut stream, address) = match listener.accept() {
             Ok(s) => s,
@@ -1009,7 +1115,7 @@ pub fn receive_with_stop(
                 .context("Set handshake write timeout")?;
             trace.phase = "handshake";
             trace.write(&log, "handshake_started", json!({}));
-            let channel = security::handshake(&mut stream, &identity, false)?;
+            let channel = security::handshake(&mut stream, identity, false)?;
             trace.write(
                 &log,
                 "handshake_completed",
@@ -1025,6 +1131,10 @@ pub fn receive_with_stop(
             trace.write(&log, "connected", json!({"peer":address.to_string()}));
             while Instant::now() < end {
                 check_local_stop(&owned)?;
+                if discovery_check.elapsed() >= Duration::from_secs(1) {
+                    check_discovery(discovery)?;
+                    discovery_check = Instant::now();
+                }
                 if !peer.pending() && last_grant.elapsed() >= LEASE_PERIOD {
                     lease += 1;
                     let now = log.ns();
@@ -1142,6 +1252,83 @@ mod tests {
         let mut state = ReceiverState::new(1_000_000_000);
         state.grant(1, log.ns());
         state
+    }
+
+    #[test]
+    fn receiver_advertisement_uses_bound_endpoint_and_a_fresh_public_id() {
+        let options = ReceiveDiscoveryOptions::default();
+        let bound: SocketAddr = "192.168.50.2:43123".parse().unwrap();
+        let first = options.advertisement(bound).unwrap();
+        let next = options.advertisement(bound).unwrap();
+        assert_eq!(first.listen_ip, bound.ip());
+        assert_eq!(first.port, bound.port());
+        assert_eq!(first.friendly_name, discovery::default_device_name());
+        assert_ne!(first.device_id, next.device_id);
+        assert_eq!(first.protocol, u16::from(crate::protocol::WIRE_VERSION));
+    }
+
+    #[test]
+    fn invalid_identity_fails_before_bind_or_discovery_start() {
+        let (writer, path) = logs();
+        let result = receive_with_discovery(
+            "not a socket address",
+            &path.with_extension("missing-identity"),
+            &mut DrySink::default(),
+            writer.log.clone(),
+            0.1,
+            &AtomicBool::new(false),
+            Some(&ReceiveDiscoveryOptions::default()),
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("Cannot read identity bundle"));
+        writer.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"listening\""));
+        assert!(!text.contains("discovery_started"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "uses loopback listeners only; no LAN multicast; run explicitly"]
+    fn receiver_bind_failure_and_preexisting_stop_never_start_discovery() {
+        let (writer, path) = logs();
+        let pair_path = path.with_extension("pairing");
+        let pair = security::create_pair(&pair_path).unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = ReceiveDiscoveryOptions::default();
+        assert!(
+            receive_with_discovery(
+                &occupied.local_addr().unwrap().to_string(),
+                &pair.mac_bundle,
+                &mut DrySink::default(),
+                writer.log.clone(),
+                0.1,
+                &AtomicBool::new(false),
+                Some(&options),
+            )
+            .is_err()
+        );
+        assert!(
+            receive_with_discovery(
+                "127.0.0.1:0",
+                &pair.mac_bundle,
+                &mut DrySink::default(),
+                writer.log.clone(),
+                0.1,
+                &AtomicBool::new(true),
+                Some(&options),
+            )
+            .is_ok()
+        );
+        writer.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"listening\"").count(), 1);
+        assert!(!text.contains("discovery_started"));
+        std::fs::remove_file(path).unwrap();
+        for bundle in [pair.mac_bundle, pair.windows_bundle] {
+            std::fs::remove_file(bundle.join("identity.json")).unwrap();
+            std::fs::remove_dir(bundle).unwrap();
+        }
+        std::fs::remove_dir(pair_path).unwrap();
     }
 
     #[test]

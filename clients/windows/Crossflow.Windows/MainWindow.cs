@@ -41,6 +41,11 @@ internal sealed class MainWindow : Window
     private Button? connectSession, armSession, pauseSession, stopSession, identityPicker;
     private TextBox? hostInput, identityInput;
     private readonly SessionController session = new();
+    private readonly DiscoveryClient discovery = new();
+    private TextBlock? discoveryStatus;
+    private StackPanel? nearbyDevices;
+    private Button? refreshDiscovery;
+    private long discoveryGeneration;
     private string targetHost = "", identityDirectory = "";
     private bool sessionAction, closing, allowClose;
     private readonly Button export = new();
@@ -154,9 +159,11 @@ internal sealed class MainWindow : Window
             closing = true; UpdateSessionUi();
             try
             {
-                if (await session.StopAsync()) { allowClose = true; Close(); return; }
+                bool scanStopped = await discovery.StopAsync();
+                bool sessionStopped = await session.StopAsync();
+                if (scanStopped && sessionStopped) { allowClose = true; Close(); return; }
                 ShowConnection();
-                if (sessionDetail is not null) sessionDetail.Text = "共享内核尚未退出。请再次停止连接，确认后再关闭窗口。";
+                if (sessionDetail is not null) sessionDetail.Text = "后台进程尚未退出。请再次停止连接，确认后再关闭窗口。";
             }
             catch { ShowConnection(); if (sessionDetail is not null) sessionDetail.Text = "未能确认共享停止，请重试停止连接。"; }
             closing = false; UpdateSessionUi();
@@ -222,6 +229,9 @@ internal sealed class MainWindow : Window
     }
     private void ResetWorkspace()
     {
+        discoveryGeneration++;
+        discovery.Cancel();
+        discoveryStatus = null; nearbyDevices = null; refreshDiscovery = null;
         if (dragOriginal is not null) CancelDrag();
         // A disconnected WinUI element's Parent may be null while its old
         // container still owns it. Release via the containers we created,
@@ -238,17 +248,31 @@ internal sealed class MainWindow : Window
     private void ShowConnection()
     {
         SelectPage("connection");
-        var page = Page(theme.Copy("connection_title"), "连接配对设备后，手动开始鼠标共享。本轮最多运行一小时。");
+        var page = Page("附近设备", "在同一局域网中查找 Crossflow 设备。发现设备不会自动连接或开始共享。");
+        var heading = new Grid();
+        heading.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        heading.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        discoveryStatus = Text("准备查找附近设备…", secondary: true);
+        discoveryStatus.VerticalAlignment = VerticalAlignment.Center; heading.Children.Add(discoveryStatus);
+        refreshDiscovery = Action("刷新", "discovery-refresh", StartDiscovery);
+        refreshDiscovery.Margin = new Thickness(16, 0, 0, 0); Grid.SetColumn(refreshDiscovery, 1); heading.Children.Add(refreshDiscovery);
+        page.Children.Add(heading);
+        nearbyDevices = new StackPanel { Spacing = 0 };
+        AutomationProperties.SetAutomationId(nearbyDevices, "nearby-devices");
+        page.Children.Add(nearbyDevices);
+        page.Children.Add(Text("首次连接需要在两台设备上确认配对。短码配对正在接入，此版本暂不能从设备列表发起连接。", "caption", true));
+        var diagnostics = new StackPanel { Spacing = 14, Padding = new Thickness(4, 12, 4, 12) };
+        diagnostics.Children.Add(Text("开发诊断 · 仅用于已有身份文件的实验连接。本轮最多运行一小时。", secondary: true));
         connectionStatus = Text("尚未连接", "section");
-        page.Children.Add(connectionStatus);
+        diagnostics.Children.Add(connectionStatus);
         hostInput = new TextBox { Header = "目标 IP 和端口", PlaceholderText = "192.168.1.20:24800", Text = targetHost, MaxLength = 128 };
         AutomationProperties.SetAutomationId(hostInput, "session-host");
         hostInput.TextChanged += (sender, _) => targetHost = ((TextBox)sender).Text;
-        page.Children.Add(hostInput);
+        diagnostics.Children.Add(hostInput);
         identityInput = new TextBox { Header = "配对身份文件夹", Text = identityDirectory, PlaceholderText = "选择现有配对文件夹" };
         AutomationProperties.SetAutomationId(identityInput, "session-identity");
         identityInput.TextChanged += (sender, _) => identityDirectory = ((TextBox)sender).Text;
-        page.Children.Add(identityInput);
+        diagnostics.Children.Add(identityInput);
         identityPicker = Action("选择身份文件夹", "session-pick-identity", async () =>
         {
             var picker = new FolderPicker(); picker.FileTypeFilter.Add("*");
@@ -256,17 +280,69 @@ internal sealed class MainWindow : Window
             try { var folder = await picker.PickSingleFolderAsync(); if (folder is not null) { identityDirectory = folder.Path; if (identityInput is not null) identityInput.Text = identityDirectory; } }
             catch { if (sessionDetail is not null) sessionDetail.Text = "无法选择文件夹，请粘贴现有配对文件夹路径。"; }
         });
-        page.Children.Add(identityPicker);
+        diagnostics.Children.Add(identityPicker);
         var controls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         connectSession = Action("连接", "session-connect", () => RunSessionAction(() => session.ConnectAsync(targetHost, identityDirectory)));
         armSession = Action("开始共享", "session-arm", () => RunSessionAction(session.ArmAsync));
         pauseSession = Action("暂停", "session-pause", () => RunSessionAction(session.PauseAsync));
         stopSession = Action("停止连接", "session-stop", () => RunSessionAction(async () => { if (!await session.StopAsync()) throw new InvalidOperationException("共享内核尚未退出，请重试停止连接。"); }));
         foreach (var button in new[] { connectSession, armSession, pauseSession, stopSession }) controls.Children.Add(button);
-        page.Children.Add(controls);
-        sessionDetail = Text("打开客户端不会自动连接或启动输入。", secondary: true); page.Children.Add(sessionDetail);
-        page.Children.Add(Text("当前真实共享仅支持鼠标移动。键盘、鼠标点击、滚轮与屏幕边缘自动切换尚未接入此入口。布局编辑仍是草稿，不会改变当前共享。", secondary: true));
+        diagnostics.Children.Add(controls);
+        sessionDetail = Text("打开客户端不会自动连接或启动输入。", secondary: true); diagnostics.Children.Add(sessionDetail);
+        diagnostics.Children.Add(Text("当前实验连接仅共享鼠标移动。键盘、鼠标点击、滚轮与屏幕边缘自动切换尚未接入此入口。布局编辑仍是草稿。", "caption", true));
+        var advanced = new Expander { Header = "开发诊断", Content = diagnostics, IsExpanded = false, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
+        AutomationProperties.SetAutomationId(advanced, "developer-diagnostics");
+        page.Children.Add(advanced);
         UpdateSessionUi();
+        if (!closing) StartDiscovery();
+    }
+    private async void StartDiscovery()
+    {
+        if (closing || activePage != "connection" || discoveryStatus is null) return;
+        long generation = ++discoveryGeneration;
+        if (refreshDiscovery is not null) refreshDiscovery.IsEnabled = false;
+        nearbyDevices?.Children.Clear();
+        discoveryStatus.Text = "正在查找附近设备…";
+        try
+        {
+            // Re-entering the page cancels and reaps the previous scan first.
+            if (!await discovery.StopAsync()) throw new InvalidOperationException("上一次扫描尚未退出，请稍后重试。");
+            if (generation != discoveryGeneration || closing) return;
+            var result = await discovery.ScanAsync();
+            if (generation != discoveryGeneration || closing || nearbyDevices is null || discoveryStatus is null) return;
+            discoveryStatus.Text = result.Devices.Count == 0 ? "暂未发现设备" : $"发现 {result.Devices.Count} 台附近设备";
+            if (result.CapacityLimited) discoveryStatus.Text += " · 结果较多，部分设备未显示";
+            if (result.Devices.Count == 0)
+                nearbyDevices.Children.Add(Text("请在另一台设备上打开支持发现的 Crossflow，并确认两台设备处于同一局域网。", secondary: true));
+            foreach (var device in result.Devices)
+            {
+                var row = new Grid { Padding = new Thickness(0, 20, 0, 20), ColumnSpacing = 16 };
+                row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                row.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                row.Children.Add(new FontIcon { Glyph = "\uE7F4", FontSize = 24, Foreground = theme.Brush("text_secondary"), VerticalAlignment = VerticalAlignment.Center });
+                var description = new StackPanel { Spacing = 5 };
+                var name = Text(device.Name, "section"); name.TextWrapping = TextWrapping.NoWrap; name.TextTrimming = TextTrimming.CharacterEllipsis;
+                description.Children.Add(name);
+                string platform = device.Platform switch { "windows" => "Windows", "macos" => "macOS", "linux" => "Linux", "ios" => "iOS", "ipados" => "iPadOS", _ => device.Platform };
+                description.Children.Add(Text($"{platform} · 未配对{(device.Compatible ? "" : " · 版本不兼容")}", "caption", true));
+                Grid.SetColumn(description, 1); row.Children.Add(description);
+                var pair = new Button { Content = device.Compatible ? "配对待接入" : "需要更新", IsEnabled = false, VerticalAlignment = VerticalAlignment.Center };
+                AutomationProperties.SetAutomationId(pair, "pair-unavailable-" + device.Id);
+                Grid.SetColumn(pair, 2); row.Children.Add(pair);
+                nearbyDevices.Children.Add(new Border { Child = row, BorderThickness = new Thickness(0, 0, 0, 1), BorderBrush = theme.Brush("border") });
+            }
+        }
+        catch (OperationCanceledException) { /* Navigation/close invalidates this generation. */ }
+        catch (Exception error)
+        {
+            if (generation == discoveryGeneration && !closing && discoveryStatus is not null)
+                discoveryStatus.Text = error is InvalidOperationException ? error.Message : "扫描失败，请检查网络后刷新。";
+        }
+        finally
+        {
+            if (generation == discoveryGeneration && !closing && refreshDiscovery is not null) refreshDiscovery.IsEnabled = true;
+        }
     }
     private async void RunSessionAction(Func<Task> operation)
     {

@@ -7,11 +7,13 @@
 //! proof of reachability or ownership. Never use `device_id` as a trusted key.
 //! The bounded application cache does not bound mdns-sd's internal DNS cache.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use mdns_sd::{
-    DaemonEvent, DaemonStatus, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo,
+    DaemonEvent, DaemonStatus, IfKind, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent,
+    ServiceInfo,
 };
 use serde::Serialize;
+use snow::resolvers::{CryptoResolver, DefaultResolver};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr, SocketAddrV6},
@@ -41,6 +43,31 @@ pub struct Advertisement {
     pub platform: String,
     pub protocol: u16,
     pub port: u16,
+    /// Actual listener IP, not a guessed primary interface. Unspecified addresses
+    /// advertise only their own family. Concrete IPv6 link-local IPs require a
+    /// scope unavailable in this field and are intentionally rejected.
+    pub listen_ip: IpAddr,
+}
+
+/// Fresh, public, per-run discovery identity. It has no relationship to keys,
+/// pairing IDs, account names, hostnames or persistent device identity.
+pub fn new_public_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    DefaultResolver
+        .resolve_rng()
+        .context("Discovery random source unavailable")?
+        .try_fill_bytes(&mut bytes)
+        .context("Cannot generate public discovery ID")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+pub fn default_device_name() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "Crossflow Windows PC",
+        "macos" => "Crossflow Mac",
+        "linux" => "Crossflow Linux PC",
+        _ => "Crossflow device",
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +196,15 @@ fn validate_id(id: &str) -> Result<()> {
 
 impl Advertisement {
     fn validate(&self) -> Result<()> {
+        self.validate_metadata()?;
+        ensure!(
+            self.listen_ip.is_unspecified() || (endpoint(self.listen_ip, 0, self.port).is_some()),
+            "Discovery requires a LAN listener; loopback, invalid and scoped link-local binds cannot be advertised"
+        );
+        Ok(())
+    }
+
+    fn validate_metadata(&self) -> Result<()> {
         validate_id(&self.device_id)?;
         ensure!(
             !self.friendly_name.trim().is_empty()
@@ -202,15 +238,37 @@ impl Advertisement {
             ("protocol", protocol.as_str()),
         ];
         // Opaque ID avoids broadcasting machine/account hostnames.
-        Ok(ServiceInfo::new(
+        let address = if self.listen_ip.is_unspecified() {
+            String::new()
+        } else {
+            self.listen_ip.to_string()
+        };
+        let mut service = ServiceInfo::new(
             SERVICE_TYPE,
             &format!("cf-{}", self.device_id),
             &format!("cf-{}.local.", self.device_id),
-            "",
+            address.as_str(),
             self.port,
             &properties[..],
-        )?
-        .enable_addr_auto())
+        )?;
+        if self.listen_ip.is_unspecified() {
+            service = service.enable_addr_auto();
+        }
+        // Do not auto-populate other addresses on a multi-address interface.
+        service.set_interfaces(vec![self.interface_selector()]);
+        Ok(service)
+    }
+
+    fn interface_selector(&self) -> IfKind {
+        if self.listen_ip.is_unspecified() {
+            if self.listen_ip.is_ipv4() {
+                IfKind::IPv4
+            } else {
+                IfKind::IPv6
+            }
+        } else {
+            IfKind::Addr(self.listen_ip)
+        }
     }
 }
 
@@ -261,8 +319,10 @@ fn parse(service: &ResolvedService, compatible_protocol: u16) -> Result<Candidat
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid discovery protocol"))?,
         port: service.port,
+        // Incoming metadata has no authority over our local listener policy.
+        listen_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
     };
-    ad.validate()?;
+    ad.validate_metadata()?;
     let mut addresses = BTreeSet::new();
     for ip in &service.addresses {
         let scope = match ip {
@@ -526,6 +586,7 @@ mod tests {
             platform: "windows".into(),
             protocol: 2,
             port: 24800,
+            listen_ip: "0.0.0.0".parse().unwrap(),
         };
         let mut service = ad.service().unwrap().as_resolved_service();
         service.fullname = format!("{alias}.{SERVICE_TYPE}");
@@ -557,11 +618,102 @@ mod tests {
             platform: "macos".into(),
             protocol: 2,
             port: 1,
+            listen_ip: "0.0.0.0".parse().unwrap(),
         };
         assert!(ad.validate().is_err());
         ad.friendly_name = "Mac".into();
         assert!(ad.validate().is_ok());
         assert!(validate_id(&"A".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn concrete_bind_never_adds_another_address_or_family() {
+        let mut ad = Advertisement {
+            device_id: "a".repeat(32),
+            friendly_name: "Crossflow test".into(),
+            platform: "windows".into(),
+            protocol: 2,
+            port: 41234,
+            listen_ip: "192.168.50.2".parse().unwrap(),
+        };
+        for address in ["192.168.50.2", "2001:db8::2"] {
+            ad.listen_ip = address.parse().unwrap();
+            let service = ad.service().unwrap();
+            assert!(!service.is_addr_auto());
+            assert_eq!(service.get_addresses().len(), 1);
+            assert!(service.get_addresses().contains(&ad.listen_ip));
+            assert_eq!(service.get_port(), 41234);
+            assert!(matches!(ad.interface_selector(), IfKind::Addr(ip) if ip == ad.listen_ip));
+        }
+        ad.listen_ip = "0.0.0.0".parse().unwrap();
+        assert!(ad.service().unwrap().is_addr_auto());
+        assert!(matches!(ad.interface_selector(), IfKind::IPv4));
+        ad.listen_ip = "::".parse().unwrap();
+        assert!(ad.service().unwrap().is_addr_auto());
+        assert!(matches!(ad.interface_selector(), IfKind::IPv6));
+        for address in [
+            "127.0.0.1",
+            "::1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:192.168.50.2",
+            "fe80::2",
+        ] {
+            ad.listen_ip = address.parse().unwrap();
+            assert!(ad.service().is_err(), "{address}");
+        }
+    }
+
+    #[test]
+    fn public_ids_are_fresh_and_do_not_require_identity_material() {
+        let mut ids = BTreeSet::new();
+        for _ in 0..32 {
+            let id = new_public_id().unwrap();
+            validate_id(&id).unwrap();
+            assert!(ids.insert(id));
+        }
+        assert!(matches!(
+            default_device_name(),
+            "Crossflow Windows PC" | "Crossflow Mac" | "Crossflow Linux PC" | "Crossflow device"
+        ));
+    }
+
+    #[test]
+    fn explicit_shutdown_wait_is_bounded_and_reports_worker_failure() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(Mutex::new(DiscoverySnapshot {
+            state: DiscoveryState::Starting,
+            candidates: vec![],
+            capacity_limited: false,
+            error: None,
+        }));
+        let worker_snapshot = snapshot.clone();
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_release = release.clone();
+        let worker = thread::spawn(move || {
+            while !worker_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            worker_snapshot.lock().unwrap().state = DiscoveryState::Error;
+        });
+        let mut handle = DiscoveryHandle {
+            stop,
+            snapshot,
+            worker: Some(worker),
+        };
+        let began = Instant::now();
+        let result = handle.wait_stopped(Duration::from_millis(5));
+        release.store(true, Ordering::Release);
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(
+            handle
+                .wait_stopped(Duration::from_secs(1))
+                .unwrap_err()
+                .to_string()
+                .contains("did not stop cleanly")
+        );
     }
 
     #[test]
@@ -678,6 +830,7 @@ mod tests {
                 platform: "windows".into(),
                 protocol: 2,
                 port: listener.local_addr().unwrap().port(),
+                listen_ip: listener.local_addr().unwrap().ip(),
             }),
             local_device_id: Some(id.clone()),
             compatible_protocol: 2,

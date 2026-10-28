@@ -9,6 +9,8 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--discovery-fixture") { DiscoverySelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
+        if (args.Length == 2 && args[0] == "--discovery-self-test") { DiscoverySelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--session-fixture") { SessionSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--session-self-test") { SessionSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--self-test") { SelfTest.Run(args[1]); return; }
