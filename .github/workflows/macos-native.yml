@@ -11,6 +11,7 @@ on:
       - 'experiments/pairing-spake2/**'
       - 'scripts/**'
       - 'Cargo.*'
+      - 'build.rs'
       - '.github/workflows/macos-native.yml'
   workflow_dispatch:
 
