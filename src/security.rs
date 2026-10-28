@@ -1067,8 +1067,11 @@ mod tests {
                     .is_err(),
                 "Wrong local role accepted"
             );
-            let saved =
-                store.remember_authorized(b, "Keychain test Windows", "127.0.0.1:5555".parse()?)?;
+            let saved = store.remember_authorized_receiver(b, "Keychain test Windows")?;
+            ensure!(
+                saved.last_endpoint.is_none(),
+                "Receiver-only peer acquired a false route"
+            );
             let reopened = crate::peers::PeerStore::at(root.join("peers"));
             ensure!(
                 reopened.list()?.peers == vec![saved],

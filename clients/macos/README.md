@@ -55,9 +55,21 @@ normal packaged calls find it beside the executable. The app packaging script
 copies and signs that native helper along with the shared bridge.
 
 Neither the native tests nor the packaged Mac Keychain workflow has run yet.
-The Mac pairing invitation UI/worker is still pending. A crash after Keychain add
+The Mac pairing invitation worker is implemented but has not run natively;
+the invitation UI remains pending. A crash after Keychain add
 but before locator commit can orphan an item, and a metadata commit failure can
 leave an uncommitted peer directory; full recovery/revocation is not implemented.
+
+To build the optional invitation worker, supply a native pinned BoringSSL archive
+via `CROSSFLOW_BORINGSSL_LIB_DIR` and run
+`sh scripts/build-macos-pairing.sh --offline` before the UI packaging script.
+This packages `crossflow-invite` alongside `crossflow-keychain`. No invitation or
+input session starts during a build. The private worker protocol is documented
+in the [pairing workspace](../../experiments/pairing-spake2/rust-pairing/README.md).
+Its saved result explicitly reports `input_ready:false`. The core now supports
+`receive --peer <id>` to resolve managed credentials without asking the user for
+an identity file. Native UI receiver startup and packaging of the core executable
+are still separate integration work; the current app cannot yet drive this flow.
 
 The app bundles the canonical `clients/design-tokens.json` and shared layouts
 from `examples/`. The four-screen example contains two devices; these are

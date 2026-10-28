@@ -27,6 +27,14 @@ bin_dir=$(swift build --package-path "$root/clients/macos" \
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin_dir/CrossflowMac" "$app/Contents/MacOS/CrossflowMac"
 cp "$keychain_helper" "$app/Contents/MacOS/crossflow-keychain"
+pairing_worker="$root/target/macos-pairing/package/crossflow-invite"
+if [ -f "$pairing_worker" ]; then
+    cp "$pairing_worker" "$app/Contents/MacOS/crossflow-invite"
+    codesign --force --sign - "$app/Contents/MacOS/crossflow-invite"
+elif [ -f "$app/Contents/MacOS/crossflow-invite" ]; then
+    # Do not retain a previous optional worker when this build has no source.
+    rm -- "$app/Contents/MacOS/crossflow-invite"
+fi
 cp "$root/clients/macos/Resources/Info.plist" "$app/Contents/Info.plist"
 cp "$root/clients/design-tokens.json" "$app/Contents/Resources/design-tokens.json"
 cp "$root/examples/layout-two-devices.json" "$app/Contents/Resources/layout-two-devices.json"

@@ -78,8 +78,11 @@ enum Command {
     Receive {
         #[arg(long, default_value = "127.0.0.1:24800")]
         bind: String,
-        #[arg(long)]
-        identity: PathBuf,
+        #[arg(long, required_unless_present = "peer", conflicts_with = "peer")]
+        identity: Option<PathBuf>,
+        /// App-managed authorized sender; no identity-file selection required.
+        #[arg(long, conflicts_with = "identity")]
+        peer: Option<String>,
         #[arg(long)]
         log: PathBuf,
         #[arg(long, default_value_t = 60.0)]
@@ -236,7 +239,10 @@ fn main() -> Result<()> {
             let (host, identity) = if let Some(id) = peer {
                 let (device, bundle) =
                     crossflow::peers::PeerStore::default_store()?.resolve(&id)?;
-                (device.last_endpoint.to_string(), bundle)
+                let endpoint = device.last_endpoint.context(
+                    "Saved peer has no input listening endpoint; this record only authorizes incoming input",
+                )?;
+                (endpoint.to_string(), bundle)
             } else {
                 (
                     host.context("Target endpoint required")?,
@@ -390,6 +396,7 @@ fn main() -> Result<()> {
         Command::Receive {
             bind,
             identity,
+            peer,
             log,
             seconds,
             inject,
@@ -399,6 +406,13 @@ fn main() -> Result<()> {
             device_name,
         } => {
             valid_duration(seconds)?;
+            let identity = if let Some(peer) = peer {
+                crossflow::peers::PeerStore::default_store()?
+                    .resolve(&peer)?
+                    .1
+            } else {
+                identity.context("Receiver requires an authorized identity")?
+            };
             ensure!(
                 gain.is_finite() && gain > 0.0 && gain <= 10.,
                 "gain must be (0,10]"
@@ -850,6 +864,53 @@ fn run_capture(
 #[cfg(test)]
 mod discovery_cli_tests {
     use super::*;
+
+    #[test]
+    fn receiver_peer_mode_requires_one_identity_source_and_never_enables_injection() {
+        let args = Args::try_parse_from([
+            "crossflow",
+            "receive",
+            "--peer",
+            &"a".repeat(64),
+            "--log",
+            "test.jsonl",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Receive {
+                identity: None,
+                peer: Some(_),
+                inject: false,
+                ..
+            }
+        ));
+        assert!(Args::try_parse_from(["crossflow", "receive", "--log", "test.jsonl"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "crossflow",
+                "receive",
+                "--peer",
+                &"a".repeat(64),
+                "--identity",
+                "legacy",
+                "--log",
+                "test.jsonl"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "crossflow",
+                "receive",
+                "--identity",
+                "legacy",
+                "--log",
+                "test.jsonl"
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn pairing_discovery_is_explicit_and_input_remains_default() {

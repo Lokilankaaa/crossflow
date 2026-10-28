@@ -1,7 +1,7 @@
 # Rust SPAKE2 integration experiment
 
 Independent workspace containing the experimental shared pairing library and the
-Windows client enrollment worker. The opt-in Windows package now uses this worker;
+Windows enrollment and macOS invitation workers. The opt-in Windows package uses its worker;
 this is not a completed cross-platform pairing release. No downloads are performed
 by Cargo's build script. The native library must be built from the
 revision and checksum in [../source-lock.json](../source-lock.json), using the
@@ -32,8 +32,8 @@ approval. The responder used a Mac protocol role on Windows with a DrySink;
 there was no macOS execution, Keychain access or OS input injection. See
 [validation evidence](../../../docs/windows-pairing-client-validation-20261029.json).
 
-The Windows worker currently initiates enrollment only. A production Mac invitation
-UI/worker, Keychain persistence, cross-machine validation, multi-address enrollment
+The Windows worker currently initiates enrollment only. Mac invitation UI,
+native worker/Keychain validation, cross-machine validation, multi-address enrollment
 fallback and distributed save recovery/revocation remain outstanding. The first
 valid discovered address is attempted. Cancellation before final authorization
 does not save trust; cancellation during an already authorized OS save cannot
@@ -43,6 +43,48 @@ that every cancellation removed a record.
 The C ABI is taken directly from that revision's `curve25519.h`, `hmac.h`,
 `digest.h`, and `mem.h`. BoringSSL does not promise ABI stability; upgrading the
 native library requires reviewing these bindings and rerunning the tests.
+
+## Invitation host and macOS worker — 2026-10-29
+
+`host::serve_one` owns one 120-second invitation, advertises its pairing service,
+and accepts at most three authentication attempts using the existing process-wide
+budget. Approval is bound to the authenticated attempt token; early, stale or
+duplicate approvals fail closed. Cancellation, control EOF, output backpressure
+and uncertain cleanup return no authorized keys. The input listener is reserved
+only: it never accepts or injects input. Discovery does not establish trust.
+
+The private `crossflow-invite` macOS process wraps this host and saves a bilaterally
+approved peer through the managed Keychain store. Build natively with
+`sh scripts/build-macos-pairing.sh --offline`, supplying the absolute native pinned
+archive directory in `CROSSFLOW_BORINGSSL_LIB_DIR`. The script does not download
+dependencies or start sharing. The UI packager includes the worker when available;
+the SwiftUI invitation screen is not integrated yet.
+
+The worker takes no arguments. Its inherited stdin accepts bounded JSON lines:
+`begin` with `name`, `approve` with the current `attempt`, or `cancel`.
+Private stdout emits `invitation_ready`, `code`, `pending`, `attempt_failed`,
+`discovery` and `saved` events. Never capture this stream in logs: the `code`
+event is for UI display only. Its `lifetime_seconds` is the original duration,
+not a refreshed countdown. The authenticated `pending` event carries the attempt
+token, peer name/platform and fingerprint. Closing stdin cancels the exchange.
+
+`saved` reports the stored peer ID and a suggested receiver port with
+`input_ready:false`; success means pairing was saved, not that input started.
+The client must separately start the core receiver using `receive --peer <id>`
+and discoverable mode. Injection remains an explicit separate choice. A sender
+that advertises no listening port is stored without a target endpoint; its
+ephemeral connection port is never treated as a listening address. Cancellation
+during an already-authorized OS save can still commit, so the UI must refresh its
+saved-device list after cancellation or an uncertain result.
+
+Windows validation covered 29 library tests, three Windows worker unit tests,
+two compile-fail doctests, and two separately invoked host tests: actual TCP
+wrong-code limits/success/handshake cancellation, and actual LAN wildcard-bind
+discovery/cancellation. Root peer-store tests (12) and CLI tests (4) passed.
+Root and pairing all-target Clippy passed for Windows and Apple targets. Apple
+checks only typecheck; the supplied Windows archive was not linked for macOS.
+Native Mac linking, Keychain access, worker execution and cross-device UI pairing
+remain untested. See [validation scope](../../../docs/macos-invitation-host-validation-20261029.json).
 
 ## Build and run on the existing Windows toolchain
 
@@ -156,9 +198,9 @@ authenticated and locally approved keys, validates them, and constructs an
 identity in memory. It does not authenticate arbitrary network data itself.
 Windows `PeerStore::remember_authorized` saves that identity directly with DPAPI
 and commits public peer metadata last. No intermediate plaintext identity file or
-user-selected identity directory is needed. These root interfaces are not yet
-wired to the client pairing screen; the root product does not depend on this
-experimental crate.
+user-selected identity directory is needed. The Windows client now uses these
+interfaces through its packaged worker; the root library does not depend on this
+separate pairing crate.
 
 The Windows-only `enrollment_tcp` opt-in tests use this transport directly and
 exercise successful approval, protected save/reload, then a new connection using

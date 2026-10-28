@@ -6,6 +6,8 @@
 
 以下补充取代下文历史记录中对应的“尚未接入”，不把本机测试算作 Mac 实机验收。
 
+Mac 邀请接收程序补充：已实现局域网广播、120 秒短码邀请、最多三次认证尝试、与当前尝试绑定的双方确认，以及通过托管 Keychain 接口保存。接收核心可按已配对设备启动，无须用户选择身份文件。真实 Windows TCP 与局域网发现/取消测试通过；设备存储 12 项、CLI 4 项回归及两平台静态检查通过。Mac 程序尚未原生运行，SwiftUI 配对入口尚未接入；保存成功明确表示“输入尚未启动”。详见 [邀请程序验证范围](macos-invitation-host-validation-20261029.json)。下文“Mac worker 待实现”由本段更新，Mac 实机与界面验收仍未通过。
+
 Mac 存储接口补充：共享 Rust 核心已加入本地 Keychain 独立进程适配、Mac 角色设备存储及打包入口。Windows 默认 workspace 回归通过（核心 168、CLI 3、普通进程 1、桥接 7）；Windows 与 Apple 目标 Clippy、Apple 全目标类型检查通过。Mac 原生 Keychain 测试未执行，不能据此宣称 Mac 已可配对。跨聊天发送再次返回“without an active turn id”，未启动新 Mac 任务；这是消息接口失败，不是 Mac 离线证据。详见 [Mac 存储适配验证范围](macos-keychain-adapter-validation-20261029.json)。
 
 最新补充：Windows 已打包 Rust 配对进程，并开放原生“附近设备 → 配对码 → 双方确认”入口。真实 WinUI 测试已通过局域网发现、短码认证、双方批准、自动保存受保护身份、点选连接且默认暂停，以及等待另一端确认时取消并退出子进程。正常流程不要求 IP 或身份文件。测试对端是同一台 Windows 上的 Mac 协议角色 DrySink，不能算作 Mac 跨机配对或可见流畅度验收。Mac 邀请界面、Keychain、跨机流程、存储失败恢复与撤销仍待完成。详见 [客户端配对验证](windows-pairing-client-validation-20261029.json)。以下三条保留较早集成状态供追溯，以本段为准。

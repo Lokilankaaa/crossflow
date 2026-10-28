@@ -27,7 +27,11 @@ pub struct PeerSummary {
     pub schema: u32,
     pub id: String,
     pub friendly_name: String,
-    pub last_endpoint: SocketAddr,
+    /// None means this peer is authorized to send input to the local receiver;
+    /// it has not advertised a listening endpoint. Never substitute a source
+    /// TCP port. Some preserves schema-1's existing JSON socket-address string.
+    #[serde(deserialize_with = "deserialize_endpoint")]
+    pub last_endpoint: Option<SocketAddr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,9 +84,28 @@ impl PeerStore {
         friendly_name: &str,
         last_endpoint: SocketAddr,
     ) -> Result<PeerSummary> {
+        self.remember_authorized_record(identity, friendly_name, Some(last_endpoint))
+    }
+
+    /// Remember an authenticated sender on the local macOS receiver without
+    /// inventing an outbound route. The caller must already have obtained local
+    /// authorization. No endpoint is inferred from the pairing TCP connection.
+    pub fn remember_authorized_receiver(
+        &self,
+        identity: Identity,
+        friendly_name: &str,
+    ) -> Result<PeerSummary> {
+        self.remember_authorized_record(identity, friendly_name, None)
+    }
+
+    fn remember_authorized_record(
+        &self,
+        identity: Identity,
+        friendly_name: &str,
+        last_endpoint: Option<SocketAddr>,
+    ) -> Result<PeerSummary> {
         supported()?;
         validate_name(friendly_name)?;
-        validate_endpoint(last_endpoint)?;
         identity.validate()?;
         ensure!(
             identity.role == local_role(),
@@ -95,6 +118,7 @@ impl PeerStore {
             last_endpoint,
         };
         validate_summary(&summary)?;
+        validate_routing_role(&summary, &identity.role)?;
         self.check_root(true)?;
         ensure!(
             self.entries()?.len() < MAX_PEERS,
@@ -202,6 +226,7 @@ impl PeerStore {
             identity.role == local_role(),
             "Peer store identity has the wrong local platform role"
         );
+        validate_routing_role(&summary, &identity.role)?;
         ensure!(
             identity.peer_public_key_hex() == id,
             "Protected identity does not match peer ID"
@@ -330,7 +355,26 @@ fn validate_summary(summary: &PeerSummary) -> Result<()> {
     ensure!(summary.schema == 1, "Unsupported peer metadata schema");
     validate_id(&summary.id)?;
     validate_name(&summary.friendly_name)?;
-    validate_endpoint(summary.last_endpoint)
+    if let Some(endpoint) = summary.last_endpoint {
+        validate_endpoint(endpoint)?;
+    }
+    Ok(())
+}
+
+fn validate_routing_role(summary: &PeerSummary, local_identity_role: &str) -> Result<()> {
+    ensure!(
+        summary.last_endpoint.is_some() || local_identity_role == "mac",
+        "A sender peer record requires an input listening endpoint"
+    );
+    Ok(())
+}
+
+// Preserve the required schema-1 field even though its value can now be null.
+// A missing field is corrupt metadata, not an implicit receiver-only record.
+fn deserialize_endpoint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<SocketAddr>, D::Error> {
+    Option::<SocketAddr>::deserialize(deserializer)
 }
 
 fn is_link(metadata: &Metadata) -> bool {
@@ -367,6 +411,51 @@ fn require_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_one_socket_strings_remain_readable_and_serialize_unchanged() {
+        let legacy = format!(
+            r#"{{"schema":1,"id":"{}","friendly_name":"Existing peer","last_endpoint":"192.168.1.20:24800"}}"#,
+            "a".repeat(64)
+        );
+        let summary: PeerSummary = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(
+            summary.last_endpoint,
+            Some("192.168.1.20:24800".parse().unwrap())
+        );
+        validate_summary(&summary).unwrap();
+        validate_routing_role(&summary, "windows").unwrap();
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap()["last_endpoint"],
+            "192.168.1.20:24800"
+        );
+        assert_eq!(
+            serde_json::from_str::<PeerSummary>(&serde_json::to_string(&summary).unwrap()).unwrap(),
+            summary
+        );
+    }
+
+    #[test]
+    fn explicit_null_is_receiver_only_and_never_invents_an_input_route() {
+        let receiver = format!(
+            r#"{{"schema":1,"id":"{}","friendly_name":"Authorized sender","last_endpoint":null}}"#,
+            "b".repeat(64)
+        );
+        let summary: PeerSummary = serde_json::from_str(&receiver).unwrap();
+        assert!(summary.last_endpoint.is_none());
+        validate_summary(&summary).unwrap();
+        validate_routing_role(&summary, "mac").unwrap();
+        for role in ["windows", "linux", "", "MAC"] {
+            assert!(validate_routing_role(&summary, role).is_err());
+        }
+        assert!(serde_json::to_value(&summary).unwrap()["last_endpoint"].is_null());
+        let mut missing = serde_json::to_value(&summary).unwrap();
+        missing.as_object_mut().unwrap().remove("last_endpoint");
+        assert!(serde_json::from_value::<PeerSummary>(missing).is_err());
+        let mut invalid = summary;
+        invalid.last_endpoint = Some("127.0.0.1:0".parse().unwrap());
+        assert!(validate_summary(&invalid).is_err());
+    }
 
     #[test]
     fn ids_names_and_endpoints_are_strict() {
@@ -560,6 +649,21 @@ mod tests {
             }
         }
 
+        #[test]
+        fn windows_store_rejects_receiver_only_api_before_any_write() {
+            let f = MemoryFixture::new();
+            let store = PeerStore::at(f.0.join("not-created"));
+            for role in ["windows", "mac"] {
+                let (identity, _) = authorized_identity(role);
+                assert!(
+                    store
+                        .remember_authorized_receiver(identity, "Authorized sender")
+                        .is_err()
+                );
+                assert!(!store.root.exists());
+            }
+        }
+
         struct Fixture {
             root: PathBuf,
             pair: PairInfo,
@@ -622,6 +726,27 @@ mod tests {
             assert!(
                 !json.contains("private") && !json.contains("bundle") && !json.contains("path")
             );
+        }
+
+        #[test]
+        fn windows_resolver_hides_null_routing_metadata_even_with_valid_dpapi_identity() {
+            let f = Fixture::new();
+            let saved = f.remember();
+            assert_eq!(saved.last_endpoint, Some("127.0.0.1:5555".parse().unwrap()));
+            let metadata = f.store.root.join(&saved.id).join(COMMIT_FILE);
+            let mut changed = saved.clone();
+            changed.last_endpoint = None;
+            fs::write(&metadata, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(f.store.resolve(&saved.id).is_err());
+            let hidden = f.store.list().unwrap();
+            assert!(hidden.peers.is_empty());
+            assert_eq!(hidden.invalid_records, 1);
+            // Existing string-shaped metadata continues to resolve and list.
+            fs::write(&metadata, serde_json::to_vec(&saved).unwrap()).unwrap();
+            assert_eq!(f.store.resolve(&saved.id).unwrap().0, saved);
+            let listed = serde_json::to_value(f.store.list().unwrap()).unwrap();
+            assert_eq!(listed["invalid_records"], 0);
+            assert_eq!(listed["peers"][0]["last_endpoint"], "127.0.0.1:5555");
         }
 
         #[test]

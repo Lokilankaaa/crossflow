@@ -404,7 +404,7 @@ fn exercise(
             let store = PeerStore::at(profile.join("Crossflow/peers"));
             let (summary, bundle) = store.resolve(fingerprint)?;
             ensure!(
-                summary.last_endpoint == input,
+                summary.last_endpoint == Some(input),
                 "saved input endpoint differs from authenticated metadata"
             );
             ensure!(
