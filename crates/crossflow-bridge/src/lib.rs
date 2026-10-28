@@ -372,4 +372,30 @@ mod tests {
         assert_eq!(response["error"]["code"], "invalid_layout");
         assert_eq!(invoke(&valid).1, first);
     }
+
+    #[test]
+    fn abi_preserves_one_ulp_crossings_and_layout_boundaries() {
+        // Do not construct these coordinates through serde_json::Value first:
+        // the regression was decimal input rounding onto the adjacent edge.
+        let request = |target_x: &str, end_x: &str| {
+            format!(
+                r#"{{"op":"layout_crossing","layout":{{"screens":[{{"id":"a","device_id":"win","x":0,"y":0,"width":1920,"height":1080}},{{"id":"b","device_id":"mac","x":{target_x},"y":0,"width":1920,"height":1080}}]}},"from_screen":"a","start":{{"x":960,"y":540}},"end":{{"x":{end_x},"y":540}}}}"#
+            )
+        };
+        let response = |target_x: &str, end_x: &str| {
+            let (status, bytes, _) = invoke(request(target_x, end_x).as_bytes());
+            assert_eq!(status, OK);
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let crossed = response("1920", "1920.0000000000002");
+        assert_eq!(crossed["result"]["crossing"]["target_screen_id"], "b");
+        let fraction = crossed["result"]["crossing"]["fraction"].as_f64().unwrap();
+        assert!(fraction > 0.0 && fraction < 1.0);
+        assert!(response("1920", "1920")["result"]["crossing"].is_null());
+        assert!(response("1920.0000000000002", "1921")["result"]["crossing"].is_null());
+        assert_eq!(
+            response("1919.9999999999998", "1921")["error"]["code"],
+            "invalid_layout"
+        );
+    }
 }
