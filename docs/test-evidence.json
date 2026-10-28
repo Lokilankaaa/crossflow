@@ -49,7 +49,19 @@
     "frontend": "offline layout editor; runtime bridge and rendered UI validation pending",
     "frontend_isolated_dom_model_assertions": 24,
     "frontend_initial_layout_rust_validation": "passed",
-    "latest_mac_native_rebuild": "not performed for new input/layout modules",
+    "latest_mac_native_rebuild": "passed: f4d6a810e793cb9e186c608606eb4a756c35b30e; dirty=false; wire_version=2",
+    "expanded_input_build_validation": {
+      "code_revision": "f4d6a810e793cb9e186c608606eb4a756c35b30e",
+      "windows_regular_tests": 80,
+      "windows_explicit_network_tests": 13,
+      "mac_regular_tests": 76,
+      "mac_explicit_network_tests": 13,
+      "both_native_release_builds": "passed; dirty=false",
+      "mac_ffi_link": "arm64 Mach-O; CoreGraphics/CoreFoundation/ApplicationServices",
+      "mac_script_missing_inject_gate": "exit 2 before creating run directory or executing receiver",
+      "actual_expanded_input_capture_or_injection": false,
+      "evidence_mac": "runs/mac-f4d6a81-validation"
+    },
     "unattended_system_input_injection": false
   },
   "mac_native_build": {
