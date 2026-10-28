@@ -4,7 +4,7 @@
 use crate::{
     input::Button,
     protocol::{button_code, button_from_code},
-    session::{MouseSink, OwnedSink},
+    session::{MouseSink, OwnedSink, WorkerTiming},
     worker_protocol::{FRAME_LEN, Message, Op, WorkerLease},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -27,6 +27,54 @@ mod tests;
 
 const RPC_TIMEOUT: Duration = Duration::from_millis(30);
 const HEARTBEAT: Duration = Duration::from_millis(25);
+
+fn timing_for_ack(
+    request: &Message,
+    response: &Message,
+    received_ns: u64,
+) -> Result<Option<WorkerTiming>> {
+    ensure!(
+        response.op == Op::Completed
+            && response.seq == request.seq
+            && response.epoch == request.epoch,
+        "input worker returned an invalid acknowledgement"
+    );
+    ensure!(
+        received_ns
+            .checked_sub(request.sent_ns)
+            .is_some_and(|age| age < crate::worker_protocol::MAX_REQUEST_AGE_NS)
+            && response.sent_ns >= request.sent_ns
+            && response.sent_ns <= received_ns,
+        "input worker response expired or clock invalid"
+    );
+    if !matches!(request.op, Op::Move | Op::Button | Op::Key | Op::Scroll) {
+        ensure!(
+            response.call_start_ns == 0 && response.call_end_ns == 0,
+            "input worker control response carries action timing"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        request.sent_ns <= response.call_start_ns
+            && response.call_start_ns <= response.call_end_ns
+            && response.call_end_ns <= response.sent_ns,
+        "input worker action timing invalid"
+    );
+    Ok(Some(WorkerTiming {
+        request_seq: request.seq,
+        dispatch_ns: response.call_start_ns - request.sent_ns,
+        sink_call_ns: response.call_end_ns - response.call_start_ns,
+        return_ns: received_ns - response.call_end_ns,
+        rpc_ns: received_ns - request.sent_ns,
+        clock: if cfg!(target_os = "macos") {
+            "mach_continuous_time_ns"
+        } else if cfg!(windows) {
+            "GetTickCount64_ms_quantized"
+        } else {
+            "CLOCK_BOOTTIME_ns"
+        },
+    }))
+}
 
 /// Same machine-wide clock in both processes, including time spent asleep.
 /// Windows is only used by fake process tests; its millisecond granularity is
@@ -276,6 +324,10 @@ pub fn run_worker<R: Read + Send + 'static, W: Write + Send + 'static>(
             let mut response = Message::new(Op::Completed);
             response.seq = request.seq;
             response.epoch = request.epoch;
+            let is_action = matches!(request.op, Op::Move | Op::Button | Op::Key | Op::Scroll);
+            if is_action {
+                response.call_start_ns = continuous_ns()?;
+            }
             match request.op {
                 Op::Reset => owned.reset()?,
                 Op::Move => {
@@ -289,6 +341,9 @@ pub fn run_worker<R: Read + Send + 'static, W: Write + Send + 'static>(
                 _ => bail!("worker received a response as a request"),
             }
             response.sent_ns = continuous_ns()?;
+            if is_action {
+                response.call_end_ns = response.sent_ns;
+            }
             // Lease expiry during a native call is terminal, even if the call
             // already posted input. That uncertain result is never replayed.
             if request.op != Op::Shutdown {
@@ -331,6 +386,8 @@ pub struct WorkerProxy {
     seq: u64,
     epoch: u64,
     last_heartbeat: Instant,
+    latest_timing: Option<WorkerTiming>,
+    failure_log: Option<crate::metrics::Log>,
 }
 impl WorkerProxy {
     pub fn spawn(command: &mut Command) -> Result<Self> {
@@ -369,6 +426,8 @@ impl WorkerProxy {
             seq: 0,
             epoch: 0,
             last_heartbeat: Instant::now(),
+            latest_timing: None,
+            failure_log: None,
         };
         let ready = proxy.responses.recv_timeout(Duration::from_secs(3));
         if !matches!(
@@ -387,6 +446,12 @@ impl WorkerProxy {
     }
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Optional bounded log records the first terminal RPC failure separately
+    /// from successful timing distributions. Never logs action payloads.
+    pub fn attach_failure_log(&mut self, log: crate::metrics::Log) {
+        self.failure_log = Some(log);
     }
 
     /// Explicit normal shutdown, including ACK and actual child exit. Drop is
@@ -412,6 +477,10 @@ impl WorkerProxy {
         self.requests.take();
     }
     fn rpc(&mut self, mut message: Message) -> Result<Message> {
+        // A failed call, control, or heartbeat can never expose an older action's
+        // timing as if it belonged to a newly processed input event.
+        self.latest_timing = None;
+        let mut failure_code = "preflight";
         let result = (|| {
             ensure!(
                 !self.terminal,
@@ -428,45 +497,64 @@ impl WorkerProxy {
                 .context("worker sequence exhausted")?;
             message.seq = self.seq;
             message.epoch = self.epoch;
+            failure_code = "clock";
             message.sent_ns = continuous_ns()?;
             let deadline = Instant::now() + RPC_TIMEOUT;
+            failure_code = "request_invalid";
+            let encoded = message.encode()?;
+            failure_code = "request_queue_failed";
             self.requests
                 .as_ref()
                 .context("worker pipe closed")?
-                .try_send(message.encode()?)
+                .try_send(encoded)
                 .context("worker request backlog")?;
             let response = self
                 .responses
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .context("input worker response uncertain; action will not be replayed")?;
+                .map_err(|error| {
+                    failure_code = if matches!(error, mpsc::RecvTimeoutError::Timeout) {
+                        "timeout"
+                    } else {
+                        "response_read_failed"
+                    };
+                    anyhow::anyhow!("input worker response uncertain; action will not be replayed")
+                })?;
+            failure_code = "clock";
+            let now_ns = continuous_ns()?;
+            let response_age = now_ns
+                .checked_sub(message.sent_ns)
+                .context("input worker continuous clock regressed")?;
+            failure_code = "timeout";
             ensure!(
-                Instant::now() < deadline,
+                Instant::now() < deadline
+                    && response_age < crate::worker_protocol::MAX_REQUEST_AGE_NS,
                 "input worker response arrived too late"
             );
-            let now_ns = continuous_ns()?;
-            ensure!(
-                now_ns
-                    .checked_sub(message.sent_ns)
-                    .is_some_and(|age| age < crate::worker_protocol::MAX_REQUEST_AGE_NS)
-                    && response.sent_ns >= message.sent_ns
-                    && response.sent_ns <= now_ns,
-                "input worker response expired or clock invalid"
-            );
-            ensure!(
-                response.op == Op::Completed
-                    && response.seq == message.seq
-                    && response.epoch == message.epoch,
-                "input worker returned an invalid acknowledgement"
-            );
+            failure_code = "invalid_ack";
+            self.latest_timing = timing_for_ack(&message, &response, now_ns)?;
             Ok(response)
         })();
         if result.is_err() {
+            if !self.terminal {
+                if let Some(log) = &self.failure_log {
+                    log.write(
+                        "worker_rpc_failure",
+                        serde_json::json!({
+                            "reason":failure_code,"request_seq":message.seq,
+                            "kind":format!("{:?}",message.op),"result":"uncertain_no_replay"
+                        }),
+                    );
+                }
+            }
             self.fail();
         }
         result
     }
 }
 impl MouseSink for WorkerProxy {
+    fn take_timing(&mut self) -> Option<WorkerTiming> {
+        self.latest_timing.take()
+    }
     fn maintain(&mut self) -> Result<()> {
         ensure!(!self.terminal, "input worker is terminal");
         if self.last_heartbeat.elapsed() >= HEARTBEAT {

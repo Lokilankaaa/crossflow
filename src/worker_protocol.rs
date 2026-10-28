@@ -8,8 +8,8 @@
 
 use anyhow::{Result, bail, ensure};
 
-pub const FRAME_LEN: usize = 64;
-pub const VERSION: u8 = 1;
+pub const FRAME_LEN: usize = 80;
+pub const VERSION: u8 = 2;
 pub const ACTIVE_LEASE_NS: u64 = 150_000_000;
 pub const IDLE_LEASE_NS: u64 = 10_000_000_000;
 pub const MAX_REQUEST_AGE_NS: u64 = 30_000_000;
@@ -43,6 +43,8 @@ pub struct Message {
     pub b: i32,
     pub code: u16,
     pub down: bool,
+    pub call_start_ns: u64,
+    pub call_end_ns: u64,
 }
 
 impl Message {
@@ -58,10 +60,23 @@ impl Message {
             b: 0,
             code: 0,
             down: false,
+            call_start_ns: 0,
+            call_end_ns: 0,
         }
     }
 
     fn validate(&self) -> Result<()> {
+        if self.op == Op::Completed {
+            ensure!(
+                self.call_start_ns <= self.call_end_ns && self.call_end_ns <= self.sent_ns,
+                "invalid worker completion timestamps"
+            );
+        } else {
+            ensure!(
+                self.call_start_ns == 0 && self.call_end_ns == 0,
+                "unrelated worker call timestamps"
+            );
+        }
         ensure!(
             self.x.is_finite() && self.y.is_finite(),
             "invalid worker coordinates"
@@ -107,6 +122,8 @@ impl Message {
     }
 
     /// Fixed-width big-endian fields. Bytes 7 and 58..64 are reserved zeroes.
+    /// Version 2 adds Completed call start/end timestamps at 64..72/72..80;
+    /// its 80-byte records are intentionally incompatible with version 1.
     pub fn encode(&self) -> Result<[u8; FRAME_LEN]> {
         self.validate()?;
         let mut bytes = [0; FRAME_LEN];
@@ -122,6 +139,8 @@ impl Message {
         bytes[48..52].copy_from_slice(&self.a.to_be_bytes());
         bytes[52..56].copy_from_slice(&self.b.to_be_bytes());
         bytes[56..58].copy_from_slice(&self.code.to_be_bytes());
+        bytes[64..72].copy_from_slice(&self.call_start_ns.to_be_bytes());
+        bytes[72..80].copy_from_slice(&self.call_end_ns.to_be_bytes());
         Ok(bytes)
     }
 
@@ -131,7 +150,7 @@ impl Message {
             "invalid worker protocol header"
         );
         ensure!(
-            bytes[6] <= 1 && bytes[7] == 0 && bytes[58..].iter().all(|&b| b == 0),
+            bytes[6] <= 1 && bytes[7] == 0 && bytes[58..64].iter().all(|&b| b == 0),
             "invalid worker reserved fields"
         );
         let op = match bytes[5] {
@@ -159,6 +178,8 @@ impl Message {
             b: i32::from_be_bytes(bytes[52..56].try_into().unwrap()),
             code: u16::from_be_bytes(bytes[56..58].try_into().unwrap()),
             down: bytes[6] == 1,
+            call_start_ns: u64::from_be_bytes(bytes[64..72].try_into().unwrap()),
+            call_end_ns: u64::from_be_bytes(bytes[72..80].try_into().unwrap()),
         };
         message.validate()?;
         Ok(message)
@@ -330,6 +351,78 @@ mod tests {
             bytes[offset] = 255;
             assert!(Message::decode(&bytes).is_err());
         }
+    }
+
+    #[test]
+    fn completion_timestamps_are_big_endian_and_ordered() {
+        let mut message = Message::new(Op::Completed);
+        message.call_start_ns = 0x0102030405060708;
+        message.call_end_ns = 0x1112131415161718;
+        message.sent_ns = message.call_end_ns + 1;
+        let encoded = message.encode().unwrap();
+        assert_eq!(&encoded[64..72], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&encoded[72..80], &[17, 18, 19, 20, 21, 22, 23, 24]);
+        assert_eq!(Message::decode(&encoded).unwrap(), message);
+        assert!(Message::new(Op::Completed).encode().is_ok());
+        for (start, end, sent) in [(2_u64, 1_u64, 3_u64), (1, 3, 2)] {
+            message.call_start_ns = start;
+            message.call_end_ns = end;
+            message.sent_ns = sent;
+            assert!(message.encode().is_err());
+            let mut invalid = Message::new(Op::Completed).encode().unwrap();
+            invalid[24..32].copy_from_slice(&sent.to_be_bytes());
+            invalid[64..72].copy_from_slice(&start.to_be_bytes());
+            invalid[72..80].copy_from_slice(&end.to_be_bytes());
+            assert!(Message::decode(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn only_completed_may_carry_call_timestamps() {
+        for op in [
+            Op::Ready,
+            Op::Reset,
+            Op::Move,
+            Op::Button,
+            Op::Key,
+            Op::Scroll,
+            Op::Heartbeat,
+            Op::Release,
+            Op::Shutdown,
+            Op::Failed,
+        ] {
+            let mut message = Message::new(op);
+            if op == Op::Key {
+                message.code = 0x04;
+            }
+            if op == Op::Scroll {
+                message.a = 120;
+            }
+            let clean = message.encode().unwrap();
+            for offset in [64, 72] {
+                let mut invalid = clean;
+                invalid[offset..offset + 8].copy_from_slice(&1_u64.to_be_bytes());
+                assert!(Message::decode(&invalid).is_err());
+            }
+            message.call_start_ns = 1;
+            assert!(message.encode().is_err());
+            message.call_start_ns = 0;
+            message.call_end_ns = 1;
+            assert!(message.encode().is_err());
+        }
+    }
+
+    #[test]
+    fn version_one_and_its_short_frame_are_incompatible() {
+        let ready = Message::new(Op::Ready);
+        assert_eq!((ready.seq, ready.epoch), (0, 0));
+        let encoded = ready.encode().unwrap();
+        assert_eq!((encoded.len(), encoded[4]), (80, 2));
+        let mut padded_v1 = encoded;
+        padded_v1[4] = 1;
+        assert!(Message::decode(&padded_v1).is_err());
+        let short: &[u8] = &padded_v1[..64];
+        assert!(<&[u8; FRAME_LEN]>::try_from(short).is_err());
     }
 
     #[test]

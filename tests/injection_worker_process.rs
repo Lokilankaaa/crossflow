@@ -93,6 +93,25 @@ impl Fixture {
             self.root.join("parent-ready").exists()
         })?;
         let events = self.events();
+        let timings: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(self.root.join("timings.json"))?)?;
+        ensure!(timings.len() == 2, "missing action timings");
+        for timing in timings {
+            let a = timing["dispatch_ns"].as_u64().context("dispatch missing")?;
+            let b = timing["sink_call_ns"]
+                .as_u64()
+                .context("sink time missing")?;
+            let c = timing["return_ns"]
+                .as_u64()
+                .context("return time missing")?;
+            let total = timing["rpc_ns"].as_u64().context("RPC time missing")?;
+            ensure!(
+                a.checked_add(b).and_then(|v| v.checked_add(c)) == Some(total)
+                    && total < 30_000_000,
+                "worker timing conservation or bound failed"
+            );
+            ensure!(timing["clock"].as_str().is_some(), "clock source missing");
+        }
         ensure!(
             events.contains(&"key-down".into()) && events.contains(&"button-down".into()),
             "fixture did not actually inject the held fake pair"
@@ -407,6 +426,24 @@ fn acknowledgement_failure_releases_inputs_after_adapter_return() -> Result<()> 
     ensure!(
         moved < released,
         "test did not exercise ACK failure after adapter return"
+    );
+    ensure!(
+        events
+            .iter()
+            .filter(|event| event.as_str() == "move")
+            .count()
+            == 1,
+        "uncertain action was replayed"
+    );
+    let summary = crossflow::metrics::summarize(&fixture.root.join("worker-rpc.jsonl"))?;
+    ensure!(summary["complete_log"] == true, "failure log incomplete");
+    ensure!(
+        summary["worker_timing"]["failure_records"] == 1,
+        "terminal retry duplicated or lost failure evidence"
+    );
+    ensure!(
+        summary["worker_timing"]["failure_logging_declared"] == true,
+        "failure coverage not declared"
     );
     fixture.passed = true;
     Ok(())

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crossflow::{
     injection_worker::{WorkerProxy, run_worker, stdio_files},
     input::Button,
+    metrics::LogWriter,
     session::MouseSink,
     worker_protocol::FRAME_LEN,
 };
@@ -116,6 +117,11 @@ fn run(mode: &str, root: &Path, behavior: &str) -> Result<()> {
                 command.arg("fail-ack");
             }
             let mut proxy = WorkerProxy::spawn(&mut command)?;
+            let writer = LogWriter::new(
+                &root.join("worker-rpc.jsonl"),
+                serde_json::json!({"worker_rpc_failure_logging":true}),
+            )?;
+            proxy.attach_failure_log(writer.log.clone());
             fs::write(root.join("worker-pid"), proxy.pid().to_string())?;
             // Let the outer test acquire a read-only OS process handle before
             // any action can trigger a rapid terminal worker exit.
@@ -124,13 +130,32 @@ fn run(mode: &str, root: &Path, behavior: &str) -> Result<()> {
             }
             proxy.reset()?;
             proxy.key(4, true)?;
+            let key_timing = proxy.take_timing().context("key timing missing")?;
+            ensure!(proxy.take_timing().is_none(), "timing was not consumed");
             proxy.button(Button::Left, true)?;
+            let button_timing = proxy.take_timing().context("button timing missing")?;
+            ensure!(
+                key_timing.request_seq + 1 == button_timing.request_seq,
+                "timing belongs to another RPC"
+            );
+            fs::write(
+                root.join("timings.json"),
+                serde_json::to_vec(&[key_timing, button_timing])?,
+            )?;
             fs::write(root.join("parent-ready"), b"held-pair-acknowledged")?;
             match behavior {
                 "ack-failure" => {
                     ensure!(
                         proxy.move_by(1.0, 1.0).is_err(),
                         "fixture ACK failure was not terminal"
+                    );
+                    ensure!(
+                        proxy.take_timing().is_none(),
+                        "failed RPC exposed old action timing"
+                    );
+                    ensure!(
+                        proxy.move_by(1.0, 1.0).is_err(),
+                        "terminal RPC was replayed"
                     );
                     fs::write(root.join("parent-ack-error"), b"terminal")?;
                 }
@@ -147,10 +172,15 @@ fn run(mode: &str, root: &Path, behavior: &str) -> Result<()> {
                     proxy.key(4, false)?;
                     proxy.button(Button::Left, false)?;
                     proxy.shutdown()?;
+                    ensure!(
+                        proxy.take_timing().is_none(),
+                        "control RPC exposed old action timing"
+                    );
                 }
                 _ => bail!("unknown fixture parent behavior"),
             }
             drop(proxy);
+            writer.finish()?;
             fs::write(root.join("parent-exit"), b"ok")?;
             Ok(())
         }

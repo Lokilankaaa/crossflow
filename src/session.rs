@@ -604,7 +604,24 @@ fn send_source(
     Ok(())
 }
 
+/// Same-machine worker timing, only for a successful acknowledged action.
+/// The sink call includes ownership bookkeeping and the platform adapter, not
+/// just CGEventPost. These are software intervals, never visible response time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct WorkerTiming {
+    pub request_seq: u64,
+    pub dispatch_ns: u64,
+    pub sink_call_ns: u64,
+    pub return_ns: u64,
+    pub rpc_ns: u64,
+    pub clock: &'static str,
+}
+
 pub trait MouseSink {
+    /// Consume the latest action timing once, before any maintenance/control RPC.
+    fn take_timing(&mut self) -> Option<WorkerTiming> {
+        None
+    }
     /// Called only by the receiving execution loop after its safety checks.
     /// An isolated adapter can renew its watchdog here; never from a timer thread.
     fn maintain(&mut self) -> Result<()> {
@@ -679,6 +696,9 @@ impl<'a> OwnedSink<'a> {
     }
 }
 impl MouseSink for OwnedSink<'_> {
+    fn take_timing(&mut self) -> Option<WorkerTiming> {
+        self.sink.take_timing()
+    }
     fn maintain(&mut self) -> Result<()> {
         check_local_stop(self)?;
         self.sink.maintain()
@@ -827,13 +847,15 @@ fn flush_moves(pending: &mut Option<MoveGroup>, sink: &mut dyn MouseSink, log: &
         .move_by(group.dx, group.dy)
         .map_err(terminal_sink_failure)?;
     let t4 = log.ns();
+    let worker_timing = sink.take_timing();
     log.write(
         "received",
         json!({
             "seq":group.last_seq,"first_seq":group.first_seq,
             "t2_ns":group.earliest_t2_ns,"t3_ns":t3,"t4_ns":t4,
             "x":x,"y":y,"lease":group.last_lease,"frames_coalesced":group.frames,
-            "receive_timestamp_source":"user_space_batch_read_complete"
+            "receive_timestamp_source":"user_space_batch_read_complete",
+            "worker_timing":worker_timing
         }),
     );
     Ok(())
@@ -885,7 +907,9 @@ fn process_received_batch(
             .map_err(terminal_sink_failure)?;
             // Do not log key codes or typed content. Sequence and timing suffice
             // for transport evidence; tests use synthetic fixture actions.
-            log.write("input_applied", json!({"seq":frame.seq,"kind":format!("{:?}",frame.kind),"t2_ns":t2,"t3_ns":t3,"t4_ns":log.ns()}));
+            let t4 = log.ns();
+            let worker_timing = sink.take_timing();
+            log.write("input_applied", json!({"seq":frame.seq,"kind":format!("{:?}",frame.kind),"t2_ns":t2,"t3_ns":t3,"t4_ns":t4,"worker_timing":worker_timing}));
         } else {
             if frame.kind == Kind::Arm {
                 sink.reset().map_err(terminal_sink_failure)?;
@@ -1319,6 +1343,88 @@ mod tests {
         assert!(process_received_batch(frames, &mut state, &mut sink, &writer.log).is_err());
         assert!(sink.moves.is_empty());
         writer.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn worker_timings_follow_coalesced_moves_and_actions_before_maintenance() {
+        #[derive(Default)]
+        struct TimedSink {
+            count: u64,
+            latest: Option<WorkerTiming>,
+        }
+        impl TimedSink {
+            fn called(&mut self) {
+                self.count += 1;
+                self.latest = Some(WorkerTiming {
+                    request_seq: self.count,
+                    dispatch_ns: 1,
+                    sink_call_ns: self.count,
+                    return_ns: 2,
+                    rpc_ns: 3 + self.count,
+                    clock: "mach_continuous_time_ns",
+                });
+            }
+        }
+        impl MouseSink for TimedSink {
+            fn take_timing(&mut self) -> Option<WorkerTiming> {
+                self.latest.take()
+            }
+            fn maintain(&mut self) -> Result<()> {
+                self.latest = None;
+                Ok(())
+            }
+            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                self.called();
+                Ok((x, y))
+            }
+            fn key(&mut self, _: u16, _: bool) -> Result<()> {
+                self.called();
+                Ok(())
+            }
+        }
+        let (writer, path) = logs();
+        let mut state = state(&writer.log);
+        let mut sink = TimedSink::default();
+        let stop = AtomicBool::new(false);
+        let mut owned = OwnedSink::new(&mut sink, &stop);
+        let mut down = frame(Kind::Key, 4, 0.);
+        down.0.code = 4;
+        down.0.down = true;
+        let mut up = frame(Kind::Key, 5, 0.);
+        up.0.code = 4;
+        let frames = vec![
+            frame(Kind::Arm, 1, 0.),
+            frame(Kind::Move, 2, 1.),
+            frame(Kind::Move, 3, 3.),
+            down,
+            up,
+            frame(Kind::Pause, 6, 3.),
+        ];
+        process_received_batch(frames, &mut state, &mut owned, &writer.log).unwrap();
+        owned.release_owned().unwrap();
+        writer.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let samples: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|v| v["event"] == "received" || v["event"] == "input_applied")
+            .collect();
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0]["frames_coalesced"], 2);
+        for (i, sample) in samples.iter().enumerate() {
+            assert_eq!(sample["seq"], i as u64 + 3);
+            assert_eq!(sample["worker_timing"]["request_seq"], i as u64 + 1);
+        }
+        let summary = crate::metrics::summarize(&path).unwrap();
+        assert_eq!(summary["worker_timing"]["valid_records"], 3);
+        assert_eq!(
+            summary["worker_timing"]["by_clock"]["mach_continuous_time_ns"]["movement"]["rpc"]["samples"],
+            1
+        );
+        assert_eq!(
+            summary["worker_timing"]["by_clock"]["mach_continuous_time_ns"]["actions"]["rpc"]["samples"],
+            2
+        );
         std::fs::remove_file(path).unwrap();
     }
     #[test]

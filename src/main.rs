@@ -268,6 +268,12 @@ fn main() -> Result<()> {
             meta["experimental_input_actions"] = json!(inject_actions);
             meta["movement_only"] = json!(inject && !inject_actions);
             meta["input_worker"] = json!(inject && inject_actions);
+            meta["input_worker_protocol_version"] = json!(if inject && inject_actions {
+                Some(crossflow::worker_protocol::VERSION)
+            } else {
+                None
+            });
+            meta["worker_rpc_failure_logging"] = json!(inject && inject_actions);
             meta["input_worker_ack"] = json!("adapter_return_only_not_os_or_display");
             meta["receiver_t3_t4_scope"] = json!(if inject && inject_actions {
                 "worker_rpc_including_adapter_not_isolated_native_injection"
@@ -291,6 +297,7 @@ fn main() -> Result<()> {
                                 .arg(gain.to_string());
                             let mut sink =
                                 crossflow::injection_worker::WorkerProxy::spawn(&mut command)?;
+                            sink.attach_failure_log(writer.log.clone());
                             let result = session::receive_with_stop(
                                 &bind,
                                 &identity,

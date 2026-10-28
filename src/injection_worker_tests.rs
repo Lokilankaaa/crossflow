@@ -323,3 +323,196 @@ fn blocked_response_writer_does_not_delay_lease_cleanup_or_worker_return() {
     reader_done.recv_timeout(Duration::from_secs(2)).unwrap();
     writer_done.recv_timeout(Duration::from_secs(2)).unwrap();
 }
+
+fn timing_pair(op: Op) -> (Message, Message) {
+    let mut request = Message::new(op);
+    request.seq = 7;
+    request.epoch = 3;
+    request.sent_ns = 100;
+    if op == Op::Key {
+        request.code = 0x04;
+    }
+    if op == Op::Scroll {
+        request.a = 120;
+    }
+    let mut response = Message::new(Op::Completed);
+    response.seq = request.seq;
+    response.epoch = request.epoch;
+    response.call_start_ns = 200;
+    response.call_end_ns = 300;
+    response.sent_ns = 400;
+    (request, response)
+}
+
+#[test]
+fn action_timing_intervals_partition_rpc_and_allow_zero_length_stages() {
+    for op in [Op::Move, Op::Button, Op::Key, Op::Scroll] {
+        let (request, mut response) = timing_pair(op);
+        let timing = timing_for_ack(&request, &response, 500).unwrap().unwrap();
+        assert_eq!(timing.request_seq, request.seq);
+        assert_eq!(
+            (
+                timing.dispatch_ns,
+                timing.sink_call_ns,
+                timing.return_ns,
+                timing.rpc_ns
+            ),
+            (100, 100, 200, 400)
+        );
+        assert_eq!(
+            timing.dispatch_ns + timing.sink_call_ns + timing.return_ns,
+            timing.rpc_ns
+        );
+        response.call_start_ns = request.sent_ns;
+        response.call_end_ns = request.sent_ns;
+        response.sent_ns = request.sent_ns;
+        let zero = timing_for_ack(&request, &response, request.sent_ns)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                zero.dispatch_ns,
+                zero.sink_call_ns,
+                zero.return_ns,
+                zero.rpc_ns
+            ),
+            (0, 0, 0, 0)
+        );
+        let last_valid = request.sent_ns + crate::worker_protocol::MAX_REQUEST_AGE_NS - 1;
+        assert!(timing_for_ack(&request, &response, last_valid).is_ok());
+    }
+}
+
+#[test]
+fn ack_timing_rejects_mismatched_identity_future_reversal_and_expiry() {
+    for case in 0..11 {
+        let (mut request, mut response) = timing_pair(Op::Move);
+        let mut received = 500;
+        match case {
+            0 => request.sent_ns = 201,        // issued after call start
+            1 => response.call_start_ns = 301, // start after end
+            2 => response.call_end_ns = 401,   // end after response send
+            3 => response.sent_ns = 501,       // response sent in receiver's future
+            4 => received = 99,                // receipt before issuance
+            5 => response.seq += 1,
+            6 => response.epoch += 1,
+            7 => response.op = Op::Failed,
+            8 => received = request.sent_ns + crate::worker_protocol::MAX_REQUEST_AGE_NS,
+            9 => received = request.sent_ns + crate::worker_protocol::MAX_REQUEST_AGE_NS + 1,
+            _ => response.sent_ns = 99, // response before request
+        }
+        assert!(
+            timing_for_ack(&request, &response, received).is_err(),
+            "invalid timing case {case}"
+        );
+    }
+}
+
+#[test]
+fn control_ack_has_no_action_timing_and_rejects_nonzero_stages() {
+    for op in [Op::Reset, Op::Heartbeat, Op::Release, Op::Shutdown] {
+        let (request, mut response) = timing_pair(op);
+        response.call_start_ns = 0;
+        response.call_end_ns = 0;
+        assert!(timing_for_ack(&request, &response, 500).unwrap().is_none());
+        for (start, end) in [(0, 1), (1, 0), (1, 1)] {
+            response.call_start_ns = start;
+            response.call_end_ns = end;
+            assert!(timing_for_ack(&request, &response, 500).is_err());
+        }
+    }
+}
+
+struct DelayedSink {
+    observed: Arc<Mutex<Option<(u64, u64, Duration)>>>,
+}
+impl MouseSink for DelayedSink {
+    fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+        let start = continuous_ns()?;
+        let wall = Instant::now();
+        thread::sleep(Duration::from_millis(20));
+        let elapsed = wall.elapsed();
+        let end = continuous_ns()?;
+        *self.observed.lock().unwrap() = Some((start, end, elapsed));
+        Ok((x, y))
+    }
+}
+
+#[test]
+fn worker_ack_timestamps_enclose_delayed_sink_call_without_claiming_proxy_latency() {
+    let (requests, request_read) = mpsc::channel();
+    let (acks, ack_read) = mpsc::channel();
+    let (blocked, _blocked_read) = mpsc::channel();
+    let (reader_finished, reader_done) = mpsc::channel();
+    let (writer_finished, writer_done) = mpsc::channel();
+    let gate = Arc::new(Gate::default());
+    gate.unblock();
+    let input = ChannelRead {
+        receive: request_read,
+        pending: None,
+        finished: reader_finished,
+    };
+    let output = BlockingWrite {
+        gate,
+        blocked,
+        acks,
+        finished: writer_finished,
+    };
+    let observed = Arc::new(Mutex::new(None));
+    let mut sink = DelayedSink {
+        observed: observed.clone(),
+    };
+    let (finished, done) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = finished.send(run_worker(input, output, &mut sink));
+    });
+    assert_eq!(
+        ack_read.recv_timeout(Duration::from_secs(2)).unwrap().op,
+        Op::Ready
+    );
+    for (seq, op) in [(1, Op::Reset), (2, Op::Move), (3, Op::Shutdown)] {
+        let mut request = Message::new(op);
+        request.seq = seq;
+        request.epoch = 1;
+        if op == Op::Move {
+            request.x = 1.0;
+            request.y = -1.0;
+        }
+        request.sent_ns = continuous_ns().unwrap();
+        requests.send(request.encode().unwrap()).unwrap();
+        let response = ack_read.recv_timeout(Duration::from_secs(2)).unwrap();
+        let received = continuous_ns().unwrap();
+        assert_eq!(
+            (response.op, response.seq, response.epoch),
+            (Op::Completed, seq, 1)
+        );
+        if op == Op::Move {
+            let (inner_start, inner_end, wall_elapsed) = observed.lock().unwrap().unwrap();
+            assert!(wall_elapsed >= Duration::from_millis(20));
+            assert!(request.sent_ns <= response.call_start_ns);
+            assert!(response.call_start_ns <= inner_start && inner_start <= inner_end);
+            assert!(inner_end <= response.call_end_ns && response.call_end_ns <= response.sent_ns);
+            assert!(response.sent_ns <= received);
+            if cfg!(windows) {
+                // GetTickCount64 is quantized; a 20ms sleep is not asserted to
+                // equal 20ms in this clock, nor to fit the proxy's 30ms budget.
+                for time in [
+                    inner_start,
+                    inner_end,
+                    response.call_start_ns,
+                    response.call_end_ns,
+                ] {
+                    assert_eq!(time % 1_000_000, 0);
+                }
+            }
+            assert_eq!((response.x, response.y), (1.0, -1.0));
+        } else {
+            assert_eq!((response.call_start_ns, response.call_end_ns), (0, 0));
+        }
+    }
+    done.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    worker.join().unwrap();
+    drop(requests);
+    reader_done.recv_timeout(Duration::from_secs(2)).unwrap();
+    writer_done.recv_timeout(Duration::from_secs(2)).unwrap();
+}
