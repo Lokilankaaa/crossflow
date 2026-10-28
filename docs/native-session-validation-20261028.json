@@ -1,0 +1,69 @@
+{
+  "date_local": "2026-10-28",
+  "timezone": "Asia/Hong_Kong",
+  "core_revision": "120d646b203d53f286e84736aebdb13a39120b23",
+  "core_build_dirty": false,
+  "production_ui_loopback": {
+    "evidence": "runs/native-ui-loopback-20261028-221502",
+    "sender": "production WinUI SessionController -> packaged Rust desktop-send",
+    "receiver": "localhost authenticated DrySink",
+    "native_capture": true,
+    "os_injection": false,
+    "observed_ui_states": [
+      "connected and paused",
+      "sharing",
+      "paused",
+      "stopped"
+    ],
+    "capture_records": 68,
+    "sent_move_records": 62,
+    "received_move_records": 62,
+    "ordered_move_sequences_equal": true,
+    "sender_log_complete": true,
+    "receiver_log_complete": true,
+    "dropped_log_records": 0,
+    "sender_errors": 0,
+    "receiver_errors": 1,
+    "receiver_error_reason": "peer disconnected after sender stop",
+    "input_origin": "Raw Input recorded; human versus automation provenance not independently established",
+    "visible_smoothness": "NOT_MEASURED"
+  },
+  "desktop_process_integration": {
+    "source": "tests/desktop_session.rs",
+    "evidence": "runs/desktop-session-36384-1793198276426596000/result.json",
+    "result": "passed",
+    "native_capture": true,
+    "os_injection": false,
+    "checks": [
+      "authenticated paused and capture ready",
+      "stale epoch denied before receiver arm",
+      "matching epoch arms receiver",
+      "pause releases receiver",
+      "explicit second arm",
+      "parent stdin EOF stops and reaps child",
+      "complete logs without dropped records"
+    ],
+    "receiver_arms": 2,
+    "earlier_passing_evidence": "runs/desktop-session-40568-1793197709594299100/result.json",
+    "cleanup_revalidation": "passed after bounded joins/child reap and checked identity deletion; explicit run exit 0 in 0.73 seconds"
+  },
+  "mac_native": {
+    "observation_source": "Mac chat 01a18017-2972-7830-84e7-bc679658db1a command outputs",
+    "synced_main_revision": "120d646b203d53f286e84736aebdb13a39120b23",
+    "core_validation": "passed",
+    "evidence": "/Users/xuewei/Downloads/projects/crossflow/runs/mac-core-validation-20261028T143012Z-yFlu92",
+    "swiftui_build": "passed; two linker search-path warnings",
+    "swift_bridge_self_tests_passed": 10,
+    "codesign_verification": "passed",
+    "native_window_validation": "not run",
+    "session_control_in_mac_ui": false,
+    "handoff": "authenticated TLS download validated using CA and SPKI pin; bundle SHA256 matched; service stopped and temporary token/private key deleted",
+    "coordination": "Mac resumed reporting after model-capacity interruption; source return requested before new timed receiver; Windows send-message API still unconfirmed"
+  },
+  "limitations": [
+    "No new cross-device input or visible smoothness measurement",
+    "Window close during active sharing not tested through real GUI",
+    "Runtime arrangement and keyboard integration remain pending",
+    "Mac UI changes have not yet been returned to Windows main"
+  ]
+}
