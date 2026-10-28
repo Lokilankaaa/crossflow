@@ -17,10 +17,11 @@ enum CrossflowLauncher {
 }
 
 struct CrossflowApp: App {
+    @NSApplicationDelegateAdaptor(DiscoveryAppDelegate.self) private var appDelegate
     @ViewState private var model = WorkspaceModel()
     var body: some Scene {
         Window("Crossflow", id: "workspace") {
-            WorkspaceView(model: model)
+            WorkspaceView(model: model, discovery: appDelegate.discovery)
                 .preferredColorScheme(.light)
                 .frame(minWidth: Theme.number("window", "minimum_width", fallback: 880),
                        minHeight: Theme.number("window", "minimum_height", fallback: 600))

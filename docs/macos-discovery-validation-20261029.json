@@ -1,0 +1,23 @@
+{
+  "date_local": "2026-10-29",
+  "status": "implementation pending native validation; draft change, not a verified Mac release",
+  "scope": "SwiftUI nearby-device page using the bundled Rust discover command; no input connection or pairing",
+  "checks_completed_on_windows": [
+    "Reviewed source-level bounded output, untrusted candidate parsing, cancellation and process cleanup",
+    "Parsed Info.plist XML and observed local-network purpose and Bonjour service declarations",
+    "Git Bash syntax-only check of scripts/build-macos-ui.sh passed"
+  ],
+  "not_run": [
+    "Swift 6 typecheck and native release build",
+    "Packaged application signature verification",
+    "Discovery parser self-test in the actual Mac executable",
+    "XCTest lifecycle fixtures (the last observed Mac Command Line Tools SDK lacked XCTest)",
+    "Mac window navigation, local-network permission flow, real device discovery and scan cancellation",
+    "Windows-to-Mac discovery and real mouse correctness/smoothness acceptance"
+  ],
+  "integration_limits": [
+    "Opening the device page browses nearby services; it does not publish an unpaired desktop control listener",
+    "Pairing remains disabled and no discovery candidate is promoted to trusted",
+    "Mac Keychain persistence and pairing-code confirmation remain separate incomplete work"
+  ]
+}

@@ -2,7 +2,9 @@ import SwiftUI
 
 struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
+    let discovery: DiscoveryModel
     @ViewState private var showDetails = false
+    @ViewState private var showingDevices = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -11,22 +13,26 @@ struct WorkspaceView: View {
             HStack(spacing: 0) {
                 sidebar.frame(width: Theme.sidebarWidth)
                 Divider().overlay(Theme.border)
-                VStack(alignment: .leading, spacing: 18) {
-                    heading
-                    ArrangementCanvas(model: model)
-                    bridgeCard
+                if showingDevices {
+                    DiscoveryView(model: discovery)
+                } else {
+                    VStack(alignment: .leading, spacing: 18) {
+                        heading
+                        ArrangementCanvas(model: model)
+                        bridgeCard
+                    }
+                    .padding(24)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Divider().overlay(Theme.border)
+                    InspectorView(model: model).frame(width: Theme.inspectorWidth)
                 }
-                .padding(24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                Divider().overlay(Theme.border)
-                InspectorView(model: model).frame(width: Theme.inspectorWidth)
             }
             Divider().overlay(Theme.border)
             HStack {
                 Image(systemName: "doc.text").foregroundStyle(Theme.secondary)
                 Text(model.banner).lineLimit(1)
                 Spacer()
-                Text("仅编辑布局 · 未启动输入共享")
+                Text(showingDevices ? "仅发现设备 · 未启动输入共享" : "仅编辑布局 · 未启动输入共享")
             }
             .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
             .padding(.horizontal, 18).padding(.vertical, 10)
@@ -82,11 +88,20 @@ struct WorkspaceView: View {
     }
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Label("工作空间", systemImage: "square.grid.2x2.fill")
-                .font(.system(size: Theme.bodySize, weight: .semibold))
-                .foregroundStyle(Theme.accent).padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.subtle, in: RoundedRectangle(cornerRadius: 10))
+            VStack(spacing: 6) {
+                Button { showingDevices = false } label: {
+                    Label("工作空间", systemImage: "square.grid.2x2.fill")
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                        .background(!showingDevices ? Theme.subtle : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                }
+                Button { showingDevices = true } label: {
+                    Label("附近设备", systemImage: "desktopcomputer")
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                        .background(showingDevices ? Theme.subtle : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                }.accessibilityIdentifier("nearby-devices")
+            }
+            .buttonStyle(.plain).foregroundStyle(Theme.accent)
+            .font(.system(size: Theme.bodySize, weight: .semibold))
             VStack(alignment: .leading, spacing: 12) {
                 Text("布局中的屏幕").font(.system(size: Theme.captionSize, weight: .semibold)).foregroundStyle(Theme.secondary)
                 ScrollView {
