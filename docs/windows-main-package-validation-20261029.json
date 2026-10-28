@@ -1,0 +1,19 @@
+{
+  "date_local": "2026-10-29",
+  "revision": "0a4bb444d4e4afd5a88aa025879c27f4e213e59f",
+  "build_dirty": false,
+  "scope": "Packaged Windows client readiness; not cross-device acceptance",
+  "build": {"result": "passed", "warnings": 0, "errors": 0, "pairing_worker_rebuilt": true},
+  "packaged_checks": {"bridge": 8, "pairing_controller": 34, "result": "passed"},
+  "pairing_worker_sha256": "AE1330D032FA3B9660D1855F8D0323839AA12C8594ACFDA0901A7770CE0D01CE",
+  "packaged_worker_matches_build": true,
+  "evidence": [
+    "runs/windows-main-package-20261029.txt",
+    "runs/windows-main-self-test-20261029.json",
+    "runs/windows-main-pairing-self-test-20261029.json"
+  ],
+  "network_pairing_executed": false,
+  "system_input_injected": false,
+  "user_mac_updated": false,
+  "remaining": ["User Mac update and native window verification", "First pairing through both native clients", "Attended visible cursor comparison"]
+}

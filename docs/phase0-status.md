@@ -6,6 +6,8 @@
 
 以下补充取代下文历史记录中对应的“尚未接入”，不把本机测试算作 Mac 实机验收。
 
+Windows 同版测试包补充：基于干净主线 `0a4bb44` 重新构建 Rust 核心、桥接、配对进程及 WinUI 包，构建零警告、零错误；实际包内八项桥接自检、34 项配对控制器自检通过，包内配对进程哈希与本轮构建一致。该自检不进行网络认证或系统输入，不替代跨机首次配对。Mac 聊天可读取历史，但发送本轮构建请求仍返回 `without an active turn id`，尚未更新用户 Mac 或启动本轮注入。详见 [Windows 同版打包验证](windows-main-package-validation-20261029.json)。
+
 Mac 客户端接入补充：`6155f1c` 已把短码邀请、双方确认、托管设备列表及接收启停接入原生设备页，并将共享内核与辅助程序打包在同一 App。GitHub arm64 Mac 的原生构建、26 项 Swift XCTest、打包桥接自检、签名校验及隔离 Keychain 测试通过。接收控制通道此前也通过五项真实 Mac DrySink 子进程测试。尚未在用户 Mac 上打开窗口验证外观/权限，尚未通过两端实际 UI 配对或物理键鼠验收；不能据此认定光标流畅度目标完成。详见 [Mac 客户端整合验证](macos-client-control-validation-20261029.json)。
 
 原生 CI 补充：GitHub arm64 macOS 已完成 `26909c2` 的原生构建检查，Rust 核心 148 项、CLI 4 项、普通进程 1 项、桥接 7 项、配对 29 项及 2 项编译失败测试通过；邀请 host 的实际 TCP 测试、SwiftUI 6 项 XCTest、打包桥接自检和签名校验通过。原生链接已验证，但没有执行 Mac Keychain 读写，也未测试用户 Mac、实际键鼠或可见流畅度。详见 [原生 CI 证据](macos-native-ci-validation-20261029.json)。
