@@ -14,6 +14,7 @@ use std::ptr::NonNull;
 use zeroize::Zeroizing;
 
 pub mod invitation;
+pub mod transport;
 
 pub const MESSAGE_BYTES: usize = 32;
 pub const CONFIRMATION_BYTES: usize = 32;

@@ -78,11 +78,11 @@ the networking layer still needs its own cancellation and total deadline.
 `ApprovedBinding` contains only the public binding and role. It records a local
 approval at that instant, not remote receipt, bilateral completion, durable trust,
 or authorization to send input. Later cancellation cannot retrospectively revoke
-that returned evidence. The next integration step needs a separate persistence
-commit policy, protected local keys, bilateral completion and revocation handling.
-These TCP fixtures discard their transient Noise keys and never create production
-identity records. The client UI, pairing listener and Mac native build remain
-unimplemented/unverified; this experiment is not first-install product pairing.
+that returned evidence. The low-level invitation TCP fixtures discard their keys.
+The reusable transport and opt-in persistence fixture below retain local keys
+without transferring private keys between devices. The client UI, discoverable
+pairing listener and Mac native build remain unimplemented/unverified; this
+experiment is not first-install product pairing.
 
 The three invitation TCP tests cover correct random-code authentication plus
 explicit approval and replay rejection; three actual wrong-code reconnections
@@ -97,6 +97,61 @@ Do not distribute a test executable without those runtime dependencies. On macOS
 build the same pinned CMake target natively, set the environment variable to its
 `boringssl` output directory, and run Cargo with the local Rust/Clang toolchain.
 macOS linking is supported by the build script but has not yet been verified.
+
+## Retained local keys and bilateral approval
+
+`transport::initiate` and `transport::respond` use the actual Noise XX and bound
+SPAKE2 exchange, retain each endpoint's locally generated static private key, and
+return a `PendingSession` without accessible keys. The responder requires an
+`AttemptPermit` reserved before Noise work. Both endpoints must explicitly call
+`approve`; the same encrypted channel exchanges exact versioned, role-labelled
+Approval then Ready frames. Only then does `EnrolledKeys` expose a zeroizing local
+private key and the authenticated peer's public key. No private key crosses the
+network. Pair IDs use the first 16 bytes of the completed Noise handshake hash.
+
+One deadline, at most 120 seconds, covers authentication, local approval waiting
+and both control exchanges. Blocking I/O retries in slices of at most 100 ms,
+checking cancellation without renewing the deadline. The responder retains its
+process-wide busy slot through the final exchange; the original invitation expiry
+and cancellation still apply after local approval. Drop or rejection shuts down
+the socket and drops the retained key. The caller must promptly dispose abandoned
+pending sessions; no background thread expires an idle Rust value on its behalf.
+
+The root core's trusted adapter `Identity::from_authorized_pairing` accepts already
+authenticated and locally approved keys, validates them, and constructs an
+identity in memory. It does not authenticate arbitrary network data itself.
+Windows `PeerStore::remember_authorized` saves that identity directly with DPAPI
+and commits public peer metadata last. No intermediate plaintext identity file or
+user-selected identity directory is needed. These root interfaces are not yet
+wired to the client pairing screen; the root product does not depend on this
+experimental crate.
+
+The Windows-only `enrollment_tcp` opt-in tests use this transport directly and
+exercise successful approval, protected save/reload, then a new connection using
+the root core's existing Noise KK protocol in both directions. Both test roles run
+on Windows: protecting the responder's identity with DPAPI is **not** macOS
+Keychain validation. They also cover peer decline and silent-handshake cancellation.
+Test credentials are deleted from temporary directories; reports remain under
+this crate's ignored `runs/` directory. They never access the real user's peer
+store or enable OS input.
+
+The additional `transport_cancel` fixture leaves the separate cancellation flag
+false and cancels only the invitation manager while the responder waits for the
+first Noise message or the peer's PAKE message. Both cases must return the specific
+invitation-revocation error, close the socket within one second and release the
+process-wide slot. The responder's read-only invitation observer is checked on
+every network wait, then replaced by the held approval observer after consent.
+
+Windows validation on 2026-10-29: 26 unit tests, 2 compile-fail doctests and all 10
+opt-in TCP tests passed. Root tests, both all-target Clippy runs and the root Apple
+target typecheck also passed. See [result-enrollment-windows.json](result-enrollment-windows.json)
+for evidence and the distinction between Windows localhost and native Mac testing.
+
+This is not an atomic distributed commit. A lost final message, crash or last-boundary
+cancellation can leave one endpoint successful and the other unsuccessful. A
+production enrollment flow still needs durable recovery/retry and revocation,
+Mac protected storage, packaging and native UI integration. Passing these fixtures
+does not mean normal first-install pairing is available in the shipped clients.
 
 ## Ownership and authentication boundary
 
@@ -117,7 +172,8 @@ macOS linking is supported by the build script but has not yet been verified.
 5. A successful `AuthenticatedBinding` contains only public binding and role. It
    proves local peer confirmation, not remote receipt of our tag or durable consent.
    The caller must finish its own send/ack and trust-persistence policy and must never
-   save trust after cancellation, timeout, or failure. This experiment saves no trust.
+   save trust after cancellation, timeout, or failure. This primitive saves no trust;
+   the opt-in enrollment fixture separately tests temporary protected storage.
 
 Role-labelled identities bind the complete Noise hash and ordered static keys into
 SPAKE2. The HMAC-SHA256 confirmation input includes a separate fixed domain, sending

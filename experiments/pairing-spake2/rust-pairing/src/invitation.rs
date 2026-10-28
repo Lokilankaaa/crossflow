@@ -346,6 +346,13 @@ pub struct AttemptPermit {
 }
 
 impl AttemptPermit {
+    pub(crate) fn attempt_check(&self) -> AttemptCheck {
+        AttemptCheck {
+            state: self.ticket.state.clone(),
+            id: self.ticket.id,
+        }
+    }
+
     pub fn start(self, binding: Binding) -> Result<InvitationPairing> {
         self.start_with_clock(binding, Instant::now)
     }
@@ -362,6 +369,30 @@ impl AttemptPermit {
             ticket: self.ticket,
             pairing,
         })
+    }
+}
+
+/// Read-only validity observer for network waits. It never owns a Ticket and
+/// cannot reserve, release, or refund either the local or process-wide slot.
+pub(crate) struct AttemptCheck {
+    state: Arc<Mutex<State>>,
+    id: AttemptId,
+}
+
+impl AttemptCheck {
+    pub(crate) fn check(&self) -> Result<()> {
+        let state = lock(&self.state)?;
+        ensure!(state.alive, "Invitation manager is closed");
+        let active = state
+            .active
+            .as_ref()
+            .context("Invitation is inactive or expired")?;
+        ensure!(
+            active.generation == self.id.generation && state.busy == Some(self.id),
+            "Invitation attempt was revoked"
+        );
+        ensure!(Instant::now() < active.deadline, "Invitation expired");
+        Ok(())
     }
 }
 
@@ -466,17 +497,66 @@ impl PendingApproval {
     }
 
     fn approve_with_clock(self, clock: impl Fn() -> Instant) -> Result<ApprovedBinding> {
+        let (approved, hold) = self.approve_held_with_clock(clock)?;
+        drop(hold);
+        Ok(approved)
+    }
+
+    pub(crate) fn approve_held(self) -> Result<(ApprovedBinding, ApprovalHold)> {
+        self.approve_held_with_clock(Instant::now)
+    }
+
+    fn approve_held_with_clock(
+        self,
+        clock: impl Fn() -> Instant,
+    ) -> Result<(ApprovedBinding, ApprovalHold)> {
         let mut state = lock(&self.ticket.state)?;
         // Validation and consumption are one linearizable operation against
         // cancel/replace/manager Drop. Never use a cached verification result.
         state.check(self.ticket.id, clock())?;
+        let deadline = state.active.as_ref().expect("checked invitation").deadline;
         state.active = None;
         let approved = ApprovedBinding {
             binding: *self.authenticated.binding(),
             role: self.authenticated.role(),
         };
         drop(state); // Ticket Drop acquires the same mutex; do not destroy it here.
-        Ok(approved)
+        Ok((
+            approved,
+            ApprovalHold {
+                ticket: self.ticket,
+                deadline,
+            },
+        ))
+    }
+}
+
+/// Keep the process-wide in-flight slot until the final transport exchange ends.
+/// Unlike ApprovedBinding, this internal lease remains revocable after local
+/// approval. It authorizes no input, persistence, or additional pairing attempt.
+pub(crate) struct ApprovalHold {
+    ticket: Ticket,
+    deadline: Instant,
+}
+
+impl ApprovalHold {
+    pub(crate) fn check(&self) -> Result<()> {
+        self.check_with_clock(Instant::now)
+    }
+
+    fn check_with_clock(&self, clock: impl Fn() -> Instant) -> Result<()> {
+        let state = lock(&self.ticket.state)?;
+        let budget = lock(&self.ticket.budget)?;
+        ensure!(
+            state.alive && state.generation == self.ticket.id.generation,
+            "Approval was revoked"
+        );
+        ensure!(
+            state.busy == Some(self.ticket.id) && budget.busy == Some(self.ticket.global_token),
+            "Approval attempt is no longer held"
+        );
+        ensure!(clock() < self.deadline, "Approval invitation expired");
+        Ok(())
     }
 }
 
@@ -841,5 +921,60 @@ mod tests {
         send::<AttemptPermit>();
         send::<PendingApproval>();
         shared::<InvitationManager>();
+    }
+
+    #[test]
+    fn approved_transport_hold_retains_global_slot_and_remains_revocable() {
+        let manager = manager();
+        let now = Instant::now();
+        let code = manager.replace_with_clock(|| now).unwrap();
+        let pending = confirm(&manager, &code, now);
+        let (approved, hold) = pending.approve_held_with_clock(|| now).unwrap();
+        let other = InvitationManager::with_budget(manager.budget.clone());
+        other.replace_with_clock(|| now).unwrap();
+        assert!(hold.check_with_clock(|| now).is_ok());
+        assert!(other.reserve_at(now).is_err());
+        manager.cancel();
+        assert!(hold.check_with_clock(|| now).is_err());
+        assert!(other.reserve_at(now).is_err());
+        drop(hold);
+        assert!(other.reserve_at(now).is_ok());
+        assert_eq!(approved.binding(), &binding());
+    }
+
+    #[test]
+    fn approved_transport_hold_expires_at_original_invitation_deadline() {
+        let manager = manager();
+        let now = Instant::now();
+        let code = manager.replace_with_clock(|| now).unwrap();
+        let pending = confirm(&manager, &code, now + Duration::from_secs(119));
+        let (_, hold) = pending
+            .approve_held_with_clock(|| now + Duration::from_secs(119))
+            .unwrap();
+        assert!(hold.check_with_clock(|| now + INVITATION_LIFETIME).is_err());
+        drop(manager);
+        assert!(hold.check_with_clock(|| now).is_err());
+    }
+
+    #[test]
+    fn attempt_observer_cannot_release_or_revive_a_ticket() {
+        let manager = manager();
+        let now = Instant::now();
+        manager.replace_with_clock(|| now).unwrap();
+        let permit = manager.reserve_at(now).unwrap();
+        let observer = permit.attempt_check();
+        assert!(observer.check().is_ok());
+        drop(observer);
+        assert!(manager.reserve_at(now).is_err());
+        let observer = permit.attempt_check();
+        manager.cancel();
+        manager.replace_with_clock(|| now).unwrap();
+        assert!(observer.check().is_err());
+        assert!(manager.reserve_at(now).is_err());
+        drop(permit);
+        let new_permit = manager.reserve_at(now).unwrap();
+        assert!(observer.check().is_err());
+        assert!(new_permit.attempt_check().check().is_ok());
+        assert_eq!(lock(&manager.budget).unwrap().reservations.len(), 2);
     }
 }

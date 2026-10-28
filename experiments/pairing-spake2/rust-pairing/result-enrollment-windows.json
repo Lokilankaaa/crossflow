@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-29",
+  "base_revision": "32e03d5",
+  "tested_with_uncommitted_changes": true,
+  "status": "Reusable opt-in pairing transport can enroll retained local keys into temporary Windows protected storage and authenticate the existing core protocol; not shipped UI pairing",
+  "boringssl_revision": "3769c110eab4ddbc0c159fadb4f1d0d98b2cf0cc",
+  "native_archive_sha256_verified": "93df76ebd0b9f8fde5b6f5847424e85f6a19acc1f1c9989233537e029bb4b486",
+  "validation": {
+    "pairing_unit_tests": "26 passed",
+    "compile_fail_doctests": "2 passed",
+    "actual_tcp_tests": "10 passed: 3 original Noise, 3 invitation, 3 enrollment, 1 manager-cancellation test covering both Noise and PAKE waits",
+    "root_workspace": "All-target tests passed; library 161 passed and 7 opt-in tests skipped; CLI, bridge, fixture validation and visible-metrics default tests passed",
+    "clippy": "Root workspace and independent pairing workspace all targets, warnings denied, passed",
+    "format": "Root workspace and independent experiment formatted; git diff whitespace check passed",
+    "apple_typecheck": "Root workspace all targets passed on Windows; not native Mac compilation and not a pairing-native-library build for Mac",
+    "success_path": "Fresh Noise XX, random invitation, SPAKE2 confirmation, both explicit approvals and Ready; independently retained local private keys match authenticated static public keys; pair IDs agree",
+    "persistence": "Root Identity::from_authorized_pairing plus PeerStore::remember_authorized; Windows DPAPI save and reload; no plaintext identity.json or imported identity bundle; fresh root Noise_KK connection and encrypted payload exchange in both directions",
+    "decline": "Both endpoints reached PendingSession, then responder declined; neither side returned enrollment keys",
+    "external_cancel": "Silent Noise peer remained connected; cancellation flag ended initiator within the 1000ms test bound; observed 100ms in final single run, not a latency benchmark",
+    "invitation_cancel": "Only InvitationManager.cancel changed, separate cancellation flag remained false; both first-Noise and post-Noise PAKE waits returned invitation-revocation errors within 1 second, closed their sockets, and released global busy so another manager could reserve",
+    "review_correction": "Added a read-only invitation validity observer to every responder network wait, then switch to a revocable ApprovalHold through final Ready; manager cancellation no longer waits for the entire transport deadline",
+    "cleanup": "Fixture reports and directory inspection confirm all generated protected identities and peer metadata deleted; only report.txt and key-cleanup.txt remain; real user store untouched"
+  },
+  "evidence": [
+    "runs/pairing-enrollment-core-tests-20261029.txt",
+    "runs/pairing-enrollment-final-unit-20261029.txt",
+    "runs/pairing-enrollment-final-tcp-20261029.txt",
+    "experiments/pairing-spake2/rust-pairing/runs/enrollment-success-5c59b8bf33aff89798611851b9f8da35/report.txt",
+    "experiments/pairing-spake2/rust-pairing/runs/enrollment-success-5c59b8bf33aff89798611851b9f8da35/key-cleanup.txt",
+    "experiments/pairing-spake2/rust-pairing/runs/enrollment-decline-449e7098ccebc3b97a7da2278cd1b810/report.txt",
+    "experiments/pairing-spake2/rust-pairing/runs/enrollment-cancel-a06c3318b5f2abb8829a949e38810748/report.txt"
+  ],
+  "limits": [
+    "Root production core does not depend on the experimental pairing crate; existing packaged client unchanged; no discoverable pairing listener or native pairing UI wired",
+    "Both enrollment roles ran on Windows localhost; responder-role DPAPI storage is not Mac Keychain, native Mac build, LAN pairing or cross-machine evidence",
+    "Success is not atomic bilateral durable storage: lost final Ready, a crash or last-boundary cancellation can leave one endpoint successful; production recovery/retry and revocation still required",
+    "Caller must drop abandoned pending states; no background task disposes an idle Rust value, and approval never enables input",
+    "Trusted root identity constructor validates key consistency but does not authenticate untrusted network data or obtain consent itself",
+    "No independent cryptographic audit, OS input injection, visible cursor measurement or phase-0 performance acceptance"
+  ]
+}

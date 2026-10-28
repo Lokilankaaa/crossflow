@@ -1,9 +1,10 @@
 //! Pinned identities and fresh authenticated Noise sessions.
 //!
-//! Noise_KK requires both static public keys before the handshake. Transfer only
-//! the intended device's identity directory through a trusted channel. No input
-//! is sent or accepted as handshake payload. Caller supplies socket deadlines
-//! and frames transport records; this module frames handshake records only.
+//! Noise_KK requires both static public keys before the handshake. Authorized
+//! pairing can construct identities in memory; legacy diagnostic bundles must
+//! reach only their intended device through a trusted channel. No input is sent
+//! or accepted as handshake payload. Caller supplies socket deadlines and frames
+//! transport records; this module frames handshake records only.
 //! Windows identities can also be stored in a current-user DPAPI envelope;
 //! protected storage does not itself perform pairing or establish trust.
 
@@ -77,6 +78,36 @@ impl std::fmt::Debug for Identity {
 }
 
 impl Identity {
+    /// Trusted local adapter after the caller has completed short-code peer
+    /// authentication AND explicit local approval. This constructor does not
+    /// authenticate network data, imply peer consent, or write any files. The
+    /// caller supplies the transport role and the authenticated peer static key.
+    pub fn from_authorized_pairing(
+        role: &str,
+        pair_id: String,
+        private: Zeroizing<[u8; 32]>,
+        peer: [u8; 32],
+    ) -> Result<Self> {
+        validate_metadata(role, &pair_id)?;
+        let mut dh = DefaultResolver
+            .resolve_dh(&snow::params::DHChoice::Curve25519)
+            .context("Curve25519 unavailable in this build")?;
+        dh.set(&private[..]);
+        let public: [u8; 32] = dh
+            .pubkey()
+            .try_into()
+            .context("Invalid Curve25519 public key length")?;
+        let identity = Self {
+            role: role.into(),
+            pair_id,
+            private: *private,
+            public,
+            peer,
+        };
+        identity.validate_keys()?;
+        Ok(identity)
+    }
+
     pub fn load(bundle: &Path) -> Result<Self> {
         // A present but damaged/inaccessible protected identity must fail closed;
         // do not silently fall back to an older plaintext identity beside it.
@@ -102,14 +133,7 @@ impl Identity {
             stored.schema == 1 && stored.pattern == PATTERN,
             "Unsupported identity format"
         );
-        ensure!(
-            stored.role == "windows" || stored.role == "mac",
-            "Unknown identity role"
-        );
-        ensure!(
-            stored.pair_id.len() == 32 && stored.pair_id.bytes().all(is_lower_hex),
-            "Invalid pair identifier"
-        );
+        validate_metadata(&stored.role, &stored.pair_id)?;
         let public = decode_key(&stored.public_key_hex)?;
         let peer = decode_key(&stored.peer_public_key_hex)?;
         let private = Zeroizing::new(decode_key(&stored.private_key_hex)?);
@@ -129,15 +153,7 @@ impl Identity {
     /// overwritten, and the source identity is not deleted. This is storage,
     /// not enrollment: callers must establish peer trust before saving.
     pub fn save_protected(&self, output: &Path) -> Result<()> {
-        self.validate_keys()?;
-        ensure!(
-            self.role == "windows" || self.role == "mac",
-            "Unknown identity role"
-        );
-        ensure!(
-            self.pair_id.len() == 32 && self.pair_id.bytes().all(is_lower_hex),
-            "Invalid pair identifier"
-        );
+        self.validate()?;
         let mut plaintext = Zeroizing::new(Vec::with_capacity(SEALED_LENGTH));
         plaintext.extend_from_slice(SEALED_HEADER);
         plaintext.push(if self.role == "windows" { 0 } else { 1 });
@@ -195,6 +211,13 @@ impl Identity {
         encode_hex(&self.peer)
     }
 
+    /// Revalidate before creating storage; public metadata may have been changed
+    /// since construction, even though the private and pinned keys are opaque.
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_metadata(&self.role, &self.pair_id)?;
+        self.validate_keys()
+    }
+
     fn validate_keys(&self) -> Result<()> {
         let mut dh = DefaultResolver
             .resolve_dh(&snow::params::DHChoice::Curve25519)
@@ -247,6 +270,15 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
 
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
+fn validate_metadata(role: &str, pair_id: &str) -> Result<()> {
+    ensure!(role == "windows" || role == "mac", "Unknown identity role");
+    ensure!(
+        pair_id.len() == 32 && pair_id.bytes().all(is_lower_hex),
+        "Invalid pair identifier"
+    );
+    Ok(())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -621,6 +653,82 @@ mod tests {
             finish_handshake(initiator, a)?,
             finish_handshake(responder, b)?,
         ))
+    }
+
+    #[test]
+    fn authorized_identity_derives_public_key_and_reuses_pinned_protocol() {
+        let (a, b) = identities();
+        let local = Identity::from_authorized_pairing(
+            "windows",
+            a.pair_id.clone(),
+            Zeroizing::new(a.private),
+            a.peer,
+        )
+        .unwrap();
+        let remote = Identity::from_authorized_pairing(
+            "mac",
+            b.pair_id.clone(),
+            Zeroizing::new(b.private),
+            b.peer,
+        )
+        .unwrap();
+        assert_eq!(local.public, a.public);
+        assert_eq!(remote.public, b.public);
+        let (mut tx, mut rx) = channels(&local, &remote).unwrap();
+        assert_eq!(
+            rx.decrypt(&tx.encrypt(b"authorized in memory").unwrap())
+                .unwrap(),
+            b"authorized in memory"
+        );
+        let private_hex = Zeroizing::new(encode_hex(&a.private));
+        let debug = format!("{local:?}");
+        assert!(debug.contains("[REDACTED]") && !debug.contains(private_hex.as_str()));
+    }
+
+    #[test]
+    fn authorized_identity_rejects_invalid_metadata_self_and_low_order_keys() {
+        let (a, _) = identities();
+        for role in ["", "Windows", "linux", "windows\n"] {
+            assert!(
+                Identity::from_authorized_pairing(
+                    role,
+                    a.pair_id.clone(),
+                    Zeroizing::new(a.private),
+                    a.peer
+                )
+                .is_err()
+            );
+        }
+        for pair_id in [
+            String::new(),
+            "a".repeat(31),
+            "a".repeat(33),
+            "A".repeat(32),
+            "g".repeat(32),
+        ] {
+            assert!(
+                Identity::from_authorized_pairing(
+                    "windows",
+                    pair_id,
+                    Zeroizing::new(a.private),
+                    a.peer
+                )
+                .is_err()
+            );
+        }
+        let mut one = [0; 32];
+        one[0] = 1;
+        for peer in [[0; 32], one, a.public] {
+            assert!(
+                Identity::from_authorized_pairing(
+                    "windows",
+                    a.pair_id.clone(),
+                    Zeroizing::new(a.private),
+                    peer
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Windows app-owned storage for previously authorized diagnostic identities.
+//! Windows app-owned storage for previously authenticated and authorized identities.
 //!
 //! Importing an existing bundle is a migration, NOT short-code pairing. Network
 //! discovery and the saved endpoint never establish trust. The pinned identity
@@ -68,6 +68,22 @@ impl PeerStore {
         validate_endpoint(last_endpoint)?;
         // Identity::load fails closed when a protected file exists but fails.
         let identity = Identity::load(bundle).context("Cannot import existing identity")?;
+        self.remember_authorized(identity, friendly_name, last_endpoint)
+    }
+
+    /// Save an identity after the caller has authenticated the peer and obtained
+    /// explicit local authorization. This does not perform pairing or infer
+    /// trust from a name/endpoint. No plaintext identity file is created.
+    pub fn remember_authorized(
+        &self,
+        identity: Identity,
+        friendly_name: &str,
+        last_endpoint: SocketAddr,
+    ) -> Result<PeerSummary> {
+        supported()?;
+        validate_name(friendly_name)?;
+        validate_endpoint(last_endpoint)?;
+        identity.validate()?;
         ensure!(
             identity.role == "windows",
             "Peer store requires a Windows sender identity"
@@ -382,6 +398,146 @@ mod tests {
     mod windows {
         use super::*;
         use crate::security::{PairInfo, create_pair};
+        use zeroize::Zeroizing;
+
+        struct MemoryFixture(PathBuf);
+        impl MemoryFixture {
+            fn new() -> Self {
+                let root = std::env::temp_dir().join(format!(
+                    "crossflow-authorized-store-{}",
+                    crate::discovery::new_public_id().unwrap()
+                ));
+                fs::create_dir(&root).unwrap();
+                Self(root)
+            }
+        }
+        impl Drop for MemoryFixture {
+            fn drop(&mut self) {
+                assert!(self.0.starts_with(std::env::temp_dir()));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn authorized_identity(role: &str) -> (Identity, Zeroizing<[u8; 32]>) {
+            let builder = snow::Builder::new(crate::security::PATTERN.parse().unwrap());
+            let local = builder.generate_keypair().unwrap();
+            let remote = builder.generate_keypair().unwrap();
+            let local_private = Zeroizing::new(local.private);
+            let _remote_private = Zeroizing::new(remote.private);
+            let private: Zeroizing<[u8; 32]> =
+                Zeroizing::new(local_private.as_slice().try_into().unwrap());
+            let identity = Identity::from_authorized_pairing(
+                role,
+                "0123456789abcdef0123456789abcdef".into(),
+                Zeroizing::new(*private),
+                remote.public.as_slice().try_into().unwrap(),
+            )
+            .unwrap();
+            (identity, private)
+        }
+
+        #[test]
+        fn authorized_identity_saves_directly_without_plaintext_and_matches_migration() {
+            let f = MemoryFixture::new();
+            let store = PeerStore::at(f.0.join("peers"));
+            let (identity, private) = authorized_identity("windows");
+            let public = identity.public_key_hex();
+            let peer = identity.peer_public_key_hex();
+            let endpoint = "127.0.0.1:5555".parse().unwrap();
+            let saved = store
+                .remember_authorized(identity, "Authorized Mac", endpoint)
+                .unwrap();
+            assert_eq!(saved.id, peer);
+            let reopened = PeerStore::at(&store.root);
+            assert_eq!(reopened.list().unwrap().peers, vec![saved.clone()]);
+            let (_, bundle) = reopened.resolve(&saved.id).unwrap();
+            let loaded = Identity::load(&bundle).unwrap();
+            assert_eq!(loaded.public_key_hex(), public);
+            assert_eq!(loaded.peer_public_key_hex(), peer);
+            let mut files = fs::read_dir(&bundle)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            files.sort();
+            assert_eq!(
+                files,
+                vec![
+                    std::ffi::OsString::from(IDENTITY_FILE),
+                    std::ffi::OsString::from(COMMIT_FILE)
+                ]
+            );
+            let sealed = fs::read(bundle.join(IDENTITY_FILE)).unwrap();
+            assert!(
+                !sealed
+                    .windows(private.len())
+                    .any(|bytes| bytes == &private[..])
+            );
+            let metadata = fs::read(bundle.join(COMMIT_FILE)).unwrap();
+            let listed = serde_json::to_string(&reopened.list().unwrap()).unwrap();
+            assert!(
+                !listed.contains("private")
+                    && !listed.contains("bundle")
+                    && !listed.contains("path")
+            );
+
+            // A diagnostic migration of the SAME protected identity is equivalent,
+            // but the direct path above did not need a source identity directory.
+            let diagnostic = f.0.join("diagnostic-protected-source");
+            loaded.save_protected(&diagnostic).unwrap();
+            let migrated = PeerStore::at(f.0.join("migrated"))
+                .remember_existing(&diagnostic, "Authorized Mac", endpoint)
+                .unwrap();
+            assert_eq!(migrated, saved);
+            assert!(!diagnostic.join("identity.json").exists());
+            assert!(
+                store
+                    .remember_authorized(loaded, "Changed", "127.0.0.1:5556".parse().unwrap())
+                    .is_err()
+            );
+            assert!(sealed == fs::read(bundle.join(IDENTITY_FILE)).unwrap());
+            assert!(metadata == fs::read(bundle.join(COMMIT_FILE)).unwrap());
+        }
+
+        #[test]
+        fn invalid_authorized_data_is_rejected_before_creating_store() {
+            let f = MemoryFixture::new();
+            let store = PeerStore::at(f.0.join("not-created"));
+            for case in 0..4 {
+                let (mut identity, _) = authorized_identity("windows");
+                let mut name = "Authorized Mac";
+                let mut endpoint = "127.0.0.1:5555".parse().unwrap();
+                match case {
+                    0 => name = " name",
+                    1 => endpoint = "0.0.0.0:5555".parse().unwrap(),
+                    2 => identity.role = "mac".into(),
+                    _ => identity.pair_id = "A".repeat(32),
+                }
+                assert!(store.remember_authorized(identity, name, endpoint).is_err());
+                assert!(!store.root.exists());
+            }
+            let (_, private) = authorized_identity("windows");
+            for peer in [[0; 32], {
+                let mut key = [0; 32];
+                key[0] = 1;
+                key
+            }] {
+                let result = Identity::from_authorized_pairing(
+                    "windows",
+                    "0123456789abcdef0123456789abcdef".into(),
+                    Zeroizing::new(*private),
+                    peer,
+                )
+                .and_then(|identity| {
+                    store.remember_authorized(
+                        identity,
+                        "Invalid peer",
+                        "127.0.0.1:5555".parse().unwrap(),
+                    )
+                });
+                assert!(result.is_err());
+                assert!(!store.root.exists());
+            }
+        }
 
         struct Fixture {
             root: PathBuf,
