@@ -6,6 +6,7 @@ pub mod input;
 pub mod metrics;
 pub mod platform;
 pub mod protocol;
+pub mod secret_store;
 pub mod security;
 pub mod session;
 pub mod shutdown;

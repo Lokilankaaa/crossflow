@@ -1,9 +1,11 @@
-//! Pinned offline identities and fresh authenticated Noise sessions.
+//! Pinned identities and fresh authenticated Noise sessions.
 //!
 //! Noise_KK requires both static public keys before the handshake. Transfer only
 //! the intended device's identity directory through a trusted channel. No input
 //! is sent or accepted as handshake payload. Caller supplies socket deadlines
 //! and frames transport records; this module frames handshake records only.
+//! Windows identities can also be stored in a current-user DPAPI envelope;
+//! protected storage does not itself perform pairing or establish trust.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,12 +15,16 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
 pub const MAX_CIPHERTEXT: usize = 65_535;
 pub const MAX_PLAINTEXT: usize = MAX_CIPHERTEXT - 16;
 const MAX_HANDSHAKE: usize = 1_024;
 const PROLOGUE: &[u8] = b"Crossflow/phase0/pinned-noise/v1/";
+const PROTECTED_FILE: &str = "identity.dpapi";
+const SEALED_HEADER: &[u8; 5] = b"CFID\x01";
+const SEALED_LENGTH: usize = 5 + 1 + 32 + 32 * 3;
 
 /// Public data only; safe for CLI output.
 #[derive(Debug, Serialize)]
@@ -41,6 +47,12 @@ struct StoredIdentity {
     private_key_hex: String,
     public_key_hex: String,
     peer_public_key_hex: String,
+}
+
+impl Drop for StoredIdentity {
+    fn drop(&mut self) {
+        self.private_key_hex.zeroize();
+    }
 }
 
 /// Intentionally not Serialize or Clone. Debug redacts the secret.
@@ -66,10 +78,24 @@ impl std::fmt::Debug for Identity {
 
 impl Identity {
     pub fn load(bundle: &Path) -> Result<Self> {
+        // A present but damaged/inaccessible protected identity must fail closed;
+        // do not silently fall back to an older plaintext identity beside it.
+        let protected = bundle.join(PROTECTED_FILE);
+        match fs::symlink_metadata(&protected) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.file_type().is_file(),
+                    "Protected identity is not a regular file"
+                );
+                let sealed = read_bounded(&protected, 65_536)?;
+                let plaintext = crate::secret_store::unprotect(&sealed)?;
+                return Self::from_protected_record(plaintext.as_slice());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("Cannot access protected identity"),
+        }
         let path = bundle.join("identity.json");
-        let metadata = fs::metadata(&path).context("Cannot read identity bundle")?;
-        ensure!(metadata.len() <= 4096, "Identity file exceeds size limit");
-        let bytes = fs::read(&path).context("Cannot read identity bundle")?;
+        let bytes = read_bounded(&path, 4096).context("Cannot read identity bundle")?;
         let stored: StoredIdentity = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("Malformed identity.json"))?;
         ensure!(
@@ -84,12 +110,78 @@ impl Identity {
             stored.pair_id.len() == 32 && stored.pair_id.bytes().all(is_lower_hex),
             "Invalid pair identifier"
         );
+        let public = decode_key(&stored.public_key_hex)?;
+        let peer = decode_key(&stored.peer_public_key_hex)?;
+        let private = Zeroizing::new(decode_key(&stored.private_key_hex)?);
         let identity = Self {
-            role: stored.role,
-            pair_id: stored.pair_id,
-            private: decode_key(&stored.private_key_hex)?,
-            public: decode_key(&stored.public_key_hex)?,
-            peer: decode_key(&stored.peer_public_key_hex)?,
+            role: stored.role.clone(),
+            pair_id: stored.pair_id.clone(),
+            private: *private,
+            public,
+            peer,
+        };
+        identity.validate_keys()?;
+        Ok(identity)
+    }
+
+    /// Persist an already authenticated identity using the current user's OS
+    /// protection. No plaintext file is written, no existing directory is
+    /// overwritten, and the source identity is not deleted. This is storage,
+    /// not enrollment: callers must establish peer trust before saving.
+    pub fn save_protected(&self, output: &Path) -> Result<()> {
+        self.validate_keys()?;
+        ensure!(
+            self.role == "windows" || self.role == "mac",
+            "Unknown identity role"
+        );
+        ensure!(
+            self.pair_id.len() == 32 && self.pair_id.bytes().all(is_lower_hex),
+            "Invalid pair identifier"
+        );
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(SEALED_LENGTH));
+        plaintext.extend_from_slice(SEALED_HEADER);
+        plaintext.push(if self.role == "windows" { 0 } else { 1 });
+        plaintext.extend_from_slice(self.pair_id.as_bytes());
+        plaintext.extend_from_slice(&self.private);
+        plaintext.extend_from_slice(&self.public);
+        plaintext.extend_from_slice(&self.peer);
+        let sealed = crate::secret_store::protect(&plaintext)?;
+        // Protection must succeed before creating any persistent state. On an
+        // unsupported platform this leaves no empty destination behind.
+        private_directory(output)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output.join(PROTECTED_FILE))
+            .context("Cannot create protected identity")?;
+        file.write_all(&sealed)
+            .context("Cannot write protected identity")?;
+        file.sync_all().context("Cannot flush protected identity")?;
+        Ok(())
+    }
+
+    fn from_protected_record(record: &[u8]) -> Result<Self> {
+        ensure!(
+            record.len() == SEALED_LENGTH && &record[..5] == SEALED_HEADER,
+            "Unsupported protected identity format"
+        );
+        let role = match record[5] {
+            0 => "windows",
+            1 => "mac",
+            _ => bail!("Unknown protected identity role"),
+        };
+        let pair_id = &record[6..38];
+        ensure!(
+            pair_id.iter().copied().all(is_lower_hex),
+            "Invalid protected pair identifier"
+        );
+        let identity = Self {
+            role: role.into(),
+            pair_id: String::from_utf8(pair_id.to_vec())
+                .context("Invalid protected pair identifier")?,
+            private: record[38..70].try_into()?,
+            public: record[70..102].try_into()?,
+            peer: record[102..134].try_into()?,
         };
         identity.validate_keys()?;
         Ok(identity)
@@ -112,8 +204,8 @@ impl Identity {
             self.public != self.peer,
             "Local and remote identities must differ"
         );
-        let mut shared = [0u8; 32];
-        dh.dh(&self.peer, &mut shared)
+        let mut shared = Zeroizing::new([0u8; 32]);
+        dh.dh(&self.peer, shared.as_mut())
             .context("Invalid paired public key")?;
         ensure!(
             shared.iter().any(|v| *v != 0),
@@ -121,6 +213,25 @@ impl Identity {
         );
         Ok(())
     }
+}
+
+impl Drop for Identity {
+    fn drop(&mut self) {
+        self.private.zeroize();
+    }
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let file = fs::File::open(path).context("Cannot read identity")?;
+    ensure!(file.metadata()?.is_file(), "Identity is not a regular file");
+    // Reserve the entire bounded read up front, avoiding reallocations that
+    // could leave freed plaintext buffers outside Zeroizing's ownership.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(limit + 1));
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("Cannot read identity")?;
+    ensure!(bytes.len() <= limit, "Identity file exceeds size limit");
+    Ok(bytes)
 }
 
 fn is_lower_hex(byte: u8) -> bool {
@@ -680,6 +791,116 @@ mod tests {
         fs::remove_dir(info.windows_bundle).unwrap();
         fs::remove_dir(info.mac_bundle).unwrap();
         fs::remove_dir(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn protected_test_directory() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "crossflow-protected-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn protected_identity_reloads_into_existing_authenticated_protocol() {
+        let (a, b) = identities();
+        let path = protected_test_directory();
+        a.save_protected(&path).unwrap();
+        assert!(!path.join("identity.json").exists());
+        let stored = fs::read(path.join(PROTECTED_FILE)).unwrap();
+        assert!(
+            !stored
+                .windows(a.private.len())
+                .any(|part| part == a.private)
+        );
+        let loaded = Identity::load(&path).unwrap();
+        assert_eq!(loaded.public, a.public);
+        assert_eq!(loaded.peer, a.peer);
+        assert_eq!(loaded.pair_id, a.pair_id);
+        let (mut tx, mut rx) = channels(&loaded, &b).unwrap();
+        assert_eq!(
+            rx.decrypt(&tx.encrypt(b"protected identity").unwrap())
+                .unwrap(),
+            b"protected identity"
+        );
+        assert!(a.save_protected(&path).is_err());
+        assert_eq!(fs::read(path.join(PROTECTED_FILE)).unwrap(), stored);
+        fs::remove_file(path.join(PROTECTED_FILE)).unwrap();
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn damaged_protected_identity_does_not_fall_back_to_plaintext() {
+        let root = protected_test_directory();
+        let pair = create_pair(&root).unwrap();
+        assert!(Identity::load(&pair.windows_bundle).is_ok());
+        let protected = pair.windows_bundle.join(PROTECTED_FILE);
+        fs::write(&protected, b"truncated-invalid-dpapi").unwrap();
+        assert!(Identity::load(&pair.windows_bundle).is_err());
+        fs::remove_file(&protected).unwrap();
+        fs::create_dir(&protected).unwrap();
+        assert!(Identity::load(&pair.windows_bundle).is_err());
+        fs::remove_dir(&protected).unwrap();
+        assert!(Identity::load(&pair.windows_bundle).is_ok());
+        for directory in [&pair.windows_bundle, &pair.mac_bundle] {
+            fs::remove_file(directory.join("identity.json")).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn valid_os_protection_does_not_bypass_identity_validation() {
+        let (a, _) = identities();
+        let path = protected_test_directory();
+        a.save_protected(&path).unwrap();
+        let file = path.join(PROTECTED_FILE);
+        let protected = fs::read(&file).unwrap();
+        let opened = crate::secret_store::unprotect(&protected).unwrap();
+        for offset in [0, 5, 6, 38, 70, 102] {
+            let mut record = Zeroizing::new(opened.as_slice().to_vec());
+            if offset == 102 {
+                record[102..134].fill(0);
+            } else {
+                record[offset] ^= 0xff;
+            }
+            let invalid = crate::secret_store::protect(&record).unwrap();
+            fs::write(&file, invalid).unwrap();
+            assert!(
+                Identity::load(&path).is_err(),
+                "invalid field at offset {offset}"
+            );
+        }
+        fs::write(&file, vec![0; 65_537]).unwrap();
+        assert!(Identity::load(&path).is_err());
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "opens localhost sockets; uses generated test identities and current-user DPAPI"]
+    fn protected_identities_authenticate_over_real_tcp() {
+        let (a, b) = identities();
+        let first = protected_test_directory();
+        let second = protected_test_directory();
+        a.save_protected(&first).unwrap();
+        b.save_protected(&second).unwrap();
+        let (client, server) = tcp_exchange(
+            Identity::load(&first).unwrap(),
+            Identity::load(&second).unwrap(),
+        );
+        for directory in [&first, &second] {
+            fs::remove_file(directory.join(PROTECTED_FILE)).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+        assert_eq!(client.unwrap(), b"accepted");
+        server.unwrap();
     }
 
     fn tcp_exchange(client: Identity, server: Identity) -> (Result<Vec<u8>>, Result<()>) {

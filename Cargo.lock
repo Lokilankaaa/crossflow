@@ -194,6 +194,7 @@ dependencies = [
  "serde_json",
  "snow",
  "windows-sys",
+ "zeroize",
 ]
 
 [[package]]

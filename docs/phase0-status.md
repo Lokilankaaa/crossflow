@@ -22,6 +22,8 @@
 
 ## 已实现
 
+2026-10-29 补充：Windows 内核已增加当前用户 DPAPI 保护存储，并接入现有身份加载与 Noise KK。真实 DPAPI 往返、损坏拒绝、不覆盖、无明文回退、恢复身份后的加密交换及 localhost TCP 握手通过；全目标测试、Clippy 和 Apple 类型检查通过。这是客户端自动保管身份的基础接口，尚未接入短码配对、应用默认目录或 Mac Keychain，也没有自动迁移或删除现有诊断文件。详见 [受保护身份验证记录](protected-identity-validation-20261029.json)。
+
 共享 Rust 核心；Windows Raw Input；Mac CoreGraphics 适配；离线身份配对与 Noise KK 加密会话；显式开启、暂停和停止；重连后暂停；有界累计位移合并；过期事件拒绝；异步有界日志与分段统计。
 
 新增实机证据见 [Mac 验证记录](mac-validation-20261028.md)：Mac 原生 release 构建与 42 项测试通过，Wi-Fi 路径下十秒合成 DrySink 成功。随后完成首轮真实鼠标共享，用户反馈“能移动，比较流畅”。有线首轮存在握手超时差异，根因未定。主观观察不等于本地鼠标、ShareMouse 的受控对照通过。
