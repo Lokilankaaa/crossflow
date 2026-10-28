@@ -3,8 +3,8 @@
   "timezone": "Asia/Hong_Kong",
   "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "host_target": "x86_64-pc-windows-gnu",
-  "unit_tests_passed": 42,
-  "explicit_localhost_tests_passed": 5,
+  "unit_tests_passed": 60,
+  "explicit_localhost_tests_passed": 6,
   "recovery_tests": {
     "authenticated_reconnect_requires_rearm_no_old_motion_replay": "passed",
     "expired_movement_lease_rejected_while_session_has_fresh_heartbeats": "passed",
@@ -37,6 +37,17 @@
   "end_to_end_physical_latency": "NOT_MEASURED",
   "one_way_network_latency": "NOT_MEASURED",
   "acceptance_status": "stage 0 incomplete",
+  "local_development": {
+    "ordered_input_queue_tests": 10,
+    "arrangement_tests": 6,
+    "keyboard_buttons_scroll": "source queue only; not connected to wire or OS adapters",
+    "layout": "validated geometry and CLI crossing calculation; no automatic device handoff",
+    "frontend": "offline layout editor; runtime bridge and rendered UI validation pending",
+    "frontend_isolated_dom_model_assertions": 24,
+    "frontend_initial_layout_rust_validation": "passed",
+    "latest_mac_native_rebuild": "not performed for new input/layout modules",
+    "unattended_system_input_injection": false
+  },
   "mac_native_build": {
     "status": "passed",
     "baseline": "3dd2de752d5e3d55ba741c2cf3771bab3ef29005",

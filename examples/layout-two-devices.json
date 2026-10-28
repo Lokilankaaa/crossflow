@@ -1,0 +1,6 @@
+{
+  "screens": [
+    { "id": "windows-main", "device_id": "windows", "x": 0, "y": 0, "width": 1920, "height": 1080 },
+    { "id": "mac-main", "device_id": "mac", "x": 1920, "y": 100, "width": 1470, "height": 956 }
+  ]
+}

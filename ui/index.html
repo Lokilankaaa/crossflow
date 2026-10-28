@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Crossflow · 屏幕布局</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#layout" aria-label="Crossflow 首页"><span class="brand-mark" aria-hidden="true">↗</span><span>Crossflow<small>让设备，自然相连。</small></span></a>
+    <div class="nav-label">工作空间</div>
+    <nav aria-label="主导航">
+      <button class="nav-item active" data-page="layout" aria-current="page"><span aria-hidden="true">▣</span>屏幕布局</button>
+      <button class="nav-item" data-page="settings"><span aria-hidden="true">⌘</span>输入设置<span class="soon">即将支持</span></button>
+      <button class="nav-item" data-page="status"><span aria-hidden="true">◉</span>连接状态</button>
+    </nav>
+    <div class="sidebar-bottom"><span class="offline-dot"></span><div>本地工作空间<small>无需账号 · 草稿保存在此浏览器</small></div></div>
+  </aside>
+  <main>
+    <header class="topbar"><span class="breadcrumb">工作空间 <span>/</span> <strong id="page-name">屏幕布局</strong></span><span class="connection-pill"><span class="offline-dot"></span>未连接</span></header>
+    <section id="page-layout" class="page">
+      <div class="page-heading"><div><p class="eyebrow">YOUR CONNECTED DESK</p><h1>每块屏幕，都在顺手的位置。</h1><p class="subtitle">拖动屏幕，还原你的桌面。以屏幕为布局单位，以设备为连接单位。</p></div><button class="primary" id="add-screen"><span aria-hidden="true">＋</span> 添加屏幕</button></div>
+      <div class="draft-banner"><span class="draft-icon" aria-hidden="true">✎</span><div><strong>正在编辑布局草稿</strong><span>此页面尚未连接共享内核；布局不会改变系统显示设置，也不会开启键鼠共享。</span></div><span id="save-status" class="save-status">本地草稿</span></div>
+      <div class="editor-layout">
+        <section class="canvas-card" aria-label="屏幕布局编辑器">
+          <div class="canvas-toolbar"><div><strong>桌面布局</strong><span id="screen-count" class="count-badge">0 块屏幕</span></div><div class="canvas-actions"><label class="toggle-label"><input type="checkbox" id="snap" checked>边缘吸附</label><button class="small-button" id="fit" title="让全部屏幕出现在画布中">适应画布</button></div></div>
+          <div class="canvas-wrap" id="canvas-wrap">
+            <svg id="canvas" viewBox="-240 -240 4000 1700" role="group" aria-label="屏幕布局画布。选中屏幕后可用方向键移动，Shift 加速，Alt 微调。">
+              <defs><pattern id="dots" width="80" height="80" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="2" fill="#d9dbe6"/></pattern></defs>
+              <rect id="grid" x="-1000000" y="-1000000" width="2000000" height="2000000" fill="url(#dots)"/>
+              <g id="screens"></g>
+            </svg>
+            <div id="empty-state" class="empty-state" hidden><span aria-hidden="true">▣</span><h2>从第一块屏幕开始</h2><p>添加屏幕，安排属于你的工作空间。</p><button id="empty-add" class="primary">添加屏幕</button></div>
+            <div class="canvas-caption"><span class="canvas-origin">自由布局</span><span>拖动调整位置 · 方向键精细移动</span></div>
+          </div>
+          <div class="canvas-footer"><span><i class="legend-dot"></i>同一设备使用相同颜色</span><span>仅边缘接触可形成跨屏入口</span></div>
+        </section>
+        <aside class="inspector-card" aria-label="选中屏幕属性">
+          <div class="inspector-heading"><span class="eyebrow">SCREEN DETAILS</span><h2>屏幕属性</h2></div>
+          <div id="no-selection" class="no-selection">选择一块屏幕，调整它的位置和尺寸。</div>
+          <form id="properties" hidden>
+            <div class="selected-screen"><span class="mini-monitor" aria-hidden="true">▣</span><div><strong id="selected-id"></strong><small id="selected-device"></small></div></div>
+            <label class="field">所属设备<input id="prop-device" name="device_id" required maxlength="128" autocomplete="off" spellcheck="false"></label>
+            <div class="field-section">位置 <span>逻辑坐标</span></div>
+            <div class="field-row"><label class="field">X<input id="prop-x" name="x" type="number" step="any" required></label><label class="field">Y<input id="prop-y" name="y" type="number" step="any" required></label></div>
+            <div class="field-section">尺寸 <span>逻辑像素</span></div>
+            <div class="field-row"><label class="field">宽度<input id="prop-width" name="width" type="number" min="0" max="32768" step="any" required></label><label class="field">高度<input id="prop-height" name="height" type="number" min="0" max="32768" step="any" required></label></div>
+            <p class="field-note">坐标 ±1,000,000；宽高大于 0 且不超过 32,768。屏幕内部不能重叠。</p>
+            <button class="secondary full" type="submit">更新属性</button>
+            <button id="delete-screen" class="text-danger full" type="button">移除此屏幕</button>
+          </form>
+          <div class="keyboard-hint"><span>⌨</span><p>方向键移动 10 像素<br>Shift：50 像素 · Alt：1 像素</p></div>
+        </aside>
+      </div>
+      <div id="notice" class="notice" role="status" aria-live="polite">示例布局已就绪。可自由调整，或导入已有草稿。</div>
+      <section class="devices-section"><div class="section-heading"><div><h2>布局中的设备 <span id="device-count"></span></h2><p>设备名称来自草稿，并非自动发现结果。</p></div><div class="file-actions"><button id="import-button" class="secondary">导入 JSON</button><button id="export-button" class="secondary">导出布局 <span aria-hidden="true">↗</span></button><input type="file" id="import-file" accept="application/json,.json" hidden></div></div><div id="device-list" class="device-list"></div></section>
+    </section>
+    <section id="page-settings" class="page" hidden><div class="page-heading"><div><p class="eyebrow">INPUT PREFERENCES</p><h1>让操作习惯，跟着你走。</h1><p class="subtitle">键盘映射正在开发，当前草稿页面不接收或转发键盘输入。</p></div></div><div class="settings-card"><div class="setting-row"><div><h2>Ctrl / Cmd 映射</h2><p>在 Windows 与 Mac 之间保留熟悉的快捷键习惯。</p></div><select disabled aria-label="Ctrl / Cmd 映射，尚未实现"><option>即将支持</option></select></div><div class="setting-row"><div><h2>按键与鼠标按钮恢复</h2><p>暂停、失联和退出时释放共享输入；此页面尚未接入运行时状态。</p></div><span class="muted-tag">开发中</span></div><div class="settings-note">这些设置尚未生效。正式功能需要共享内核与两端客户端共同支持。</div></div></section>
+    <section id="page-status" class="page" hidden><div class="page-heading"><div><p class="eyebrow">CONNECTION STATUS</p><h1>准备好，再连接。</h1><p class="subtitle">此界面是可离线使用的布局编辑器，尚未与 Crossflow 进程通信。</p></div></div><div class="status-grid"><article class="status-card"><span class="offline-dot"></span><h2>共享内核未连接</h2><p>无法从此页面启动或停止共享，也无法读取真实连接状态。</p></article><article class="status-card"><span class="status-symbol">↔</span><h2>尚无性能数据</h2><p>延迟、事件频率和连接质量需要实机测量，此处不显示模拟数值。</p></article><article class="status-card"><span class="status-symbol">⌂</span><h2>草稿保存在本机</h2><p>布局存于浏览器本地存储。导出 JSON 可留存副本或转移到其他设备。</p></article></div></section>
+    <footer class="app-footer"><span>Crossflow · 阶段 0</span><span>独立的桌面，连贯的体验。</span></footer>
+  </main>
+  <dialog id="add-dialog"><form id="add-form"><div class="dialog-heading"><div><p class="eyebrow">ADD A SCREEN</p><h2>添加一块屏幕</h2></div><button class="icon-button" type="button" id="close-dialog" aria-label="关闭">×</button></div><p class="dialog-note">新屏幕会放在当前布局右侧，你可以随后拖动它。</p><label class="field">屏幕标识<input id="new-id" required maxlength="128" placeholder="例如 desktop-main" autocomplete="off"></label><label class="field">设备标识<input id="new-device" required maxlength="128" placeholder="例如 windows-desktop" list="device-options" autocomplete="off"><datalist id="device-options"></datalist></label><div class="field-row"><label class="field">宽度<input id="new-width" type="number" value="1920" min="0" max="32768" required></label><label class="field">高度<input id="new-height" type="number" value="1080" min="0" max="32768" required></label></div><p id="dialog-error" class="dialog-error" role="alert"></p><div class="dialog-actions"><button type="button" id="cancel-dialog" class="secondary">取消</button><button type="submit" class="primary">添加屏幕</button></div></form></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

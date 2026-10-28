@@ -1,0 +1,699 @@
+//! Ordered source-side input for one explicitly armed control epoch.
+//!
+//! This module does not inject input or release remote keys. Before applying
+//! any pause/session transition (including a `Paused` result or `pop` error),
+//! the integration must release/reset the receiver's remotely owned buttons
+//! and keys. Clearing this queue alone cannot release input already delivered.
+//! Remote ownership must be tracked separately from local physical held state.
+
+use std::collections::{BTreeSet, VecDeque};
+
+pub const INPUT_QUEUE_CAPACITY: usize = 256;
+pub const INPUT_MAX_AGE_NS: u64 = 30_000_000;
+const MAX_COORDINATE: f64 = (1u64 << 48) as f64;
+const MAX_RELATIVE_MOVE: f64 = 20_000.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InputAction {
+    /// Cumulative source displacement since the current arm, not screen pixels.
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: Button,
+        down: bool,
+    },
+    /// Raw wheel units: 120 is one conventional notch. Preserve sub-notch input.
+    Scroll {
+        horizontal: i32,
+        vertical: i32,
+    },
+    /// Usage ID on the USB HID Keyboard/Keypad page (0x07), never a platform VK.
+    Key {
+        usage: u16,
+        down: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QueuedInput {
+    pub action: InputAction,
+    /// Earliest capture in a coalesced move; all times share one monotonic clock.
+    pub captured_at_ns: u64,
+    pub captures_coalesced: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseReason {
+    QueueOverflow,
+    StaleInput,
+    ClockRegressed,
+    InvalidMovement,
+    InvalidKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedError {
+    Active,
+    InvalidKey,
+}
+
+/// Keyboard/Keypad page usages defined by USB HID Usage Tables 1.7, pp. 93–95.
+/// Excludes no-event/error codes and reserved ranges, never a platform keycode.
+pub fn is_keyboard_usage(usage: u16) -> bool {
+    matches!(usage, 0x04..=0xA4 | 0xB0..=0xDD | 0xE0..=0xE7)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureOutcome {
+    Queued,
+    Coalesced,
+    Ignored,
+    /// The queue is now paused and empty. The caller must release remote input.
+    Paused(PauseReason),
+}
+
+/// A bounded, ordered queue. Buttons, keys and wheel events are movement
+/// barriers; only adjacent movement events coalesce. Capture physical button
+/// and key changes even while paused/disconnected, otherwise pre-held input
+/// cannot be distinguished from a newly pressed control after arming. Call
+/// `seed_physical_held` with a platform snapshot before the first arm and after
+/// capture gaps; a successful initial seed is required to arm. The epoch sets
+/// track accepted source downs, not remote delivery.
+pub struct SourceInputQueue {
+    connected: bool,
+    active: bool,
+    queue: VecDeque<QueuedInput>,
+    x: f64,
+    y: f64,
+    last_move_group_delta: (f64, f64),
+    physical_state_seeded: bool,
+    local_buttons: BTreeSet<Button>,
+    local_keys: BTreeSet<u16>,
+    epoch_buttons: BTreeSet<Button>,
+    epoch_keys: BTreeSet<u16>,
+    last_checked_ns: Option<u64>,
+}
+
+impl Default for SourceInputQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SourceInputQueue {
+    pub fn new() -> Self {
+        Self {
+            connected: false,
+            active: false,
+            queue: VecDeque::with_capacity(INPUT_QUEUE_CAPACITY),
+            x: 0.0,
+            y: 0.0,
+            last_move_group_delta: (0.0, 0.0),
+            physical_state_seeded: false,
+            local_buttons: BTreeSet::new(),
+            local_keys: BTreeSet::new(),
+            epoch_buttons: BTreeSet::new(),
+            epoch_keys: BTreeSet::new(),
+            last_checked_ns: None,
+        }
+    }
+
+    /// A new authenticated session always starts paused. Local physical held
+    /// state survives reconnection; a held key must be released and pressed anew.
+    pub fn begin_session(&mut self) {
+        self.pause();
+        self.connected = true;
+    }
+
+    pub fn end_session(&mut self) {
+        self.pause();
+        self.connected = false;
+    }
+
+    /// A capture stop/restart invalidates the physical snapshot and session.
+    /// The caller must release remote input, then seed a fresh snapshot and
+    /// establish a session before another arm. A network reconnect alone does
+    /// not require this reset when physical capture remained continuous.
+    pub fn capture_reset(&mut self) {
+        self.end_session();
+        self.physical_state_seeded = false;
+        self.local_buttons.clear();
+        self.local_keys.clear();
+    }
+
+    /// Replace the local physical snapshot atomically while paused. Invalid
+    /// snapshots leave prior state unchanged. The platform must keep capture
+    /// running around this snapshot so presses cannot be missed before arming.
+    pub fn seed_physical_held(
+        &mut self,
+        buttons: impl IntoIterator<Item = Button>,
+        keys: impl IntoIterator<Item = u16>,
+    ) -> Result<(), SeedError> {
+        if self.active {
+            return Err(SeedError::Active);
+        }
+        let keys: BTreeSet<_> = keys.into_iter().collect();
+        if keys.iter().any(|&usage| !is_keyboard_usage(usage)) {
+            return Err(SeedError::InvalidKey);
+        }
+        self.local_buttons = buttons.into_iter().collect();
+        self.local_keys = keys;
+        self.physical_state_seeded = true;
+        Ok(())
+    }
+
+    /// Returns true only for a new explicit arm of a connected, paused session.
+    pub fn arm(&mut self) -> bool {
+        if !self.connected || self.active || !self.physical_state_seeded {
+            return false;
+        }
+        self.pause();
+        self.active = true;
+        true
+    }
+
+    /// Discard queued input and accepted epoch downs, preserving physical held state.
+    /// The caller must also release remote ownership; no release is injected here.
+    pub fn pause(&mut self) {
+        self.active = false;
+        self.queue.clear();
+        self.epoch_buttons.clear();
+        self.epoch_keys.clear();
+        self.x = 0.0;
+        self.y = 0.0;
+        self.last_move_group_delta = (0.0, 0.0);
+        self.last_checked_ns = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn fail(&mut self, reason: PauseReason) -> CaptureOutcome {
+        self.pause();
+        CaptureOutcome::Paused(reason)
+    }
+
+    fn check_age(&mut self, now_ns: u64) -> Result<(), PauseReason> {
+        let reason = if self.last_checked_ns.is_some_and(|last| now_ns < last) {
+            Some(PauseReason::ClockRegressed)
+        } else if self
+            .queue
+            .front()
+            .is_some_and(|event| now_ns.saturating_sub(event.captured_at_ns) > INPUT_MAX_AGE_NS)
+        {
+            Some(PauseReason::StaleInput)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.pause();
+            return Err(reason);
+        }
+        self.last_checked_ns = Some(now_ns);
+        Ok(())
+    }
+
+    fn enqueue(&mut self, action: InputAction, now_ns: u64) -> CaptureOutcome {
+        if let InputAction::Move { .. } = action {
+            if let Some(last) = self.queue.back_mut() {
+                if matches!(last.action, InputAction::Move { .. }) {
+                    last.action = action;
+                    last.captures_coalesced = last.captures_coalesced.saturating_add(1);
+                    return CaptureOutcome::Coalesced;
+                }
+            }
+        }
+        if self.queue.len() == INPUT_QUEUE_CAPACITY {
+            return self.fail(PauseReason::QueueOverflow);
+        }
+        self.queue.push_back(QueuedInput {
+            action,
+            captured_at_ns: now_ns,
+            captures_coalesced: 1,
+        });
+        CaptureOutcome::Queued
+    }
+
+    /// Source raw relative motion. Paused movement is not carried into a new arm.
+    pub fn move_by(&mut self, dx: f64, dy: f64, now_ns: u64) -> CaptureOutcome {
+        if !self.active {
+            return CaptureOutcome::Ignored;
+        }
+        if let Err(reason) = self.check_age(now_ns) {
+            return CaptureOutcome::Paused(reason);
+        }
+        let x = self.x + dx;
+        let y = self.y + dy;
+        let group_delta = if self
+            .queue
+            .back()
+            .is_some_and(|event| matches!(event.action, InputAction::Move { .. }))
+        {
+            (
+                self.last_move_group_delta.0 + dx,
+                self.last_move_group_delta.1 + dy,
+            )
+        } else {
+            (dx, dy)
+        };
+        if !dx.is_finite()
+            || !dy.is_finite()
+            || dx.abs() > MAX_RELATIVE_MOVE
+            || dy.abs() > MAX_RELATIVE_MOVE
+            || !x.is_finite()
+            || !y.is_finite()
+            || x.abs() > MAX_COORDINATE
+            || y.abs() > MAX_COORDINATE
+            || group_delta.0.abs() > MAX_RELATIVE_MOVE
+            || group_delta.1.abs() > MAX_RELATIVE_MOVE
+        {
+            return self.fail(PauseReason::InvalidMovement);
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return CaptureOutcome::Ignored;
+        }
+        self.x = x;
+        self.y = y;
+        self.last_move_group_delta = group_delta;
+        self.enqueue(InputAction::Move { x, y }, now_ns)
+    }
+
+    pub fn button(&mut self, button: Button, down: bool, now_ns: u64) -> CaptureOutcome {
+        let changed = if down {
+            self.local_buttons.insert(button)
+        } else {
+            self.local_buttons.remove(&button)
+        };
+        if !self.active {
+            return CaptureOutcome::Ignored;
+        }
+        if let Err(reason) = self.check_age(now_ns) {
+            return CaptureOutcome::Paused(reason);
+        }
+        if !changed {
+            return CaptureOutcome::Ignored;
+        }
+        if down {
+            self.epoch_buttons.insert(button);
+        } else if !self.epoch_buttons.remove(&button) {
+            return CaptureOutcome::Ignored;
+        }
+        self.enqueue(InputAction::Button { button, down }, now_ns)
+    }
+
+    pub fn key(&mut self, usage: u16, down: bool, now_ns: u64) -> CaptureOutcome {
+        // Validate before touching physical state, including while paused.
+        if !is_keyboard_usage(usage) {
+            return if self.active {
+                self.fail(PauseReason::InvalidKey)
+            } else {
+                CaptureOutcome::Ignored
+            };
+        }
+        let changed = if down {
+            self.local_keys.insert(usage)
+        } else {
+            self.local_keys.remove(&usage)
+        };
+        if !self.active {
+            return CaptureOutcome::Ignored;
+        }
+        if let Err(reason) = self.check_age(now_ns) {
+            return CaptureOutcome::Paused(reason);
+        }
+        if !changed {
+            return CaptureOutcome::Ignored;
+        }
+        if down {
+            self.epoch_keys.insert(usage);
+        } else if !self.epoch_keys.remove(&usage) {
+            return CaptureOutcome::Ignored;
+        }
+        self.enqueue(InputAction::Key { usage, down }, now_ns)
+    }
+
+    pub fn scroll(&mut self, horizontal: i32, vertical: i32, now_ns: u64) -> CaptureOutcome {
+        if !self.active {
+            return CaptureOutcome::Ignored;
+        }
+        if let Err(reason) = self.check_age(now_ns) {
+            return CaptureOutcome::Paused(reason);
+        }
+        if horizontal == 0 && vertical == 0 {
+            return CaptureOutcome::Ignored;
+        }
+        self.enqueue(
+            InputAction::Scroll {
+                horizontal,
+                vertical,
+            },
+            now_ns,
+        )
+    }
+
+    /// Check freshness again at delivery. Any failure pauses and empties the
+    /// queue; the caller must release remote input, not send stale key releases.
+    pub fn pop(&mut self, now_ns: u64) -> Result<Option<QueuedInput>, PauseReason> {
+        if !self.active {
+            return Ok(None);
+        }
+        self.check_age(now_ns)?;
+        Ok(self.queue.pop_front())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn armed() -> SourceInputQueue {
+        let mut queue = SourceInputQueue::new();
+        queue.seed_physical_held([], []).unwrap();
+        queue.begin_session();
+        assert!(queue.arm());
+        queue
+    }
+
+    #[test]
+    fn movement_coalesces_only_between_ordered_barriers() {
+        let mut queue = armed();
+        queue.move_by(2.0, 3.0, 1);
+        assert_eq!(queue.move_by(4.0, -1.0, 2), CaptureOutcome::Coalesced);
+        queue.button(Button::Left, true, 3);
+        queue.move_by(1.0, 1.0, 4);
+        queue.scroll(15, -120, 5);
+        queue.key(0x04, true, 6);
+        queue.move_by(-2.0, 0.0, 7);
+        assert_eq!(queue.pending_len(), 6);
+        let first = queue.pop(8).unwrap().unwrap();
+        assert_eq!(first.action, InputAction::Move { x: 6.0, y: 2.0 });
+        assert_eq!((first.captured_at_ns, first.captures_coalesced), (1, 2));
+        let actions: Vec<_> = std::iter::from_fn(|| queue.pop(8).unwrap())
+            .map(|event| event.action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                InputAction::Button {
+                    button: Button::Left,
+                    down: true
+                },
+                InputAction::Move { x: 7.0, y: 3.0 },
+                InputAction::Scroll {
+                    horizontal: 15,
+                    vertical: -120
+                },
+                InputAction::Key {
+                    usage: 0x04,
+                    down: true
+                },
+                InputAction::Move { x: 5.0, y: 3.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn clicks_and_key_releases_survive_but_repeats_and_unmatched_ups_do_not() {
+        let mut queue = armed();
+        for now in [1, 3] {
+            queue.button(Button::Left, true, now);
+            queue.button(Button::Left, false, now + 1);
+        }
+        queue.key(0x04, true, 5);
+        assert_eq!(queue.key(0x04, true, 6), CaptureOutcome::Ignored);
+        queue.key(0x04, false, 7);
+        assert_eq!(queue.key(0x04, false, 8), CaptureOutcome::Ignored);
+        assert_eq!(
+            queue.button(Button::Right, false, 9),
+            CaptureOutcome::Ignored
+        );
+        assert_eq!(queue.pending_len(), 6);
+        let actions: Vec<_> = std::iter::from_fn(|| queue.pop(10).unwrap())
+            .map(|event| event.action)
+            .collect();
+        assert_eq!(
+            actions[0],
+            InputAction::Button {
+                button: Button::Left,
+                down: true
+            }
+        );
+        assert_eq!(
+            actions[1],
+            InputAction::Button {
+                button: Button::Left,
+                down: false
+            }
+        );
+        assert_eq!(actions[2..4], actions[0..2]);
+        assert_eq!(
+            actions[4..],
+            [
+                InputAction::Key {
+                    usage: 0x04,
+                    down: true
+                },
+                InputAction::Key {
+                    usage: 0x04,
+                    down: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn physically_held_inputs_do_not_cross_pause_or_session_boundaries() {
+        let mut queue = SourceInputQueue::new();
+        queue.seed_physical_held([], []).unwrap();
+        queue.key(0xE1, true, 1);
+        queue.button(Button::Back, true, 2);
+        queue.begin_session();
+        assert!(queue.arm());
+        assert_eq!(queue.key(0xE1, true, 3), CaptureOutcome::Ignored);
+        assert_eq!(queue.key(0xE1, false, 4), CaptureOutcome::Ignored);
+        assert_eq!(
+            queue.button(Button::Back, false, 5),
+            CaptureOutcome::Ignored
+        );
+        queue.key(0xE1, true, 6);
+        queue.end_session();
+        assert_eq!(queue.pending_len(), 0);
+        assert!(!queue.arm());
+        queue.begin_session();
+        queue.arm();
+        assert_eq!(queue.key(0xE1, true, 7), CaptureOutcome::Ignored);
+        assert_eq!(queue.key(0xE1, false, 8), CaptureOutcome::Ignored);
+        assert_eq!(queue.key(0xE1, true, 9), CaptureOutcome::Queued);
+        queue.pause();
+        queue.move_by(100.0, 100.0, 10);
+        queue.arm();
+        queue.move_by(1.0, 2.0, 11);
+        assert_eq!(
+            queue.pop(12).unwrap().unwrap().action,
+            InputAction::Move { x: 1.0, y: 2.0 }
+        );
+    }
+
+    #[test]
+    fn overflow_discards_whole_epoch_and_never_loses_only_a_release() {
+        let mut queue = armed();
+        queue.key(0x04, true, 0);
+        for now in 1..INPUT_QUEUE_CAPACITY as u64 {
+            queue.scroll(0, 1, now);
+        }
+        assert_eq!(queue.pending_len(), INPUT_QUEUE_CAPACITY);
+        assert_eq!(
+            queue.key(0x04, false, 256),
+            CaptureOutcome::Paused(PauseReason::QueueOverflow)
+        );
+        assert!(!queue.is_active());
+        assert_eq!(queue.pending_len(), 0);
+        assert!(queue.pop(257).unwrap().is_none());
+        queue.arm();
+        assert_eq!(queue.key(0x04, true, 258), CaptureOutcome::Queued);
+    }
+
+    #[test]
+    fn full_queue_can_coalesce_last_move_but_cannot_displace_a_control() {
+        let mut queue = armed();
+        for now in 0..255 {
+            queue.scroll(0, 1, now);
+        }
+        queue.move_by(1.0, 2.0, 255);
+        assert_eq!(queue.pending_len(), INPUT_QUEUE_CAPACITY);
+        assert_eq!(queue.move_by(2.0, 3.0, 256), CaptureOutcome::Coalesced);
+        assert!(queue.is_active());
+        assert_eq!(
+            queue.button(Button::Forward, true, 257),
+            CaptureOutcome::Paused(PauseReason::QueueOverflow)
+        );
+        assert_eq!(queue.pending_len(), 0);
+        queue.arm();
+        assert_eq!(
+            queue.button(Button::Forward, true, 258),
+            CaptureOutcome::Ignored
+        );
+        assert_eq!(
+            queue.button(Button::Forward, false, 259),
+            CaptureOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn stale_coalesced_movement_keeps_earliest_age_and_fails_closed() {
+        let mut queue = armed();
+        queue.move_by(1.0, 0.0, 1);
+        queue.move_by(1.0, 0.0, INPUT_MAX_AGE_NS);
+        assert_eq!(
+            queue.pop(INPUT_MAX_AGE_NS + 2),
+            Err(PauseReason::StaleInput)
+        );
+        assert!(!queue.is_active());
+        assert_eq!(queue.pending_len(), 0);
+        queue.arm();
+        queue.key(0x04, true, 1);
+        assert_eq!(
+            queue.key(0x04, false, INPUT_MAX_AGE_NS + 2),
+            CaptureOutcome::Paused(PauseReason::StaleInput)
+        );
+        queue.arm();
+        assert_eq!(
+            queue.key(0x04, true, INPUT_MAX_AGE_NS + 3),
+            CaptureOutcome::Queued
+        );
+    }
+
+    #[test]
+    fn invalid_motion_and_clock_regression_pause_without_forwarding() {
+        for delta in [f64::NAN, f64::INFINITY, MAX_RELATIVE_MOVE + 1.0] {
+            let mut queue = armed();
+            queue.key(0x04, true, 1);
+            assert_eq!(
+                queue.move_by(delta, 0.0, 2),
+                CaptureOutcome::Paused(PauseReason::InvalidMovement)
+            );
+            assert!(!queue.is_active());
+            assert_eq!(queue.pending_len(), 0);
+        }
+        let mut queue = armed();
+        queue.x = MAX_COORDINATE;
+        assert_eq!(
+            queue.move_by(1.0, 0.0, 1),
+            CaptureOutcome::Paused(PauseReason::InvalidMovement)
+        );
+        assert!(!queue.is_active());
+        let mut queue = armed();
+        queue.move_by(1.0, 0.0, 10);
+        assert_eq!(queue.pop(9), Err(PauseReason::ClockRegressed));
+        assert_eq!(queue.pending_len(), 0);
+    }
+
+    #[test]
+    fn snapshot_must_be_valid_and_paused_and_is_invalidated_on_capture_reset() {
+        let mut queue = SourceInputQueue::new();
+        queue.begin_session();
+        assert!(!queue.arm());
+        assert_eq!(
+            queue.seed_physical_held([], [0]),
+            Err(SeedError::InvalidKey)
+        );
+        assert!(!queue.arm());
+        queue.seed_physical_held([Button::Left], [0xE1]).unwrap();
+        assert_eq!(
+            queue.seed_physical_held([], [0xFFFF]),
+            Err(SeedError::InvalidKey)
+        );
+        assert!(queue.arm());
+        assert_eq!(queue.seed_physical_held([], []), Err(SeedError::Active));
+        assert_eq!(queue.key(0xE1, false, 1), CaptureOutcome::Ignored);
+        assert_eq!(
+            queue.button(Button::Left, false, 2),
+            CaptureOutcome::Ignored
+        );
+        queue.key(0x04, true, 3);
+        queue.capture_reset();
+        assert_eq!(queue.pending_len(), 0);
+        assert!(!queue.arm());
+        queue.begin_session();
+        assert!(!queue.arm());
+        queue.seed_physical_held([], [0x04]).unwrap();
+        assert!(queue.arm());
+        assert_eq!(queue.key(0x04, true, 4), CaptureOutcome::Ignored);
+        assert_eq!(queue.key(0x04, false, 5), CaptureOutcome::Ignored);
+        assert_eq!(queue.key(0x04, true, 6), CaptureOutcome::Queued);
+    }
+
+    #[test]
+    fn reserved_keyboard_usages_never_enter_physical_state_or_queue() {
+        for usage in [0, 1, 2, 3, 0xA5, 0xAF, 0xDE, 0xDF, 0xE8, u16::MAX] {
+            let mut queue = SourceInputQueue::new();
+            assert_eq!(queue.key(usage, true, 1), CaptureOutcome::Ignored);
+            assert!(queue.local_keys.is_empty());
+            queue.seed_physical_held([], []).unwrap();
+            queue.begin_session();
+            queue.arm();
+            queue.key(0x04, true, 2);
+            assert_eq!(
+                queue.key(usage, true, 3),
+                CaptureOutcome::Paused(PauseReason::InvalidKey)
+            );
+            assert!(!queue.is_active());
+            assert_eq!(queue.pending_len(), 0);
+            assert!(!queue.local_keys.contains(&usage));
+        }
+        for usage in [0x04, 0xA4, 0xB0, 0xDD, 0xE0, 0xE7] {
+            let mut queue = armed();
+            assert_eq!(queue.key(usage, true, 1), CaptureOutcome::Queued);
+            assert_eq!(queue.key(usage, false, 2), CaptureOutcome::Queued);
+        }
+    }
+
+    #[test]
+    fn grouped_movement_bound_resets_at_barriers_and_after_delivery() {
+        let mut queue = armed();
+        queue.move_by(15_000.0, 0.0, 1);
+        assert_eq!(
+            queue.move_by(15_000.0, 0.0, 2),
+            CaptureOutcome::Paused(PauseReason::InvalidMovement)
+        );
+        assert_eq!(queue.pending_len(), 0);
+        queue.arm();
+        queue.move_by(15_000.0, 0.0, 3);
+        queue.scroll(0, 1, 4);
+        assert_eq!(queue.move_by(15_000.0, 0.0, 5), CaptureOutcome::Queued);
+        assert_eq!(queue.pending_len(), 3);
+        queue.pop(6).unwrap();
+        queue.pop(6).unwrap();
+        assert_eq!(
+            queue.pop(6).unwrap().unwrap().action,
+            InputAction::Move {
+                x: 30_000.0,
+                y: 0.0
+            }
+        );
+        assert_eq!(queue.move_by(15_000.0, 0.0, 7), CaptureOutcome::Queued);
+        assert_eq!(
+            queue.pop(8).unwrap().unwrap().action,
+            InputAction::Move {
+                x: 45_000.0,
+                y: 0.0
+            }
+        );
+    }
+}

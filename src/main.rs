@@ -71,7 +71,36 @@ enum Command {
     Summarize {
         path: PathBuf,
     },
+    /// Validate a saved layout draft without changing any display or input.
+    LayoutCheck {
+        path: PathBuf,
+    },
+    /// Calculate one logical screen crossing without moving a system cursor.
+    LayoutTrace {
+        path: PathBuf,
+        #[arg(long)]
+        from: String,
+        #[arg(long, allow_hyphen_values = true)]
+        start_x: f64,
+        #[arg(long, allow_hyphen_values = true)]
+        start_y: f64,
+        #[arg(long, allow_hyphen_values = true)]
+        end_x: f64,
+        #[arg(long, allow_hyphen_values = true)]
+        end_y: f64,
+    },
     Environment,
+}
+
+fn load_layout(path: &std::path::Path) -> Result<crossflow::arrangement::Layout> {
+    use std::io::Read;
+    // Bound reads before parsing untrusted imported layout files.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(1_048_577)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 1_048_576, "layout file exceeds 1 MiB");
+    Ok(serde_json::from_slice(&bytes)?)
 }
 fn metadata(mode: &str) -> serde_json::Value {
     json!({
@@ -133,6 +162,41 @@ fn main() -> Result<()> {
         }
         Command::Summarize { path } => {
             println!("{}", serde_json::to_string_pretty(&summarize(&path)?)?)
+        }
+        Command::LayoutCheck { path } => {
+            let layout = load_layout(&path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "valid":true,"screens":layout.screens().len(),
+                    "applied_to_session":false,"layout":layout
+                }))?
+            );
+        }
+        Command::LayoutTrace {
+            path,
+            from,
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
+            use crossflow::arrangement::Point;
+            let layout = load_layout(&path)?;
+            let crossing = layout.crossing(
+                &from,
+                Point {
+                    x: start_x,
+                    y: start_y,
+                },
+                Point { x: end_x, y: end_y },
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "crossing":crossing,"system_input_injected":false
+                }))?
+            );
         }
         Command::Environment => {
             #[allow(unused_mut)]

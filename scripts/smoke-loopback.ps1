@@ -25,7 +25,7 @@ try {
     if ($target.injection_call.samples -lt 100) { throw 'Insufficient delivered movement samples.' }
     if (-not $source.complete_log -or -not $target.complete_log) { throw 'Incomplete logs.' }
     if ($source.dropped_log_records -gt 0 -or $target.dropped_log_records -gt 0) { throw 'Dropped log records.' }
-    [pscustomobject]@{ Run=$runId; Sent=$source.source_processing.samples; AppliedDryRun=$target.injection_call.samples; SourceP95Ms=$source.source_processing.p95_ms; ReceiveP95Ms=$target.receiver_processing.p95_ms; VisibleSmoothness='NOT_MEASURED'; Logs=$runDir } | Format-List
+    [pscustomobject]@{ Run=$runId; QueuedMoves=$source.queued_move_records; AppliedDryRun=$target.injection_call.samples; SourceP95Ms=$source.source_processing.p95_ms; ReceiveP95Ms=$target.receiver_processing.p95_ms; VisibleSmoothness='NOT_MEASURED'; Logs=$runDir } | Format-List
 } finally {
     if (-not $receiver.HasExited) { $receiver.Kill(); $receiver.WaitForExit() }
     $receiver.Dispose()

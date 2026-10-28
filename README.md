@@ -116,6 +116,19 @@ Windows 运行：
 
 ## 项目结构与状态
 
+### 屏幕布局开发工具
+
+`ui/index.html` 是两端共用的离线布局编辑器，可拖动、调整屏幕属性并导入／导出布局 JSON。界面里的设备是布局草稿，不代表已发现或已连接的真实设备；导出不会改变系统显示排列或开启共享。
+
+Rust 核心可验证同一份布局，并计算一次边缘穿越：
+
+```powershell
+./target/debug/crossflow.exe layout-check examples/layout-two-devices.json
+./target/debug/crossflow.exe layout-trace examples/layout-two-devices.json --from windows-main --start-x 1910 --start-y 500 --end-x 1930 --end-y 500
+```
+
+示例数据不代表实机配置。布局计算已独立实现，自动发现显示器、跨屏切换控制权以及正式桌面客户端封装尚未接入。键盘、点击和滚轮已有共享输入队列开发，但现有网络程序仍只转发鼠标移动。
+
 - `src/`：共享核心和 CLI；`src/platform/`：平台输入适配。
 - `docs/architecture.md`：统一核心、客户端一致性与平台边界。
 - `docs/phase0-status.md`：实际验证记录和仍需完成的项目。
