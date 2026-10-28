@@ -1,4 +1,4 @@
-param([ValidateSet('Debug','Release')][string]$Configuration = 'Release', [switch]$NoRestore, [switch]$BootstrapSdk, [switch]$SkipBridge)
+param([ValidateSet('Debug','Release')][string]$Configuration = 'Release', [switch]$NoRestore, [switch]$BootstrapSdk, [switch]$SkipBridge, [switch]$WithPairing, [string]$PairingLibraryDir = $env:CROSSFLOW_BORINGSSL_LIB_DIR)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $sdk = Join-Path $projectRoot '.tools/dotnet/dotnet.exe'
@@ -17,6 +17,10 @@ $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $env:DOTNET_NOLOGO = '1'
 $env:NUGET_PACKAGES = Join-Path $projectRoot '.tools/nuget'
+if ($WithPairing) {
+    & (Join-Path $PSScriptRoot 'build-pairing-worker.ps1') -LibraryDir $PairingLibraryDir
+    if ($LASTEXITCODE -ne 0) { throw 'Pairing worker packaging failed.' }
+}
 Push-Location $projectRoot
 try {
     $coreArguments = @('build', '--release', '--locked', '--package', 'crossflow')

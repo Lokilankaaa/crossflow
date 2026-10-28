@@ -10,8 +10,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 zeroize = "1"
+serde = { version = "1", features = ["derive"] }
 snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
-
-[dev-dependencies]
 crossflow = { path = "../../.." }
 serde_json = "1"

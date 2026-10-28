@@ -26,6 +26,9 @@ use std::{
 };
 
 pub const SERVICE_TYPE: &str = "_crossflow._tcp.local.";
+/// Enrollment endpoints never enter the input-service browser or LanRoutes.
+pub const PAIRING_SERVICE_TYPE: &str = "_crossflow-pair._tcp.local.";
+pub const PAIRING_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CANDIDATES: usize = 64;
 pub const MAX_ADDRESSES: usize = 32;
 const MAX_RECORDS: usize = 256;
@@ -117,6 +120,16 @@ pub struct DiscoveryHandle {
 
 impl DiscoveryHandle {
     pub fn start(config: DiscoveryConfig) -> Result<Self> {
+        Self::start_service(config, SERVICE_TYPE)
+    }
+
+    /// Browse/publish only short-code enrollment endpoints. Addresses and names
+    /// remain untrusted; this does not start pairing or grant input permission.
+    pub fn start_pairing(config: DiscoveryConfig) -> Result<Self> {
+        Self::start_service(config, PAIRING_SERVICE_TYPE)
+    }
+
+    fn start_service(config: DiscoveryConfig, service_type: &'static str) -> Result<Self> {
         ensure!(config.compatible_protocol != 0, "protocol must be nonzero");
         if let Some(id) = &config.local_device_id {
             validate_id(id)?;
@@ -139,7 +152,7 @@ impl DiscoveryHandle {
         let worker = thread::Builder::new()
             .name("crossflow-discovery".into())
             .spawn(move || {
-                run(config, &worker_stop, &worker_snapshot);
+                run(config, service_type, &worker_stop, &worker_snapshot);
             })?;
         Ok(Self {
             stop,
@@ -227,7 +240,12 @@ impl Advertisement {
         Ok(())
     }
 
+    #[cfg(test)]
     fn service(&self) -> Result<ServiceInfo> {
+        self.service_for(SERVICE_TYPE)
+    }
+
+    fn service_for(&self, service_type: &'static str) -> Result<ServiceInfo> {
         self.validate()?;
         let protocol = self.protocol.to_string();
         let properties = [
@@ -244,7 +262,7 @@ impl Advertisement {
             self.listen_ip.to_string()
         };
         let mut service = ServiceInfo::new(
-            SERVICE_TYPE,
+            service_type,
             &format!("cf-{}", self.device_id),
             &format!("cf-{}.local.", self.device_id),
             address.as_str(),
@@ -293,14 +311,23 @@ fn endpoint(ip: IpAddr, scope: u32, port: u16) -> Option<SocketAddr> {
     }
 }
 
+#[cfg(test)]
 fn parse(service: &ResolvedService, compatible_protocol: u16) -> Result<Candidate> {
+    parse_for(service, compatible_protocol, SERVICE_TYPE)
+}
+
+fn parse_for(
+    service: &ResolvedService,
+    compatible_protocol: u16,
+    service_type: &str,
+) -> Result<Candidate> {
     ensure!(
-        service.ty_domain.eq_ignore_ascii_case(SERVICE_TYPE)
+        service.ty_domain.eq_ignore_ascii_case(service_type)
             && service.fullname.len() <= 255
             && service
                 .fullname
                 .to_ascii_lowercase()
-                .ends_with(SERVICE_TYPE),
+                .ends_with(service_type),
         "invalid discovery service"
     );
     let value = |key| -> Result<&str> {
@@ -349,10 +376,19 @@ struct Record {
     candidate: Candidate,
     seen: Instant,
 }
-#[derive(Default)]
 struct Cache {
     records: BTreeMap<String, Record>,
     capacity_limited: bool,
+    service_type: &'static str,
+}
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            capacity_limited: false,
+            service_type: SERVICE_TYPE,
+        }
+    }
 }
 
 impl Cache {
@@ -364,7 +400,7 @@ impl Cache {
         now: Instant,
     ) {
         let key = service.fullname.to_ascii_lowercase();
-        let Ok(candidate) = parse(service, protocol) else {
+        let Ok(candidate) = parse_for(service, protocol, self.service_type) else {
             // An invalid update must not leave a previous apparently-valid entry.
             self.records.remove(&key);
             return;
@@ -446,11 +482,11 @@ fn publish(
     };
 }
 
-fn shutdown(daemon: &ServiceDaemon, fullname: Option<&str>) -> Result<()> {
+fn shutdown(daemon: &ServiceDaemon, fullname: Option<&str>, service_type: &str) -> Result<()> {
     if let Some(name) = fullname {
         let _ = daemon.unregister(name);
     }
-    let _ = daemon.stop_browse(SERVICE_TYPE);
+    let _ = daemon.stop_browse(service_type);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match daemon.shutdown() {
@@ -470,8 +506,16 @@ fn shutdown(daemon: &ServiceDaemon, fullname: Option<&str>) -> Result<()> {
     }
 }
 
-fn run(config: DiscoveryConfig, stop: &AtomicBool, shared: &Mutex<DiscoverySnapshot>) {
-    let mut cache = Cache::default();
+fn run(
+    config: DiscoveryConfig,
+    service_type: &'static str,
+    stop: &AtomicBool,
+    shared: &Mutex<DiscoverySnapshot>,
+) {
+    let mut cache = Cache {
+        service_type,
+        ..Cache::default()
+    };
     if stop.load(Ordering::Acquire) {
         publish(shared, DiscoveryState::Stopped, &cache, None);
         return;
@@ -495,9 +539,9 @@ fn run(config: DiscoveryConfig, stop: &AtomicBool, shared: &Mutex<DiscoverySnaps
     let result = (|| -> Result<()> {
         let monitor = daemon.monitor()?;
         daemon.set_ip_check_interval(5)?;
-        let mut events = daemon.browse(SERVICE_TYPE)?;
+        let mut events = daemon.browse(service_type)?;
         if let Some(ad) = &config.advertisement {
-            let service = ad.service()?;
+            let service = ad.service_for(service_type)?;
             fullname = Some(service.get_fullname().to_owned());
             daemon.register(service)?;
         }
@@ -543,8 +587,8 @@ fn run(config: DiscoveryConfig, stop: &AtomicBool, shared: &Mutex<DiscoverySnaps
             if now.duration_since(refreshed) >= REFRESH_INTERVAL {
                 // Re-browse provides current DNS cache/address updates even when
                 // an unchanged peer does not emit another resolved event.
-                daemon.stop_browse(SERVICE_TYPE)?;
-                events = daemon.browse(SERVICE_TYPE)?;
+                daemon.stop_browse(service_type)?;
+                events = daemon.browse(service_type)?;
                 refreshed = now;
             }
             publish(shared, DiscoveryState::Browsing, &cache, None);
@@ -553,7 +597,7 @@ fn run(config: DiscoveryConfig, stop: &AtomicBool, shared: &Mutex<DiscoverySnaps
         Ok(())
     })();
     publish(shared, DiscoveryState::Stopping, &cache, None);
-    let cleanup = shutdown(&daemon, fullname.as_deref());
+    let cleanup = shutdown(&daemon, fullname.as_deref(), service_type);
     cache.records.clear();
     if cleanup.is_err() {
         publish(
@@ -594,6 +638,29 @@ mod tests {
             .addresses
             .insert(ip.parse::<IpAddr>().unwrap().into());
         service
+    }
+
+    #[test]
+    fn pairing_and_input_service_caches_are_disjoint() {
+        let input = service(1, "input", "192.168.1.2");
+        let mut pairing = input.clone();
+        pairing.ty_domain = PAIRING_SERVICE_TYPE.into();
+        pairing.fullname = format!("pairing.{PAIRING_SERVICE_TYPE}");
+        assert!(parse_for(&pairing, 2, PAIRING_SERVICE_TYPE).is_ok());
+        assert!(parse_for(&pairing, 2, SERVICE_TYPE).is_err());
+        assert!(parse_for(&input, 2, PAIRING_SERVICE_TYPE).is_err());
+        let mut input_cache = Cache::default();
+        input_cache.resolved(&pairing, 2, None, Instant::now());
+        assert!(input_cache.candidates().is_empty());
+        let mut pair_cache = Cache {
+            service_type: PAIRING_SERVICE_TYPE,
+            ..Cache::default()
+        };
+        pair_cache.resolved(&input, 2, None, Instant::now());
+        assert!(pair_cache.candidates().is_empty());
+        pair_cache.resolved(&pairing, 2, None, Instant::now());
+        assert_eq!(pair_cache.candidates().len(), 1);
+        assert!(!pair_cache.candidates()[0].trusted);
     }
 
     #[test]
@@ -816,6 +883,72 @@ mod tests {
         assert!(cache.candidates().is_empty());
         cache.removed(&two.fullname);
         assert_eq!(cache.candidates().len(), 1);
+    }
+
+    #[test]
+    #[ignore = "opens real LAN multicast sockets; explicitly opt in on an authorized test network"]
+    fn real_pairing_mdns_publish_and_browse() -> Result<()> {
+        let ip: std::net::Ipv4Addr = std::env::var("CROSSFLOW_TEST_LAN_IP")
+            .context("set CROSSFLOW_TEST_LAN_IP to an authorized local RFC1918 address")?
+            .parse()?;
+        ensure!(ip.is_private(), "explicit private LAN address required");
+        let listener = std::net::TcpListener::bind((ip, 0))?;
+        let address = listener.local_addr()?;
+        let id = new_public_id()?;
+        let mut publisher = DiscoveryHandle::start_pairing(DiscoveryConfig {
+            advertisement: Some(Advertisement {
+                device_id: id.clone(),
+                friendly_name: "Crossflow pairing discovery test".into(),
+                platform: "macos".into(),
+                protocol: PAIRING_PROTOCOL_VERSION,
+                port: address.port(),
+                listen_ip: address.ip(),
+            }),
+            local_device_id: Some(id.clone()),
+            compatible_protocol: PAIRING_PROTOCOL_VERSION,
+        })?;
+        let mut browser = DiscoveryHandle::start_pairing(DiscoveryConfig {
+            advertisement: None,
+            local_device_id: None,
+            compatible_protocol: PAIRING_PROTOCOL_VERSION,
+        })?;
+        let start = Instant::now();
+        let mut found = false;
+        let mut publish_snapshot = None;
+        let mut browse_snapshot = None;
+        while start.elapsed() < Duration::from_secs(10) {
+            if let Some(snapshot) = publisher.try_snapshot() {
+                publish_snapshot = Some(snapshot);
+            }
+            if let Some(snapshot) = browser.try_snapshot() {
+                found = snapshot.candidates.iter().any(|c| {
+                    c.device_id == id
+                        && !c.trusted
+                        && c.compatible
+                        && c.addresses.contains(&address)
+                });
+                browse_snapshot = Some(snapshot);
+            }
+            if found
+                || publish_snapshot.as_ref().is_some_and(|s| s.error.is_some())
+                || browse_snapshot.as_ref().is_some_and(|s| s.error.is_some())
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!(
+            "pairing mDNS publisher={publish_snapshot:?}; browser={browse_snapshot:?}; found={found}"
+        );
+        let publisher_stop = publisher.wait_stopped(Duration::from_secs(3));
+        let browser_stop = browser.wait_stopped(Duration::from_secs(3));
+        publisher_stop?;
+        browser_stop?;
+        ensure!(
+            found,
+            "pairing service was not discovered on the authorized LAN interface"
+        );
+        Ok(())
     }
 
     #[test]

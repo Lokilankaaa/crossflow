@@ -14,6 +14,7 @@
 use crate::invitation::{ApprovalHold, AttemptCheck, AttemptPermit, PendingApproval};
 use crate::{AuthenticatedBinding, Binding, Pairing, Role};
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{
@@ -116,6 +117,29 @@ impl PendingSession {
         &self.binding
     }
 
+    /// Exchange authenticated public display/routing metadata exactly once,
+    /// before either endpoint approves. Both peers must opt into this exchange.
+    pub fn exchange_info(mut self, local: PeerInfo) -> Result<IdentifiedSession> {
+        self.wire.remaining()?;
+        local.validate()?;
+        let mut payload = vec![CONTROL_VERSION, 3, self.role.byte()];
+        payload.extend_from_slice(&serde_json::to_vec(&local)?);
+        encrypted_send(&mut self.wire, &mut self.noise, &payload)?;
+        let peer = encrypted_receive(&mut self.wire, &mut self.noise)?;
+        ensure!(
+            peer.len() > 3 && peer[..3] == [CONTROL_VERSION, 3, self.role.peer().byte()],
+            "Unexpected pairing metadata stage, role or version"
+        );
+        let peer_info: PeerInfo = serde_json::from_slice(&peer[3..])
+            .map_err(|_| anyhow::anyhow!("Invalid authenticated peer metadata"))?;
+        peer_info.validate()?;
+        self.wire.remaining()?;
+        Ok(IdentifiedSession {
+            session: self,
+            peer_info,
+        })
+    }
+
     /// Explicit local approval followed by reciprocal Approval and Ready messages.
     /// No return value with keys exists on failure. Success is NOT bilateral
     /// durable persistence or proof that the peer received our final message.
@@ -160,6 +184,70 @@ impl PendingSession {
             role,
         })
     }
+}
+
+/// Metadata authenticated by the current pairing channel, never by discovery.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerInfo {
+    pub version: u8,
+    pub name: String,
+    pub input_port: u16,
+    pub platform: String,
+}
+
+impl PeerInfo {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.version == 1, "Unsupported peer metadata version");
+        ensure!(
+            matches!(self.platform.as_str(), "windows" | "macos"),
+            "Unsupported peer platform"
+        );
+        // The byte bound follows discovery; the character bound also fits the
+        // current PeerStore, so accepted metadata can be safely persisted there.
+        ensure!(
+            !self.name.is_empty() && self.name.len() <= 96 && self.name.chars().count() <= 64,
+            "Invalid peer name length"
+        );
+        ensure!(
+            self.name.trim() == self.name,
+            "Invalid peer name whitespace"
+        );
+        ensure!(
+            !self.name.chars().any(|ch| ch.is_control()
+                || matches!(ch,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' |
+            '\u{2066}'..='\u{206f}' | '\u{feff}')),
+            "Unsafe peer name characters"
+        );
+        Ok(())
+    }
+}
+
+pub struct IdentifiedSession {
+    session: PendingSession,
+    peer_info: PeerInfo,
+}
+
+impl IdentifiedSession {
+    pub fn peer_info(&self) -> &PeerInfo {
+        &self.peer_info
+    }
+    pub fn binding(&self) -> &Binding {
+        self.session.binding()
+    }
+    pub fn approve(self) -> Result<EnrolledPeer> {
+        Ok(EnrolledPeer {
+            keys: self.session.approve()?,
+            peer_info: self.peer_info,
+        })
+    }
+}
+
+/// No Debug/Serialize/Clone because this result contains secret key ownership.
+pub struct EnrolledPeer {
+    pub keys: EnrolledKeys,
+    pub peer_info: PeerInfo,
 }
 
 /// Keys become accessible only after the explicitly approved transport completes.
@@ -473,5 +561,50 @@ mod tests {
         fn send<T: Send>() {}
         send::<PendingSession>();
         send::<EnrolledKeys>();
+        send::<IdentifiedSession>();
+        send::<EnrolledPeer>();
+    }
+
+    #[test]
+    fn peer_info_is_strict_public_metadata_compatible_with_storage_names() {
+        let mut info = PeerInfo {
+            version: 1,
+            name: "工作用 MacBook".into(),
+            input_port: 0,
+            platform: "macos".into(),
+        };
+        assert!(info.validate().is_ok());
+        for name in [
+            "",
+            " leading",
+            "trailing ",
+            "line\nname",
+            "name\u{202e}",
+            "name\u{2066}",
+            &"x".repeat(65),
+            &"名".repeat(33),
+        ] {
+            info.name = name.into();
+            assert!(info.validate().is_err());
+        }
+        info.name = "名".repeat(32);
+        assert!(info.validate().is_ok());
+        info.version = 2;
+        assert!(info.validate().is_err());
+        info.version = 1;
+        info.platform = "linux".into();
+        assert!(info.validate().is_err());
+        assert!(
+            serde_json::from_str::<PeerInfo>(
+                r#"{"version":1,"name":"Mac","input_port":1,"platform":"macos","extra":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PeerInfo>(
+                r#"{"version":1,"name":"Mac","input_port":65536,"platform":"macos"}"#
+            )
+            .is_err()
+        );
     }
 }

@@ -1,0 +1,80 @@
+{
+  "date": "2026-10-29",
+  "base_commit": "2bf43ed",
+  "scope": "Windows native client enrollment with same-machine LAN responder; not macOS or physical input acceptance",
+  "implementation": {
+    "discovery": "Dedicated pairing mDNS service, separate from authenticated input route discovery",
+    "normal_flow": ["select discovered invitation", "enter eight-digit code", "verify authenticated device", "approve on both ends", "save Windows DPAPI peer", "connect paused"],
+    "manual_ip_required": false,
+    "identity_file_required": false,
+    "code_in_process_arguments": false,
+    "worker": "Rust crossflow-enroll, bundled with native Windows client",
+    "mac_invitation_ui_available": false
+  },
+  "automated_validation": {
+    "pairing_library_tests_passed": 27,
+    "worker_unit_tests_passed": 3,
+    "compile_fail_doctests_passed": 2,
+    "explicit_socket_tests_passed": 11,
+    "controller_process_checks_passed": 34,
+    "pairing_all_target_clippy_warnings_denied": "passed",
+    "final_native_client_build": "passed with zero warnings and errors",
+    "packaging_override_check": "explicit target directory and x86_64-pc-windows-gnu override inherited CARGO_TARGET_DIR and CARGO_BUILD_TARGET; packaged executable SHA256 equals current build output",
+    "root_apple_all_target_typecheck": "passed; not native macOS execution",
+    "real_pairing_mdns": "passed on owned LAN interface with network-enabled execution",
+    "local_evidence": [
+      "runs/pairing-client-unit-20261029.txt",
+      "runs/pairing-client-tcp-20261029.txt",
+      "runs/pairing-controller-self-test-20261029.json",
+      "experiments/pairing-spake2/rust-pairing/runs/worker-enrollment-89d80c28be6c73fa9d49de3bc657a274/result.json"
+    ]
+  },
+  "actual_gui": {
+    "isolated_profile": true,
+    "success": {
+      "discovered_without_manual_ip": true,
+      "authenticated_name_shown": true,
+      "both_approvals_required": true,
+      "saved_peer_visible": true,
+      "dialog_closed": true,
+      "existing_noise_kk_connection": true,
+      "initial_state": "connected_paused",
+      "receiver_first_control": "Pause",
+      "share_armed": false,
+      "stop_and_window_exit": true,
+      "fixture_exit_code": 0,
+      "fixture_credentials_removed": true,
+      "client_test_credentials_removed": true,
+      "local_evidence": "runs/pairing-ui-e8622f66b6e946d6a31c84fca29c5244/gui-success-final"
+    },
+    "cancel_while_waiting_remote_approval": {
+      "local_approval_sent": true,
+      "remote_approval_sent": false,
+      "cancel_button_enabled": true,
+      "dialog_closed": true,
+      "worker_exited": true,
+      "saved_peer_count_before": 1,
+      "saved_peer_count_after": 1,
+      "fixture_paired": false,
+      "fixture_exit_code": 0,
+      "fixture_credentials_removed": true,
+      "local_evidence": "runs/pairing-ui-e8622f66b6e946d6a31c84fca29c5244/gui-cancel-final"
+    },
+    "os_input_injected": false,
+    "fixture_storage": "Windows DPAPI with Mac protocol role; not macOS Keychain",
+    "repairs": [
+      "Removed shared primary-button deferral that prevented cancellation while busy",
+      "Completed the active closing event rather than issuing a second Hide during close",
+      "Applied light theme and collapsed technical device details",
+      "Removed only the successful invitation row after verified save and worker cleanup; this final cosmetic row change was build-checked after GUI run"
+    ]
+  },
+  "failed_attempts_and_limits": [
+    "Restricted execution could not discover the fixture; same real mDNS test passed with authorized LAN access. No firewall or system security settings were changed.",
+    "An earlier GUI invitation expired during inspection before bilateral approval; no identity was saved. A fresh invitation completed successfully after dialog repairs.",
+    "Windows enrollment currently attempts the first valid candidate address and is initiator-only.",
+    "Cancellation during an already authorized OS save is not an atomic rollback; the UI refreshes the stored-device list.",
+    "Mac native invitation, Keychain persistence, cross-machine pairing and failure recovery remain unverified.",
+    "No visible cursor smoothness, real keyboard release, high-refresh comparison or ShareMouse benchmark is claimed. Phase 0 goal remains active."
+  ]
+}

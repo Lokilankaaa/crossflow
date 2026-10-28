@@ -18,6 +18,14 @@ SDK 来源与哈希见构建脚本；微软发布元数据：<https://builds.dot
 
 输出目录：`Crossflow.Windows/bin/x64/Release/net10.0-windows10.0.19041.0/win-x64/`。运行该目录的 `Crossflow.Windows.exe`，移动应用时保留整个输出目录。构建复制 `crossflow.exe`、`crossflow_bridge.dll`、共享 `clients/design-tokens.json` 和 `examples/layout-four-screens.json`。仅从应用所在目录加载 Rust DLL 和启动 sender。构建脚本始终构建 Rust CLI；`-SkipBridge` 仅跳过 bridge 构建。
 
+配对发起端使用同包 `crossflow-enroll.exe`，复用共享 Rust 身份和设备存储。首次打包此组件时，先按 `experiments/pairing-spake2/source-lock.json` 在本机构建 BoringSSL，再执行：
+
+```powershell
+./scripts/build-windows-ui.ps1 -WithPairing -PairingLibraryDir 'C:/absolute/path/to/boringssl'
+```
+
+`-PairingLibraryDir` 也可通过 `CROSSFLOW_BORINGSSL_LIB_DIR` 指定。脚本不会下载原生库，当前只支持已经验证的仓库 LLVM-MinGW 工具链；会同时复制 `libc++.dll`、`libunwind.dll`、`libwinpthread-1.dll`。单独重建组件可运行 `scripts/build-pairing-worker.ps1 -LibraryDir ... -Offline`，之后重建 WinUI 将其打包。已有本地组件也会随普通 WinUI 构建复制；发布前应以 `-WithPairing` 从当前源码重建。缺少任一配对组件时，界面明确提示且不能发起配对，已保存设备仍可连接。
+
 ## 本轮功能
 
 - 原生排列画布、屏幕拖动与边缘吸附；方向键移动 10 个布局单位，Shift + 方向键移动 50。
@@ -26,11 +34,16 @@ SDK 来源与哈希见构建脚本；微软发布元数据：<https://builds.dot
 - 从所选屏幕中心向四个边缘发起纯布局穿越预览，不移动系统光标。
 - 统一主题、浅色、高 DPI、原生键盘焦点、关键控件 AutomationId。
 - 示例通过“显示示例”明确载入，不表示已发现或已连接的设备。
-- 设备页指定 IP:端口与已有身份文件夹；身份文件仅由 Rust 读取。每轮最多一小时。
+- 设备页显示已配对设备，点选后使用应用保存的信息连接；手动 IP 与身份目录仅保留在折叠的开发诊断中。每轮最多一小时。
+- 附近设备列表浏览独立配对邀请服务；输入 8 位短码后，显示经认证的设备名称和公钥，再明确确认配对。成功后自动保存到当前用户 DPAPI 设备存储并刷新列表，不自动开启共享。配对码仅走私有进程管道，不进入命令行或日志。
 - 会话状态直接来自 Rust JSONL；仅 paused + capture_ready 可开始，并使用当前 epoch。重连不会自动恢复共享。
 - 关闭窗口先异步停止并回收子进程，不显示第二个诊断窗口。状态超过两秒未更新、协议错误或异常退出会停止连接。
 
 当前这个会话入口仅转发鼠标移动，尚未接入键盘、点击、滚轮或布局自动跨屏。布局仍可独立编辑与导出，不能视为已经应用到运行中的共享。
+
+目前已接 Windows 配对发起端；现有 Mac 客户端仍缺邀请界面、Keychain 保存和接收会话托管，不能宣称两台正式客户端已能完成首次配对。验证使用真实本机网络对端 fixture；fixture 的 Mac 角色仍使用 Windows DPAPI，不是 Mac 实机。配对服务 `_crossflow-pair._tcp.local.` 和输入服务 `_crossflow._tcp.local.` 分开，只有受认证通道提供的输入端口会保存。当前发起端选用首个有效 LAN 候选地址，初次配对的多地址失败切换尚未实现。
+
+验证或等待确认期间可以取消；窗口、页面和对话框关闭均请求取消并等待子进程回收。若已经确认且保存恰好完成，取消或通信失败不能保证撤销这次保存；界面提示刷新已配对列表检查状态。两端持久化不是原子事务，尚需恢复和解除配对流程。
 
 修改提交在后台调用 Rust，仅通过校验才更新当前布局。任务期间禁止其他布局操作；异步导入结果与草稿版本不匹配时丢弃，避免旧结果覆盖新状态。无效修改保留上一份有效布局并显示错误。
 
@@ -47,3 +60,5 @@ if ($check.ExitCode -ne 0) { throw 'Crossflow native client self-test failed.' }
 此模式不创建窗口、不采集/注入输入，八项检查验证真实 C# → Rust 调用、共享主题、多设备多屏布局、重叠拒绝、未知字段拒绝、普通与大坐标跨屏计算。进程退出码非零表示失败。
 
 另可使用 `--session-self-test <输出文件>` 运行假子进程协议测试，覆盖就绪/epoch门禁、stderr持续读取、异常EOF、错误版本、状态失联与强制回收；它只启动客户端自身的显式 fixture 模式，不启动 Rust 捕获。两种自检均不替代原生窗口视觉、交互与实机鼠标验收。
+
+`--pairing-self-test <输出文件>` 验证配对控制器拒绝提前成功、错误设备 ID、重复/未知字段、危险名称、过量输出、非零退出，以及取消后的实际子进程回收。它使用假子进程，不进行网络认证或写入身份；真实 Rust worker 测试见独立配对 crate 的 `tests/worker_enrollment.rs`。

@@ -70,6 +70,9 @@ enum Command {
     Discover {
         #[arg(long, default_value_t = 5.0)]
         seconds: f64,
+        /// Browse enrollment invitations, never input receiver endpoints.
+        #[arg(long)]
+        pairing: bool,
     },
     /// Receive encrypted movement. Default is a sink without OS input injection.
     Receive {
@@ -298,18 +301,25 @@ fn main() -> Result<()> {
                 .remember_existing(&identity, &name, endpoint)?;
             println!("{}", serde_json::to_string_pretty(&device)?);
         }
-        Command::Discover { seconds } => {
+        Command::Discover { seconds, pairing } => {
             ensure!(
                 seconds.is_finite() && seconds > 0.0 && seconds <= 60.0,
                 "discovery duration must be >0 and <=60 seconds"
             );
-            let mut discovery = crossflow::discovery::DiscoveryHandle::start(
-                crossflow::discovery::DiscoveryConfig {
-                    advertisement: None,
-                    local_device_id: None,
-                    compatible_protocol: crossflow::protocol::WIRE_VERSION.into(),
+            let config = crossflow::discovery::DiscoveryConfig {
+                advertisement: None,
+                local_device_id: None,
+                compatible_protocol: if pairing {
+                    crossflow::discovery::PAIRING_PROTOCOL_VERSION
+                } else {
+                    crossflow::protocol::WIRE_VERSION.into()
                 },
-            )?;
+            };
+            let mut discovery = if pairing {
+                crossflow::discovery::DiscoveryHandle::start_pairing(config)?
+            } else {
+                crossflow::discovery::DiscoveryHandle::start(config)?
+            };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
             let mut snapshot = None;
             while !stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
@@ -840,6 +850,22 @@ fn run_capture(
 #[cfg(test)]
 mod discovery_cli_tests {
     use super::*;
+
+    #[test]
+    fn pairing_discovery_is_explicit_and_input_remains_default() {
+        assert!(matches!(
+            Args::try_parse_from(["crossflow", "discover"])
+                .unwrap()
+                .command,
+            Command::Discover { pairing: false, .. }
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["crossflow", "discover", "--pairing"])
+                .unwrap()
+                .command,
+            Command::Discover { pairing: true, .. }
+        ));
+    }
 
     #[test]
     fn desktop_peer_mode_excludes_manual_identity_and_host() {

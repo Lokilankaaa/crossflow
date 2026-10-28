@@ -1,10 +1,44 @@
 # Rust SPAKE2 integration experiment
 
-Independent workspace, not a production dependency or pairing release. No downloads
-are performed by Cargo's build script. The native library must be built from the
+Independent workspace containing the experimental shared pairing library and the
+Windows client enrollment worker. The opt-in Windows package now uses this worker;
+this is not a completed cross-platform pairing release. No downloads are performed
+by Cargo's build script. The native library must be built from the
 revision and checksum in [../source-lock.json](../source-lock.json), using the
 existing parent CMake experiment. The build script checks that the explicit static
 archive exists; it cannot establish the provenance of a caller-supplied archive.
+
+## Windows client integration — 2026-10-29
+
+The WinUI device page browses `_crossflow-pair._tcp.local.`, separately from
+trusted input-route discovery. It starts the bundled Rust `crossflow-enroll`
+worker over private standard streams, verifies an eight-digit invitation code,
+shows the authenticated device name, and requires explicit approval on both ends.
+The worker exchanges bounded device metadata inside the authenticated transport,
+retains the locally generated private key, and saves the resulting identity to
+the application-managed Windows DPAPI peer store. Neither the code nor private
+key is passed in process arguments or logged. The code is not a reusable password.
+
+Build with `scripts/build-windows-ui.ps1 -WithPairing -PairingLibraryDir <absolute-directory>`.
+The explicit directory must contain the pinned BoringSSL `libcrypto.a`; the
+packaging script also copies the three tested GNU runtime DLLs. Missing components
+disable the pairing entry point. Root Cargo does not build this independent
+workspace automatically. See [Windows client instructions](../../../clients/windows/README.md).
+
+Actual WinUI testing with a same-machine LAN responder covered discovery, code
+entry, bilateral approval, protected storage, connection with the existing Noise KK
+protocol in paused state, and cancellation while waiting for the responder's
+approval. The responder used a Mac protocol role on Windows with a DrySink;
+there was no macOS execution, Keychain access or OS input injection. See
+[validation evidence](../../../docs/windows-pairing-client-validation-20261029.json).
+
+The Windows worker currently initiates enrollment only. A production Mac invitation
+UI/worker, Keychain persistence, cross-machine validation, multi-address enrollment
+fallback and distributed save recovery/revocation remain outstanding. The first
+valid discovered address is attempted. Cancellation before final authorization
+does not save trust; cancellation during an already authorized OS save cannot
+promise rollback, so the UI refreshes the stored-device list rather than claiming
+that every cancellation removed a record.
 
 The C ABI is taken directly from that revision's `curve25519.h`, `hmac.h`,
 `digest.h`, and `mem.h`. BoringSSL does not promise ABI stability; upgrading the
@@ -150,8 +184,9 @@ for evidence and the distinction between Windows localhost and native Mac testin
 This is not an atomic distributed commit. A lost final message, crash or last-boundary
 cancellation can leave one endpoint successful and the other unsuccessful. A
 production enrollment flow still needs durable recovery/retry and revocation,
-Mac protected storage, packaging and native UI integration. Passing these fixtures
-does not mean normal first-install pairing is available in the shipped clients.
+Mac protected storage and Mac native UI integration. The Windows worker/UI
+integration above supplements these earlier fixtures; the fixtures alone do not
+establish that cross-platform first-install pairing is ready.
 
 ## Ownership and authentication boundary
 

@@ -43,6 +43,12 @@ internal sealed class MainWindow : Window
     private readonly SessionController session = new();
     private readonly DiscoveryClient discovery = new();
     private readonly PeerClient peers = new();
+    private readonly PairingController pairing = new();
+    private ContentDialog? pairingDialog;
+    private Task<bool> pairingPageCleanup = Task.FromResult(true);
+    private readonly List<(Button Button, bool Compatible)> pairButtons = [];
+    private long pairingGeneration;
+    private bool pairingBusy;
     private Task<bool> peerPageCleanup = Task.FromResult(true);
     private TextBlock? peerStatus;
     private StackPanel? savedPeers;
@@ -164,9 +170,10 @@ internal sealed class MainWindow : Window
             args.Cancel = true;
             if (closing) return;
             closing = true; UpdateSessionUi();
+            pairingGeneration++; pairing.Cancel(); pairingDialog?.Hide();
             try
             {
-                var readsStopped = await Task.WhenAll(discovery.StopAsync(), peers.StopAsync());
+                var readsStopped = await Task.WhenAll(discovery.StopAsync(), peers.StopAsync(), pairing.StopAsync());
                 bool scanStopped = readsStopped.All(stopped => stopped);
                 bool sessionStopped = await session.StopAsync();
                 if (scanStopped && sessionStopped) { allowClose = true; Close(); return; }
@@ -237,6 +244,8 @@ internal sealed class MainWindow : Window
     }
     private void ResetWorkspace()
     {
+        pairingGeneration++; pairing.Cancel(); pairingDialog?.Hide();
+        pairingPageCleanup = pairing.StopAsync(); pairButtons.Clear();
         discoveryGeneration++;
         discovery.Cancel();
         discoveryStatus = null; nearbyDevices = null; refreshDiscovery = null;
@@ -290,7 +299,8 @@ internal sealed class MainWindow : Window
         nearbyDevices = new StackPanel { Spacing = 0 };
         AutomationProperties.SetAutomationId(nearbyDevices, "nearby-devices");
         page.Children.Add(nearbyDevices);
-        page.Children.Add(Text("首次连接需要在两台设备上确认配对。附近的新设备配对尚未接入；已配对设备可从上方列表连接。", "caption", true));
+        page.Children.Add(Text("在另一台设备打开配对邀请，选择设备并输入 8 位配对码。两端确认后会记住设备；共享需要另行开始。", "caption", true));
+        if (!PairingController.IsAvailable) page.Children.Add(Text("此安装尚未包含配对组件，请使用包含配对组件的客户端版本。已保存设备仍可连接。", "caption", true));
         var diagnostics = new StackPanel { Spacing = 14, Padding = new Thickness(4, 12, 4, 12) };
         diagnostics.Children.Add(Text("开发诊断 · 仅用于已有身份文件的实验连接。本轮最多运行一小时。", secondary: true));
         hostInput = new TextBox { Header = "目标 IP 和端口", PlaceholderText = "192.168.1.20:24800", Text = targetHost, MaxLength = 128 };
@@ -369,6 +379,7 @@ internal sealed class MainWindow : Window
         long generation = ++discoveryGeneration;
         if (refreshDiscovery is not null) refreshDiscovery.IsEnabled = false;
         nearbyDevices?.Children.Clear();
+        pairButtons.Clear();
         discoveryStatus.Text = "正在查找附近设备…";
         try
         {
@@ -380,7 +391,7 @@ internal sealed class MainWindow : Window
             discoveryStatus.Text = result.Devices.Count == 0 ? "暂未发现设备" : $"发现 {result.Devices.Count} 台附近设备";
             if (result.CapacityLimited) discoveryStatus.Text += " · 结果较多，部分设备未显示";
             if (result.Devices.Count == 0)
-                nearbyDevices.Children.Add(Text("请在另一台设备上打开支持发现的 Crossflow，并确认两台设备处于同一局域网。", secondary: true));
+                nearbyDevices.Children.Add(Text("请在另一台设备上打开 Crossflow 的配对邀请，并确认两台设备处于同一局域网。", secondary: true));
             foreach (var device in result.Devices)
             {
                 var row = new Grid { Padding = new Thickness(0, 20, 0, 20), ColumnSpacing = 16 };
@@ -394,11 +405,24 @@ internal sealed class MainWindow : Window
                 string platform = device.Platform switch { "windows" => "Windows", "macos" => "macOS", "linux" => "Linux", "ios" => "iOS", "ipados" => "iPadOS", _ => device.Platform };
                 description.Children.Add(Text($"{platform} · 未配对{(device.Compatible ? "" : " · 版本不兼容")}", "caption", true));
                 Grid.SetColumn(description, 1); row.Children.Add(description);
-                var pair = new Button { Content = device.Compatible ? "配对待接入" : "需要更新", IsEnabled = false, VerticalAlignment = VerticalAlignment.Center };
-                AutomationProperties.SetAutomationId(pair, "pair-unavailable-" + device.Id);
+                var pair = new Button { Content = device.Compatible ? "配对" : "需要更新", IsEnabled = false, VerticalAlignment = VerticalAlignment.Center };
+                AutomationProperties.SetAutomationId(pair, "pair-device-" + device.Id);
+                pairButtons.Add((pair, device.Compatible));
                 Grid.SetColumn(pair, 2); row.Children.Add(pair);
-                nearbyDevices.Children.Add(new Border { Child = row, BorderThickness = new Thickness(0, 0, 0, 1), BorderBrush = theme.Brush("border") });
+                var invitationRow = new Border { Child = row, BorderThickness = new Thickness(0, 0, 0, 1), BorderBrush = theme.Brush("border") };
+                pair.Click += (_, _) => BeginPairing(device, () =>
+                {
+                    // Remove only the exact card used by this completed attempt.
+                    // Discovery IDs/names are not authenticated peer identifiers.
+                    if (generation != discoveryGeneration || nearbyDevices is null || nearbyDevices.Children.IndexOf(invitationRow) < 0) return;
+                    nearbyDevices.Children.Remove(invitationRow);
+                    pairButtons.RemoveAll(entry => ReferenceEquals(entry.Button, pair));
+                    if (nearbyDevices.Children.Count == 0)
+                        nearbyDevices.Children.Add(Text("暂无其他配对邀请。添加设备时，请打开另一台设备的配对邀请后刷新。", secondary: true));
+                });
+                nearbyDevices.Children.Add(invitationRow);
             }
+            UpdateSessionUi();
         }
         catch (OperationCanceledException) { /* Navigation/close invalidates this generation. */ }
         catch (Exception error)
@@ -411,9 +435,152 @@ internal sealed class MainWindow : Window
             if (generation == discoveryGeneration && !closing && refreshDiscovery is not null) refreshDiscovery.IsEnabled = true;
         }
     }
+    private async void BeginPairing(NearbyDevice device, Action removeCompletedInvitation)
+    {
+        if (closing || pairingBusy || pairing.IsRunning || session.Snapshot.ProcessRunning || !device.Compatible || activePage != "connection") return;
+        long generation = ++pairingGeneration;
+        pairingBusy = true; UpdateSessionUi();
+        bool current() => generation == pairingGeneration && !closing && activePage == "connection";
+        string? savedId = null;
+        ContentDialog? dialog = null;
+        try
+        {
+            if (!await pairingPageCleanup || !await pairing.StopAsync()) throw new InvalidOperationException("上一次配对尚未退出，请稍后重试。");
+            if (!current()) return;
+            string? endpoint = null;
+            foreach (var address in device.Addresses)
+            {
+                try { endpoint = PairingController.ValidateEndpoint(address); break; }
+                catch (InvalidOperationException) { /* Other advertised interfaces may be usable. */ }
+            }
+            if (endpoint is null) throw new InvalidOperationException("该设备没有可用的局域网配对地址，请刷新后重试。");
+            var content = new StackPanel { Spacing = 14, MinWidth = 360, MaxWidth = 460 };
+            var instruction = Text("在另一台设备上查看配对邀请，并输入显示的 8 位数字。", secondary: true);
+            content.Children.Add(instruction);
+            var code = new TextBox { Header = "配对码", PlaceholderText = "8 位数字", MaxLength = 8,
+                InputScope = new InputScope { Names = { new InputScopeName { NameValue = InputScopeNameValue.Number } } } };
+            AutomationProperties.SetAutomationId(code, "pairing-code"); content.Children.Add(code);
+            var detail = Text("发现信息尚未认证。输入配对码后，将核对设备身份。", "caption", true);
+            AutomationProperties.SetAutomationId(detail, "pairing-status"); content.Children.Add(detail);
+            var fingerprint = Text("", "caption", true); fingerprint.FontFamily = new FontFamily("Consolas");
+            AutomationProperties.SetAutomationId(fingerprint, "pairing-fingerprint");
+            var deviceDetails = new Expander { Header = "设备详情", Content = fingerprint, IsExpanded = false,
+                HorizontalAlignment = HorizontalAlignment.Stretch, Visibility = Visibility.Collapsed };
+            content.Children.Add(deviceDetails);
+            dialog = new ContentDialog { XamlRoot = root.XamlRoot, RequestedTheme = ElementTheme.Light, Title = "配对新设备", Content = content,
+                PrimaryButtonText = "验证配对码", CloseButtonText = "取消", DefaultButton = ContentDialogButton.Primary };
+            AutomationProperties.SetAutomationId(dialog, "pairing-dialog");
+            pairingDialog = dialog;
+            bool authenticated = false, approvalAttempted = false, operation = false, allowDialogClose = false, ending = false;
+            dialog.PrimaryButtonClick += async (_, args) =>
+            {
+                args.Cancel = true;
+                if (operation || ending || !current()) return;
+                // Keep the dialog open synchronously. Holding a button deferral
+                // here would make WinUI ignore Close/Escape while network I/O waits.
+                operation = true; dialog.IsPrimaryButtonEnabled = false;
+                try
+                {
+                    if (!authenticated)
+                    {
+                        string suppliedCode = code.Text;
+                        if (suppliedCode.Length != 8 || suppliedCode.Any(c => c is < '0' or > '9'))
+                            throw new InvalidOperationException("请输入 8 位数字配对码。");
+                        code.Text = ""; code.IsEnabled = false;
+                        detail.Text = "正在验证配对码和设备身份…";
+                        var pending = pairing.BeginAsync(endpoint, suppliedCode);
+                        suppliedCode = string.Empty;
+                        var peer = await pending;
+                        if (!current() || ending) return;
+                        authenticated = true; code.Visibility = Visibility.Collapsed;
+                        instruction.Text = "配对码验证成功，请核对这台设备后确认。";
+                        string platform = peer.Platform switch { "windows" => "Windows", "macos" => "macOS", "linux" => "Linux", "ios" => "iOS", "ipados" => "iPadOS", _ => "设备" };
+                        dialog.Title = "确认设备身份";
+                        detail.Text = $"已认证设备：{peer.Name}（{platform}）\n确认这是你要配对的设备，并在另一台设备确认。";
+                        fingerprint.Text = "设备公钥指纹\n" + string.Join("\n", Enumerable.Range(0, 4).Select(i => peer.Fingerprint.Substring(i * 16, 16)));
+                        deviceDetails.Visibility = Visibility.Visible;
+                        dialog.PrimaryButtonText = "确认配对";
+                    }
+                    else
+                    {
+                        approvalAttempted = true;
+                        detail.Text = "正在等待另一台设备确认并保存配对信息…";
+                        savedId = await pairing.ApproveAsync();
+                        if (!current() || ending) return;
+                        detail.Text = "配对已保存。可以从已配对设备列表连接。";
+                        allowDialogClose = true; dialog.Hide();
+                    }
+                }
+                catch (OperationCanceledException) { if (current() && !ending) detail.Text = "配对请求已结束。如已点击确认，请刷新已配对设备检查保存状态。"; }
+                catch (Exception error)
+                {
+                    if (current() && !ending)
+                    {
+                        detail.Text = error is InvalidOperationException ? error.Message : "配对未完成，请关闭后重新配对。";
+                        // Never silently retry a cryptographic attempt using the same code.
+                        if (code.IsEnabled) dialog.IsPrimaryButtonEnabled = true;
+                    }
+                }
+                finally
+                {
+                    operation = false;
+                    if (current() && !ending && authenticated && !approvalAttempted && savedId is null && pairing.IsRunning) dialog.IsPrimaryButtonEnabled = true;
+                }
+            };
+            dialog.Closing += async (_, args) =>
+            {
+                if (allowDialogClose) return;
+                args.Cancel = true;
+                if (ending) return;
+                ending = true; dialog.IsPrimaryButtonEnabled = false; code.Text = "";
+                var deferral = args.GetDeferral();
+                bool stopped = false;
+                try { pairing.Cancel(); stopped = await pairing.StopAsync(); }
+                catch { stopped = false; }
+                finally
+                {
+                    // Resume THIS native close after cleanup. Calling Hide again
+                    // while the closing deferral is in flight can be ignored.
+                    try
+                    {
+                        if (stopped) { allowDialogClose = true; args.Cancel = false; }
+                        else { ending = false; detail.Text = "后台配对进程尚未退出，请再次取消，确认停止后再关闭。"; }
+                    }
+                    finally { deferral.Complete(); }
+                }
+            };
+            await dialog.ShowAsync();
+            // Even a programmatic hide must confirm that no worker was abandoned.
+            bool stopped = await pairing.StopAsync();
+            if (!stopped) throw new InvalidOperationException("后台配对进程尚未退出，请再次取消或关闭窗口。");
+            if (approvalAttempted && current()) StartPeers();
+            if (savedId is not null && current())
+            {
+                removeCompletedInvitation();
+                if (discoveryStatus is not null) discoveryStatus.Text = "配对已保存。请在已配对设备列表中连接；共享不会自动开始。";
+            }
+            else if (approvalAttempted && current() && discoveryStatus is not null)
+                discoveryStatus.Text = "配对请求已结束。请查看已配对设备列表，确认是否已经保存。";
+        }
+        catch (Exception error)
+        {
+            if (current() && discoveryStatus is not null)
+                discoveryStatus.Text = error is InvalidOperationException ? error.Message : "无法开始配对，请刷新后重试。";
+        }
+        finally
+        {
+            pairing.Cancel(); pairingPageCleanup = pairing.StopAsync();
+            bool stopped = false;
+            try { stopped = await pairingPageCleanup; } catch { }
+            if (!stopped && current() && discoveryStatus is not null) discoveryStatus.Text = "后台配对进程尚未退出，请再次关闭窗口确认停止。";
+            if (pairingDialog == dialog) pairingDialog = null;
+            pairingBusy = false; UpdateSessionUi();
+        }
+    }
+
     private async void RunSessionAction(Func<Task> operation)
     {
-        if (sessionAction || closing) return;
+        if (sessionAction || pairingBusy || closing) return;
         sessionAction = true; UpdateSessionUi();
         string? error = null;
         try { await operation(); }
@@ -427,11 +594,12 @@ internal sealed class MainWindow : Window
         if (connectionStatus is not null) connectionStatus.Text = title;
         sidebarState.Text = title;
         sidebarPrimary.Content = !state.ProcessRunning ? "连接设备" : state.State == "sharing" ? "暂停共享" : state.CanArm ? "开始共享" : "等待就绪";
-        sidebarPrimary.IsEnabled = !sessionAction && !closing && (!state.ProcessRunning || state.CanArm || (state.State == "sharing" && !state.CommandPending && !state.StopRequested));
+        sidebarPrimary.IsEnabled = !pairingBusy && !sessionAction && !closing && (!state.ProcessRunning || state.CanArm || (state.State == "sharing" && !state.CommandPending && !state.StopRequested));
         sidebarStop.IsEnabled = state.ProcessRunning && !sessionAction && !closing;
         sidebarStop.Visibility = state.ProcessRunning ? Visibility.Visible : Visibility.Collapsed;
-        if (connectSession is not null) connectSession.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
-        foreach (var button in peerConnectButtons) button.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
+        if (connectSession is not null) connectSession.IsEnabled = !pairingBusy && !state.ProcessRunning && !sessionAction && !closing;
+        foreach (var button in peerConnectButtons) button.IsEnabled = !pairingBusy && !state.ProcessRunning && !sessionAction && !closing;
+        foreach (var pair in pairButtons) pair.Button.IsEnabled = pair.Compatible && PairingController.IsAvailable && !pairingBusy && !pairing.IsRunning && !state.ProcessRunning && !sessionAction && !closing;
         if (armSession is not null) armSession.IsEnabled = state.CanArm && !sessionAction && !closing;
         if (pauseSession is not null) pauseSession.IsEnabled = state.State == "sharing" && !state.CommandPending && !state.StopRequested && !sessionAction && !closing;
         if (stopSession is not null) stopSession.IsEnabled = state.ProcessRunning && !sessionAction && !closing;

@@ -203,6 +203,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "crossflow",
+ "serde",
  "serde_json",
  "snow",
  "zeroize",

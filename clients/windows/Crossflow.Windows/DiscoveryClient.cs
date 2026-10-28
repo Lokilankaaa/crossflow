@@ -14,9 +14,9 @@ internal sealed class DiscoveryClient
 {
     internal const int MaxOutputBytes = BoundedCoreCommand<DiscoveryResult>.MaxOutputBytes;
     private readonly BoundedCoreCommand<DiscoveryResult> command;
-    internal DiscoveryClient() => command = new(["discover", "--seconds", "3"], Parse);
+    internal DiscoveryClient() => command = new(["discover", "--pairing", "--seconds", "3"], Parse);
     internal DiscoveryClient(Func<ProcessStartInfo> fixture, TimeSpan timeout, Func<Stream, Stream>? fixtureOutput = null)
-        => command = new(["discover", "--seconds", "3"], Parse, fixture, timeout, fixtureOutput);
+        => command = new(["discover", "--pairing", "--seconds", "3"], Parse, fixture, timeout, fixtureOutput);
     internal Task<DiscoveryResult> ScanAsync() => command.RunAsync();
     internal void Cancel() => command.Cancel();
     internal Task<bool> StopAsync() => command.StopAsync();
