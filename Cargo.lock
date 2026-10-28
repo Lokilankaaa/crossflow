@@ -196,6 +196,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossflow-bridge"
+version = "0.1.0"
+dependencies = [
+ "crossflow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
