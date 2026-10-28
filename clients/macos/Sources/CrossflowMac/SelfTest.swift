@@ -12,7 +12,11 @@ enum SelfTest {
             details["environment"] = environment
             checks["bridge_api_v1"] = environment["api_version"]?.number == 1 && environment["ok"] == .bool(true)
 
-            let example = try LayoutDocument.bundledExample()
+            let fourScreens = try LayoutDocument.bundledExample()
+            checks["shared_four_screen_sample"] = fourScreens.screens.count == 4 && Set(fourScreens.screens.map(\.deviceID)).count == 2
+            let fourValid = try await bridge.request(.object(["op": .string("layout_validate"), "layout": fourScreens.json]))
+            checks["four_screen_sample_valid"] = fourValid["ok"] == .bool(true)
+            let example = try LayoutDocument.bundledExample(resource: "layout-two-devices")
             guard example.screens.count == 2 else { throw DocumentError.shape }
             let layout = example.json
             let valid = try await bridge.request(.object(["op": .string("layout_validate"), "layout": layout]))
@@ -36,8 +40,7 @@ enum SelfTest {
                 "end": .object(["x": .number(1920.0.nextUp), "y": .number(500)])
             ]))
             details["crossing"] = crossing
-            // The result shape is checked against the frozen bridge response in integration.
-            checks["crossing_request_succeeds"] = crossing["ok"] == .bool(true)
+            checks["crossing_targets_mac"] = crossing["ok"] == .bool(true) && crossing["result"]?["crossing"]?["target_screen_id"] == .string("mac-main") && crossing["result"]?["system_input_injected"] == .bool(false)
 
             var tinyOverlap = example
             tinyOverlap.screens[1].x = 1920.0.nextDown

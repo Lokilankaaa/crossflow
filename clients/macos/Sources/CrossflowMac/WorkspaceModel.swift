@@ -7,7 +7,7 @@ final class WorkspaceModel {
     var document = LayoutDocument(screens: [])
     var selectedID: UUID?
     var isExample = true
-    var documentName = "双屏工作台"
+    var documentName = "多屏工作台"
     var hasChanges = false
     var fitGeneration = 0
     var banner = "拖动屏幕，安排你的工作空间。"
@@ -80,7 +80,7 @@ final class WorkspaceModel {
         do {
             let example = try LayoutDocument.bundledExample()
             checkpoint(); document = example; selectedID = document.screens.first?.id
-            isExample = true; documentName = "双屏工作台"; changed(); fitGeneration += 1
+            isExample = true; documentName = "多屏工作台"; changed(); fitGeneration += 1
             banner = "已载入示例布局 · 设备信息不是在线发现结果。"
         } catch { alertMessage = error.localizedDescription }
     }

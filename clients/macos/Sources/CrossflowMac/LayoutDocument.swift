@@ -87,8 +87,8 @@ struct LayoutDocument: Equatable, Sendable {
         extra = root // Preserve unknown fields so Rust can reject them; never silently strip them.
     }
 
-    static func bundledExample() throws -> Self {
-        guard let url = Bundle.main.url(forResource: "layout-two-devices", withExtension: "json") else {
+    static func bundledExample(resource: String = "layout-four-screens") throws -> Self {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "json") else {
             throw DocumentError.sampleMissing
         }
         return try Self(data: Data(contentsOf: url))

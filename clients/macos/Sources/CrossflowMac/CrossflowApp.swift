@@ -21,8 +21,9 @@ struct CrossflowApp: App {
     var body: some Scene {
         Window("Crossflow", id: "workspace") {
             WorkspaceView(model: model)
-                .frame(minWidth: Theme.number("window", "min_width", fallback: 880),
-                       minHeight: Theme.number("window", "min_height", fallback: 600))
+                .preferredColorScheme(.light)
+                .frame(minWidth: Theme.number("window", "minimum_width", fallback: 880),
+                       minHeight: Theme.number("window", "minimum_height", fallback: 600))
         }
         .defaultSize(width: Theme.number("window", "width", fallback: 1180),
                      height: Theme.number("window", "height", fallback: 760))

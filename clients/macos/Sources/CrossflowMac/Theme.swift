@@ -33,12 +33,12 @@ enum Theme {
     static var border: Color { color("border", fallback: .separatorColor) }
     static var accent: Color { color("accent", fallback: .controlAccentColor) }
     static var subtle: Color { color("accent_subtle", fallback: .quaternaryLabelColor) }
-    static var deviceAccent: Color { color("secondarydevice", fallback: .systemTeal) }
+    static var deviceAccent: Color { color("device_secondary", fallback: .systemTeal) }
     static var titleSize: Double { number("typography", "title", fallback: 26) }
     static var bodySize: Double { number("typography", "body", fallback: 14) }
     static var captionSize: Double { number("typography", "caption", fallback: 12) }
-    static var sidebarWidth: Double { number("window", "sidebar", fallback: 200) }
-    static var inspectorWidth: Double { number("window", "inspector", fallback: 260) }
+    static var sidebarWidth: Double { number("window", "sidebar_width", fallback: 236) }
+    static var inspectorWidth: Double { number("window", "inspector_width", fallback: 260) }
 }
 
 struct StatusBadge: View {

@@ -53,7 +53,7 @@ struct WorkspaceView: View {
             Image(systemName: "rectangle.2.swap").font(.system(size: 20, weight: .semibold)).foregroundStyle(Theme.accent)
             Text("Crossflow").font(.system(size: 18, weight: .semibold))
             Rectangle().fill(Theme.border).frame(width: 1, height: 18).padding(.horizontal, 6)
-            Text(Theme.copy("draft", fallback: "布局草稿")).foregroundStyle(Theme.secondary)
+            Text(Theme.copy("draft_label", fallback: "布局草稿")).foregroundStyle(Theme.secondary)
             if model.hasChanges { Circle().fill(Theme.accent).frame(width: 5, height: 5).help("尚未导出更改") }
             Spacer()
             Button { model.undo() } label: { Image(systemName: "arrow.uturn.backward") }
@@ -71,12 +71,12 @@ struct WorkspaceView: View {
     private var heading: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text(Theme.copy("workspace_title", fallback: "屏幕排列"))
+                Text(Theme.copy("layout_title", fallback: "屏幕排列"))
                     .font(.system(size: Theme.titleSize, weight: .semibold))
                 Spacer()
                 StatusBadge(title: model.isExample ? "示例布局" : "已导入草稿")
             }
-            Text(Theme.copy("workspace_subtitle", fallback: "拖动屏幕，匹配你的桌面布局。"))
+            Text(Theme.copy("layout_subtitle", fallback: "拖动屏幕，匹配你的桌面布局。"))
                 .foregroundStyle(Theme.secondary)
         }
     }
@@ -96,8 +96,8 @@ struct WorkspaceView: View {
                                 HStack(spacing: 9) {
                                     Image(systemName: "display").font(.system(size: 17)).foregroundStyle(Theme.accent)
                                     VStack(alignment: .leading, spacing: 4) {
-                                        Text(screen.deviceID.isEmpty ? "未命名设备" : screen.deviceID).fontWeight(.medium).lineLimit(1)
-                                        Text(model.isExample ? "示例屏幕" : "草稿屏幕").font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
+                                        Text(screen.screenID.isEmpty ? "未命名屏幕" : screen.screenID).fontWeight(.medium).lineLimit(1)
+                                        Text(screen.deviceID.isEmpty ? "未命名设备" : screen.deviceID).font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                                     }
                                     Spacer(minLength: 0)
                                 }
@@ -112,10 +112,10 @@ struct WorkspaceView: View {
             }
             Spacer(minLength: 0)
             VStack(alignment: .leading, spacing: 9) {
-                StatusBadge(title: "未连接")
+                StatusBadge(title: "会话尚未接入")
                 Text(Theme.copy("session_unavailable", fallback: "共享会话尚未接入"))
                     .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
-                Text(model.isExample ? Theme.copy("example_notice", fallback: "示例屏幕，不代表已发现的设备。") : "布局中的设备尚未连接。")
+                Text(model.isExample ? Theme.copy("sample_notice", fallback: "示例屏幕，不代表已发现的设备。") : "布局中的设备尚未连接。")
                     .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -129,7 +129,7 @@ struct WorkspaceView: View {
             Image(systemName: model.bridgeAvailable ? "checkmark.shield" : "puzzlepiece.extension")
                 .font(.system(size: 22)).foregroundStyle(Theme.accent).padding(.top, 2)
             VStack(alignment: .leading, spacing: 5) {
-                Text(model.bridgeAvailable ? Theme.copy("kernel_ready", fallback: "布局内核已就绪") : "布局校验暂不可用")
+                Text(model.bridgeAvailable ? Theme.copy("core_ready", fallback: "布局内核已就绪") : "布局校验暂不可用")
                     .fontWeight(.semibold)
                 Text(model.bridgeMessage).font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
