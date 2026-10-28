@@ -158,6 +158,16 @@ impl Drop for TimerPeriod {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let stop = Arc::new(AtomicBool::new(false));
+    // Keep the handler alive until workers, adapters and log writers finish.
+    let _shutdown = if matches!(
+        &args.command,
+        Command::Receive { .. } | Command::Send { .. } | Command::Capture { .. }
+    ) {
+        Some(crossflow::shutdown::Shutdown::install(stop.clone())?)
+    } else {
+        None
+    };
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
     match args.command {
@@ -299,7 +309,14 @@ fn main() -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                             inject_actions,
                         );
-                        session::receive(&bind, &identity, &mut sink, writer.log.clone(), seconds)
+                        session::receive_with_stop(
+                            &bind,
+                            &identity,
+                            &mut sink,
+                            writer.log.clone(),
+                            seconds,
+                            &stop,
+                        )
                     })()
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -310,7 +327,14 @@ fn main() -> Result<()> {
                 }
             } else {
                 let mut sink = session::DrySink::default();
-                let r = session::receive(&bind, &identity, &mut sink, writer.log.clone(), seconds);
+                let r = session::receive_with_stop(
+                    &bind,
+                    &identity,
+                    &mut sink,
+                    writer.log.clone(),
+                    seconds,
+                    &stop,
+                );
                 eprintln!(
                     "Dry run: {} movements, final cumulative ({:.2}, {:.2})",
                     sink.moves, sink.x, sink.y
@@ -349,12 +373,11 @@ fn main() -> Result<()> {
             let writer = LogWriter::new(&log, meta)?;
             if experimental_inputs {
                 let result =
-                    run_ordered_sender(host, identity, seconds, max_hz, writer.log.clone());
+                    run_ordered_sender(host, identity, seconds, max_hz, writer.log.clone(), stop);
                 writer.finish()?;
                 result?;
             } else {
                 let motion = Arc::new(Mutex::new(Motion::default()));
-                let stop = Arc::new(AtomicBool::new(false));
                 let m = motion.clone();
                 let s = stop.clone();
                 let l = writer.log.clone();
@@ -384,7 +407,13 @@ fn main() -> Result<()> {
                 }
                 let result = worker
                     .join()
-                    .map_err(|_| anyhow::anyhow!("sender thread panicked"))?;
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("sender thread panicked")));
+                if let Err(error) = &result {
+                    writer.log.write(
+                        "error",
+                        json!({"stage":"sender_exit","message":format!("{error:#}")}),
+                    );
+                }
                 writer.finish()?;
                 capture_result?;
                 result?;
@@ -395,7 +424,7 @@ fn main() -> Result<()> {
             let writer = LogWriter::new(&log, metadata("local_capture_only"))?;
             let result = run_capture(
                 Arc::new(Mutex::new(Motion::default())),
-                Arc::new(AtomicBool::new(false)),
+                stop,
                 writer.log.clone(),
                 seconds,
                 true,
@@ -413,6 +442,7 @@ fn run_ordered_sender(
     seconds: f64,
     max_hz: u32,
     log: crossflow::metrics::Log,
+    stop: Arc<AtomicBool>,
 ) -> Result<()> {
     #[cfg(windows)]
     {
@@ -424,7 +454,6 @@ fn run_ordered_sender(
             "Experimental keyboard/buttons/wheel enabled. Windows local input is NOT suppressed; start with a DrySink receiver. Sharing remains paused until you explicitly enable it."
         );
         let input = Arc::new(Mutex::new(SourceInputQueue::new()));
-        let stop = Arc::new(AtomicBool::new(false));
         let network_input = input.clone();
         let network_stop = stop.clone();
         let network_log = log.clone();
@@ -518,8 +547,11 @@ fn run_ordered_sender(
             stop.clone(),
             Some(std::time::Duration::from_secs_f64(seconds)),
         );
-        input.lock().unwrap().capture_reset();
         stop.store(true, Ordering::Release);
+        input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capture_reset();
         let network = worker
             .join()
             .map_err(|_| anyhow::anyhow!("ordered sender thread panicked"))?;
@@ -528,7 +560,7 @@ fn run_ordered_sender(
     }
     #[cfg(not(windows))]
     {
-        let _ = (host, identity, seconds, max_hz, log);
+        let _ = (host, identity, seconds, max_hz, log, stop);
         anyhow::bail!("experimental physical input capture currently requires Windows")
     }
 }

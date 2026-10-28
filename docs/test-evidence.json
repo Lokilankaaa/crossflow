@@ -5,6 +5,18 @@
   "host_target": "x86_64-pc-windows-gnu",
   "unit_tests_passed": 80,
   "explicit_localhost_tests_passed": 13,
+  "cooperative_shutdown_validation": {
+    "windows_parent_process_tests": 2,
+    "child_fixture_entry_excluded_from_test_count": true,
+    "windows_signals": ["Ctrl+C", "Ctrl+Break"],
+    "held_fake_key_and_button_released_exactly_once": true,
+    "cli_dry_receiver_signal_exit_and_complete_log": true,
+    "duplicate_guard_rejected_and_fresh_guard_has_no_stale_request": true,
+    "apple_all_targets_type_check": "passed",
+    "mac_native_signal_execution": "pending",
+    "actual_os_input": false,
+    "unverified": ["Windows console close", "SIGKILL/TerminateProcess", "crash", "actual OS input release"]
+  },
   "recovery_tests": {
     "authenticated_reconnect_requires_rearm_no_old_motion_replay": "passed",
     "expired_movement_lease_rejected_while_session_has_fresh_heartbeats": "passed",

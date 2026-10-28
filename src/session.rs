@@ -659,13 +659,15 @@ impl MouseSink for DrySink {
 /// This cannot recover OS state after a forced process kill.
 struct OwnedSink<'a> {
     sink: &'a mut dyn MouseSink,
+    stop: &'a AtomicBool,
     buttons: BTreeSet<Button>,
     keys: BTreeSet<u16>,
 }
 impl<'a> OwnedSink<'a> {
-    fn new(sink: &'a mut dyn MouseSink) -> Self {
+    fn new(sink: &'a mut dyn MouseSink, stop: &'a AtomicBool) -> Self {
         Self {
             sink,
+            stop,
             buttons: BTreeSet::new(),
             keys: BTreeSet::new(),
         }
@@ -713,7 +715,7 @@ impl MouseSink for OwnedSink<'_> {
         self.sink.scroll(horizontal, vertical)
     }
     fn emergency_pressed(&self) -> bool {
-        self.sink.emergency_pressed()
+        self.stop.load(Ordering::Acquire) || self.sink.emergency_pressed()
     }
     fn release_owned(&mut self) -> Result<()> {
         let mut failures = Vec::new();
@@ -902,6 +904,19 @@ pub fn receive(
     log: Log,
     seconds: f64,
 ) -> Result<()> {
+    receive_with_stop(address, bundle, sink, log, seconds, &AtomicBool::new(false))
+}
+
+/// A stop request follows the same explicit release path as local Escape.
+/// No signal handler or process-global state is installed by the session API.
+pub fn receive_with_stop(
+    address: &str,
+    bundle: &Path,
+    sink: &mut dyn MouseSink,
+    log: Log,
+    seconds: f64,
+    stop: &AtomicBool,
+) -> Result<()> {
     let identity = Identity::load(bundle)?;
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
@@ -916,7 +931,7 @@ pub fn receive(
     let end = Instant::now() + Duration::from_secs_f64(seconds);
     let mut attempt_id = 0u64;
     while Instant::now() < end {
-        if sink.emergency_pressed() {
+        if stop.load(Ordering::Acquire) || sink.emergency_pressed() {
             log.write("emergency_stop", json!({}));
             return Ok(());
         }
@@ -937,8 +952,9 @@ pub fn receive(
             peer: Some(address),
         };
         trace.write(&log, "tcp_accepted", json!({}));
-        let mut owned = OwnedSink::new(sink);
+        let mut owned = OwnedSink::new(sink, stop);
         let attempt = (|| -> Result<()> {
+            check_local_stop(&owned)?;
             trace.phase = "socket_setup";
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
