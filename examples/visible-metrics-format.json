@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "template": true,
+  "format_notes": "EMPTY TEMPLATE — NOT MEASURED. Fill actual evidence, set template=false, and submit exactly A/B/C rounds 1..5. See Input/Round/Segment schema comments in visible_metrics.rs. All paths are local, relative to this JSON. No sample measurements are supplied.",
+  "measurement_kind": "external_video_visible_updates",
+  "baseline_reference": "",
+  "randomized_order_reference": "",
+  "all_rounds_included": false,
+  "conditions": {
+    "id": "",
+    "direction": "windows_to_mac",
+    "details": "",
+    "actual_refresh_hz": null,
+    "fixed_refresh": false,
+    "refresh_evidence": ""
+  },
+  "rounds": []
+}
