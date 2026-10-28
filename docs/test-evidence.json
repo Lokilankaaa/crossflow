@@ -3,7 +3,7 @@
   "timezone": "Asia/Hong_Kong",
   "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "host_target": "x86_64-pc-windows-gnu",
-  "unit_tests_passed": 37,
+  "unit_tests_passed": 39,
   "explicit_localhost_tests_passed": 5,
   "recovery_tests": {
     "authenticated_reconnect_requires_rearm_no_old_motion_replay": "passed",
@@ -32,9 +32,66 @@
     "expected_terminal_disconnects": 1,
     "actual_os_injection": false
   },
-  "mac_visible_smoothness": "NOT_TESTED",
+  "mac_visible_smoothness": "User reported movement and relatively smooth; objective visible cadence NOT_MEASURED",
   "sharemouse_comparison": "NOT_TESTED",
   "end_to_end_physical_latency": "NOT_MEASURED",
   "one_way_network_latency": "NOT_MEASURED",
-  "acceptance_status": "stage 0 incomplete"
+  "acceptance_status": "stage 0 incomplete",
+  "mac_native_build": {
+    "status": "passed",
+    "baseline": "3dd2de752d5e3d55ba741c2cf3771bab3ef29005",
+    "platform": "M4 MacBook Air; macOS 27.0.1; arm64",
+    "tests_passed": 42,
+    "display_reported_hz": 60,
+    "permission_preflight": "allowed; actual injection not tested"
+  },
+  "cross_device_wifi_drysink": {
+    "status": "passed transport smoke; final cumulative position not compared",
+    "sender_seconds": 10,
+    "sent_frames": 7602,
+    "applied_movement_groups": 5138,
+    "receiver_processing_p95_ms": 0.0075,
+    "sender_errors": 0,
+    "receiver_terminal_disconnects": 1,
+    "dropped_log_records": 0,
+    "actual_os_injection": false
+  },
+  "cross_device_wired": "incomplete: sender handshake timeout; receiver completed three local handshakes then EOF; root cause unconfirmed",
+  "windows_control_ui": {
+    "commit": "310fe45",
+    "tests": "39 regular tests passed, fmt/clippy and Apple target type check passed",
+    "hotkeys": "Ctrl+Alt+Space toggles; Ctrl+Alt+Esc stops",
+    "capture_only_window": "observed, sharing button disabled, timed exit",
+    "user_real_input": "connected; arm/pause/rearm; normal early exit"
+  },
+  "physical_windows_to_mac": {
+    "sender_build": "3dd2de7 + uncommitted Windows controller change; dirty=true",
+    "receiver_build": "3dd2de7; dirty=false",
+    "sender_elapsed_seconds": 46.7425427,
+    "raw_input_packets": 11665,
+    "motion_packets": 11633,
+    "sent_frames": 8030,
+    "sender_errors": 0,
+    "sender_log_complete": true,
+    "source_processing_p95_ms": 1.6902,
+    "source_processing_p99_ms": 1.9836,
+    "user_observation": "能移动，比较流畅",
+    "controlled_sharemouse_comparison": false,
+    "receiver": {
+      "mode": "receiver_inject",
+      "calls": 5551,
+      "arm_count": 2,
+      "runtime_pause_count": 1,
+      "receiver_processing_p95_ms": 0.010667,
+      "injection_call_p95_ms": 2.822,
+      "injection_call_p99_ms": 7.72425,
+      "injection_call_max_ms": 19.933666,
+      "log_complete": true,
+      "dropped_log_records": 0,
+      "expected_terminal_disconnects": 1,
+      "exit_code": 0,
+      "remaining_listener": false,
+      "mac_escape_tested": false
+    }
+  }
 }
