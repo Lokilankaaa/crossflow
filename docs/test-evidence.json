@@ -3,7 +3,7 @@
   "timezone": "Asia/Hong_Kong",
   "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "host_target": "x86_64-pc-windows-gnu",
-  "unit_tests_passed": 39,
+  "unit_tests_passed": 42,
   "explicit_localhost_tests_passed": 5,
   "recovery_tests": {
     "authenticated_reconnect_requires_rearm_no_old_motion_replay": "passed",
@@ -56,7 +56,7 @@
     "dropped_log_records": 0,
     "actual_os_injection": false
   },
-  "cross_device_wired": "incomplete: sender handshake timeout; receiver completed three local handshakes then EOF; root cause unconfirmed",
+  "cross_device_wired": "initial handshake timeout not reproduced in two baseline trials and new 60-second trial; root cause unconfirmed; see diagnostics_validation",
   "windows_control_ui": {
     "commit": "310fe45",
     "tests": "39 regular tests passed, fmt/clippy and Apple target type check passed",
@@ -93,5 +93,46 @@
       "remaining_listener": false,
       "mac_escape_tested": false
     }
+  },
+  "diagnostics_validation": {
+    "code_revision": "f93e5b89ef6d8d600633b44a0e349df4b7953dfa",
+    "windows_regular_tests": 42,
+    "windows_explicit_network_tests": 5,
+    "mac_regular_tests": 40,
+    "mac_explicit_network_tests": 5,
+    "both_native_release_builds": "passed; dirty=false",
+    "wired_baseline": "two 10-second passes; original failure not reproduced, root cause unknown",
+    "wired_baseline_sender_frames": [
+      7864,
+      7930
+    ],
+    "wired_baseline_receiver_moves": [
+      7822,
+      7880
+    ],
+    "new_wired_sender_seconds": 60,
+    "new_wired_sender_frames": 46831,
+    "new_wired_sender_errors": 0,
+    "new_wired_sender_log_complete": true,
+    "sender_local_handshake_ms": 8.2545,
+    "new_wired_receiver_summary": "connection and timed execution passed; one-frame accounting difference unresolved",
+    "new_wired_receiver": {
+      "applied_movement_groups": 46705,
+      "frames_coalesced": 46830,
+      "sender_receiver_frame_difference": 1,
+      "receiver_processing_p95_ms": 0.003625,
+      "receiver_processing_p99_ms": 0.004750,
+      "receiver_processing_max_ms": 0.110292,
+      "local_handshake_ms": 1.787625,
+      "log_records": 46714,
+      "log_complete": true,
+      "dropped_log_records": 0,
+      "expected_terminal_disconnects": 1,
+      "handshake_failures": 0,
+      "exit_code": 0,
+      "remaining_listener": false,
+      "final_cumulative_position_compared": false
+    },
+    "actual_os_injection": false
   }
 }
