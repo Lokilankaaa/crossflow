@@ -4,6 +4,16 @@
   "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "host_target": "x86_64-pc-windows-gnu",
   "unit_tests_passed": 106,
+  "mac_validation_handoff": {
+    "script": "scripts/validate-mac-core.sh",
+    "shell_syntax_check": "passed with Git Bash bash -n on Windows",
+    "non_macos_execution_guard": "passed; exits 2 before creating evidence or running Cargo",
+    "mac_native_script_execution": "not run",
+    "current_remote_execution_channel": "unavailable: remote wait tool cannot reach Mac host; current project list has no Mac entry",
+    "last_read_thread_state": "waitingOnApproval; not confirmation of live execution or termination",
+    "script_scope": "native builds, fake input tests and read-only environment; no actual capture/injection or UI",
+    "evidence_retention": "per-step stdout/stderr, status and build/Git metadata; some existing test fixtures delete their own temporary logs"
+  },
   "worker_timing_validation": {
     "private_ipc_version": 2,
     "private_ipc_frame_bytes": 80,
