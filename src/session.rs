@@ -605,6 +605,11 @@ fn send_source(
 }
 
 pub trait MouseSink {
+    /// Called only by the receiving execution loop after its safety checks.
+    /// An isolated adapter can renew its watchdog here; never from a timer thread.
+    fn maintain(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn reset(&mut self) -> Result<()> {
         Ok(())
     }
@@ -657,14 +662,14 @@ impl MouseSink for DrySink {
 /// Tracks attempted remote downs, including adapters that post then return an
 /// error. Cleanup is explicit so failures can be reported, never hidden by Drop.
 /// This cannot recover OS state after a forced process kill.
-struct OwnedSink<'a> {
+pub(crate) struct OwnedSink<'a> {
     sink: &'a mut dyn MouseSink,
     stop: &'a AtomicBool,
     buttons: BTreeSet<Button>,
     keys: BTreeSet<u16>,
 }
 impl<'a> OwnedSink<'a> {
-    fn new(sink: &'a mut dyn MouseSink, stop: &'a AtomicBool) -> Self {
+    pub(crate) fn new(sink: &'a mut dyn MouseSink, stop: &'a AtomicBool) -> Self {
         Self {
             sink,
             stop,
@@ -674,6 +679,10 @@ impl<'a> OwnedSink<'a> {
     }
 }
 impl MouseSink for OwnedSink<'_> {
+    fn maintain(&mut self) -> Result<()> {
+        check_local_stop(self)?;
+        self.sink.maintain()
+    }
     fn reset(&mut self) -> Result<()> {
         self.release_owned()?;
         self.sink.reset()
@@ -761,6 +770,12 @@ impl std::fmt::Display for TerminalReceiverFailure {
 }
 impl std::error::Error for TerminalReceiverFailure {}
 fn terminal_sink_failure(error: anyhow::Error) -> anyhow::Error {
+    // Maintenance can observe a stop between the loop's earlier check and an
+    // adapter call. Preserve that cooperative stop instead of relabeling it as
+    // an adapter failure; receive_with_stop must still finish normally.
+    if error.is::<TerminalReceiverFailure>() {
+        return error;
+    }
     TerminalReceiverFailure {
         message: format!("Input adapter stopped: {error}"),
         emergency: false,
@@ -892,6 +907,11 @@ fn process_received_batch(
                 return Ok(true);
             }
         }
+        if frame.kind != Kind::Pause {
+            // Renew only after a validated frame has completed. A slow batch
+            // must not starve the isolated input owner; stopping never renews.
+            sink.maintain().map_err(terminal_sink_failure)?;
+        }
     }
     flush_moves(&mut pending, sink, log)?;
     Ok(false)
@@ -935,6 +955,7 @@ pub fn receive_with_stop(
             log.write("emergency_stop", json!({}));
             return Ok(());
         }
+        sink.maintain().map_err(terminal_sink_failure)?;
         let (mut stream, address) = match listener.accept() {
             Ok(s) => s,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -1001,6 +1022,7 @@ pub fn receive_with_stop(
                     last_input.elapsed() < Duration::from_millis(250),
                     "sender inactive; session discarded"
                 );
+                owned.maintain().map_err(terminal_sink_failure)?;
                 thread::sleep(Duration::from_micros(500));
             }
             Ok(())

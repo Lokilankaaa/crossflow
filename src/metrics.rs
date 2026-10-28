@@ -137,6 +137,7 @@ pub fn summarize(path: &Path) -> Result<Value> {
     let mut action_receive = vec![];
     let mut action_inject = vec![];
     let mut transport = vec![];
+    let mut adapter_scopes = std::collections::BTreeSet::new();
     let mut queued_moves = 0u64;
     let mut cadence_raw = vec![];
     let mut cadence_bursts = vec![];
@@ -173,6 +174,15 @@ pub fn summarize(path: &Path) -> Result<Value> {
             }
         };
         events += 1;
+        if v["event"] == "metadata" {
+            adapter_scopes.insert(match v["data"]["receiver_t3_t4_scope"].as_str() {
+                Some("local_adapter_call") => "local_adapter_call",
+                Some("worker_rpc_including_adapter_not_isolated_native_injection") => {
+                    "worker_rpc_including_adapter_not_isolated_native_injection"
+                }
+                _ => "unspecified",
+            });
+        }
         if v.get("local_ns").is_some() {
             if let Some(now) = timestamp(&v, "local_ns", &mut issues) {
                 if last_local_ns.is_some_and(|last| now < last) {
@@ -271,6 +281,8 @@ pub fn summarize(path: &Path) -> Result<Value> {
         "action_source_processing":distribution(action_source),
         "action_receiver_processing":distribution(action_receive),
         "action_adapter_call":distribution(action_inject),
+        "receiver_adapter_timing_scopes":adapter_scopes,
+        "adapter_timing_warning":"injection_call and action_adapter_call measure t3..t4. With an input worker this includes pipe scheduling and ACK wait, not isolated native injection. Missing or mixed scopes cannot establish isolated injection timing.",
         "injection_call":distribution(inject),"visible_smoothness":"NOT_MEASURED",
         "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized"
     }))
@@ -364,6 +376,21 @@ mod tests {
         assert!(result["source_processing"].is_null());
         assert!(result["injection_call"].is_null());
         assert_eq!(result["queued_move_records"], 0);
+    }
+
+    #[test]
+    fn worker_timing_scope_survives_summary_without_claiming_native_latency() {
+        let result = summarize_text(concat!(
+            "{\"event\":\"metadata\",\"data\":{\"receiver_t3_t4_scope\":\"worker_rpc_including_adapter_not_isolated_native_injection\"}}\n",
+            "{\"event\":\"received\",\"t2_ns\":10,\"t3_ns\":30,\"t4_ns\":40}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n"
+        ));
+        assert_eq!(
+            result["receiver_adapter_timing_scopes"],
+            json!(["worker_rpc_including_adapter_not_isolated_native_injection"])
+        );
+        assert_eq!(result["injection_call"]["samples"], 1);
+        assert_eq!(result["visible_smoothness"], "NOT_MEASURED");
     }
 
     #[test]
