@@ -222,15 +222,22 @@ impl Drop for Identity {
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
-    let file = fs::File::open(path).context("Cannot read identity")?;
+    let mut file = fs::File::open(path).context("Cannot read identity")?;
     ensure!(file.metadata()?.is_file(), "Identity is not a regular file");
-    // Reserve the entire bounded read up front, avoiding reallocations that
-    // could leave freed plaintext buffers outside Zeroizing's ownership.
-    let mut bytes = Zeroizing::new(Vec::with_capacity(limit + 1));
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .context("Cannot read identity")?;
-    ensure!(bytes.len() <= limit, "Identity file exceeds size limit");
+    // Read into a fixed allocation rather than read_to_end: no growth or
+    // reallocations can leave freed plaintext outside Zeroizing's ownership.
+    let mut bytes = Zeroizing::new(vec![0; limit + 1]);
+    let mut length = 0;
+    while length < bytes.len() {
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(count) => length += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("Cannot read identity"),
+        }
+    }
+    ensure!(length <= limit, "Identity file exceeds size limit");
+    bytes.truncate(length);
     Ok(bytes)
 }
 
