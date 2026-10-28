@@ -16,7 +16,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use windows_sys::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_HOTKEY_ALREADY_REGISTERED, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -29,16 +31,65 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, KillTimer,
-    LoadCursorW, MSG, RegisterClassW, SW_SHOWNOACTIVATE, SendMessageW, SetTimer, SetWindowLongPtrW,
-    SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW, WM_CLOSE, WM_COMMAND,
-    WM_HOTKEY, WM_INPUT, WM_NCCREATE, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
-    WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, IDC_ARROW,
+    KillTimer, LoadCursorW, MSG, RegisterClassW, SW_SHOWNOACTIVATE, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW, WM_CLOSE,
+    WM_COMMAND, WM_HOTKEY, WM_INPUT, WM_NCCREATE, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 const TOGGLE: usize = 1;
 const STOP: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowMode {
+    Diagnostics,
+    Headless,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HotkeyStatus {
+    Registered,
+    Conflict,
+}
+
+/// Only a known ownership conflict can degrade to buttons. Preserve every other
+/// failure, including zero/unknown error codes, rather than masking OS failures.
+/// Track successful registrations immediately so later failures still clean up.
+fn record_hotkey_registration(
+    id: i32,
+    shortcut: &str,
+    result: Result<(), u32>,
+    registered: &mut Vec<i32>,
+    window_mode: WindowMode,
+) -> Result<HotkeyStatus, String> {
+    match result {
+        Ok(()) => {
+            registered.push(id);
+            Ok(HotkeyStatus::Registered)
+        }
+        Err(ERROR_HOTKEY_ALREADY_REGISTERED) if window_mode == WindowMode::Diagnostics => {
+            Ok(HotkeyStatus::Conflict)
+        }
+        Err(code) => Err(format!(
+            "RegisterHotKey({shortcut}) failed: {} (Win32 {code})",
+            std::io::Error::from_raw_os_error(code as i32)
+        )),
+    }
+}
+
+fn hotkey_instructions(toggle: HotkeyStatus, stop: HotkeyStatus) -> String {
+    let toggle = match toggle {
+        HotkeyStatus::Registered => "Ctrl + Alt + 空格：开始 / 暂停",
+        HotkeyStatus::Conflict => "Ctrl + Alt + 空格：被占用，不可用；请使用按钮",
+    };
+    let stop = match stop {
+        HotkeyStatus::Registered => "Ctrl + Alt + Esc：停止并退出",
+        HotkeyStatus::Conflict => "Ctrl + Alt + Esc：被占用，不可用；请使用按钮",
+    };
+    format!("{toggle}\r\n{stop}\r\n随时点击“停止并退出”或关闭此窗口即可停止。")
+}
 
 /// Snapshot of the real session state, supplied by the shared core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -685,7 +736,10 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
             WM_TIMER => {}
             _ => {}
         }
-        let display = state.refresh(message != WM_TIMER);
+        let display = slot
+            .controls
+            .get()
+            .and_then(|_| state.refresh(message != WM_TIMER));
         drop(state);
         if let (Some(controls), Some(display)) = (slot.controls.get(), display) {
             controls.render(display);
@@ -769,6 +823,7 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
 
 /// Ctrl+Alt+Space requests Toggle; Ctrl+Alt+Escape emits Stop and ends capture.
 /// A visible control window provides the same actions and real session status.
+/// Conflicting hotkeys are marked unavailable; buttons/window-close still work.
 /// External stop is checked between events with a 10 ms idle wakeup. Callbacks
 /// only collect data; they must not perform network or blocking I/O. Filtering
 /// device-less packets is not proof against all virtual/driver input sources.
@@ -778,7 +833,44 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
     stop: Arc<AtomicBool>,
     duration: Option<Duration>,
 ) -> Result<CaptureStats, String> {
-    run_capture_mode(on_event, status_fn, stop, duration, false)
+    run_capture_mode(
+        on_event,
+        status_fn,
+        || {},
+        stop,
+        duration,
+        false,
+        WindowMode::Diagnostics,
+    )
+}
+
+/// Movement-only capture for a GUI-owned session worker, without diagnostic UI.
+/// Uses a message-only window; both global shortcuts must register successfully
+/// because there are no local fallback buttons. Toggle consults the real session
+/// status, and the caller owns initial/reconnect pause policy. The caller must
+/// set `stop` on parent disconnect; it is checked with a 10 ms idle wakeup.
+/// `on_ready` runs once after input, hotkeys and timer are registered. It must
+/// only publish readiness without blocking; it never runs on setup failure.
+pub fn run_capture_headless_with_status<
+    F: FnMut(CaptureEvent),
+    S: FnMut() -> CaptureStatus,
+    R: FnOnce(),
+>(
+    on_event: F,
+    status_fn: S,
+    on_ready: R,
+    stop: Arc<AtomicBool>,
+    duration: Option<Duration>,
+) -> Result<CaptureStats, String> {
+    run_capture_mode(
+        on_event,
+        status_fn,
+        on_ready,
+        stop,
+        duration,
+        false,
+        WindowMode::Headless,
+    )
 }
 
 /// Experimental physical mouse/keyboard capture. Local events also reach local
@@ -790,15 +882,25 @@ pub fn run_input_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> Captu
     stop: Arc<AtomicBool>,
     duration: Option<Duration>,
 ) -> Result<CaptureStats, String> {
-    run_capture_mode(on_event, status_fn, stop, duration, true)
+    run_capture_mode(
+        on_event,
+        status_fn,
+        || {},
+        stop,
+        duration,
+        true,
+        WindowMode::Diagnostics,
+    )
 }
 
 fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     on_event: F,
     status_fn: S,
+    on_ready: impl FnOnce(),
     stop: Arc<AtomicBool>,
     duration: Option<Duration>,
     full_input: bool,
+    window_mode: WindowMode,
 ) -> Result<CaptureStats, String> {
     if stop.load(Ordering::Acquire) {
         return Ok(CaptureStats::default());
@@ -847,25 +949,44 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         lpfnWndProc: Some(window_proc::<F, S>),
         hInstance: resources.instance,
         lpszClassName: resources.name.as_ptr(),
-        hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-        hbrBackground: (COLOR_WINDOW + 1) as usize as _,
+        hCursor: if window_mode == WindowMode::Diagnostics {
+            unsafe { LoadCursorW(null_mut(), IDC_ARROW) }
+        } else {
+            null_mut()
+        },
+        hbrBackground: if window_mode == WindowMode::Diagnostics {
+            (COLOR_WINDOW + 1) as usize as _
+        } else {
+            null_mut()
+        },
         ..unsafe { std::mem::zeroed() }
     };
     if unsafe { RegisterClassW(&class) } == 0 {
         return Err(win_error("RegisterClassW"));
     }
     resources.registered = true;
+    let (style, x, y, width, height, parent) = match window_mode {
+        WindowMode::Diagnostics => (
+            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            460,
+            320,
+            null_mut(),
+        ),
+        WindowMode::Headless => (0, 0, 0, 0, 0, HWND_MESSAGE),
+    };
     resources.hwnd = unsafe {
         CreateWindowExW(
             0,
             resources.name.as_ptr(),
             wide("Crossflow · 鼠标共享").as_ptr(),
-            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            460,
-            278,
-            null_mut(),
+            style,
+            x,
+            y,
+            width,
+            height,
+            parent,
             null_mut(),
             resources.instance,
             (&*state as *const CallbackState<F, S>).cast(),
@@ -874,76 +995,71 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     if resources.hwnd.is_null() {
         return Err(win_error("CreateWindowExW"));
     }
-    let make_control = |class: &str, text: &str, style, x, y, width, height, id: usize| {
-        let control = unsafe {
-            CreateWindowExW(
-                0,
-                wide(class).as_ptr(),
-                wide(text).as_ptr(),
-                WS_CHILD | WS_VISIBLE | style,
-                x,
-                y,
-                width,
-                height,
-                resources.hwnd,
-                id as _,
-                resources.instance,
-                null(),
-            )
+    let instruction_control = if window_mode == WindowMode::Diagnostics {
+        let make_control = |class: &str, text: &str, style, x, y, width, height, id: usize| {
+            let control = unsafe {
+                CreateWindowExW(
+                    0,
+                    wide(class).as_ptr(),
+                    wide(text).as_ptr(),
+                    WS_CHILD | WS_VISIBLE | style,
+                    x,
+                    y,
+                    width,
+                    height,
+                    resources.hwnd,
+                    id as _,
+                    resources.instance,
+                    null(),
+                )
+            };
+            if control.is_null() {
+                return Err(win_error("CreateWindowExW(control)"));
+            }
+            unsafe {
+                SendMessageW(
+                    control,
+                    WM_SETFONT,
+                    GetStockObject(DEFAULT_GUI_FONT) as usize,
+                    1,
+                );
+            }
+            Ok(control)
         };
-        if control.is_null() {
-            return Err(win_error("CreateWindowExW(control)"));
+        let status = make_control("STATIC", "等待连接", 0, 20, 20, 410, 28, 10)?;
+        // Fill this only after registration results are known. Never advertise a
+        // shortcut as usable when another application owns it.
+        let instruction_control = make_control("STATIC", "", 0, 20, 60, 410, 140, 11)?;
+        let toggle = make_control(
+            "BUTTON",
+            "开始共享",
+            WS_TABSTOP | BS_PUSHBUTTON as u32,
+            20,
+            220,
+            180,
+            34,
+            TOGGLE,
+        )?;
+        make_control(
+            "BUTTON",
+            "停止并退出",
+            WS_TABSTOP | BS_PUSHBUTTON as u32,
+            220,
+            220,
+            180,
+            34,
+            STOP,
+        )?;
+        let controls = Controls { status, toggle };
+        state.controls.set(Some(controls));
+        let display = state.data.borrow_mut().refresh(true);
+        if let Some(display) = display {
+            controls.render(display);
         }
-        unsafe {
-            SendMessageW(
-                control,
-                WM_SETFONT,
-                GetStockObject(DEFAULT_GUI_FONT) as usize,
-                1,
-            );
-        }
-        Ok(control)
-    };
-    let status = make_control("STATIC", "等待连接", 0, 20, 20, 410, 28, 10)?;
-    let lifetime = duration.map_or_else(
-        || "关闭此窗口也会安全停止。".to_owned(),
-        |duration| format!("本次试验将在 {:.0} 秒后自动结束。", duration.as_secs_f64()),
-    );
-    let mode_note = if full_input {
-        "实验模式：键盘/点击也会转发；Windows 本地输入仍生效。"
+        Some(instruction_control)
     } else {
-        "仅共享移动，不转发点击；本机光标仍会移动。"
+        None
     };
-    let instructions = format!(
-        "Ctrl + Alt + 空格：开始 / 暂停\r\nCtrl + Alt + Esc：停止并退出\r\n{mode_note}\r\n{lifetime}"
-    );
-    make_control("STATIC", &instructions, 0, 20, 60, 410, 100, 11)?;
-    let toggle = make_control(
-        "BUTTON",
-        "开始共享",
-        WS_TABSTOP | BS_PUSHBUTTON as u32,
-        20,
-        180,
-        180,
-        34,
-        TOGGLE,
-    )?;
-    make_control(
-        "BUTTON",
-        "停止并退出",
-        WS_TABSTOP | BS_PUSHBUTTON as u32,
-        220,
-        180,
-        180,
-        34,
-        STOP,
-    )?;
-    let controls = Controls { status, toggle };
-    state.controls.set(Some(controls));
-    let display = state.data.borrow_mut().refresh(true);
-    if let Some(display) = display {
-        controls.render(display);
-    }
     let device = RAWINPUTDEVICE {
         usUsagePage: 1,
         usUsage: 2,
@@ -967,8 +1083,12 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         }
         resources.raw_keyboard = true;
     }
-    for (id, key) in [(TOGGLE as i32, VK_SPACE), (STOP as i32, VK_ESCAPE)] {
-        if unsafe {
+    let mut hotkey_states = [HotkeyStatus::Conflict; 2];
+    for (state, (id, key, shortcut)) in hotkey_states.iter_mut().zip([
+        (TOGGLE as i32, VK_SPACE, "Ctrl+Alt+Space"),
+        (STOP as i32, VK_ESCAPE, "Ctrl+Alt+Escape"),
+    ]) {
+        let result = if unsafe {
             RegisterHotKey(
                 resources.hwnd,
                 id,
@@ -977,17 +1097,36 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
             )
         } == 0
         {
-            return Err(format!(
-                "{}; check desktop permissions or a conflicting Ctrl+Alt+{} binding",
-                win_error("RegisterHotKey"),
-                if id == TOGGLE as i32 {
-                    "Space"
-                } else {
-                    "Escape"
-                }
-            ));
+            // Read the error exactly once before any formatting or other APIs.
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(())
+        };
+        *state =
+            record_hotkey_registration(id, shortcut, result, &mut resources.hotkeys, window_mode)?;
+        if *state == HotkeyStatus::Conflict {
+            eprintln!(
+                "{shortcut} is unavailable (already registered by another application). Use the Crossflow buttons; Stop or closing its window always exits."
+            );
         }
-        resources.hotkeys.push(id);
+    }
+    if let Some(instruction_control) = instruction_control {
+        let lifetime = duration.map_or_else(
+            || "关闭此窗口也会安全停止。".to_owned(),
+            |duration| format!("本次试验将在 {:.0} 秒后自动结束。", duration.as_secs_f64()),
+        );
+        let mode_note = if full_input {
+            "实验模式：键盘/点击也会转发；Windows 本地输入仍生效。"
+        } else {
+            "仅共享移动，不转发点击；本机光标仍会移动。"
+        };
+        let instructions = format!(
+            "{}\r\n{mode_note}\r\n{lifetime}",
+            hotkey_instructions(hotkey_states[0], hotkey_states[1]),
+        );
+        if unsafe { SetWindowTextW(instruction_control, wide(&instructions).as_ptr()) } == 0 {
+            return Err(win_error("SetWindowTextW(shortcut instructions)"));
+        }
     }
     if full_input {
         // Registration is already live: messages continue queuing while this
@@ -1006,8 +1145,14 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         return Err(win_error("SetTimer"));
     }
     // Display once without taking focus; never force activation on status updates.
-    unsafe {
-        ShowWindow(resources.hwnd, SW_SHOWNOACTIVATE);
+    if window_mode == WindowMode::Diagnostics {
+        unsafe {
+            ShowWindow(resources.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+    if !state.stop.load(Ordering::Acquire) && catch_unwind(AssertUnwindSafe(on_ready)).is_err() {
+        state.stop.store(true, Ordering::Release);
+        return Err("capture ready callback panicked; stopped safely".into());
     }
     let started = Instant::now();
     let mut message = MaybeUninit::<MSG>::zeroed();
@@ -1056,6 +1201,194 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_hotkeys_require_both_successes_and_keep_partial_cleanup() {
+        for (failing_id, name) in [(TOGGLE, "Ctrl+Alt+Space"), (STOP, "Ctrl+Alt+Escape")] {
+            for code in [ERROR_HOTKEY_ALREADY_REGISTERED, 0, 5, 87, u32::MAX] {
+                let mut registered = Vec::new();
+                if failing_id == STOP {
+                    assert_eq!(
+                        record_hotkey_registration(
+                            TOGGLE as i32,
+                            "Ctrl+Alt+Space",
+                            Ok(()),
+                            &mut registered,
+                            WindowMode::Headless,
+                        )
+                        .unwrap(),
+                        HotkeyStatus::Registered
+                    );
+                }
+                let error = record_hotkey_registration(
+                    failing_id as i32,
+                    name,
+                    Err(code),
+                    &mut registered,
+                    WindowMode::Headless,
+                )
+                .unwrap_err();
+                assert!(error.contains(name));
+                assert!(error.contains(&format!("(Win32 {code})")));
+                let expected = if failing_id == STOP {
+                    vec![TOGGLE as i32]
+                } else {
+                    vec![]
+                };
+                assert_eq!(registered, expected);
+            }
+        }
+        let mut registered = Vec::new();
+        for id in [TOGGLE, STOP] {
+            assert_eq!(
+                record_hotkey_registration(
+                    id as i32,
+                    "shortcut",
+                    Ok(()),
+                    &mut registered,
+                    WindowMode::Headless,
+                )
+                .unwrap(),
+                HotkeyStatus::Registered
+            );
+        }
+        assert_eq!(registered, vec![TOGGLE as i32, STOP as i32]);
+    }
+
+    #[test]
+    fn headless_stopped_or_invalid_start_never_signals_ready_or_samples_input() {
+        for pre_stopped in [false, true] {
+            let result = run_capture_headless_with_status(
+                |_| panic!("must not sample input"),
+                || panic!("must not query status"),
+                || panic!("must not signal ready"),
+                Arc::new(AtomicBool::new(pre_stopped)),
+                Some(Duration::ZERO),
+            );
+            if pre_stopped {
+                assert_eq!(result.unwrap().packets, 0);
+            } else {
+                assert_eq!(result.unwrap_err(), "capture duration must be positive");
+            }
+        }
+    }
+
+    #[test]
+    fn hotkey_conflicts_keep_only_successful_registrations_for_cleanup() {
+        for toggle_conflict in [false, true] {
+            for stop_conflict in [false, true] {
+                let mut registered = Vec::new();
+                let mut states = Vec::new();
+                for (id, conflict) in [(TOGGLE, toggle_conflict), (STOP, stop_conflict)] {
+                    states.push(
+                        record_hotkey_registration(
+                            id as i32,
+                            "test shortcut",
+                            if conflict {
+                                Err(ERROR_HOTKEY_ALREADY_REGISTERED)
+                            } else {
+                                Ok(())
+                            },
+                            &mut registered,
+                            WindowMode::Diagnostics,
+                        )
+                        .unwrap(),
+                    );
+                }
+                let expected: Vec<i32> = [(TOGGLE, toggle_conflict), (STOP, stop_conflict)]
+                    .into_iter()
+                    .filter_map(|(id, conflict)| (!conflict).then_some(id as i32))
+                    .collect();
+                assert_eq!(registered, expected);
+                assert_eq!(states[0] == HotkeyStatus::Conflict, toggle_conflict);
+                assert_eq!(states[1] == HotkeyStatus::Conflict, stop_conflict);
+                let instructions = hotkey_instructions(states[0], states[1]);
+                assert_eq!(
+                    instructions.contains("空格：被占用，不可用"),
+                    toggle_conflict
+                );
+                assert_eq!(instructions.contains("Esc：被占用，不可用"), stop_conflict);
+                assert_eq!(instructions.contains("空格：开始 / 暂停"), !toggle_conflict);
+                assert_eq!(instructions.contains("Esc：停止并退出"), !stop_conflict);
+                assert!(instructions.contains("点击“停止并退出”或关闭此窗口"));
+            }
+        }
+    }
+
+    #[test]
+    fn non_conflict_hotkey_errors_fail_without_losing_cleanup_or_error_code() {
+        // Includes absent/unknown codes, access denied, invalid parameters/window,
+        // and resource exhaustion. Only the explicit conflict code may degrade.
+        for code in [0, 5, 87, 1400, 1450, u32::MAX] {
+            let mut registered = Vec::new();
+            record_hotkey_registration(
+                TOGGLE as i32,
+                "Ctrl+Alt+Space",
+                Ok(()),
+                &mut registered,
+                WindowMode::Diagnostics,
+            )
+            .unwrap();
+            let error = record_hotkey_registration(
+                STOP as i32,
+                "Ctrl+Alt+Escape",
+                Err(code),
+                &mut registered,
+                WindowMode::Diagnostics,
+            )
+            .unwrap_err();
+            assert!(error.contains("RegisterHotKey(Ctrl+Alt+Escape)"));
+            assert!(error.contains(&format!("(Win32 {code})")));
+            assert_eq!(registered, vec![TOGGLE as i32]);
+        }
+    }
+
+    #[test]
+    fn unavailable_shortcuts_do_not_arm_or_disable_local_stop() {
+        for status in [
+            CaptureStatus::Disconnected,
+            CaptureStatus::Ready,
+            CaptureStatus::Active,
+        ] {
+            let events = RefCell::new(Vec::new());
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut state = State {
+                callback: |event| events.borrow_mut().push(event),
+                status_fn: || status,
+                connected_once: false,
+                displayed: None,
+                refreshed_at: None,
+                stop: stop.clone(),
+                stats: CaptureStats::default(),
+                error: None,
+                full_input: false,
+                shortcuts: ShortcutFilter::default(),
+            };
+            let mut registered = Vec::new();
+            for id in [TOGGLE, STOP] {
+                record_hotkey_registration(
+                    id as i32,
+                    "test shortcut",
+                    Err(ERROR_HOTKEY_ALREADY_REGISTERED),
+                    &mut registered,
+                    WindowMode::Diagnostics,
+                )
+                .unwrap();
+            }
+            state.refresh(true);
+            assert!(
+                events.borrow().is_empty(),
+                "registration/refresh must not arm"
+            );
+            assert!(!stop.load(Ordering::Acquire));
+            // Both the Stop button and WM_CLOSE route to this exact command,
+            // independent of any successful global hotkey registration.
+            state.command(STOP);
+            assert!(stop.load(Ordering::Acquire));
+            assert!(matches!(events.borrow().as_slice(), [CaptureEvent::Stop]));
+        }
+    }
+
     fn packet(dx: i32, dy: i32) -> RAWINPUT {
         let mut raw: RAWINPUT = unsafe { std::mem::zeroed() };
         raw.header.dwSize = (size_of::<RAWINPUTHEADER>() + size_of::<RAWMOUSE>()) as u32;

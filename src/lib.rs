@@ -1,4 +1,5 @@
 pub mod arrangement;
+pub mod desktop;
 pub mod injection_worker;
 pub mod input;
 pub mod metrics;

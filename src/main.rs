@@ -26,6 +26,20 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Private native-client session; inherited pipes carry controls, not input.
+    #[command(hide = true)]
+    DesktopSend {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long, default_value_t = 3600.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 1000)]
+        max_hz: u32,
+    },
     /// Private inherited-pipe input owner. Never connects to the network.
     #[command(hide = true)]
     InputWorker {
@@ -168,7 +182,10 @@ fn main() -> Result<()> {
     // Keep the handler alive until workers, adapters and log writers finish.
     let _shutdown = if matches!(
         &args.command,
-        Command::Receive { .. } | Command::Send { .. } | Command::Capture { .. }
+        Command::Receive { .. }
+            | Command::Send { .. }
+            | Command::Capture { .. }
+            | Command::DesktopSend { .. }
     ) {
         Some(crossflow::shutdown::Shutdown::install(stop.clone())?)
     } else {
@@ -177,6 +194,37 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
     match args.command {
+        Command::DesktopSend {
+            host,
+            identity,
+            log,
+            seconds,
+            max_hz,
+        } => {
+            let mut meta = metadata("native_client_sender");
+            meta["host"] = json!(host);
+            meta["desktop_control_protocol"] = json!(1);
+            meta["duration_seconds"] = json!(seconds);
+            meta["max_hz"] = json!(max_hz);
+            let writer = LogWriter::new(&log, meta)?;
+            #[cfg(windows)]
+            crossflow::desktop::run(
+                crossflow::desktop::Options {
+                    host,
+                    identity,
+                    seconds,
+                    max_hz,
+                },
+                writer,
+                stop,
+            )?;
+            #[cfg(not(windows))]
+            {
+                let _ = (host, identity, seconds, max_hz);
+                writer.finish()?;
+                anyhow::bail!("native client sending currently requires Windows");
+            }
+        }
         Command::InputWorker { gain } => {
             // This private child owns its process: do not print panic payloads
             // (which could contain input) or block cleanup on stderr output.

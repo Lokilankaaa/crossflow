@@ -16,6 +16,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreLockedMode>true</RestoreLockedMode>
   </PropertyGroup>
@@ -26,7 +27,8 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="../../design-tokens.json" Link="design-tokens.json" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="../../../examples/layout-two-devices.json" Link="sample-layout.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../../examples/layout-four-screens.json" Link="sample-layout.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="../../../target/release/crossflow_bridge.dll" Link="crossflow_bridge.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../target/release/crossflow_bridge.dll')" />
+    <Content Include="../../../target/release/crossflow.exe" Link="crossflow.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../target/release/crossflow.exe')" />
   </ItemGroup>
 </Project>
