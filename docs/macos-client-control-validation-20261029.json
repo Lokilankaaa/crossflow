@@ -1,6 +1,23 @@
 {
   "date_local": "2026-10-29",
-  "status": "native client integration implemented; first combined native validation pending",
+  "status": "native compile, process/model tests and isolated Keychain tests passed; attended user-device acceptance pending",
+  "native_validation": {
+    "head_commit": "6155f1c3f5348a7fdc0021d99a6e619614e59d2c",
+    "run_url": "https://github.com/Lokilankaaa/crossflow/actions/runs/40762826773",
+    "job_id": 123078991248,
+    "result": "success",
+    "environment": "GitHub-hosted arm64 macOS; not the user's Mac",
+    "swift_xctest_passed": 26,
+    "model_tests": 4,
+    "protocol_tests": 7,
+    "discovery_tests": 4,
+    "layout_tests": 6,
+    "native_process_tests": 5,
+    "release_build_and_signature": "passed",
+    "packaged_bridge_self_test": "passed",
+    "isolated_keychain_script": "passed; random test entries reopened and removed, helper built for this native runner",
+    "local_job_log": "runs/mac-ci-job-123078991248.txt"
+  },
   "branch": "feature/macos-client-control",
   "base_receiver_commit": "2b859982016a62f570b706073fcf399f1962c27a",
   "behavior": [
@@ -13,7 +30,7 @@
     "Pairing success is bound to the explicitly approved peer fingerprint and actual child completion",
     "Post-save/cancel refresh is queued if an earlier peer query is still running"
   ],
-  "tests_prepared": [
+  "tests_executed": [
     "Strict wire parsing and command bounds",
     "Actual native process pipes, EOF/cancellation, malformed output and forced cleanup",
     "Immediate invite-stop/shutdown before launch and approved identity binding",
@@ -21,7 +38,7 @@
     "Isolated native Keychain tests on the ephemeral CI runner"
   ],
   "not_proven": [
-    "Combined SwiftUI compile and XCTest results for these new files",
+    "Production invitation/receiver workers driven through the actual native device page",
     "Native window appearance, permissions and interaction on the user's Mac",
     "Actual Windows-to-Mac code pairing through both UIs",
     "Physical key/button release and Escape behavior",

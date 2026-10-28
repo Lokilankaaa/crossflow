@@ -1,6 +1,6 @@
 # Crossflow for macOS
 
-Native SwiftUI layout editor and nearby-device browser, built with SwiftPM and
+Native SwiftUI layout editor and device connection page, built with SwiftPM and
 packaged as a macOS app. The layout editor remains the default opening page.
 The editor preserves unknown JSON fields for Rust to reject; layout validation
 and crossing decisions run through the bundled `crossflow-bridge` C ABI.
@@ -24,7 +24,7 @@ copied to `Contents/MacOS/crossflow` and signed before the containing app.
 The script does not silently use older `target/release` artifacts.
 Neither script launches input sharing.
 
-## Managed identity storage (native validation pending)
+## Managed identity storage
 
 The shared Rust core now supports the Mac role in its managed peer store at
 `~/Library/Application Support/Crossflow/peers`. Secret identity bytes are stored
@@ -57,9 +57,11 @@ Tests use `CROSSFLOW_KEYCHAIN_HELPER` to select the absolute freshly built binar
 normal packaged calls find it beside the executable. The app packaging script
 copies and signs that native helper along with the shared bridge.
 
-Neither the native tests nor the packaged Mac Keychain workflow has run yet.
-The Mac pairing invitation worker is implemented but has not run natively;
-the invitation UI remains pending. A crash after Keychain add
+The native invitation UI is now wired to the worker. Combined native compilation,
+26 XCTest cases and isolated Keychain tests pass on the GitHub macOS runner.
+Actual UI-driven pairing and signing/ACL continuity on the user's Mac remain
+unverified; the isolated storage checks do not prove that complete workflow.
+A crash after Keychain add
 but before locator commit can orphan an item, and a metadata commit failure can
 leave an uncommitted peer directory; full recovery/revocation is not implemented.
 
@@ -71,8 +73,8 @@ input session starts during a build. The private worker protocol is documented
 in the [pairing workspace](../../experiments/pairing-spake2/rust-pairing/README.md).
 Its saved result explicitly reports `input_ready:false`. The core now supports
 `receive --peer <id>` to resolve managed credentials without asking the user for
-an identity file. Native UI receiver startup and packaging of the core executable
-are still separate integration work; the current app cannot yet drive this flow.
+an identity file. The device page starts this receiver through its supervised
+control channel and the core executable is packaged beside the UI.
 
 The app bundles the canonical `clients/design-tokens.json` and shared layouts
 from `examples/`. The four-screen example contains two devices; these are
@@ -94,46 +96,58 @@ Run `swift test --package-path clients/macos` with an SDK providing XCTest. The
 previously available Mac Command Line Tools lacked that module; `--self-test`
 does not require XCTest.
 
-This discovery change was prepared on Windows without a Swift compiler. It has
-**not been compiled or executed on macOS**: the new self-test and XCTest cases,
-Swift 6 concurrency checks, bundled child launch/signature, network permission
-prompt, actual LAN results, cancel/quit behavior and UI rendering still need
-native validation. Script syntax and plist parsing are static checks only.
+The combined device-page change was prepared on Windows. Native CI checks Swift 6
+compilation, child process fixtures, protocol/model tests, discovery and layout
+regressions. Network permissions, actual LAN results, window close/quit behavior
+and rendered UI still need verification on the user's Mac. Static checks alone
+are not native validation.
 
 After the build and self-test commands above pass on a Mac, open the app and
-choose **附近设备**. Check first entry, refresh, stop, leave/re-enter and quit while
-scanning against another device advertising Crossflow. A valid empty result is
+choose **附近设备** in the sidebar to open the device page. Check first entry,
+refresh, stop, leave/re-enter and quit while scanning against another device
+advertising Crossflow. A valid empty result is
 different from a failed scan. Keep native results with the tested revision.
 
 ## Current scope
 
-Native CI on GitHub's arm64 macOS runner now passes for `26909c2`: release
-SwiftUI/package build, all six XCTest cases, packaged bridge self-test and app
-signature verification. The invitation and Keychain helpers also link natively.
-This updates the earlier build-only limitations above; their native storage and
-invitation-process behavior, and the user's Mac UI/input remain untested.
-See [native CI evidence](../../docs/macos-native-ci-validation-20261029.json).
+Native CI on GitHub's arm64 macOS runner passes for `6155f1c`: release
+SwiftUI/package build, all 26 XCTest cases, packaged bridge self-test, app
+signature verification and isolated Keychain checks. Invitation-process behavior
+through the actual UI, and the user's Mac window/input remain untested.
+See [combined native evidence](../../docs/macos-client-control-validation-20261029.json).
 
 The core's opt-in [receiver control channel](../../docs/receiver-client-control.md)
-adds parent-EOF stop and actual lifecycle status for the next UI integration.
-The current SwiftUI screen does not yet launch it.
+passed native Mac process tests at `2b85998`. The current SwiftUI device page
+uses it for explicit start/stop; actual window and cross-device interaction
+remain to be validated.
 
 - Select and drag individual screens, edit draft properties, undo/redo, and
   import/export JSON using native file panels.
 - Edits invalidate validation. Late validation responses are discarded, and
   export validates its exact snapshot before presenting the save panel.
-- The nearby-device page runs the bundled Rust CLI with `discover --seconds 3`
-  on entry and refresh, showing names, platforms and unpaired status from its
-  result. Pairing is visibly disabled; discovery does not authorize input.
+- The device page browses nearby services, generates a short-lived Mac invitation,
+  displays the authenticated Windows peer and requires explicit approval. A saved
+  identity must match that approved peer. The code is cleared on cancellation or
+  completion and never logged or passed in process arguments.
+- Saved-device selection resolves managed credentials internally. Reception starts
+  only on the explicit button. Movement-only input is the default; keyboard,
+  buttons and scroll require the experimental checkbox. Window closure and quit
+  close the parent control channel and await cleanup.
+- Private process supervision uses bounded nonblocking pipes, null stderr and
+  generic errors. Forced or unconfirmed receiver termination prevents restart in
+  that client instance. Paired records refresh after success or cancellation,
+  including cancellation during an already-authorized save.
 - Discovery has an eight-second child deadline, bounded pipe output, strict JSON
   validation and cooperative cancellation with bounded termination escalation.
   Failed child cleanup retains its slot and prevents a second scan. App quit
   waits for cleanup; if cleanup cannot be confirmed, quit is cancelled and the
   page offers another stop attempt.
-- The app declares its local-network use and `_crossflow._tcp` Bonjour service.
+- The app declares its local-network use and `_crossflow._tcp` and
+  `_crossflow-pair._tcp` Bonjour services.
   IP addresses and identifiers are not part of the nearby-device workflow.
-- The bridge still exposes layout operations only. Pairing, session control,
-  and applying a layout to an input session are not connected to this Mac UI.
+- The C bridge still exposes layout operations only. Pairing and session control
+  use the packaged Rust processes; applying a draft layout to an input session
+  remains separate work.
 - The packaged build uses the shared light palette. A native screenshot and
   interaction pass for the updated four-screen build remain to be performed.
 
