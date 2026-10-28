@@ -98,6 +98,8 @@ jobs:
           mkdir -p runs/ci
           dist/Crossflow.app/Contents/MacOS/CrossflowMac --self-test "$PWD/runs/ci/macos-ui-self-test.json"
           codesign --verify --deep --strict dist/Crossflow.app
+      - name: Native protected identity tests
+        run: sh scripts/validate-mac-keychain.sh --offline
       - name: Preserve non-secret self-test report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -13,5 +13,5 @@
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
     <key>NSLocalNetworkUsageDescription</key><string>Crossflow 使用局域网查找附近设备。发现不会自动配对或开启输入共享。</string>
-    <key>NSBonjourServices</key><array><string>_crossflow._tcp</string></array>
+    <key>NSBonjourServices</key><array><string>_crossflow._tcp</string><string>_crossflow-pair._tcp</string></array>
 </dict></plist>

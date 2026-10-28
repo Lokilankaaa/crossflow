@@ -3,6 +3,7 @@ import SwiftUI
 struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
     let discovery: DiscoveryModel
+    let devices: DeviceModel
     @ViewState private var showDetails = false
     @ViewState private var showingDevices = false
 
@@ -14,7 +15,7 @@ struct WorkspaceView: View {
                 sidebar.frame(width: Theme.sidebarWidth)
                 Divider().overlay(Theme.border)
                 if showingDevices {
-                    DiscoveryView(model: discovery)
+                    DeviceView(model: devices, discovery: discovery)
                 } else {
                     VStack(alignment: .leading, spacing: 18) {
                         heading
@@ -32,7 +33,8 @@ struct WorkspaceView: View {
                 Image(systemName: "doc.text").foregroundStyle(Theme.secondary)
                 Text(model.banner).lineLimit(1)
                 Spacer()
-                Text(showingDevices ? "仅发现设备 · 未启动输入共享" : "仅编辑布局 · 未启动输入共享")
+                Text(devices.operation != nil ? devices.message : "布局草稿 · 在设备页开始共享")
+                    .lineLimit(1)
             }
             .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
             .padding(.horizontal, 18).padding(.vertical, 10)
@@ -127,8 +129,8 @@ struct WorkspaceView: View {
             }
             Spacer(minLength: 0)
             VStack(alignment: .leading, spacing: 9) {
-                StatusBadge(title: "会话尚未接入")
-                Text(Theme.copy("session_unavailable", fallback: "共享会话尚未接入"))
+                StatusBadge(title: devices.isSharing ? "共享中" : "设备连接", active: devices.isSharing)
+                Text(devices.message)
                     .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                 Text(model.isExample ? Theme.copy("sample_notice", fallback: "示例屏幕，不代表已发现的设备。") : "布局中的设备尚未连接。")
                     .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)

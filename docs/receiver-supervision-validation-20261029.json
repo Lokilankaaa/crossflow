@@ -2,7 +2,16 @@
   "date": "2026-10-29",
   "base_commit": "26909c206e07f12efe1b88162ee5577f35b86a14",
   "source_state": "receiver supervision changes committed with this report",
-  "status": "Windows verified, native Mac CI pending for this change",
+  "status": "Windows and native Mac CI passed; user-device input remains untested",
+  "mac_native": {
+    "head_commit": "2b859982016a62f570b706073fcf399f1962c27a",
+    "run_url": "https://github.com/Lokilankaaa/crossflow/actions/runs/40760579158",
+    "result": "success",
+    "core_unit_passed": 153,
+    "real_drysink_child_process_tests_passed": 5,
+    "explicit_observer_tcp_test_passed": 1,
+    "local_job_log": "runs/mac-ci-job-123071081425.txt"
+  },
   "behavior": {
     "opt_in": "receive --control-stdio",
     "commands": "stop only; EOF requests cooperative stop; invalid control fails closed",
@@ -49,7 +58,6 @@
     "runs/receiver-supervision-apple-check-20261029.txt"
   ],
   "remaining": [
-    "Run the new process/observer tests on native macOS",
     "Wire native SwiftUI start/stop and parent-window lifetime to the receiver channel",
     "Validate Mac permissions, actual release and Escape",
     "Complete Windows/Mac local/ShareMouse/Crossflow visible-motion acceptance"

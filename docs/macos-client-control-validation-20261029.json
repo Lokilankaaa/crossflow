@@ -1,0 +1,30 @@
+{
+  "date_local": "2026-10-29",
+  "status": "native client integration implemented; first combined native validation pending",
+  "branch": "feature/macos-client-control",
+  "base_receiver_commit": "2b859982016a62f570b706073fcf399f1962c27a",
+  "behavior": [
+    "Native device page displays a short-lived invitation code and requires explicit confirmation of the authenticated peer",
+    "Paired devices are read from the managed store; no manual IP or identity-file controls",
+    "Receive starts the bundled shared Rust core with the selected managed peer and LAN discovery",
+    "Movement-only input is default; experimental keyboard/buttons/scroll require a separate checkbox",
+    "Closing the owning window or quitting requests receiver cleanup; termination requires confirmation",
+    "Bounded private process pipes, null stderr and fixed generic errors",
+    "Pairing success is bound to the explicitly approved peer fingerprint and actual child completion",
+    "Post-save/cancel refresh is queued if an earlier peer query is still running"
+  ],
+  "tests_prepared": [
+    "Strict wire parsing and command bounds",
+    "Actual native process pipes, EOF/cancellation, malformed output and forced cleanup",
+    "Immediate invite-stop/shutdown before launch and approved identity binding",
+    "Existing discovery and layout XCTest cases",
+    "Isolated native Keychain tests on the ephemeral CI runner"
+  ],
+  "not_proven": [
+    "Combined SwiftUI compile and XCTest results for these new files",
+    "Native window appearance, permissions and interaction on the user's Mac",
+    "Actual Windows-to-Mac code pairing through both UIs",
+    "Physical key/button release and Escape behavior",
+    "Local/ShareMouse/Crossflow visible mouse comparison"
+  ]
+}

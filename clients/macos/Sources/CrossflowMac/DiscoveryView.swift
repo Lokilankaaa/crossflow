@@ -66,14 +66,16 @@ final class DiscoveryModel {
 @MainActor
 final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate {
     let discovery = DiscoveryModel()
+    let devices = DeviceModel()
     private var awaitingShutdown = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !awaitingShutdown else { return .terminateLater }
         awaitingShutdown = true
         Task {
-            let stopped = await discovery.shutdown()
+            let devicesStopped = await devices.shutdown()
+            let discoveryStopped = await discovery.shutdown()
             awaitingShutdown = false
-            sender.reply(toApplicationShouldTerminate: stopped)
+            sender.reply(toApplicationShouldTerminate: devicesStopped && discoveryStopped)
         }
         return .terminateLater
     }
