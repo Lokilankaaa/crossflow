@@ -1,9 +1,13 @@
 import Darwin
 import Foundation
 
+protocol BridgeRequesting: Sendable {
+    func request(_ value: JSONValue) async throws -> JSONValue
+}
+
 /// The native UI owns bytes; Rust owns all layout validation and crossing logic.
 /// This actor serializes C calls away from the main actor. No capture or receive API exists here.
-actor BridgeClient {
+actor BridgeClient: BridgeRequesting {
     typealias VersionFunction = @convention(c) () -> UInt32
     typealias RequestFunction = @convention(c) (
         UnsafePointer<UInt8>?, Int, UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>?

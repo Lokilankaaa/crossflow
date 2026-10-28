@@ -87,20 +87,21 @@ struct LayoutDocument: Equatable, Sendable {
         extra = root // Preserve unknown fields so Rust can reject them; never silently strip them.
     }
 
-    static var example: Self {
-        Self(screens: [
-            ScreenDraft(screenID: "windows-main", deviceID: "windows", x: 0, y: 0, width: 1920, height: 1080),
-            ScreenDraft(screenID: "mac-main", deviceID: "mac", x: 1920, y: 100, width: 1470, height: 956)
-        ])
+    static func bundledExample() throws -> Self {
+        guard let url = Bundle.main.url(forResource: "layout-two-devices", withExtension: "json") else {
+            throw DocumentError.sampleMissing
+        }
+        return try Self(data: Data(contentsOf: url))
     }
 }
 
 enum DocumentError: LocalizedError {
-    case shape, tooLarge
+    case shape, tooLarge, sampleMissing
     var errorDescription: String? {
         switch self {
         case .shape: "无法读取布局结构。需要 screens 数组，以及每个屏幕的 ID、设备 ID 和数值坐标、尺寸。"
         case .tooLarge: "文件超过 1 MiB，请选择较小的布局 JSON。"
+        case .sampleMissing: "应用包缺少共享示例布局，请重新构建客户端。"
         }
     }
 }

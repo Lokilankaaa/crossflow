@@ -62,7 +62,7 @@ struct WorkspaceView: View {
                 .disabled(!model.canRedo).help("重做 ⇧⌘Z").accessibilityLabel("重做")
             Button("导入…", systemImage: "square.and.arrow.down") { model.importDocument() }
                 .accessibilityIdentifier("import-layout")
-            Button("导出草稿…", systemImage: "square.and.arrow.up") { model.exportDocument() }
+            Button("导出草稿…", systemImage: "square.and.arrow.up") { Task { await model.exportDocument() } }
                 .buttonStyle(.borderedProminent).accessibilityIdentifier("export-layout")
         }
         .buttonStyle(.bordered).padding(.horizontal, 20).padding(.vertical, 14)

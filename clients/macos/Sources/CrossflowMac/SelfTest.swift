@@ -12,15 +12,17 @@ enum SelfTest {
             details["environment"] = environment
             checks["bridge_api_v1"] = environment["api_version"]?.number == 1 && environment["ok"] == .bool(true)
 
-            let layout = LayoutDocument.example.json
+            let example = try LayoutDocument.bundledExample()
+            guard example.screens.count == 2 else { throw DocumentError.shape }
+            let layout = example.json
             let valid = try await bridge.request(.object(["op": .string("layout_validate"), "layout": layout]))
             checks["valid_layout_accepted"] = valid["ok"] == .bool(true)
-            var overlap = LayoutDocument.example
+            var overlap = example
             overlap.screens[1].x = 1900
             let invalid = try await bridge.request(.object(["op": .string("layout_validate"), "layout": overlap.json]))
             checks["overlap_rejected"] = invalid["ok"] == .bool(false)
 
-            var unknown = LayoutDocument.example
+            var unknown = example
             unknown.extra["extra"] = .bool(true)
             let decoded = try LayoutDocument(data: unknown.json.data())
             checks["unknown_fields_preserved"] = decoded.extra["extra"] == .bool(true)
@@ -37,7 +39,7 @@ enum SelfTest {
             // The result shape is checked against the frozen bridge response in integration.
             checks["crossing_request_succeeds"] = crossing["ok"] == .bool(true)
 
-            var tinyOverlap = LayoutDocument.example
+            var tinyOverlap = example
             tinyOverlap.screens[1].x = 1920.0.nextDown
             let tinyResult = try await bridge.request(.object(["op": .string("layout_validate"), "layout": tinyOverlap.json]))
             checks["one_ulp_overlap_rejected"] = tinyResult["ok"] == .bool(false)

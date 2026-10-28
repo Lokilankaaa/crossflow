@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 @MainActor @Observable
 final class WorkspaceModel {
-    var document = LayoutDocument.example
+    var document = LayoutDocument(screens: [])
     var selectedID: UUID?
     var isExample = true
     var documentName = "双屏工作台"
@@ -18,12 +18,16 @@ final class WorkspaceModel {
     var validationPassed = false
     var validating = false
     var environmentJSON = ""
-    @ObservationIgnored let bridge = BridgeClient()
+    @ObservationIgnored let bridge: any BridgeRequesting
     private var undoStack: [LayoutDocument] = []
     private var redoStack: [LayoutDocument] = []
     @ObservationIgnored private var revision = 0
 
-    init() { selectedID = document.screens.first?.id }
+    init(bridge: any BridgeRequesting = BridgeClient(), initialDocument: LayoutDocument? = nil) {
+        self.bridge = bridge
+        do { document = try initialDocument ?? .bundledExample(); selectedID = document.screens.first?.id }
+        catch { banner = error.localizedDescription }
+    }
     var selectedScreen: ScreenDraft? { document.screens.first { $0.id == selectedID } }
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
@@ -73,9 +77,12 @@ final class WorkspaceModel {
         if selectedScreen == nil { selectedID = document.screens.first?.id }
     }
     func loadExample() {
-        checkpoint(); document = .example; selectedID = document.screens.first?.id
-        isExample = true; documentName = "双屏工作台"; changed(); fitGeneration += 1
-        banner = "已载入示例布局 · 设备信息不是在线发现结果。"
+        do {
+            let example = try LayoutDocument.bundledExample()
+            checkpoint(); document = example; selectedID = document.screens.first?.id
+            isExample = true; documentName = "双屏工作台"; changed(); fitGeneration += 1
+            banner = "已载入示例布局 · 设备信息不是在线发现结果。"
+        } catch { alertMessage = error.localizedDescription }
     }
     func importDocument() {
         let panel = NSOpenPanel()
@@ -94,16 +101,29 @@ final class WorkspaceModel {
             banner = "已导入布局草稿。设备连接状态尚未接入。"
         } catch { alertMessage = error.localizedDescription }
     }
-    func exportDocument() {
+    func exportDocument() async {
+        let snapshot = document
+        let snapshotRevision = revision
         do {
-            let data = try document.json.data(pretty: true)
+            // Always ask Rust about this exact export snapshot; never reuse an older valid badge.
+            var snapshotPassed = false
+            if bridgeAvailable {
+                let response = try await bridge.request(.object(["op": .string("layout_validate"), "layout": snapshot.json]))
+                guard snapshotRevision == revision else {
+                    banner = "布局已更改，请重新导出当前草稿。"; return
+                }
+                snapshotPassed = response["ok"] == .bool(true)
+                validationPassed = snapshotPassed
+                validationMessage = snapshotPassed ? "Rust 校验通过" : "Rust 未通过：\(response["error"]?["message"]?.string ?? "布局无效")"
+            }
+            let data = try snapshot.json.data(pretty: true)
             let panel = NSSavePanel(); panel.allowedContentTypes = [.json]
             panel.nameFieldStringValue = "crossflow-layout.json"
-            panel.message = validationPassed ? "导出已通过 Rust 校验的布局。" : "导出未校验草稿；不会应用到设备。"
+            panel.message = snapshotPassed ? "导出已通过 Rust 校验的布局。" : "导出未通过校验或未校验的草稿；不会应用到设备。"
             guard panel.runModal() == .OK, let url = panel.url else { return }
             try data.write(to: url, options: .atomic)
-            hasChanges = false
-            banner = validationPassed ? "布局已导出。" : "未校验草稿已导出。"
+            if snapshotRevision == revision { hasChanges = false }
+            banner = snapshotPassed ? "布局已导出。" : "草稿已导出，尚不可应用。"
         } catch { alertMessage = error.localizedDescription }
     }
     func refreshBridge() async {
