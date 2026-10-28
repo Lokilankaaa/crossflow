@@ -26,11 +26,13 @@ param(
     [int]$MaxHz = 1000,
     [ValidateNotNullOrEmpty()]
     [string]$LogDirectory = 'runs',
-    [switch]$DryRunSynthetic
+    [switch]$DryRunSynthetic,
+    [switch]$ExperimentalInputs
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($DryRunSynthetic -and $ExperimentalInputs) { throw 'ExperimentalInputs cannot be combined with DryRunSynthetic.' }
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $binary = Join-Path $projectRoot 'target/release/crossflow.exe'
 
@@ -81,7 +83,12 @@ if ($DryRunSynthetic) {
 } else {
     Write-Host 'Start the Mac receiver first. Sharing starts PAUSED, including after reconnect.'
     Write-Host 'Ctrl+Alt+Space: start/pause. Ctrl+Alt+Esc: stop. The control window offers the same actions.'
-    Write-Host 'Movement only: clicks are not shared, and the Windows cursor still moves.'
+    if ($ExperimentalInputs) {
+        $nativeArguments += '--experimental-inputs'
+        Write-Warning 'EXPERIMENTAL KEYS/BUTTONS/WHEEL: Windows local input still acts locally. Start with a Mac DrySink; live actions require --inject --inject-actions on the Mac.'
+    } else {
+        Write-Host 'Movement only: clicks are not shared, and the Windows cursor still moves.'
+    }
 }
 # Splat a real argument array; never build a shell command or Invoke-Expression.
 & $binary @nativeArguments

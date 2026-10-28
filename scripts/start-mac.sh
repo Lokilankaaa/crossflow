@@ -10,6 +10,7 @@ Usage: sh scripts/start-mac.sh --bind IP:PORT [options]
   --gain N           Positive decimal <=10 (default: 1; used with --inject)
   --log-dir DIR      Directory for unique logs (default: runs)
   --inject           Explicitly enable macOS cursor movement; default is DrySink
+  --inject-actions   Experimental keyboard/buttons/wheel; also requires --inject
   --help             Show help without starting a receiver
 
 Example: sh scripts/start-mac.sh --bind 192.168.50.2:24800 --inject
@@ -26,6 +27,7 @@ seconds=180
 gain=1
 log_directory=runs
 inject=false
+inject_actions=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --bind) need_value "$@"; bind_address=$2; shift 2 ;;
@@ -34,10 +36,12 @@ while [ "$#" -gt 0 ]; do
         --gain) need_value "$@"; gain=$2; shift 2 ;;
         --log-dir) need_value "$@"; log_directory=$2; shift 2 ;;
         --inject) inject=true; shift ;;
+        --inject-actions) inject_actions=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) fail "Unknown option: $1 (use --help)" ;;
     esac
 done
+[ "$inject_actions" != true ] || [ "$inject" = true ] || fail '--inject-actions requires --inject.'
 [ -n "$bind_address" ] || fail 'Supply --bind with the Mac interface IP and port, e.g. 192.168.50.2:24800.'
 case "$bind_address" in *:*) ;; *) fail '--bind must include a port, e.g. 192.168.50.2:24800.' ;; esac
 case "$seconds" in ''|*[!0-9]*) fail '--seconds must be an integer from 1 to 3600.' ;; esac
@@ -59,6 +63,10 @@ set -- receive --bind "$bind_address" --identity "$identity" --log "$log_path" -
 printf 'Crossflow receiver: %s | %s seconds | gain %s\nLog: %s\n' "$bind_address" "$seconds" "$gain" "$log_path"
 if [ "$inject" = true ]; then
     set -- "$@" --inject
+    if [ "$inject_actions" = true ]; then
+        set -- "$@" --inject-actions
+        printf '%s\n' 'EXPERIMENTAL INPUT: keys/buttons/wheel enabled. Forced process termination cleanup is not guaranteed; use only an attended test.'
+    fi
     printf '%s\n' 'LIVE CURSOR MODE: only use a physical Windows sender, not -DryRunSynthetic.'
     printf '%s\n' 'Allow required macOS permissions. Hold Escape on the Mac to stop; Ctrl+C also exits.'
     printf '%s\n' 'On Windows, Ctrl+Alt+Space starts/pauses sharing; Ctrl+Alt+Esc stops it.'

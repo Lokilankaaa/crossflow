@@ -18,7 +18,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Crossflow Rust phase 0 — movement-only measurement prototype"
+    about = "Crossflow Rust phase 0 — shared input and measurement prototype"
 )]
 struct Args {
     #[command(subcommand)]
@@ -43,6 +43,9 @@ enum Command {
         seconds: f64,
         #[arg(long)]
         inject: bool,
+        /// Experimental keyboard/buttons/scroll injection; requires explicit OS injection.
+        #[arg(long, requires = "inject")]
+        inject_actions: bool,
         #[arg(long, default_value_t = 1.0)]
         gain: f64,
     },
@@ -60,6 +63,9 @@ enum Command {
         max_hz: u32,
         #[arg(long)]
         synthetic: bool,
+        /// Experimental keys/buttons/wheel. Local Windows input is not suppressed.
+        #[arg(long, conflicts_with = "synthetic")]
+        experimental_inputs: bool,
     },
     /// Capture cadence only; does not open a network connection or inject input.
     Capture {
@@ -112,6 +118,7 @@ fn metadata(mode: &str) -> serde_json::Value {
         "build_unix_seconds":env!("CROSSFLOW_BUILD_UNIX_SECONDS"),
         "run_started_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d|d.as_millis()),
         "transport":"Noise_KK_25519_ChaChaPoly_BLAKE2s over TCP_NODELAY",
+        "wire_version":crossflow::protocol::WIRE_VERSION,
         "movement_only":true,"visible_metrics":"not measured by software timestamps"
     })
 }
@@ -213,6 +220,7 @@ fn main() -> Result<()> {
             log,
             seconds,
             inject,
+            inject_actions,
             gain,
         } => {
             valid_duration(seconds)?;
@@ -228,6 +236,8 @@ fn main() -> Result<()> {
             meta["gain"] = json!(gain);
             meta["bind"] = json!(bind);
             meta["duration_seconds"] = json!(seconds);
+            meta["experimental_input_actions"] = json!(inject_actions);
+            meta["movement_only"] = json!(inject && !inject_actions);
             #[cfg(target_os = "macos")]
             {
                 meta["platform"] = crossflow::platform::macos::environment();
@@ -236,25 +246,61 @@ fn main() -> Result<()> {
             let result = if inject {
                 #[cfg(target_os = "macos")]
                 {
-                    struct Native(crossflow::platform::macos::MacMouseSink);
-                    impl session::MouseSink for Native {
-                        fn reset(&mut self) -> Result<()> {
-                            self.0.reset().map_err(|e| anyhow::anyhow!(e.to_string()))
+                    (|| -> Result<()> {
+                        struct Native(crossflow::platform::macos::MacMouseSink, bool);
+                        impl session::MouseSink for Native {
+                            fn reset(&mut self) -> Result<()> {
+                                self.0.reset().map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                                self.0
+                                    .move_by(x, y)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                            fn emergency_pressed(&self) -> bool {
+                                self.0.emergency_pressed()
+                            }
+                            fn button(
+                                &mut self,
+                                button: crossflow::input::Button,
+                                down: bool,
+                            ) -> Result<()> {
+                                if !self.1 {
+                                    ensure!(!down, "button injection requires --inject-actions");
+                                    return Ok(());
+                                }
+                                self.0
+                                    .button(button, down)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                            fn key(&mut self, usage: u16, down: bool) -> Result<()> {
+                                if !self.1 {
+                                    ensure!(!down, "keyboard injection requires --inject-actions");
+                                    return Ok(());
+                                }
+                                self.0
+                                    .key(usage, down)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                            fn scroll(&mut self, horizontal: i32, vertical: i32) -> Result<()> {
+                                ensure!(self.1, "scroll injection requires --inject-actions");
+                                self.0
+                                    .scroll(horizontal, vertical)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
+                            fn release_owned(&mut self) -> Result<()> {
+                                self.0
+                                    .release_owned()
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
                         }
-                        fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
-                            self.0
-                                .move_by(x, y)
-                                .map_err(|e| anyhow::anyhow!(e.to_string()))
-                        }
-                        fn emergency_pressed(&self) -> bool {
-                            self.0.emergency_pressed()
-                        }
-                    }
-                    let mut sink = Native(
-                        crossflow::platform::macos::MacMouseSink::new(gain)
-                            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-                    );
-                    session::receive(&bind, &identity, &mut sink, writer.log.clone(), seconds)
+                        let mut sink = Native(
+                            crossflow::platform::macos::MacMouseSink::new(gain)
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                            inject_actions,
+                        );
+                        session::receive(&bind, &identity, &mut sink, writer.log.clone(), seconds)
+                    })()
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -271,6 +317,12 @@ fn main() -> Result<()> {
                 );
                 r
             };
+            if let Err(error) = &result {
+                writer.log.write(
+                    "error",
+                    json!({"stage":"receiver_exit","message":format!("{error:#}")}),
+                );
+            }
             writer.finish()?;
             result?;
         }
@@ -281,6 +333,7 @@ fn main() -> Result<()> {
             seconds,
             max_hz,
             synthetic,
+            experimental_inputs,
         } => {
             valid_duration(seconds)?;
             let mut meta = metadata(if synthetic {
@@ -291,42 +344,51 @@ fn main() -> Result<()> {
             meta["max_hz"] = json!(max_hz);
             meta["host"] = json!(host);
             meta["duration_seconds"] = json!(seconds);
+            meta["experimental_input_actions"] = json!(experimental_inputs);
+            meta["movement_only"] = json!(!experimental_inputs);
             let writer = LogWriter::new(&log, meta)?;
-            let motion = Arc::new(Mutex::new(Motion::default()));
-            let stop = Arc::new(AtomicBool::new(false));
-            let m = motion.clone();
-            let s = stop.clone();
-            let l = writer.log.clone();
-            let worker = thread::spawn(move || {
-                let result = session::send(
-                    session::SendOptions {
-                        host: &host,
-                        bundle: &identity,
-                        seconds,
-                        max_hz,
-                        synthetic,
-                    },
-                    m,
-                    s.clone(),
-                    l,
-                );
-                s.store(true, Ordering::Relaxed);
-                result
-            });
-            let capture_result = if !synthetic {
-                run_capture(motion, stop.clone(), writer.log.clone(), seconds, false)
+            if experimental_inputs {
+                let result =
+                    run_ordered_sender(host, identity, seconds, max_hz, writer.log.clone());
+                writer.finish()?;
+                result?;
             } else {
-                Ok(())
-            };
-            if capture_result.is_err() {
-                stop.store(true, Ordering::Relaxed)
+                let motion = Arc::new(Mutex::new(Motion::default()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let m = motion.clone();
+                let s = stop.clone();
+                let l = writer.log.clone();
+                let worker = thread::spawn(move || {
+                    let result = session::send(
+                        session::SendOptions {
+                            host: &host,
+                            bundle: &identity,
+                            seconds,
+                            max_hz,
+                            synthetic,
+                        },
+                        m,
+                        s.clone(),
+                        l,
+                    );
+                    s.store(true, Ordering::Relaxed);
+                    result
+                });
+                let capture_result = if !synthetic {
+                    run_capture(motion, stop.clone(), writer.log.clone(), seconds, false)
+                } else {
+                    Ok(())
+                };
+                if capture_result.is_err() {
+                    stop.store(true, Ordering::Relaxed)
+                }
+                let result = worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("sender thread panicked"))?;
+                writer.finish()?;
+                capture_result?;
+                result?;
             }
-            let result = worker
-                .join()
-                .map_err(|_| anyhow::anyhow!("sender thread panicked"))?;
-            writer.finish()?;
-            capture_result?;
-            result?;
         }
         Command::Capture { log, seconds } => {
             valid_duration(seconds)?;
@@ -343,6 +405,132 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_ordered_sender(
+    host: String,
+    identity: PathBuf,
+    seconds: f64,
+    max_hz: u32,
+    log: crossflow::metrics::Log,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use crossflow::input::{CaptureOutcome, SourceInputQueue};
+        use crossflow::platform::windows::{
+            CaptureEvent, CaptureStatus, run_input_capture_with_status,
+        };
+        eprintln!(
+            "Experimental keyboard/buttons/wheel enabled. Windows local input is NOT suppressed; start with a DrySink receiver. Sharing remains paused until you explicitly enable it."
+        );
+        let input = Arc::new(Mutex::new(SourceInputQueue::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let network_input = input.clone();
+        let network_stop = stop.clone();
+        let network_log = log.clone();
+        let worker = thread::spawn(move || {
+            let result = session::send_ordered(
+                session::SendOptions {
+                    host: &host,
+                    bundle: &identity,
+                    seconds,
+                    max_hz,
+                    synthetic: false,
+                },
+                network_input,
+                network_stop.clone(),
+                network_log,
+            );
+            network_stop.store(true, Ordering::Release);
+            result
+        });
+        let event_input = input.clone();
+        let event_stop = stop.clone();
+        let state_input = input.clone();
+        let result = run_input_capture_with_status(
+            move |event| {
+                let mut source = event_input.lock().unwrap();
+                let outcome = match event {
+                    CaptureEvent::Delta {
+                        dx,
+                        dy,
+                        captured_at,
+                    } => {
+                        let t0 = log.at(captured_at);
+                        log.write("capture", json!({"t0_ns":t0}));
+                        source.move_by(dx as f64, dy as f64, t0)
+                    }
+                    CaptureEvent::Button {
+                        button,
+                        down,
+                        captured_at,
+                    } => source.button(button, down, log.at(captured_at)),
+                    CaptureEvent::Key {
+                        usage,
+                        down,
+                        captured_at,
+                    } => source.key(usage, down, log.at(captured_at)),
+                    CaptureEvent::Scroll {
+                        horizontal,
+                        vertical,
+                        captured_at,
+                    } => source.scroll(horizontal, vertical, log.at(captured_at)),
+                    CaptureEvent::Snapshot { buttons, keys } => {
+                        if source.seed_physical_held(buttons, keys).is_err() {
+                            source.capture_reset();
+                            log.write("error", json!({"stage":"physical_snapshot","message":"Could not initialize paused physical input state"}));
+                            event_stop.store(true, Ordering::Release);
+                        }
+                        CaptureOutcome::Ignored
+                    }
+                    CaptureEvent::Toggle => {
+                        if source.is_active() {
+                            source.pause();
+                        } else {
+                            source.arm();
+                        }
+                        log.write("toggle", json!({"active":source.is_active()}));
+                        CaptureOutcome::Ignored
+                    }
+                    CaptureEvent::Stop => {
+                        source.pause();
+                        event_stop.store(true, Ordering::Release);
+                        CaptureOutcome::Ignored
+                    }
+                };
+                if let CaptureOutcome::Paused(reason) = outcome {
+                    log.write(
+                        "input_queue_paused",
+                        json!({"reason":format!("{reason:?}")}),
+                    );
+                }
+            },
+            move || {
+                let source = state_input.lock().unwrap();
+                if !source.is_connected() {
+                    CaptureStatus::Disconnected
+                } else if source.is_active() {
+                    CaptureStatus::Active
+                } else {
+                    CaptureStatus::Ready
+                }
+            },
+            stop.clone(),
+            Some(std::time::Duration::from_secs_f64(seconds)),
+        );
+        input.lock().unwrap().capture_reset();
+        stop.store(true, Ordering::Release);
+        let network = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("ordered sender thread panicked"))?;
+        result.map_err(|e| anyhow::anyhow!(e))?;
+        network
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (host, identity, seconds, max_hz, log);
+        anyhow::bail!("experimental physical input capture currently requires Windows")
+    }
 }
 
 fn run_capture(
@@ -383,6 +571,8 @@ fn run_capture(
                 CaptureEvent::Stop => {
                     callback_stop.store(true, Ordering::Relaxed);
                 }
+                // Expanded capture is opt-in and is not registered by this path.
+                _ => {}
             },
             move || {
                 if capture_only {

@@ -1,9 +1,11 @@
-//! Movement-only Windows Raw Input capture. Source cursor is never suppressed
-//! or confined. No buttons or keyboard events are forwarded. The dedicated
-//! process owns its mouse Raw Input registration; callbacks must be nonblocking.
+//! Windows Raw Input capture. Compatibility entry points capture movement only;
+//! the explicit full-input entry point also captures buttons, wheel and keys.
+//! Local input is never suppressed or confined. Callbacks must be nonblocking.
 
+use crate::input::Button;
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeSet,
     ffi::c_void,
     mem::{MaybeUninit, size_of},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -18,11 +20,11 @@ use windows_sys::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRES
 use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
-    VK_SPACE,
+    EnableWindow, GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+    MapVirtualKeyW, RegisterHotKey, UnregisterHotKey, VK_ESCAPE, VK_SPACE,
 };
 use windows_sys::Win32::UI::Input::{
-    GetRawInputData, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT,
+    GetRawInputData, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RAWMOUSE, RID_INPUT,
     RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -88,7 +90,7 @@ impl Controls {
             DisplayStatus::CaptureOnly => ("仅采集测试 · 不向其他设备共享", "开始共享", false),
             DisplayStatus::Waiting => ("等待连接 · 连接成功后可开始共享", "开始共享", false),
             DisplayStatus::Ready => ("已连接 · 等待开启", "开始共享", true),
-            DisplayStatus::Active => ("正在共享 · 移动鼠标可控制 Mac", "暂停共享", true),
+            DisplayStatus::Active => ("正在共享输入", "暂停共享", true),
             DisplayStatus::Disconnected => ("断线暂停 · 重连后请手动开始共享", "开始共享", false),
         };
         unsafe {
@@ -99,12 +101,32 @@ impl Controls {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum CaptureEvent {
     /// Relative device counts, before Windows pointer acceleration.
     Delta {
         dx: i32,
         dy: i32,
+        captured_at: Instant,
+    },
+    /// Initial physical held state; emitted only by the full-input entry point.
+    Snapshot {
+        buttons: Vec<Button>,
+        keys: Vec<u16>,
+    },
+    Button {
+        button: Button,
+        down: bool,
+        captured_at: Instant,
+    },
+    Key {
+        usage: u16,
+        down: bool,
+        captured_at: Instant,
+    },
+    Scroll {
+        horizontal: i32,
+        vertical: i32,
         captured_at: Instant,
     },
     Toggle,
@@ -121,7 +143,275 @@ pub struct CaptureStats {
     pub non_mouse: u64,
     pub malformed: u64,
     pub read_errors: u64,
+    pub keyboard: u64,
+    pub buttons: u64,
+    pub wheel: u64,
+    pub unsupported_keys: u64,
+    pub overruns: u64,
+    pub local_shortcuts: u64,
     pub elapsed: Duration,
+}
+
+// Scan Set 1 to HID page 0x07. This is a physical-position map, not text.
+// Microsoft reference: https://learn.microsoft.com/windows/win32/inputdev/about-keyboard-input
+const SCAN_TO_HID: &[(u16, u16)] = &[
+    (0x01, 0x29),
+    (0x02, 0x1e),
+    (0x03, 0x1f),
+    (0x04, 0x20),
+    (0x05, 0x21),
+    (0x06, 0x22),
+    (0x07, 0x23),
+    (0x08, 0x24),
+    (0x09, 0x25),
+    (0x0a, 0x26),
+    (0x0b, 0x27),
+    (0x0c, 0x2d),
+    (0x0d, 0x2e),
+    (0x0e, 0x2a),
+    (0x0f, 0x2b),
+    (0x10, 0x14),
+    (0x11, 0x1a),
+    (0x12, 0x08),
+    (0x13, 0x15),
+    (0x14, 0x17),
+    (0x15, 0x1c),
+    (0x16, 0x18),
+    (0x17, 0x0c),
+    (0x18, 0x12),
+    (0x19, 0x13),
+    (0x1a, 0x2f),
+    (0x1b, 0x30),
+    (0x1c, 0x28),
+    (0x1d, 0xe0),
+    (0x1e, 0x04),
+    (0x1f, 0x16),
+    (0x20, 0x07),
+    (0x21, 0x09),
+    (0x22, 0x0a),
+    (0x23, 0x0b),
+    (0x24, 0x0d),
+    (0x25, 0x0e),
+    (0x26, 0x0f),
+    (0x27, 0x33),
+    (0x28, 0x34),
+    (0x29, 0x35),
+    (0x2a, 0xe1),
+    (0x2b, 0x31),
+    (0x2c, 0x1d),
+    (0x2d, 0x1b),
+    (0x2e, 0x06),
+    (0x2f, 0x19),
+    (0x30, 0x05),
+    (0x31, 0x11),
+    (0x32, 0x10),
+    (0x33, 0x36),
+    (0x34, 0x37),
+    (0x35, 0x38),
+    (0x36, 0xe5),
+    (0x37, 0x55),
+    (0x38, 0xe2),
+    (0x39, 0x2c),
+    (0x3a, 0x39),
+    (0x3b, 0x3a),
+    (0x3c, 0x3b),
+    (0x3d, 0x3c),
+    (0x3e, 0x3d),
+    (0x3f, 0x3e),
+    (0x40, 0x3f),
+    (0x41, 0x40),
+    (0x42, 0x41),
+    (0x43, 0x42),
+    (0x44, 0x43),
+    (0x45, 0x53),
+    (0x46, 0x47),
+    (0x47, 0x5f),
+    (0x48, 0x60),
+    (0x49, 0x61),
+    (0x4a, 0x56),
+    (0x4b, 0x5c),
+    (0x4c, 0x5d),
+    (0x4d, 0x5e),
+    (0x4e, 0x57),
+    (0x4f, 0x59),
+    (0x50, 0x5a),
+    (0x51, 0x5b),
+    (0x52, 0x62),
+    (0x53, 0x63),
+    (0x54, 0x46),
+    (0x56, 0x64),
+    (0x57, 0x44),
+    (0x58, 0x45),
+    (0xe01c, 0x58),
+    (0xe01d, 0xe4),
+    (0xe035, 0x54),
+    (0xe037, 0x46),
+    (0xe038, 0xe6),
+    (0xe045, 0x53),
+    (0xe047, 0x4a),
+    (0xe048, 0x52),
+    (0xe049, 0x4b),
+    (0xe04b, 0x50),
+    (0xe04d, 0x4f),
+    (0xe04f, 0x4d),
+    (0xe050, 0x51),
+    (0xe051, 0x4e),
+    (0xe052, 0x49),
+    (0xe053, 0x4c),
+    (0xe05b, 0xe3),
+    (0xe05c, 0xe7),
+    (0xe05d, 0x65),
+];
+fn scan_to_hid(scan: u16) -> Option<u16> {
+    SCAN_TO_HID
+        .iter()
+        .find_map(|&(code, usage)| (code == scan).then_some(usage))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InputPacket {
+    Mouse {
+        dx: i32,
+        dy: i32,
+        flags: u16,
+        wheel: i32,
+    },
+    Key {
+        usage: u16,
+        down: bool,
+    },
+    Absolute,
+    DeviceLess,
+    Other,
+    UnsupportedKey,
+    Malformed,
+    Overrun,
+}
+
+fn decode_input(raw: &RAWINPUT, bytes: u32, map_vk: impl Fn(u16) -> u16) -> InputPacket {
+    if bytes < size_of::<RAWINPUTHEADER>() as u32 {
+        return InputPacket::Malformed;
+    }
+    let payload = match raw.header.dwType {
+        0 => size_of::<RAWMOUSE>(),
+        1 => size_of::<RAWKEYBOARD>(),
+        _ => return InputPacket::Other,
+    };
+    let required = (size_of::<RAWINPUTHEADER>() + payload) as u32;
+    if bytes < required || raw.header.dwSize < required || raw.header.dwSize > bytes {
+        return InputPacket::Malformed;
+    }
+    if raw.header.hDevice.is_null() {
+        return InputPacket::DeviceLess;
+    }
+    if raw.header.dwType == 0 {
+        let mouse = unsafe { raw.data.mouse };
+        if mouse.usFlags & 1 != 0 {
+            return InputPacket::Absolute;
+        }
+        let buttons = unsafe { mouse.Anonymous.Anonymous };
+        if buttons.usButtonFlags & !0x0fff != 0 {
+            return InputPacket::Malformed;
+        }
+        return InputPacket::Mouse {
+            dx: mouse.lLastX,
+            dy: mouse.lLastY,
+            flags: buttons.usButtonFlags,
+            wheel: buttons.usButtonData as i16 as i32,
+        };
+    }
+    let keyboard = unsafe { raw.data.keyboard };
+    if keyboard.MakeCode == 0xff {
+        return InputPacket::Overrun;
+    }
+    if keyboard.Reserved != 0 || keyboard.Flags & !7 != 0 || keyboard.Flags & 6 == 6 {
+        return InputPacket::Malformed;
+    }
+    if keyboard.VKey >= 0xff || keyboard.VKey == 0x13 {
+        return InputPacket::UnsupportedKey;
+    }
+    // E1 Pause has no ordinary, consistent break sequence. Do not manufacture
+    // a held key from it. Multimedia/vendor/IME keys are also unsupported here.
+    if keyboard.Flags & 4 != 0 {
+        return InputPacket::UnsupportedKey;
+    }
+    let scan = if keyboard.MakeCode == 0 {
+        map_vk(keyboard.VKey)
+    } else {
+        if keyboard.MakeCode > 0x7f {
+            return InputPacket::Malformed;
+        }
+        keyboard.MakeCode | if keyboard.Flags & 2 != 0 { 0xe000 } else { 0 }
+    };
+    match scan_to_hid(scan) {
+        Some(usage) => InputPacket::Key {
+            usage,
+            down: keyboard.Flags & 1 == 0,
+        },
+        None => InputPacket::UnsupportedKey,
+    }
+}
+
+const BUTTON_FLAGS: [(Button, u16, u16); 5] = [
+    (Button::Left, 1, 2),
+    (Button::Right, 4, 8),
+    (Button::Middle, 16, 32),
+    (Button::Back, 64, 128),
+    (Button::Forward, 256, 512),
+];
+const BUTTON_VKS: [(Button, i32); 5] = [
+    (Button::Left, 1),
+    (Button::Right, 2),
+    (Button::Middle, 4),
+    (Button::Back, 5),
+    (Button::Forward, 6),
+];
+
+fn physical_snapshot(
+    mut held: impl FnMut(i32) -> bool,
+    map_vk: impl Fn(u16) -> u16,
+) -> (Vec<Button>, Vec<u16>) {
+    let buttons = BUTTON_VKS
+        .iter()
+        .filter_map(|&(button, vk)| held(vk).then_some(button))
+        .collect();
+    let mut keys = BTreeSet::new();
+    for vk in 8..=254u16 {
+        // Skip aggregate Shift/Ctrl/Alt: the individual sides are sampled below.
+        if matches!(vk, 0x10..=0x13) || !held(vk as i32) {
+            continue;
+        }
+        if let Some(usage) = scan_to_hid(map_vk(vk)) {
+            keys.insert(usage);
+        }
+    }
+    (buttons, keys.into_iter().collect())
+}
+
+#[derive(Default)]
+struct ShortcutFilter {
+    held: BTreeSet<u16>,
+    suppressed: BTreeSet<u16>,
+}
+impl ShortcutFilter {
+    fn observe(&mut self, usage: u16, down: bool) -> bool {
+        let chord = (self.held.contains(&0xe0) || self.held.contains(&0xe4))
+            && (self.held.contains(&0xe2) || self.held.contains(&0xe6));
+        let suppress = if down && chord && matches!(usage, 0x2c | 0x29) {
+            self.suppressed.insert(usage);
+            true
+        } else if !down {
+            self.suppressed.remove(&usage)
+        } else {
+            self.suppressed.contains(&usage)
+        };
+        if down {
+            self.held.insert(usage);
+        } else {
+            self.held.remove(&usage);
+        }
+        suppress
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -168,6 +458,8 @@ struct State<F, S> {
     stop: Arc<AtomicBool>,
     stats: CaptureStats,
     error: Option<String>,
+    full_input: bool,
+    shortcuts: ShortcutFilter,
 }
 struct CallbackState<F, S> {
     data: RefCell<State<F, S>>,
@@ -220,6 +512,9 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
         Some(display)
     }
     fn emit(&mut self, event: CaptureEvent) {
+        if self.stop.load(Ordering::Acquire) {
+            return;
+        }
         // A panic may not unwind over the Windows callback boundary.
         if catch_unwind(AssertUnwindSafe(|| (self.callback)(event))).is_err() {
             self.error = Some("capture callback panicked; stopped safely".into());
@@ -229,7 +524,8 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
     fn read(&mut self, handle: LPARAM, captured_at: Instant) {
         let mut raw = MaybeUninit::<RAWINPUT>::zeroed();
         let mut size = size_of::<RAWINPUT>() as u32;
-        // Only mouse usage is registered; unexpected oversized packets fail.
+        // RAWINPUT covers the registered mouse and optional keyboard payloads;
+        // unexpected oversized packets fail rather than reading partial data.
         let bytes = unsafe {
             GetRawInputData(
                 handle as *mut c_void,
@@ -248,6 +544,13 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
         self.stats.packets += 1;
         // All union bytes are initialized, including bytes not set by Windows.
         let raw = unsafe { raw.assume_init() };
+        if self.full_input {
+            let packet = decode_input(&raw, bytes, |vk| unsafe {
+                MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) as u16
+            });
+            self.input_packet(packet, captured_at);
+            return;
+        }
         match decode(&raw, bytes) {
             Packet::Motion(dx, dy) => {
                 self.stats.motion += 1;
@@ -264,6 +567,74 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
             Packet::Malformed => {
                 self.stats.malformed += 1;
                 self.error = Some("malformed Raw Input packet; stopped safely".into());
+                self.stop.store(true, Ordering::Release);
+            }
+        }
+    }
+    fn input_packet(&mut self, packet: InputPacket, captured_at: Instant) {
+        match packet {
+            InputPacket::Mouse {
+                dx,
+                dy,
+                flags,
+                wheel,
+            } => {
+                // A raw packet has one timestamp and no finer ordering. Use an
+                // explicit movement -> button transitions -> wheel convention.
+                if dx != 0 || dy != 0 {
+                    self.stats.motion += 1;
+                    self.emit(CaptureEvent::Delta {
+                        dx,
+                        dy,
+                        captured_at,
+                    });
+                } else {
+                    self.stats.zero_motion += 1;
+                }
+                for (button, down_flag, up_flag) in BUTTON_FLAGS {
+                    for (flag, down) in [(down_flag, true), (up_flag, false)] {
+                        if flags & flag != 0 {
+                            self.stats.buttons += 1;
+                            self.emit(CaptureEvent::Button {
+                                button,
+                                down,
+                                captured_at,
+                            });
+                        }
+                    }
+                }
+                if flags & 0x0c00 != 0 && wheel != 0 {
+                    self.stats.wheel += 1;
+                    self.emit(CaptureEvent::Scroll {
+                        horizontal: if flags & 0x0800 != 0 { wheel } else { 0 },
+                        vertical: if flags & 0x0400 != 0 { wheel } else { 0 },
+                        captured_at,
+                    });
+                }
+            }
+            InputPacket::Key { usage, down } => {
+                self.stats.keyboard += 1;
+                if self.shortcuts.observe(usage, down) {
+                    self.stats.local_shortcuts += 1;
+                } else {
+                    self.emit(CaptureEvent::Key {
+                        usage,
+                        down,
+                        captured_at,
+                    });
+                }
+            }
+            InputPacket::Absolute => self.stats.absolute += 1,
+            InputPacket::DeviceLess => self.stats.device_less += 1,
+            InputPacket::Other => self.stats.non_mouse += 1,
+            InputPacket::UnsupportedKey => self.stats.unsupported_keys += 1,
+            InputPacket::Malformed | InputPacket::Overrun => {
+                if packet == InputPacket::Overrun {
+                    self.stats.overruns += 1;
+                } else {
+                    self.stats.malformed += 1;
+                }
+                self.error = Some("invalid or overrun Raw Input packet; stopped safely".into());
                 self.stop.store(true, Ordering::Release);
             }
         }
@@ -345,6 +716,7 @@ struct Resources {
     registered: bool,
     hwnd: HWND,
     raw: bool,
+    raw_keyboard: bool,
     hotkeys: Vec<i32>,
     timer: usize,
 }
@@ -361,6 +733,15 @@ impl Drop for Resources {
                 let remove = RAWINPUTDEVICE {
                     usUsagePage: 1,
                     usUsage: 2,
+                    dwFlags: RIDEV_REMOVE,
+                    hwndTarget: null_mut(),
+                };
+                RegisterRawInputDevices(&remove, 1, size_of::<RAWINPUTDEVICE>() as u32);
+            }
+            if self.raw_keyboard {
+                let remove = RAWINPUTDEVICE {
+                    usUsagePage: 1,
+                    usUsage: 6,
                     dwFlags: RIDEV_REMOVE,
                     hwndTarget: null_mut(),
                 };
@@ -397,6 +778,28 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
     stop: Arc<AtomicBool>,
     duration: Option<Duration>,
 ) -> Result<CaptureStats, String> {
+    run_capture_mode(on_event, status_fn, stop, duration, false)
+}
+
+/// Experimental physical mouse/keyboard capture. Local events also reach local
+/// applications. Snapshot, Button, Key and Scroll are emitted only in this mode.
+/// The caller must seed physical state before enabling its shared input queue.
+pub fn run_input_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
+    on_event: F,
+    status_fn: S,
+    stop: Arc<AtomicBool>,
+    duration: Option<Duration>,
+) -> Result<CaptureStats, String> {
+    run_capture_mode(on_event, status_fn, stop, duration, true)
+}
+
+fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
+    on_event: F,
+    status_fn: S,
+    stop: Arc<AtomicBool>,
+    duration: Option<Duration>,
+    full_input: bool,
+) -> Result<CaptureStats, String> {
     if stop.load(Ordering::Acquire) {
         return Ok(CaptureStats::default());
     }
@@ -420,6 +823,8 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
             stop: stop.clone(),
             stats: CaptureStats::default(),
             error: None,
+            full_input,
+            shortcuts: ShortcutFilter::default(),
         }),
         controls: Cell::new(None),
         stop,
@@ -431,6 +836,7 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
         registered: false,
         hwnd: null_mut(),
         raw: false,
+        raw_keyboard: false,
         hotkeys: Vec::new(),
         timer: 0,
     };
@@ -503,8 +909,13 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
         || "关闭此窗口也会安全停止。".to_owned(),
         |duration| format!("本次试验将在 {:.0} 秒后自动结束。", duration.as_secs_f64()),
     );
+    let mode_note = if full_input {
+        "实验模式：键盘/点击也会转发；Windows 本地输入仍生效。"
+    } else {
+        "仅共享移动，不转发点击；本机光标仍会移动。"
+    };
     let instructions = format!(
-        "Ctrl + Alt + 空格：开始 / 暂停\r\nCtrl + Alt + Esc：停止并退出\r\n仅共享移动，不转发点击；本机光标仍会移动。\r\n{lifetime}"
+        "Ctrl + Alt + 空格：开始 / 暂停\r\nCtrl + Alt + Esc：停止并退出\r\n{mode_note}\r\n{lifetime}"
     );
     make_control("STATIC", &instructions, 0, 20, 60, 410, 100, 11)?;
     let toggle = make_control(
@@ -543,6 +954,19 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
         return Err(win_error("RegisterRawInputDevices"));
     }
     resources.raw = true;
+    if full_input {
+        let keyboard = RAWINPUTDEVICE {
+            usUsagePage: 1,
+            usUsage: 6,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: resources.hwnd,
+        };
+        if unsafe { RegisterRawInputDevices(&keyboard, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0
+        {
+            return Err(win_error("RegisterRawInputDevices(keyboard)"));
+        }
+        resources.raw_keyboard = true;
+    }
     for (id, key) in [(TOGGLE as i32, VK_SPACE), (STOP as i32, VK_ESCAPE)] {
         if unsafe {
             RegisterHotKey(
@@ -564,6 +988,18 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
             ));
         }
         resources.hotkeys.push(id);
+    }
+    if full_input {
+        // Registration is already live: messages continue queuing while this
+        // bounded startup snapshot is sampled. Never use the unreliable low
+        // "pressed since last call" bit, and never log the actual held keys.
+        let (buttons, keys) = physical_snapshot(
+            |vk| unsafe { GetAsyncKeyState(vk) < 0 },
+            |vk| unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) as u16 },
+        );
+        let mut state = state.data.borrow_mut();
+        state.shortcuts.held.extend(keys.iter().copied());
+        state.emit(CaptureEvent::Snapshot { buttons, keys });
     }
     resources.timer = unsafe { SetTimer(resources.hwnd, 1, 10, None) };
     if resources.timer == 0 {
@@ -669,6 +1105,8 @@ mod tests {
             stop: stop.clone(),
             stats: CaptureStats::default(),
             error: None,
+            full_input: false,
+            shortcuts: ShortcutFilter::default(),
         };
         state.emit(CaptureEvent::Toggle);
         assert!(stop.load(Ordering::Acquire));
@@ -714,6 +1152,8 @@ mod tests {
             stop: stop.clone(),
             stats: CaptureStats::default(),
             error: None,
+            full_input: false,
+            shortcuts: ShortcutFilter::default(),
         };
         state.command(TOGGLE);
         assert!(events.borrow().is_empty());
@@ -728,5 +1168,203 @@ mod tests {
         assert!(matches!(events.borrow().last(), Some(CaptureEvent::Stop)));
         state.command(TOGGLE);
         assert_eq!(events.borrow().len(), 2);
+    }
+
+    fn keyboard(scan: u16, flags: u16) -> RAWINPUT {
+        let mut raw = packet(0, 0);
+        raw.header.dwType = 1;
+        raw.header.dwSize = (size_of::<RAWINPUTHEADER>() + size_of::<RAWKEYBOARD>()) as u32;
+        raw.data.keyboard = RAWKEYBOARD {
+            MakeCode: scan,
+            Flags: flags,
+            VKey: 0x41,
+            ..Default::default()
+        };
+        raw
+    }
+    #[test]
+    fn physical_keyboard_mapping_preserves_sides_navigation_and_fkeys() {
+        for (scan, usage) in [
+            (0x1e, 0x04),
+            (0x10, 0x14),
+            (0x3b, 0x3a),
+            (0x58, 0x45),
+            (0x1d, 0xe0),
+            (0xe01d, 0xe4),
+            (0x2a, 0xe1),
+            (0x36, 0xe5),
+            (0x38, 0xe2),
+            (0xe038, 0xe6),
+            (0xe05b, 0xe3),
+            (0xe05c, 0xe7),
+            (0xe048, 0x52),
+            (0x48, 0x60),
+            (0xe01c, 0x58),
+            (0x1c, 0x28),
+            (0xe045, 0x53),
+        ] {
+            assert_eq!(scan_to_hid(scan), Some(usage));
+        }
+        assert_eq!(scan_to_hid(0xe12d), None);
+        assert_eq!(
+            scan_to_hid(0xe02a),
+            None,
+            "fake extended Shift is not a real modifier"
+        );
+        let scans: BTreeSet<_> = SCAN_TO_HID.iter().map(|&(scan, _)| scan).collect();
+        assert_eq!(scans.len(), SCAN_TO_HID.len());
+    }
+    #[test]
+    fn keyboard_decode_filters_source_overrun_and_unsupported_e1() {
+        let raw = keyboard(0x1d, 3);
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0),
+            InputPacket::Key {
+                usage: 0xe4,
+                down: false
+            }
+        );
+        let mut raw = keyboard(0x1e, 0);
+        raw.header.hDevice = null_mut();
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0),
+            InputPacket::DeviceLess
+        );
+        let raw = keyboard(0xff, 0);
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0),
+            InputPacket::Overrun
+        );
+        let raw = keyboard(0x1d, 4);
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0),
+            InputPacket::UnsupportedKey
+        );
+        let mut pause = keyboard(0x45, 0);
+        pause.data.keyboard.VKey = 0x13;
+        assert_eq!(
+            decode_input(&pause, pause.header.dwSize, |_| 0),
+            InputPacket::UnsupportedKey
+        );
+        let raw = keyboard(0x1d, 6);
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0),
+            InputPacket::Malformed
+        );
+        let raw = keyboard(0, 0);
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0xe01c),
+            InputPacket::Key {
+                usage: 0x58,
+                down: true
+            }
+        );
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize - 1, |_| 0),
+            InputPacket::Malformed
+        );
+    }
+    #[test]
+    fn mouse_packet_keeps_buttons_and_signed_subnotch_scroll() {
+        let mut raw = packet(12, -7);
+        raw.data.mouse.Anonymous.Anonymous.usButtonFlags = 1 | 2 | 0x0800;
+        raw.data.mouse.Anonymous.Anonymous.usButtonData = (-30i16) as u16;
+        assert_eq!(
+            decode_input(&raw, raw.header.dwSize, |_| 0),
+            InputPacket::Mouse {
+                dx: 12,
+                dy: -7,
+                flags: 1 | 2 | 0x0800,
+                wheel: -30
+            }
+        );
+        assert_eq!(
+            decode(&raw, raw.header.dwSize),
+            Packet::Motion(12, -7),
+            "compatibility decoder remains movement-only"
+        );
+    }
+    #[test]
+    fn snapshot_uses_physical_buttons_and_distinct_modifier_sides() {
+        let (buttons, keys) = physical_snapshot(
+            |vk| matches!(vk, 1 | 6 | 0x10 | 0xa0 | 0xa1 | 0xa3 | 0xa5),
+            |vk| match vk {
+                0x10 => panic!("aggregate modifier must be ignored"),
+                0xa0 => 0x2a,
+                0xa1 => 0x36,
+                0xa3 => 0xe01d,
+                0xa5 => 0xe038,
+                _ => 0,
+            },
+        );
+        assert_eq!(buttons, vec![Button::Left, Button::Forward]);
+        assert_eq!(keys, vec![0xe1, 0xe4, 0xe5, 0xe6]);
+    }
+    #[test]
+    fn shortcut_trigger_up_remains_suppressed_after_modifiers_release() {
+        for trigger in [0x2c, 0x29] {
+            let mut filter = ShortcutFilter::default();
+            assert!(!filter.observe(0xe0, true));
+            assert!(!filter.observe(0xe6, true));
+            assert!(filter.observe(trigger, true));
+            assert!(!filter.observe(0xe0, false));
+            assert!(!filter.observe(0xe6, false));
+            assert!(
+                filter.observe(trigger, true),
+                "typematic trigger remains local"
+            );
+            assert!(filter.observe(trigger, false));
+            assert!(
+                !filter.observe(trigger, true),
+                "ordinary next press is forwarded"
+            );
+            assert!(!filter.observe(trigger, false));
+        }
+    }
+    #[test]
+    fn full_packet_callbacks_are_ordered_and_overrun_stops() {
+        let events = RefCell::new(Vec::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut state = State {
+            callback: |event| events.borrow_mut().push(event),
+            status_fn: || CaptureStatus::Ready,
+            connected_once: false,
+            displayed: None,
+            refreshed_at: None,
+            stop: stop.clone(),
+            stats: CaptureStats::default(),
+            error: None,
+            full_input: true,
+            shortcuts: ShortcutFilter::default(),
+        };
+        let at = Instant::now();
+        state.input_packet(
+            InputPacket::Mouse {
+                dx: 3,
+                dy: 4,
+                flags: 1 | 2 | 0x400,
+                wheel: -120,
+            },
+            at,
+        );
+        assert!(matches!(events.borrow().as_slice(),[
+            CaptureEvent::Delta {dx:3,dy:4,captured_at:a},
+            CaptureEvent::Button {button:Button::Left,down:true,captured_at:b},
+            CaptureEvent::Button {button:Button::Left,down:false,captured_at:c},
+            CaptureEvent::Scroll {horizontal:0,vertical:-120,captured_at:d},
+        ] if *a==at && *b==at && *c==at && *d==at));
+        state.input_packet(InputPacket::Overrun, at);
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(state.stats.overruns, 1);
+        state.emit(CaptureEvent::Key {
+            usage: 0x04,
+            down: true,
+            captured_at: at,
+        });
+        assert_eq!(
+            events.borrow().len(),
+            4,
+            "nothing emitted after fail-closed stop"
+        );
     }
 }

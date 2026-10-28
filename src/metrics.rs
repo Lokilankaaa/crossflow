@@ -133,6 +133,9 @@ pub fn summarize(path: &Path) -> Result<Value> {
     let mut src = vec![];
     let mut recv = vec![];
     let mut inject = vec![];
+    let mut action_source = vec![];
+    let mut action_receive = vec![];
+    let mut action_inject = vec![];
     let mut transport = vec![];
     let mut queued_moves = 0u64;
     let mut cadence_raw = vec![];
@@ -187,6 +190,19 @@ pub fn summarize(path: &Path) -> Result<Value> {
         }
         if v["event"] == "transport_summary" {
             transport.push(v.clone());
+        }
+        if v["event"] == "input_queued" {
+            if let Some(d) = timing_delta(&v, "t0_ns", "t1_ns", &mut issues) {
+                action_source.push(d);
+            }
+        }
+        if v["event"] == "input_applied" {
+            if let Some(d) = timing_delta(&v, "t2_ns", "t3_ns", &mut issues) {
+                action_receive.push(d);
+            }
+            if let Some(d) = timing_delta(&v, "t3_ns", "t4_ns", &mut issues) {
+                action_inject.push(d);
+            }
         }
         if v["event"] == "received" {
             if let Some(d) = timing_delta(&v, "t2_ns", "t3_ns", &mut issues) {
@@ -252,6 +268,9 @@ pub fn summarize(path: &Path) -> Result<Value> {
         "transport_attempts":transport,
         "send_evidence":"sent records mark local queueing, not socket completion or receiver acknowledgement. Missing transport summaries mean socket completion is unknown; socket completion never proves remote application.",
         "source_processing":distribution(src),"receiver_processing":distribution(recv),
+        "action_source_processing":distribution(action_source),
+        "action_receiver_processing":distribution(action_receive),
+        "action_adapter_call":distribution(action_inject),
         "injection_call":distribution(inject),"visible_smoothness":"NOT_MEASURED",
         "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized"
     }))
@@ -330,6 +349,21 @@ mod tests {
         let result = summarize(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         result
+    }
+
+    #[test]
+    fn action_timings_stay_separate_from_cursor_movement() {
+        let result = summarize_text(concat!(
+            "{\"event\":\"input_queued\",\"t0_ns\":100,\"t1_ns\":200}\n",
+            "{\"event\":\"input_applied\",\"t2_ns\":10,\"t3_ns\":30,\"t4_ns\":40}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n"
+        ));
+        assert_eq!(result["action_source_processing"]["samples"], 1);
+        assert_eq!(result["action_receiver_processing"]["samples"], 1);
+        assert_eq!(result["action_adapter_call"]["samples"], 1);
+        assert!(result["source_processing"].is_null());
+        assert!(result["injection_call"].is_null());
+        assert_eq!(result["queued_move_records"], 0);
     }
 
     #[test]

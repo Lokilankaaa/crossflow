@@ -93,6 +93,7 @@ pub enum CaptureOutcome {
 pub struct SourceInputQueue {
     connected: bool,
     active: bool,
+    control_epoch: u64,
     queue: VecDeque<QueuedInput>,
     x: f64,
     y: f64,
@@ -102,7 +103,8 @@ pub struct SourceInputQueue {
     local_keys: BTreeSet<u16>,
     epoch_buttons: BTreeSet<Button>,
     epoch_keys: BTreeSet<u16>,
-    last_checked_ns: Option<u64>,
+    last_capture_ns: Option<u64>,
+    last_poll_ns: Option<u64>,
 }
 
 impl Default for SourceInputQueue {
@@ -116,6 +118,7 @@ impl SourceInputQueue {
         Self {
             connected: false,
             active: false,
+            control_epoch: 0,
             queue: VecDeque::with_capacity(INPUT_QUEUE_CAPACITY),
             x: 0.0,
             y: 0.0,
@@ -125,7 +128,8 @@ impl SourceInputQueue {
             local_keys: BTreeSet::new(),
             epoch_buttons: BTreeSet::new(),
             epoch_keys: BTreeSet::new(),
-            last_checked_ns: None,
+            last_capture_ns: None,
+            last_poll_ns: None,
         }
     }
 
@@ -186,6 +190,7 @@ impl SourceInputQueue {
     /// Discard queued input and accepted epoch downs, preserving physical held state.
     /// The caller must also release remote ownership; no release is injected here.
     pub fn pause(&mut self) {
+        self.control_epoch = self.control_epoch.wrapping_add(1);
         self.active = false;
         self.queue.clear();
         self.epoch_buttons.clear();
@@ -193,11 +198,36 @@ impl SourceInputQueue {
         self.x = 0.0;
         self.y = 0.0;
         self.last_move_group_delta = (0.0, 0.0);
-        self.last_checked_ns = None;
+        self.last_capture_ns = None;
+        self.last_poll_ns = None;
     }
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    /// Changes even when a pause and re-arm occur between transport polls.
+    /// A new Arm must reset/release remote state before this epoch's input.
+    pub fn control_epoch(&self) -> u64 {
+        self.control_epoch
+    }
+
+    pub fn front_action(&self) -> Option<InputAction> {
+        self.queue.front().map(|event| event.action)
+    }
+
+    /// Validate before transport writes, even when rate limiting delays a pop.
+    /// Use the same monotonic clock as capture, while holding the queue lock.
+    pub fn validate_pending(&mut self, now_ns: u64) -> Result<(), PauseReason> {
+        if self.active {
+            self.check_poll(now_ns)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn pending_len(&self) -> usize {
@@ -209,8 +239,8 @@ impl SourceInputQueue {
         CaptureOutcome::Paused(reason)
     }
 
-    fn check_age(&mut self, now_ns: u64) -> Result<(), PauseReason> {
-        let reason = if self.last_checked_ns.is_some_and(|last| now_ns < last) {
+    fn check_age(&mut self, now_ns: u64, clock_regressed: bool) -> Result<(), PauseReason> {
+        let reason = if clock_regressed {
             Some(PauseReason::ClockRegressed)
         } else if self
             .queue
@@ -225,7 +255,27 @@ impl SourceInputQueue {
             self.pause();
             return Err(reason);
         }
-        self.last_checked_ns = Some(now_ns);
+        Ok(())
+    }
+
+    fn check_capture(&mut self, captured_at_ns: u64) -> Result<(), PauseReason> {
+        // A physical event can wait for this mutex while the sender polls.
+        // Preserve its original capture time, comparing only capture order.
+        let regressed = self
+            .last_capture_ns
+            .is_some_and(|last| captured_at_ns < last);
+        self.check_age(captured_at_ns, regressed)?;
+        self.last_capture_ns = Some(captured_at_ns);
+        Ok(())
+    }
+
+    fn check_poll(&mut self, now_ns: u64) -> Result<(), PauseReason> {
+        // Poll timestamps are sampled under the queue mutex. They must not
+        // precede an earlier poll or a capture already observed by this queue.
+        let regressed = self.last_poll_ns.is_some_and(|last| now_ns < last)
+            || self.last_capture_ns.is_some_and(|last| now_ns < last);
+        self.check_age(now_ns, regressed)?;
+        self.last_poll_ns = Some(now_ns);
         Ok(())
     }
 
@@ -250,12 +300,13 @@ impl SourceInputQueue {
         CaptureOutcome::Queued
     }
 
-    /// Source raw relative motion. Paused movement is not carried into a new arm.
+    /// Source raw relative motion. `now_ns` is the original capture timestamp,
+    /// which can precede mutex acquisition. Paused movement is not carried forward.
     pub fn move_by(&mut self, dx: f64, dy: f64, now_ns: u64) -> CaptureOutcome {
         if !self.active {
             return CaptureOutcome::Ignored;
         }
-        if let Err(reason) = self.check_age(now_ns) {
+        if let Err(reason) = self.check_capture(now_ns) {
             return CaptureOutcome::Paused(reason);
         }
         let x = self.x + dx;
@@ -303,7 +354,7 @@ impl SourceInputQueue {
         if !self.active {
             return CaptureOutcome::Ignored;
         }
-        if let Err(reason) = self.check_age(now_ns) {
+        if let Err(reason) = self.check_capture(now_ns) {
             return CaptureOutcome::Paused(reason);
         }
         if !changed {
@@ -334,7 +385,7 @@ impl SourceInputQueue {
         if !self.active {
             return CaptureOutcome::Ignored;
         }
-        if let Err(reason) = self.check_age(now_ns) {
+        if let Err(reason) = self.check_capture(now_ns) {
             return CaptureOutcome::Paused(reason);
         }
         if !changed {
@@ -352,7 +403,7 @@ impl SourceInputQueue {
         if !self.active {
             return CaptureOutcome::Ignored;
         }
-        if let Err(reason) = self.check_age(now_ns) {
+        if let Err(reason) = self.check_capture(now_ns) {
             return CaptureOutcome::Paused(reason);
         }
         if horizontal == 0 && vertical == 0 {
@@ -373,7 +424,7 @@ impl SourceInputQueue {
         if !self.active {
             return Ok(None);
         }
-        self.check_age(now_ns)?;
+        self.check_poll(now_ns)?;
         Ok(self.queue.pop_front())
     }
 }
@@ -662,6 +713,68 @@ mod tests {
             assert_eq!(queue.key(usage, true, 1), CaptureOutcome::Queued);
             assert_eq!(queue.key(usage, false, 2), CaptureOutcome::Queued);
         }
+    }
+
+    #[test]
+    fn rapid_pause_and_rearm_exposes_a_new_control_epoch() {
+        let mut queue = armed();
+        let previous = queue.control_epoch();
+        queue.move_by(1.0, 2.0, 1);
+        queue.pause();
+        assert!(queue.arm());
+        assert!(queue.is_active());
+        assert_ne!(queue.control_epoch(), previous);
+        assert_eq!(queue.pending_len(), 0);
+        queue.move_by(3.0, 4.0, 2);
+        assert_eq!(
+            queue.pop(3).unwrap().unwrap().action,
+            InputAction::Move { x: 3.0, y: 4.0 }
+        );
+        queue.end_session();
+        assert!(!queue.is_connected());
+        queue.begin_session();
+        assert!(queue.is_connected());
+        assert!(!queue.is_active());
+    }
+
+    #[test]
+    fn delayed_capture_preserves_timestamp_without_regressing_sender_poll_clock() {
+        let mut queue = armed();
+        queue.move_by(1.0, 0.0, 80);
+        assert_eq!(queue.pop(100).unwrap().unwrap().captured_at_ns, 80);
+        // Captured in order, but delivery to this mutex occurred after poll 100.
+        assert_eq!(queue.move_by(2.0, 0.0, 90), CaptureOutcome::Queued);
+        let delivered = queue.pop(110).unwrap().unwrap();
+        assert_eq!(delivered.captured_at_ns, 90);
+        assert_eq!(delivered.action, InputAction::Move { x: 3.0, y: 0.0 });
+        assert!(queue.is_active());
+        // A genuinely reversed capture still fails, independently of polling.
+        assert_eq!(
+            queue.key(0x04, true, 89),
+            CaptureOutcome::Paused(PauseReason::ClockRegressed)
+        );
+        assert_eq!(queue.pending_len(), 0);
+    }
+
+    #[test]
+    fn delayed_capture_is_still_aged_and_poll_rollback_is_independent() {
+        let mut queue = armed();
+        queue.move_by(1.0, 0.0, 80);
+        queue.pop(100).unwrap();
+        queue.validate_pending(INPUT_MAX_AGE_NS + 200).unwrap();
+        assert_eq!(queue.key(0x04, true, 90), CaptureOutcome::Queued);
+        assert_eq!(
+            queue.pop(INPUT_MAX_AGE_NS + 201),
+            Err(PauseReason::StaleInput)
+        );
+        assert!(!queue.is_active());
+        assert_eq!(queue.pending_len(), 0);
+        queue.arm();
+        queue.move_by(1.0, 0.0, 80);
+        queue.pop(100).unwrap();
+        // No reversed physical capture is involved in this polling rollback.
+        assert_eq!(queue.validate_pending(99), Err(PauseReason::ClockRegressed));
+        assert!(!queue.is_active());
     }
 
     #[test]

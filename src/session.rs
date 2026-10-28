@@ -1,4 +1,5 @@
 use crate::{
+    input::{Button, InputAction, SourceInputQueue},
     metrics::Log,
     protocol::{Frame, Kind},
     security::{self, Identity, SecureChannel},
@@ -7,6 +8,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::Path,
@@ -222,9 +224,96 @@ pub struct SendOptions<'a> {
     pub synthetic: bool,
 }
 
+enum SenderSource {
+    Motion(Arc<Mutex<Motion>>),
+    Ordered(Arc<Mutex<SourceInputQueue>>),
+}
+impl SenderSource {
+    fn connected(&self, connected: bool) {
+        match self {
+            Self::Motion(motion) => motion.lock().unwrap().connected(connected),
+            Self::Ordered(input) => {
+                let mut input = input.lock().unwrap();
+                if connected {
+                    input.begin_session();
+                } else {
+                    input.end_session();
+                }
+            }
+        }
+    }
+
+    fn pump(&self, peer: &mut Peer, epoch: u64, log: &Log) -> Result<Vec<(Frame, Instant)>> {
+        match self {
+            Self::Motion(_) => peer.pump(),
+            Self::Ordered(input) => {
+                // The socket is nonblocking. Keep the source lock across this
+                // bounded pump so a pause cannot race a pending socket write.
+                let mut input = input.lock().unwrap();
+                ensure!(input.is_connected(), "local capture session ended");
+                if let Err(reason) = input.validate_pending(log.ns()) {
+                    log.write(
+                        "input_queue_paused",
+                        json!({"reason":format!("{reason:?}")}),
+                    );
+                }
+                // Encryption consumes a Noise nonce even before socket write.
+                // Cancelling a queued record therefore requires a new session;
+                // never flush pre-pause input merely to preserve that nonce.
+                // Pending controls carry no physical input and can finish
+                // before the next epoch control (notably initial Pause -> Arm).
+                let pending_control = matches!(
+                    peer.counts.pending,
+                    Some((Kind::Arm | Kind::Pause | Kind::Heartbeat | Kind::Stop, _))
+                );
+                ensure!(
+                    !peer.pending() || input.control_epoch() == epoch || pending_control,
+                    "input epoch changed with pending transport record; discard session"
+                );
+                peer.pump()
+            }
+        }
+    }
+}
+impl Drop for SenderSource {
+    fn drop(&mut self) {
+        if let Self::Ordered(input) = self {
+            // Covers setup errors and explicit stop, without replaying queued
+            // events. Receiver session cleanup releases any delivered downs.
+            input
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .end_session();
+        }
+    }
+}
+
 pub fn send(
     options: SendOptions<'_>,
     motion: Arc<Mutex<Motion>>,
+    stop: Arc<AtomicBool>,
+    log: Log,
+) -> Result<()> {
+    send_source(options, SenderSource::Motion(motion), stop, log)
+}
+
+/// Send explicitly armed, ordered physical inputs over the shared connection
+/// engine. Capture must stay active while paused and use this Log's clock.
+/// Preserve the original event timestamp even when it precedes acquiring the
+/// source mutex; queue mutations remain locked. Sender polling timestamps are
+/// sampled under that mutex. Synthetic movement is only supported by `send`.
+pub fn send_ordered(
+    options: SendOptions<'_>,
+    input: Arc<Mutex<SourceInputQueue>>,
+    stop: Arc<AtomicBool>,
+    log: Log,
+) -> Result<()> {
+    send_source(options, SenderSource::Ordered(input), stop, log)
+}
+
+fn send_source(
+    options: SendOptions<'_>,
+    source: SenderSource,
     stop: Arc<AtomicBool>,
     log: Log,
 ) -> Result<()> {
@@ -235,6 +324,10 @@ pub fn send(
         max_hz,
         synthetic,
     } = options;
+    ensure!(
+        !synthetic || matches!(&source, SenderSource::Motion(_)),
+        "ordered input requires synthetic=false"
+    );
     ensure!((60..=8000).contains(&max_hz), "max-hz must be 60..8000");
     let identity = Identity::load(bundle)?;
     let end = Instant::now() + Duration::from_secs_f64(seconds);
@@ -288,7 +381,7 @@ pub fn send(
             trace.phase = "transport";
             peer.summary = Some((log.clone(), trace.clone()));
             connected_once = true;
-            motion.lock().unwrap().connected(true);
+            source.connected(true);
             trace.write(
                 &log,
                 "connected",
@@ -313,7 +406,7 @@ pub fn send(
             let mut synthetic_position = (0.0, 0.0);
             let mut synth_armed = false;
             while !stop.load(Ordering::Relaxed) && Instant::now() < end {
-                for (f, received_at) in peer.pump()? {
+                for (f, received_at) in source.pump(&mut peer, epoch, &log)? {
                     ensure!(f.kind == Kind::Lease, "receiver sent unexpected frame");
                     ensure!(f.lease > lease, "non-increasing receiver lease");
                     lease = f.lease;
@@ -324,6 +417,9 @@ pub fn send(
                     "receiver lease stream lost"
                 );
                 if synthetic && lease > 0 {
+                    let SenderSource::Motion(motion) = &source else {
+                        unreachable!()
+                    };
                     if !synth_armed {
                         motion.lock().unwrap().toggle();
                         synth_armed = true;
@@ -339,73 +435,155 @@ pub fn send(
                     synthetic_position = pos;
                 }
                 if lease > 0 && !peer.pending() {
-                    // Snapshot and drain under the same lock. A capture after
-                    // this drain will establish a fresh pending_since value,
-                    // rather than inheriting the timestamp of already-sent data.
-                    // queue() encrypts into memory only; socket I/O is outside
-                    // this lock in pump().
-                    let mut state = motion.lock().unwrap();
-                    let now = log.ns();
-                    if state.epoch == epoch
-                        && state.active
-                        && state
-                            .pending_since_ns
-                            .is_some_and(|t| now.saturating_sub(t) > 30_000_000)
-                    {
-                        let age = now - state.pending_since_ns.unwrap();
-                        state.active = false;
-                        state.epoch += 1;
-                        state.pending_since_ns = None;
-                        drop(state);
-                        log.write("stale_source_discard", json!({"pending_age_ns":age}));
-                        eprintln!("Source backlog discarded; Ctrl+Alt+Space to re-arm.");
-                        continue;
-                    }
-                    let kind = if state.epoch != epoch {
-                        Some(if state.active { Kind::Arm } else { Kind::Pause })
-                    } else if state.active
-                        && state.captures != last_captures
-                        && sent.elapsed() >= interval
-                    {
-                        Some(Kind::Move)
-                    } else if last_heartbeat.elapsed() >= Duration::from_millis(40) {
-                        Some(Kind::Heartbeat)
-                    } else {
-                        None
-                    };
-                    if let Some(kind) = kind {
-                        seq += 1;
-                        let mut frame = Frame::new(kind);
-                        frame.seq = seq;
-                        frame.lease = lease;
-                        frame.x = state.x;
-                        frame.y = state.y;
-                        frame.t1_ns = now;
-                        frame.t0_ns = if kind == Kind::Move {
-                            state.pending_since_ns.unwrap_or(state.t0_ns)
-                        } else {
-                            now
-                        };
-                        peer.queue(frame)?;
-                        if kind == Kind::Move {
-                            log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":state.captures-last_captures,"lease":lease,"completion":"queued_local"}));
-                            sent = Instant::now();
-                        } else {
-                            log.write("control", json!({"kind":format!("{kind:?}"),"seq":seq}));
+                    match &source {
+                        SenderSource::Motion(motion) => {
+                            // Snapshot and drain under the same lock. A capture after
+                            // this drain will establish a fresh pending_since value,
+                            // rather than inheriting the timestamp of already-sent data.
+                            // queue() encrypts into memory only; socket I/O is outside
+                            // this lock in pump().
+                            let mut state = motion.lock().unwrap();
+                            let now = log.ns();
+                            if state.epoch == epoch
+                                && state.active
+                                && state
+                                    .pending_since_ns
+                                    .is_some_and(|t| now.saturating_sub(t) > 30_000_000)
+                            {
+                                let age = now - state.pending_since_ns.unwrap();
+                                state.active = false;
+                                state.epoch += 1;
+                                state.pending_since_ns = None;
+                                drop(state);
+                                log.write("stale_source_discard", json!({"pending_age_ns":age}));
+                                eprintln!("Source backlog discarded; Ctrl+Alt+Space to re-arm.");
+                                continue;
+                            }
+                            let kind = if state.epoch != epoch {
+                                Some(if state.active { Kind::Arm } else { Kind::Pause })
+                            } else if state.active
+                                && state.captures != last_captures
+                                && sent.elapsed() >= interval
+                            {
+                                Some(Kind::Move)
+                            } else if last_heartbeat.elapsed() >= Duration::from_millis(40) {
+                                Some(Kind::Heartbeat)
+                            } else {
+                                None
+                            };
+                            if let Some(kind) = kind {
+                                seq += 1;
+                                let mut frame = Frame::new(kind);
+                                frame.seq = seq;
+                                frame.lease = lease;
+                                frame.x = state.x;
+                                frame.y = state.y;
+                                frame.t1_ns = now;
+                                frame.t0_ns = if kind == Kind::Move {
+                                    state.pending_since_ns.unwrap_or(state.t0_ns)
+                                } else {
+                                    now
+                                };
+                                peer.queue(frame)?;
+                                if kind == Kind::Move {
+                                    log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":state.captures-last_captures,"lease":lease,"completion":"queued_local"}));
+                                    sent = Instant::now();
+                                } else {
+                                    log.write(
+                                        "control",
+                                        json!({"kind":format!("{kind:?}"),"seq":seq}),
+                                    );
+                                }
+                                if matches!(kind, Kind::Arm | Kind::Move | Kind::Pause) {
+                                    last_captures = state.captures;
+                                    epoch = state.epoch;
+                                    state.pending_since_ns = None;
+                                }
+                                last_heartbeat = Instant::now();
+                            }
                         }
-                        if matches!(kind, Kind::Arm | Kind::Move | Kind::Pause) {
-                            last_captures = state.captures;
-                            epoch = state.epoch;
-                            state.pending_since_ns = None;
+                        SenderSource::Ordered(input) => {
+                            let mut input = input.lock().unwrap();
+                            let now = log.ns();
+                            if let Err(reason) = input.validate_pending(now) {
+                                log.write(
+                                    "input_queue_paused",
+                                    json!({"reason":format!("{reason:?}")}),
+                                );
+                            }
+                            let mut captures = 0;
+                            let next = if input.control_epoch() != epoch {
+                                // Each arm begins at zero even when captures arrived
+                                // before this control frame. Receiver Arm releases
+                                // old owned input before rebasing the new epoch.
+                                Some(Frame::new(if input.is_active() {
+                                    Kind::Arm
+                                } else {
+                                    Kind::Pause
+                                }))
+                            } else if input.is_active() && input.front_action().is_some() {
+                                // Never skip a rate-limited Move to send a later
+                                // button/key/wheel event out of order.
+                                if matches!(input.front_action(), Some(InputAction::Move { .. }))
+                                    && sent.elapsed() < interval
+                                {
+                                    None
+                                } else {
+                                    match input.pop(now) {
+                                        Ok(Some(event)) => {
+                                            captures = event.captures_coalesced;
+                                            Some(Frame::from_input(event, now)?)
+                                        }
+                                        Ok(None) => None,
+                                        Err(reason) => {
+                                            log.write(
+                                                "input_queue_paused",
+                                                json!({"reason":format!("{reason:?}")}),
+                                            );
+                                            Some(Frame::new(Kind::Pause))
+                                        }
+                                    }
+                                }
+                            } else if last_heartbeat.elapsed() >= Duration::from_millis(40) {
+                                Some(Frame::new(Kind::Heartbeat))
+                            } else {
+                                None
+                            };
+                            if let Some(mut frame) = next {
+                                seq += 1;
+                                frame.seq = seq;
+                                frame.lease = lease;
+                                if captures == 0 {
+                                    frame.t0_ns = now;
+                                    frame.t1_ns = now;
+                                }
+                                peer.queue(frame)?;
+                                match frame.kind {
+                                    Kind::Move => {
+                                        log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":captures,"lease":lease,"completion":"queued_local"}));
+                                        sent = Instant::now();
+                                    }
+                                    Kind::Button | Kind::Key | Kind::Scroll => {
+                                        // Never log key usages, down/up payloads or
+                                        // wheel values: only pipeline timing/kind.
+                                        log.write("input_queued",json!({"kind":format!("{:?}",frame.kind),"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"completion":"queued_local"}));
+                                    }
+                                    _ => log.write(
+                                        "control",
+                                        json!({"kind":format!("{:?}",frame.kind),"seq":seq}),
+                                    ),
+                                }
+                                epoch = input.control_epoch();
+                                last_heartbeat = Instant::now();
+                            }
                         }
-                        last_heartbeat = Instant::now();
                     }
                 }
                 thread::sleep(Duration::from_micros(500));
             }
             Ok(())
         })();
-        motion.lock().unwrap().connected(false);
+        source.connected(false);
         if let Err(e) = attempt {
             trace.write(
                 &log,
@@ -431,6 +609,23 @@ pub trait MouseSink {
         Ok(())
     }
     fn move_by(&mut self, dx: f64, dy: f64) -> Result<(f64, f64)>;
+    /// Releases (`down=false`) must bypass emergency/display guards that block
+    /// new input. Errors must not contain keycodes, typed text or input payloads.
+    fn button(&mut self, _button: Button, _down: bool) -> Result<()> {
+        bail!("mouse buttons are not supported by this adapter")
+    }
+    /// Releases (`down=false`) must bypass emergency/display guards that block
+    /// new input. Errors must not contain keycodes, typed text or input payloads.
+    fn key(&mut self, _usage: u16, _down: bool) -> Result<()> {
+        bail!("keyboard input is not supported by this adapter")
+    }
+    fn scroll(&mut self, _horizontal: i32, _vertical: i32) -> Result<()> {
+        bail!("scroll input is not supported by this adapter")
+    }
+    /// Release only inputs owned by this remote session, even during emergency stop.
+    fn release_owned(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn emergency_pressed(&self) -> bool {
         false
     }
@@ -447,6 +642,108 @@ impl MouseSink for DrySink {
         self.y += dy;
         self.moves += 1;
         Ok((self.x, self.y))
+    }
+    fn button(&mut self, _button: Button, _down: bool) -> Result<()> {
+        Ok(())
+    }
+    fn key(&mut self, _usage: u16, _down: bool) -> Result<()> {
+        Ok(())
+    }
+    fn scroll(&mut self, _horizontal: i32, _vertical: i32) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Tracks attempted remote downs, including adapters that post then return an
+/// error. Cleanup is explicit so failures can be reported, never hidden by Drop.
+/// This cannot recover OS state after a forced process kill.
+struct OwnedSink<'a> {
+    sink: &'a mut dyn MouseSink,
+    buttons: BTreeSet<Button>,
+    keys: BTreeSet<u16>,
+}
+impl<'a> OwnedSink<'a> {
+    fn new(sink: &'a mut dyn MouseSink) -> Self {
+        Self {
+            sink,
+            buttons: BTreeSet::new(),
+            keys: BTreeSet::new(),
+        }
+    }
+}
+impl MouseSink for OwnedSink<'_> {
+    fn reset(&mut self) -> Result<()> {
+        self.release_owned()?;
+        self.sink.reset()
+    }
+    fn move_by(&mut self, dx: f64, dy: f64) -> Result<(f64, f64)> {
+        self.sink.move_by(dx, dy)
+    }
+    fn button(&mut self, button: Button, down: bool) -> Result<()> {
+        if down {
+            ensure!(self.buttons.insert(button), "duplicate remote button down");
+        } else {
+            ensure!(
+                self.buttons.contains(&button),
+                "remote button up without owned down"
+            );
+        }
+        self.sink.button(button, down)?;
+        if !down {
+            self.buttons.remove(&button);
+        }
+        Ok(())
+    }
+    fn key(&mut self, usage: u16, down: bool) -> Result<()> {
+        if down {
+            ensure!(self.keys.insert(usage), "duplicate remote key down");
+        } else {
+            ensure!(
+                self.keys.contains(&usage),
+                "remote key up without owned down"
+            );
+        }
+        self.sink.key(usage, down)?;
+        if !down {
+            self.keys.remove(&usage);
+        }
+        Ok(())
+    }
+    fn scroll(&mut self, horizontal: i32, vertical: i32) -> Result<()> {
+        self.sink.scroll(horizontal, vertical)
+    }
+    fn emergency_pressed(&self) -> bool {
+        self.sink.emergency_pressed()
+    }
+    fn release_owned(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        // Ordinary keys sort before modifiers. Attempt every release even if
+        // one adapter call fails, retaining failed ownership for retry/reporting.
+        for usage in self.keys.iter().copied().collect::<Vec<_>>() {
+            match self.sink.key(usage, false) {
+                Ok(()) => {
+                    self.keys.remove(&usage);
+                }
+                Err(error) => failures.push(format!("key release: {error:#}")),
+            }
+        }
+        for button in self.buttons.iter().copied().collect::<Vec<_>>() {
+            match self.sink.button(button, false) {
+                Ok(()) => {
+                    self.buttons.remove(&button);
+                }
+                Err(error) => failures.push(format!("button release: {error:#}")),
+            }
+        }
+        if let Err(error) = self.sink.release_owned() {
+            failures.push(format!("adapter cleanup: {error:#}"));
+        }
+        ensure!(
+            failures.is_empty(),
+            "remote input cleanup failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
     }
 }
 
@@ -538,11 +835,11 @@ fn process_received_batch(
     for (frame, received_at) in frames {
         check_local_stop(sink)?;
         let t2 = log.at(received_at);
+        // Lease validity uses processing time, not the earlier arrival stamp.
+        let delta = state.apply(frame, log.ns())?;
         if frame.kind != Kind::Move {
             flush_moves(&mut pending, sink, log)?;
         }
-        // Lease validity uses processing time, not the earlier arrival stamp.
-        let delta = state.apply(frame, log.ns())?;
         if let Some(delta) = delta {
             if let Some(group) = pending.as_mut() {
                 group.extend(frame, delta, t2);
@@ -557,11 +854,33 @@ fn process_received_batch(
                     last_lease: frame.lease,
                 });
             }
+        } else if matches!(frame.kind, Kind::Button | Kind::Key | Kind::Scroll) {
+            check_local_stop(sink)?;
+            let t3 = log.ns();
+            match frame.kind {
+                Kind::Button => {
+                    sink.button(crate::protocol::button_from_code(frame.code)?, frame.down)
+                }
+                Kind::Key => sink.key(frame.code, frame.down),
+                Kind::Scroll => sink.scroll(frame.wheel_x, frame.wheel_y),
+                _ => unreachable!(),
+            }
+            .map_err(terminal_sink_failure)?;
+            // Do not log key codes or typed content. Sequence and timing suffice
+            // for transport evidence; tests use synthetic fixture actions.
+            log.write("input_applied", json!({"seq":frame.seq,"kind":format!("{:?}",frame.kind),"t2_ns":t2,"t3_ns":t3,"t4_ns":log.ns()}));
         } else {
             if frame.kind == Kind::Arm {
                 sink.reset().map_err(terminal_sink_failure)?;
                 log.write("armed", json!({"seq":frame.seq}));
             } else {
+                if matches!(frame.kind, Kind::Pause | Kind::Stop) {
+                    sink.release_owned().map_err(terminal_sink_failure)?;
+                    log.write(
+                        "input_released",
+                        json!({"reason":format!("{:?}",frame.kind)}),
+                    );
+                }
                 log.write(
                     "control_received",
                     json!({"kind":format!("{:?}",frame.kind),"seq":frame.seq}),
@@ -618,6 +937,7 @@ pub fn receive(
             peer: Some(address),
         };
         trace.write(&log, "tcp_accepted", json!({}));
+        let mut owned = OwnedSink::new(sink);
         let attempt = (|| -> Result<()> {
             trace.phase = "socket_setup";
             stream
@@ -643,7 +963,7 @@ pub fn receive(
             let mut last_input = Instant::now();
             trace.write(&log, "connected", json!({"peer":address.to_string()}));
             while Instant::now() < end {
-                check_local_stop(sink)?;
+                check_local_stop(&owned)?;
                 if !peer.pending() && last_grant.elapsed() >= LEASE_PERIOD {
                     lease += 1;
                     let now = log.ns();
@@ -658,7 +978,7 @@ pub fn receive(
                 if !frames.is_empty() {
                     last_input = Instant::now();
                 }
-                if process_received_batch(frames, &mut state, sink, &log)? {
+                if process_received_batch(frames, &mut state, &mut owned, &log)? {
                     return Ok(());
                 }
                 ensure!(
@@ -669,6 +989,15 @@ pub fn receive(
             }
             Ok(())
         })();
+        // Every accepted connection reaches cleanup, including transport,
+        // validation, permission, emergency and normal-duration exits.
+        let cleanup = owned.release_owned();
+        drop(owned);
+        if let Err(error) = cleanup {
+            trace.write(&log, "error", json!({"stage":"receiver_cleanup","message":format!("{error:#}"),"session_error":attempt.as_ref().err().map(|e|format!("{e:#}"))}));
+            return Err(terminal_sink_failure(error));
+        }
+        log.write("input_released", json!({"reason":"session_end"}));
         if let Err(e) = attempt {
             if let Some(terminal) = e.downcast_ref::<TerminalReceiverFailure>() {
                 if terminal.emergency {
@@ -869,7 +1198,10 @@ mod tests {
             assert_eq!(summary["socket_completed_moves"], 0);
             assert_eq!(summary["pending_seq"], 2);
             assert_eq!(summary["pending_written_bytes"], 0);
-            assert_eq!(summary["pending_total_bytes"], 74);
+            assert_eq!(
+                summary["pending_total_bytes"],
+                2 + crate::protocol::FRAME_LEN + 16
+            );
             assert_eq!(summary["attempt_id"], 1);
             std::fs::remove_file(path)?;
             std::fs::remove_dir_all(identities)?;

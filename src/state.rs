@@ -61,6 +61,9 @@ impl ReceiverState {
         self.leases.insert(token, now);
     }
     pub fn apply(&mut self, f: Frame, now: u64) -> Result<Option<(f64, f64)>> {
+        // Also validate direct callers: wire decoding is not the only way to
+        // construct a Frame. Reject invalid payloads before changing state.
+        f.encode()?;
         ensure!(f.kind != Kind::Lease, "sender cannot grant lease");
         ensure!(
             self.last_seq.is_none_or(|n| f.seq > n),
@@ -90,10 +93,15 @@ impl ReceiverState {
             return Ok(None);
         }
         ensure!(
-            f.kind == Kind::Move && self.active,
-            "movement before explicit arm"
+            matches!(f.kind, Kind::Move | Kind::Button | Kind::Scroll | Kind::Key) && self.active,
+            "input before explicit arm"
         );
-        ensure!(f.t1_ns - f.t0_ns <= 30_000_000, "source movement stale");
+        ensure!(f.t1_ns - f.t0_ns <= 30_000_000, "source input stale");
+        if matches!(f.kind, Kind::Button | Kind::Scroll | Kind::Key) {
+            // Controls are ordered barriers, not displacement baselines.
+            // The session layer owns applying/releasing the resulting input.
+            return Ok(None);
+        }
         let d = (f.x - self.x, f.y - self.y);
         ensure!(
             d.0.abs() <= 20_000.0 && d.1.abs() <= 20_000.0,
@@ -166,5 +174,118 @@ mod tests {
         m.connected(true);
         assert!(!m.active);
         assert!(!Motion::default().toggle());
+    }
+
+    fn action(kind: Kind, seq: u64) -> Frame {
+        let mut f = frame(kind, seq, 0.0);
+        match kind {
+            Kind::Button => {
+                f.code = 0;
+                f.down = true;
+            }
+            Kind::Scroll => f.wheel_y = -120,
+            Kind::Key => {
+                f.code = 0xE1;
+                f.down = true;
+            }
+            _ => panic!("test action must be a button, scroll, or key"),
+        }
+        f
+    }
+
+    #[test]
+    fn controls_require_arm_and_cannot_replay_or_resume_after_pause() {
+        for kind in [Kind::Button, Kind::Scroll, Kind::Key] {
+            let mut s = ReceiverState::new(150);
+            s.grant(9, 10);
+            assert!(s.apply(action(kind, 1), 11).is_err());
+            s.apply(frame(Kind::Arm, 2, 100.), 12).unwrap();
+            assert_eq!(s.apply(action(kind, 3), 13).unwrap(), None);
+            assert!(s.apply(action(kind, 3), 14).is_err());
+            s.apply(frame(Kind::Pause, 4, 0.), 15).unwrap();
+            assert!(s.apply(action(kind, 5), 16).is_err());
+            assert!(!s.active);
+        }
+    }
+
+    #[test]
+    fn controls_reject_expired_lease_and_stale_or_reversed_source_time() {
+        for kind in [Kind::Button, Kind::Scroll, Kind::Key] {
+            let mut s = ReceiverState::new(150);
+            s.grant(9, 10);
+            s.apply(frame(Kind::Arm, 1, 0.), 11).unwrap();
+            assert!(s.apply(action(kind, 2), 161).is_err());
+            assert!(!s.active);
+
+            for (start, end) in [(0, 30_000_001), (2, 1)] {
+                let mut s = ReceiverState::new(150);
+                s.grant(9, 10);
+                s.apply(frame(Kind::Arm, 1, 0.), 11).unwrap();
+                let mut f = action(kind, 2);
+                f.t0_ns = start;
+                f.t1_ns = end;
+                assert!(s.apply(f, 12).is_err());
+            }
+            let mut s = ReceiverState::new(150);
+            s.grant(9, 10);
+            s.apply(frame(Kind::Arm, 1, 0.), 11).unwrap();
+            let mut boundary = action(kind, 2);
+            boundary.t1_ns = 30_000_000;
+            assert_eq!(s.apply(boundary, 12).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn controls_preserve_cumulative_movement_baseline() {
+        let mut s = ReceiverState::new(150);
+        s.grant(9, 10);
+        s.apply(frame(Kind::Arm, 1, 100.), 11).unwrap();
+        assert_eq!(
+            s.apply(frame(Kind::Move, 2, 110.), 12).unwrap(),
+            Some((10., 0.))
+        );
+        for (index, kind) in [Kind::Button, Kind::Scroll, Kind::Key]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                s.apply(action(kind, index as u64 + 3), 13 + index as u64)
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            s.apply(frame(Kind::Move, 6, 120.), 16).unwrap(),
+            Some((10., 0.))
+        );
+    }
+
+    #[test]
+    fn direct_invalid_payload_cannot_mutate_receiver_state() {
+        for kind in [Kind::Button, Kind::Scroll, Kind::Key] {
+            let mut s = ReceiverState::new(150);
+            s.grant(9, 10);
+            s.apply(frame(Kind::Arm, 1, 100.), 11).unwrap();
+            let mut invalid = action(kind, 2);
+            match kind {
+                Kind::Button => invalid.code = 5,
+                Kind::Scroll => invalid.wheel_y = 0,
+                Kind::Key => invalid.code = 0,
+                _ => unreachable!(),
+            }
+            assert!(s.apply(invalid, 12).is_err());
+            assert!(s.active);
+            // A malformed direct call has not consumed sequence 2.
+            assert_eq!(s.apply(action(kind, 2), 12).unwrap(), None);
+            assert_eq!(
+                s.apply(frame(Kind::Move, 3, 105.), 13).unwrap(),
+                Some((5., 0.))
+            );
+        }
+        let mut s = ReceiverState::new(150);
+        s.grant(9, 10);
+        assert!(s.apply(frame(Kind::Arm, 1, f64::NAN), 11).is_err());
+        assert!(!s.active);
+        s.apply(frame(Kind::Arm, 1, 0.), 11).unwrap();
     }
 }
