@@ -72,8 +72,8 @@ Windows 运行：
 ./target/release/crossflow.exe send --host MAC_LAN_IP:24800 --identity .pairing/windows --log runs/windows-input-01.jsonl --seconds 60 --max-hz 1000
 ```
 
-- 连接成功后仍是暂停状态。按 **Ctrl+Alt+F8** 开启或暂停远端移动。
-- Windows 按 **Ctrl+Alt+F9** 结束发送；Mac 按 **Escape** 结束接收。两个命令默认最多运行 60 秒，Ctrl+C 也可退出。
+- 发送端打开原生控制窗口，显示连接与共享状态。连接成功后仍是暂停状态，点击“开始共享”按钮或按 **Ctrl+Alt+空格** 开启；再次点击或按键可暂停。
+- Windows 点击“停止并退出”、关闭控制窗口或按 **Ctrl+Alt+Esc** 结束发送；Mac 按 **Escape** 结束接收。两个命令默认最多运行 60 秒，Ctrl+C 也可退出。
 - 重新连接必须再次手动开启，避免无意抢回控制。显示器变化、休眠、权限或注入错误会终止接收运行。
 - 开启时 Mac 光标需位于主显示器；每次开启从当前位置建立基线。
 - 本版不发送点击：Mac 光标移动时，Windows 本地鼠标仍可移动和点击，测试时注意自己正在操作哪一台设备。

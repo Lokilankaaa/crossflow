@@ -156,7 +156,7 @@ pub fn send(
                 if synthetic {
                     "Synthetic test starting"
                 } else {
-                    "Movement paused. Ctrl+Alt+F8 toggles; Ctrl+Alt+F9 stops."
+                    "Movement paused. Ctrl+Alt+Space toggles; Ctrl+Alt+Esc stops."
                 }
             );
             let mut lease = 0;
@@ -215,7 +215,7 @@ pub fn send(
                         state.pending_since_ns = None;
                         drop(state);
                         log.write("stale_source_discard", json!({"pending_age_ns":age}));
-                        eprintln!("Source backlog discarded; Ctrl+Alt+F8 to re-arm.");
+                        eprintln!("Source backlog discarded; Ctrl+Alt+Space to re-arm.");
                         continue;
                     }
                     let kind = if state.epoch != epoch {

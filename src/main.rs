@@ -46,7 +46,7 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         gain: f64,
     },
-    /// Capture Windows Raw Input; Ctrl+Alt+F8 arms, Ctrl+Alt+F9 exits.
+    /// Capture Windows Raw Input; Ctrl+Alt+Space arms, Ctrl+Alt+Esc exits.
     Send {
         #[arg(long)]
         host: String,
@@ -290,9 +290,10 @@ fn run_capture(
 ) -> Result<()> {
     #[cfg(windows)]
     {
-        use crossflow::platform::windows::{CaptureEvent, run_capture};
+        use crossflow::platform::windows::{CaptureEvent, CaptureStatus, run_capture_with_status};
         let callback_stop = stop.clone();
-        let stats = run_capture(
+        let status_motion = motion.clone();
+        let stats = run_capture_with_status(
             move |event| match event {
                 CaptureEvent::Delta {
                     dx,
@@ -317,6 +318,19 @@ fn run_capture(
                 }
                 CaptureEvent::Stop => {
                     callback_stop.store(true, Ordering::Relaxed);
+                }
+            },
+            move || {
+                if capture_only {
+                    return CaptureStatus::CaptureOnly;
+                }
+                let state = status_motion.lock().unwrap();
+                if !state.connected {
+                    CaptureStatus::Disconnected
+                } else if state.active {
+                    CaptureStatus::Active
+                } else {
+                    CaptureStatus::Ready
                 }
             },
             stop,

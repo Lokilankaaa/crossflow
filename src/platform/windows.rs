@@ -15,22 +15,89 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_F8, VK_F9,
+    EnableWindow, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
+    VK_SPACE,
 };
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWMOUSE, RID_INPUT,
     RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, KillTimer, MSG, RegisterClassW, SetTimer,
-    SetWindowLongPtrW, TranslateMessage, UnregisterClassW, WM_CLOSE, WM_HOTKEY, WM_INPUT,
-    WM_NCCREATE, WNDCLASSW,
+    BS_PUSHBUTTON, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, KillTimer,
+    LoadCursorW, MSG, RegisterClassW, SW_SHOWNOACTIVATE, SendMessageW, SetTimer, SetWindowLongPtrW,
+    SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW, WM_CLOSE, WM_COMMAND,
+    WM_HOTKEY, WM_INPUT, WM_NCCREATE, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+const TOGGLE: usize = 1;
+const STOP: usize = 2;
+
+/// Snapshot of the real session state, supplied by the shared core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureStatus {
+    CaptureOnly,
+    Disconnected,
+    Ready,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayStatus {
+    CaptureOnly,
+    Waiting,
+    Ready,
+    Active,
+    Disconnected,
+}
+
+fn display_status(status: CaptureStatus, connected_once: &mut bool) -> DisplayStatus {
+    match status {
+        CaptureStatus::CaptureOnly => DisplayStatus::CaptureOnly,
+        CaptureStatus::Disconnected if *connected_once => DisplayStatus::Disconnected,
+        CaptureStatus::Disconnected => DisplayStatus::Waiting,
+        CaptureStatus::Ready => {
+            *connected_once = true;
+            DisplayStatus::Ready
+        }
+        CaptureStatus::Active => {
+            *connected_once = true;
+            DisplayStatus::Active
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Controls {
+    status: HWND,
+    toggle: HWND,
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+impl Controls {
+    fn render(self, status: DisplayStatus) {
+        let (text, button, enabled) = match status {
+            DisplayStatus::CaptureOnly => ("仅采集测试 · 不向其他设备共享", "开始共享", false),
+            DisplayStatus::Waiting => ("等待连接 · 连接成功后可开始共享", "开始共享", false),
+            DisplayStatus::Ready => ("已连接 · 等待开启", "开始共享", true),
+            DisplayStatus::Active => ("正在共享 · 移动鼠标可控制 Mac", "暂停共享", true),
+            DisplayStatus::Disconnected => ("断线暂停 · 重连后请手动开始共享", "开始共享", false),
+        };
+        unsafe {
+            SetWindowTextW(self.status, wide(text).as_ptr());
+            SetWindowTextW(self.toggle, wide(button).as_ptr());
+            EnableWindow(self.toggle, i32::from(enabled));
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureEvent {
@@ -92,18 +159,66 @@ fn decode(raw: &RAWINPUT, bytes: u32) -> Packet {
     Packet::Motion(mouse.lLastX, mouse.lLastY)
 }
 
-struct State<F> {
+struct State<F, S> {
     callback: F,
+    status_fn: S,
+    connected_once: bool,
+    displayed: Option<DisplayStatus>,
+    refreshed_at: Option<Instant>,
     stop: Arc<AtomicBool>,
     stats: CaptureStats,
     error: Option<String>,
 }
-struct CallbackState<F> {
-    data: RefCell<State<F>>,
+struct CallbackState<F, S> {
+    data: RefCell<State<F, S>>,
+    controls: Cell<Option<Controls>>,
     stop: Arc<AtomicBool>,
     reentrant: Cell<bool>,
 }
-impl<F: FnMut(CaptureEvent)> State<F> {
+impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
+    fn status(&mut self) -> CaptureStatus {
+        match catch_unwind(AssertUnwindSafe(|| (self.status_fn)())) {
+            Ok(status) => status,
+            Err(_) => {
+                self.error = Some("status callback panicked; stopped safely".into());
+                self.stop.store(true, Ordering::Release);
+                CaptureStatus::Disconnected
+            }
+        }
+    }
+
+    fn command(&mut self, command: usize) {
+        if self.stop.load(Ordering::Acquire) {
+            return;
+        }
+        if command == STOP {
+            self.emit(CaptureEvent::Stop);
+            self.stop.store(true, Ordering::Release);
+        } else if command == TOGGLE
+            && matches!(self.status(), CaptureStatus::Ready | CaptureStatus::Active)
+        {
+            // The callback must also check connection state under the core lock.
+            self.emit(CaptureEvent::Toggle);
+        }
+    }
+
+    fn refresh(&mut self, force: bool) -> Option<DisplayStatus> {
+        if !force
+            && self
+                .refreshed_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(100))
+        {
+            return None;
+        }
+        self.refreshed_at = Some(Instant::now());
+        let current = self.status();
+        let display = display_status(current, &mut self.connected_once);
+        if self.displayed == Some(display) {
+            return None;
+        }
+        self.displayed = Some(display);
+        Some(display)
+    }
     fn emit(&mut self, event: CaptureEvent) {
         // A panic may not unwind over the Windows callback boundary.
         if catch_unwind(AssertUnwindSafe(|| (self.callback)(event))).is_err() {
@@ -155,7 +270,7 @@ impl<F: FnMut(CaptureEvent)> State<F> {
     }
 }
 
-unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent)>(
+unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
@@ -165,7 +280,15 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent)>(
         let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
     }
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CallbackState<F>;
+    // Native painting/text updates may synchronously reenter the window proc.
+    // They do not need the capture state and must not trip its borrow guard.
+    if !matches!(
+        message,
+        WM_INPUT | WM_HOTKEY | WM_COMMAND | WM_CLOSE | WM_TIMER
+    ) {
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CallbackState<F, S>;
     if !pointer.is_null() {
         // Box remains alive until window destruction; the loop owns access.
         // A callback that pumps native messages must not alias mutable state.
@@ -185,23 +308,18 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent)>(
                 drop(state);
                 return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             }
-            WM_HOTKEY => {
-                if wparam == 1 {
-                    state.emit(CaptureEvent::Toggle);
-                }
-                if wparam == 2 {
-                    state.emit(CaptureEvent::Stop);
-                    state.stop.store(true, Ordering::Release);
-                }
-                return 0;
-            }
-            WM_CLOSE => {
-                state.emit(CaptureEvent::Stop);
-                state.stop.store(true, Ordering::Release);
-                return 0;
-            }
+            WM_HOTKEY => state.command(wparam),
+            WM_COMMAND if (wparam >> 16) == 0 => state.command(wparam & 0xffff),
+            WM_CLOSE => state.command(STOP),
+            WM_TIMER => {}
             _ => {}
         }
+        let display = state.refresh(message != WM_TIMER);
+        drop(state);
+        if let (Some(controls), Some(display)) = (slot.controls.get(), display) {
+            controls.render(display);
+        }
+        return 0;
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -259,12 +377,23 @@ impl Drop for Resources {
     }
 }
 
-/// Ctrl+Alt+F8 emits Toggle; Ctrl+Alt+F9 emits Stop and ends capture.
+/// Capture-only compatibility entry point. The window cannot arm sharing.
+pub fn run_capture<F: FnMut(CaptureEvent)>(
+    on_event: F,
+    stop: Arc<AtomicBool>,
+    duration: Option<Duration>,
+) -> Result<CaptureStats, String> {
+    run_capture_with_status(on_event, || CaptureStatus::CaptureOnly, stop, duration)
+}
+
+/// Ctrl+Alt+Space requests Toggle; Ctrl+Alt+Escape emits Stop and ends capture.
+/// A visible control window provides the same actions and real session status.
 /// External stop is checked between events with a 10 ms idle wakeup. Callbacks
 /// only collect data; they must not perform network or blocking I/O. Filtering
 /// device-less packets is not proof against all virtual/driver input sources.
-pub fn run_capture<F: FnMut(CaptureEvent)>(
+pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     on_event: F,
+    status_fn: S,
     stop: Arc<AtomicBool>,
     duration: Option<Duration>,
 ) -> Result<CaptureStats, String> {
@@ -284,10 +413,15 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
     let state = Box::new(CallbackState {
         data: RefCell::new(State {
             callback: on_event,
+            status_fn,
+            connected_once: false,
+            displayed: None,
+            refreshed_at: None,
             stop: stop.clone(),
             stats: CaptureStats::default(),
             error: None,
         }),
+        controls: Cell::new(None),
         stop,
         reentrant: Cell::new(false),
     });
@@ -304,9 +438,11 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
         return Err(win_error("GetModuleHandleW"));
     }
     let class = WNDCLASSW {
-        lpfnWndProc: Some(window_proc::<F>),
+        lpfnWndProc: Some(window_proc::<F, S>),
         hInstance: resources.instance,
         lpszClassName: resources.name.as_ptr(),
+        hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
+        hbrBackground: (COLOR_WINDOW + 1) as usize as _,
         ..unsafe { std::mem::zeroed() }
     };
     if unsafe { RegisterClassW(&class) } == 0 {
@@ -317,20 +453,85 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
         CreateWindowExW(
             0,
             resources.name.as_ptr(),
-            null(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
+            wide("Crossflow · 鼠标共享").as_ptr(),
+            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            460,
+            278,
+            null_mut(),
             null_mut(),
             resources.instance,
-            (&*state as *const CallbackState<F>).cast(),
+            (&*state as *const CallbackState<F, S>).cast(),
         )
     };
     if resources.hwnd.is_null() {
         return Err(win_error("CreateWindowExW"));
+    }
+    let make_control = |class: &str, text: &str, style, x, y, width, height, id: usize| {
+        let control = unsafe {
+            CreateWindowExW(
+                0,
+                wide(class).as_ptr(),
+                wide(text).as_ptr(),
+                WS_CHILD | WS_VISIBLE | style,
+                x,
+                y,
+                width,
+                height,
+                resources.hwnd,
+                id as _,
+                resources.instance,
+                null(),
+            )
+        };
+        if control.is_null() {
+            return Err(win_error("CreateWindowExW(control)"));
+        }
+        unsafe {
+            SendMessageW(
+                control,
+                WM_SETFONT,
+                GetStockObject(DEFAULT_GUI_FONT) as usize,
+                1,
+            );
+        }
+        Ok(control)
+    };
+    let status = make_control("STATIC", "等待连接", 0, 20, 20, 410, 28, 10)?;
+    let lifetime = duration.map_or_else(
+        || "关闭此窗口也会安全停止。".to_owned(),
+        |duration| format!("本次试验将在 {:.0} 秒后自动结束。", duration.as_secs_f64()),
+    );
+    let instructions = format!(
+        "Ctrl + Alt + 空格：开始 / 暂停\r\nCtrl + Alt + Esc：停止并退出\r\n仅共享移动，不转发点击；本机光标仍会移动。\r\n{lifetime}"
+    );
+    make_control("STATIC", &instructions, 0, 20, 60, 410, 100, 11)?;
+    let toggle = make_control(
+        "BUTTON",
+        "开始共享",
+        WS_TABSTOP | BS_PUSHBUTTON as u32,
+        20,
+        180,
+        180,
+        34,
+        TOGGLE,
+    )?;
+    make_control(
+        "BUTTON",
+        "停止并退出",
+        WS_TABSTOP | BS_PUSHBUTTON as u32,
+        220,
+        180,
+        180,
+        34,
+        STOP,
+    )?;
+    let controls = Controls { status, toggle };
+    state.controls.set(Some(controls));
+    let display = state.data.borrow_mut().refresh(true);
+    if let Some(display) = display {
+        controls.render(display);
     }
     let device = RAWINPUTDEVICE {
         usUsagePage: 1,
@@ -342,7 +543,7 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
         return Err(win_error("RegisterRawInputDevices"));
     }
     resources.raw = true;
-    for (id, key) in [(1, VK_F8), (2, VK_F9)] {
+    for (id, key) in [(TOGGLE as i32, VK_SPACE), (STOP as i32, VK_ESCAPE)] {
         if unsafe {
             RegisterHotKey(
                 resources.hwnd,
@@ -353,9 +554,13 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
         } == 0
         {
             return Err(format!(
-                "{}; check desktop permissions or a conflicting Ctrl+Alt+F{} binding",
+                "{}; check desktop permissions or a conflicting Ctrl+Alt+{} binding",
                 win_error("RegisterHotKey"),
-                if id == 1 { 8 } else { 9 }
+                if id == TOGGLE as i32 {
+                    "Space"
+                } else {
+                    "Escape"
+                }
             ));
         }
         resources.hotkeys.push(id);
@@ -363,6 +568,10 @@ pub fn run_capture<F: FnMut(CaptureEvent)>(
     resources.timer = unsafe { SetTimer(resources.hwnd, 1, 10, None) };
     if resources.timer == 0 {
         return Err(win_error("SetTimer"));
+    }
+    // Display once without taking focus; never force activation on status updates.
+    unsafe {
+        ShowWindow(resources.hwnd, SW_SHOWNOACTIVATE);
     }
     let started = Instant::now();
     let mut message = MaybeUninit::<MSG>::zeroed();
@@ -453,6 +662,10 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut state = State {
             callback: |_| panic!("callback failed"),
+            status_fn: || CaptureStatus::Ready,
+            connected_once: false,
+            displayed: None,
+            refreshed_at: None,
             stop: stop.clone(),
             stats: CaptureStats::default(),
             error: None,
@@ -460,5 +673,60 @@ mod tests {
         state.emit(CaptureEvent::Toggle);
         assert!(stop.load(Ordering::Acquire));
         assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn connection_history_changes_status_without_arming() {
+        let mut seen = false;
+        assert_eq!(
+            display_status(CaptureStatus::Disconnected, &mut seen),
+            DisplayStatus::Waiting
+        );
+        assert_eq!(
+            display_status(CaptureStatus::Ready, &mut seen),
+            DisplayStatus::Ready
+        );
+        assert_eq!(
+            display_status(CaptureStatus::Active, &mut seen),
+            DisplayStatus::Active
+        );
+        assert_eq!(
+            display_status(CaptureStatus::Disconnected, &mut seen),
+            DisplayStatus::Disconnected
+        );
+        assert_eq!(
+            display_status(CaptureStatus::Ready, &mut seen),
+            DisplayStatus::Ready
+        );
+    }
+
+    #[test]
+    fn toggle_uses_current_connection_and_close_stops() {
+        let status = Cell::new(CaptureStatus::Disconnected);
+        let events = RefCell::new(Vec::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut state = State {
+            callback: |event| events.borrow_mut().push(event),
+            status_fn: || status.get(),
+            connected_once: false,
+            displayed: None,
+            refreshed_at: None,
+            stop: stop.clone(),
+            stats: CaptureStats::default(),
+            error: None,
+        };
+        state.command(TOGGLE);
+        assert!(events.borrow().is_empty());
+        status.set(CaptureStatus::Ready);
+        state.command(TOGGLE);
+        assert!(matches!(events.borrow().as_slice(), [CaptureEvent::Toggle]));
+        status.set(CaptureStatus::Disconnected);
+        state.command(TOGGLE);
+        assert_eq!(events.borrow().len(), 1);
+        state.command(STOP);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(matches!(events.borrow().last(), Some(CaptureEvent::Stop)));
+        state.command(TOGGLE);
+        assert_eq!(events.borrow().len(), 2);
     }
 }
