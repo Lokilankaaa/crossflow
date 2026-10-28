@@ -33,7 +33,11 @@ cargo test --locked
 
 Mac 需要 Xcode Command Line Tools 提供系统框架链接能力。Windows GNU 便携工具只用于本机开发，不是产品分发依赖；生成的 Windows 程序可单独测试。`Cargo.lock` 固定依赖版本。
 
-## 首次配对
+## 首次配对（阶段 0 开发诊断）
+
+正式客户端的目标流程是“自动发现局域网设备 → 点选 → 双方确认配对码 → 记住设备”，由应用保管身份密钥，不向普通用户索取 IP 或身份文件。以下文件交换仅为当前诊断入口；正式配对与原生设备列表尚在接入。
+
+共享内核已加入真实 mDNS/DNS-SD 发布与浏览，可用 `crossflow discover --seconds 5` 做限时浏览诊断。输出中的设备均未认证，不会建立输入会话；空列表也不证明跨机发现已通过。Windows 本机发布/浏览测试已通过，跨机网络、两端原生列表与配对码仍待集成。发现服务使用 `_crossflow._tcp.local.`，限制候选数量，保留 IPv6 接口作用域，不广播配对码或身份密钥。
 
 ```powershell
 ./target/release/crossflow.exe pair --out .pairing
@@ -147,7 +151,7 @@ Mac 原生复验可运行 `sh scripts/validate-mac-core.sh`；依赖已缓存时
 
 ### 屏幕布局开发工具
 
-`ui/index.html` 是离线交互草稿。正式界面以轻量、美观、响应快为目标，采用 macOS SwiftUI 与 Windows WinUI 3 方向，共享设计资源并调用同一 Rust 内核。Windows 已有可编译的原生布局客户端，见 [构建与功能说明](clients/windows/README.md)；Mac 原生客户端正在独立验证聊天中开发，尚未汇入主分支。HTML 草稿不作为正式客户端技术选型。
+`ui/index.html` 是离线交互草稿。正式界面以轻量、美观、响应快为目标，采用 macOS SwiftUI 与 Windows WinUI 3，共享设计资源并调用同一 Rust 内核。两端源码均已汇入主分支，见 [Windows 构建说明](clients/windows/README.md)与 [Mac 构建说明](clients/macos/README.md)。Mac 已通过原生构建及十项真实桥接自检，仍待原生窗口视觉验证和会话控制接入。HTML 草稿不作为正式客户端技术选型。
 
 Windows 原生客户端构建：
 

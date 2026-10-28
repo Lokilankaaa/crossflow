@@ -1,0 +1,21 @@
+{
+  "date_local": "2026-10-28",
+  "dependency": "mdns-sd 0.21.6",
+  "service_type": "_crossflow._tcp.local.",
+  "pure_tests_passed": 6,
+  "explicit_windows_multicast_test": "passed in 0.86 seconds; one publisher and browser on same Windows machine",
+  "cli_browse_three_seconds": "exit 0, empty candidate list, no error; no active Crossflow peer expected",
+  "workspace_tests": "passed",
+  "workspace_clippy": "passed",
+  "apple_all_targets_check": "passed on Windows, not native Mac execution",
+  "fmt": "passed after formatting CLI",
+  "trust": "all candidates untrusted; no pairing or input connection",
+  "limits": [
+    "Mac native discovery not run",
+    "Windows-to-Mac discovery not run",
+    "Native device-list integration not implemented",
+    "Pairing-code protocol and protected identity storage pending",
+    "Application cache bounded; dependency DNS cache not independently bounded",
+    "Shutdown ACK observed, not an exposed join of library internal thread"
+  ]
+}

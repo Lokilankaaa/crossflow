@@ -51,6 +51,11 @@ enum Command {
         #[arg(long, default_value = ".pairing")]
         out: PathBuf,
     },
+    /// Browse nearby Crossflow services; discovery never grants input permission.
+    Discover {
+        #[arg(long, default_value_t = 5.0)]
+        seconds: f64,
+    },
     /// Receive encrypted movement. Default is a sink without OS input injection.
     Receive {
         #[arg(long, default_value = "127.0.0.1:24800")]
@@ -186,6 +191,7 @@ fn main() -> Result<()> {
             | Command::Send { .. }
             | Command::Capture { .. }
             | Command::DesktopSend { .. }
+            | Command::Discover { .. }
     ) {
         Some(crossflow::shutdown::Shutdown::install(stop.clone())?)
     } else {
@@ -243,6 +249,38 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&crossflow::security::create_pair(&out)?)?
             );
+        }
+        Command::Discover { seconds } => {
+            ensure!(
+                seconds.is_finite() && seconds > 0.0 && seconds <= 60.0,
+                "discovery duration must be >0 and <=60 seconds"
+            );
+            let mut discovery = crossflow::discovery::DiscoveryHandle::start(
+                crossflow::discovery::DiscoveryConfig {
+                    advertisement: None,
+                    local_device_id: None,
+                    compatible_protocol: crossflow::protocol::WIRE_VERSION.into(),
+                },
+            )?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+            let mut snapshot = None;
+            while !stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                if let Some(current) = discovery.try_snapshot() {
+                    snapshot = Some(current);
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if let Some(current) = discovery.try_snapshot() {
+                snapshot = Some(current);
+            }
+            discovery.stop();
+            let stopped = discovery.wait_stopped(std::time::Duration::from_secs(3));
+            let snapshot =
+                snapshot.ok_or_else(|| anyhow::anyhow!("discovery state unavailable"))?;
+            let failed = snapshot.error.is_some();
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            stopped?;
+            ensure!(!failed, "local discovery failed; see reported status");
         }
         Command::Summarize { path } => {
             println!("{}", serde_json::to_string_pretty(&summarize(&path)?)?)

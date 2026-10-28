@@ -58,12 +58,35 @@
     "native_window_validation": "not run",
     "session_control_in_mac_ui": false,
     "handoff": "authenticated TLS download validated using CA and SPKI pin; bundle SHA256 matched; service stopped and temporary token/private key deleted",
-    "coordination": "Mac resumed reporting after model-capacity interruption; source return requested before new timed receiver; Windows send-message API still unconfirmed"
+    "coordination": "Mac can read and report; main-to-Mac follow-up tool still fails. New cross-device listener not confirmed.",
+    "github_integration": "Mac official login completed; feature/macos-native-client c2a5820 pushed, fetched, reviewed and merged into main 2fe46bc; main pushed"
   },
   "limitations": [
     "No new cross-device input or visible smoothness measurement",
-    "Window close during active sharing not tested through real GUI",
     "Runtime arrangement and keyboard integration remain pending",
-    "Mac UI changes have not yet been returned to Windows main"
-  ]
+    "Mac UI session controls and native visual/interaction validation remain pending"
+  ],
+  "gui_close_while_sharing": {
+    "evidence": "runs/native-ui-close-20261028-225215",
+    "core_build_revision": "120d646b203d53f286e84736aebdb13a39120b23",
+    "result": "passed",
+    "os_injection": false,
+    "scenario": "First bounded receiver expired before sharing test; same-port restart authenticated; UI stayed paused; manual arm confirmed at receiver; title-bar close exited GUI and sender",
+    "verified_gui_pid": 36832,
+    "verified_sender_pid": 540,
+    "process_check_local": "2026-10-28T22:57:51.4736137+08:00",
+    "remaining_processes": 0,
+    "receiver_arms": 1,
+    "received_movements": 0,
+    "sender_capture_records": 284,
+    "sender_complete": true,
+    "restarted_receiver_complete": true,
+    "dropped_log_records": 0,
+    "sender_expected_errors": [
+      "one peer disconnect when first receiver expired",
+      "49 TCP connection timeouts before restarted receiver"
+    ],
+    "receiver_expected_errors": 1,
+    "limits": "Control lifecycle and process exit only; no movement arrived in this run, no OS key/button release or display measurement"
+  }
 }
