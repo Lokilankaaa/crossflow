@@ -42,6 +42,13 @@ internal sealed class MainWindow : Window
     private TextBox? hostInput, identityInput;
     private readonly SessionController session = new();
     private readonly DiscoveryClient discovery = new();
+    private readonly PeerClient peers = new();
+    private Task<bool> peerPageCleanup = Task.FromResult(true);
+    private TextBlock? peerStatus;
+    private StackPanel? savedPeers;
+    private Button? refreshPeers;
+    private readonly List<Button> peerConnectButtons = [];
+    private long peerGeneration;
     private TextBlock? discoveryStatus;
     private StackPanel? nearbyDevices;
     private Button? refreshDiscovery;
@@ -159,7 +166,8 @@ internal sealed class MainWindow : Window
             closing = true; UpdateSessionUi();
             try
             {
-                bool scanStopped = await discovery.StopAsync();
+                var readsStopped = await Task.WhenAll(discovery.StopAsync(), peers.StopAsync());
+                bool scanStopped = readsStopped.All(stopped => stopped);
                 bool sessionStopped = await session.StopAsync();
                 if (scanStopped && sessionStopped) { allowClose = true; Close(); return; }
                 ShowConnection();
@@ -232,6 +240,10 @@ internal sealed class MainWindow : Window
         discoveryGeneration++;
         discovery.Cancel();
         discoveryStatus = null; nearbyDevices = null; refreshDiscovery = null;
+        peerGeneration++;
+        peers.Cancel();
+        peerPageCleanup = peers.StopAsync();
+        peerStatus = null; savedPeers = null; refreshPeers = null; peerConnectButtons.Clear();
         if (dragOriginal is not null) CancelDrag();
         // A disconnected WinUI element's Parent may be null while its old
         // container still owns it. Release via the containers we created,
@@ -248,7 +260,25 @@ internal sealed class MainWindow : Window
     private void ShowConnection()
     {
         SelectPage("connection");
-        var page = Page("附近设备", "在同一局域网中查找 Crossflow 设备。发现设备不会自动连接或开始共享。");
+        var page = Page("设备", "选择已配对设备连接。新发现的设备需要完成配对后才能共享。");
+        connectionStatus = Text("尚未连接", "section"); page.Children.Add(connectionStatus);
+        var controls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        armSession = Action("开始共享", "session-arm", () => RunSessionAction(session.ArmAsync));
+        pauseSession = Action("暂停", "session-pause", () => RunSessionAction(session.PauseAsync));
+        stopSession = Action("停止连接", "session-stop", () => RunSessionAction(async () => { if (!await session.StopAsync()) throw new InvalidOperationException("共享内核尚未退出，请重试停止连接。"); }));
+        foreach (var button in new[] { armSession, pauseSession, stopSession }) controls.Children.Add(button);
+        page.Children.Add(controls);
+        sessionDetail = Text("连接后保持暂停，需要手动开始共享。", secondary: true); page.Children.Add(sessionDetail);
+        var savedHeading = new Grid();
+        savedHeading.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        savedHeading.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        savedHeading.Children.Add(Text("已配对设备", "section"));
+        refreshPeers = Action("刷新列表", "peers-refresh", StartPeers);
+        Grid.SetColumn(refreshPeers, 1); savedHeading.Children.Add(refreshPeers); page.Children.Add(savedHeading);
+        peerStatus = Text("正在读取已配对设备…", "caption", true); page.Children.Add(peerStatus);
+        savedPeers = new StackPanel(); AutomationProperties.SetAutomationId(savedPeers, "saved-peers"); page.Children.Add(savedPeers);
+        page.Children.Add(Divider());
+        page.Children.Add(Text("附近设备", "section"));
         var heading = new Grid();
         heading.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
         heading.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
@@ -260,11 +290,9 @@ internal sealed class MainWindow : Window
         nearbyDevices = new StackPanel { Spacing = 0 };
         AutomationProperties.SetAutomationId(nearbyDevices, "nearby-devices");
         page.Children.Add(nearbyDevices);
-        page.Children.Add(Text("首次连接需要在两台设备上确认配对。短码配对正在接入，此版本暂不能从设备列表发起连接。", "caption", true));
+        page.Children.Add(Text("首次连接需要在两台设备上确认配对。附近的新设备配对尚未接入；已配对设备可从上方列表连接。", "caption", true));
         var diagnostics = new StackPanel { Spacing = 14, Padding = new Thickness(4, 12, 4, 12) };
         diagnostics.Children.Add(Text("开发诊断 · 仅用于已有身份文件的实验连接。本轮最多运行一小时。", secondary: true));
-        connectionStatus = Text("尚未连接", "section");
-        diagnostics.Children.Add(connectionStatus);
         hostInput = new TextBox { Header = "目标 IP 和端口", PlaceholderText = "192.168.1.20:24800", Text = targetHost, MaxLength = 128 };
         AutomationProperties.SetAutomationId(hostInput, "session-host");
         hostInput.TextChanged += (sender, _) => targetHost = ((TextBox)sender).Text;
@@ -281,20 +309,59 @@ internal sealed class MainWindow : Window
             catch { if (sessionDetail is not null) sessionDetail.Text = "无法选择文件夹，请粘贴现有配对文件夹路径。"; }
         });
         diagnostics.Children.Add(identityPicker);
-        var controls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         connectSession = Action("连接", "session-connect", () => RunSessionAction(() => session.ConnectAsync(targetHost, identityDirectory)));
-        armSession = Action("开始共享", "session-arm", () => RunSessionAction(session.ArmAsync));
-        pauseSession = Action("暂停", "session-pause", () => RunSessionAction(session.PauseAsync));
-        stopSession = Action("停止连接", "session-stop", () => RunSessionAction(async () => { if (!await session.StopAsync()) throw new InvalidOperationException("共享内核尚未退出，请重试停止连接。"); }));
-        foreach (var button in new[] { connectSession, armSession, pauseSession, stopSession }) controls.Children.Add(button);
-        diagnostics.Children.Add(controls);
-        sessionDetail = Text("打开客户端不会自动连接或启动输入。", secondary: true); diagnostics.Children.Add(sessionDetail);
+        diagnostics.Children.Add(connectSession);
         diagnostics.Children.Add(Text("当前实验连接仅共享鼠标移动。键盘、鼠标点击、滚轮与屏幕边缘自动切换尚未接入此入口。布局编辑仍是草稿。", "caption", true));
         var advanced = new Expander { Header = "开发诊断", Content = diagnostics, IsExpanded = false, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
         AutomationProperties.SetAutomationId(advanced, "developer-diagnostics");
         page.Children.Add(advanced);
         UpdateSessionUi();
-        if (!closing) StartDiscovery();
+        if (!closing) { StartPeers(); StartDiscovery(); }
+    }
+    private async void StartPeers()
+    {
+        if (closing || activePage != "connection" || peerStatus is null) return;
+        long generation = ++peerGeneration;
+        if (refreshPeers is not null) refreshPeers.IsEnabled = false;
+        savedPeers?.Children.Clear(); peerConnectButtons.Clear();
+        peerStatus.Text = "正在读取已配对设备…";
+        try
+        {
+            await peerPageCleanup;
+            if (generation != peerGeneration || closing) return;
+            if (!await peers.StopAsync()) throw new InvalidOperationException("设备列表读取尚未退出，请稍后重试。");
+            if (generation != peerGeneration || closing) return;
+            var result = await peers.ReadAsync();
+            if (generation != peerGeneration || closing || savedPeers is null || peerStatus is null) return;
+            peerStatus.Text = result.Peers.Count == 0 ? "尚无已配对设备" : $"已保存 {result.Peers.Count} 台设备 · 在线状态由连接后确认";
+            if (result.InvalidRecords != 0)
+                peerStatus.Text = $"有 {result.InvalidRecords} 条已保存记录无法验证，已隐藏。{(result.Peers.Count == 0 ? "目前没有可连接的有效记录。" : $"以下 {result.Peers.Count} 条记录可尝试连接。")}";
+            foreach (var peer in result.Peers)
+            {
+                var row = new Grid { Padding = new Thickness(0, 16, 0, 16), ColumnSpacing = 16 };
+                row.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                var description = new StackPanel { Spacing = 5 };
+                var name = Text(peer.Name, "section"); name.TextWrapping = TextWrapping.NoWrap; name.TextTrimming = TextTrimming.CharacterEllipsis;
+                description.Children.Add(name); description.Children.Add(Text("已保存配对信息", "caption", true));
+                row.Children.Add(description);
+                var connect = Action("连接", "peer-connect-" + peer.Id, () => RunSessionAction(() => session.ConnectPeerAsync(peer.Id)));
+                connect.VerticalAlignment = VerticalAlignment.Center;
+                peerConnectButtons.Add(connect); Grid.SetColumn(connect, 1); row.Children.Add(connect);
+                savedPeers.Children.Add(new Border { Child = row, BorderBrush = theme.Brush("border"), BorderThickness = new Thickness(0, 0, 0, 1) });
+            }
+            UpdateSessionUi();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error)
+        {
+            if (generation == peerGeneration && !closing && peerStatus is not null)
+                peerStatus.Text = error is InvalidOperationException ? error.Message : "无法读取已配对设备，请刷新重试。";
+        }
+        finally
+        {
+            if (generation == peerGeneration && !closing && refreshPeers is not null) refreshPeers.IsEnabled = true;
+        }
     }
     private async void StartDiscovery()
     {
@@ -350,7 +417,7 @@ internal sealed class MainWindow : Window
         sessionAction = true; UpdateSessionUi();
         string? error = null;
         try { await operation(); }
-        catch (Exception failure) { error = failure is InvalidOperationException ? failure.Message : "无法完成连接操作，请检查地址与身份文件夹。"; }
+        catch (Exception failure) { error = failure is InvalidOperationException ? failure.Message : "无法完成连接操作，请检查设备与已保存的配对记录。"; }
         finally { sessionAction = false; UpdateSessionUi(); if (error is not null && sessionDetail is not null) sessionDetail.Text = error; }
     }
     private void UpdateSessionUi()
@@ -364,6 +431,7 @@ internal sealed class MainWindow : Window
         sidebarStop.IsEnabled = state.ProcessRunning && !sessionAction && !closing;
         sidebarStop.Visibility = state.ProcessRunning ? Visibility.Visible : Visibility.Collapsed;
         if (connectSession is not null) connectSession.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
+        foreach (var button in peerConnectButtons) button.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
         if (armSession is not null) armSession.IsEnabled = state.CanArm && !sessionAction && !closing;
         if (pauseSession is not null) pauseSession.IsEnabled = state.State == "sharing" && !state.CommandPending && !state.StopRequested && !sessionAction && !closing;
         if (stopSession is not null) stopSession.IsEnabled = state.ProcessRunning && !sessionAction && !closing;

@@ -13,11 +13,12 @@ internal static class SessionSelfTest
         var watch = Stopwatch.StartNew();
         while (!condition()) { if (watch.ElapsedMilliseconds > milliseconds) throw new TimeoutException("session fixture timed out"); await Task.Delay(10); }
     }
-    private static SessionController Controller(string mode) => new((_, _, _) =>
+    private static SessionController Controller(string mode) => new((_, _, _) => FixtureStart(mode));
+    private static ProcessStartInfo FixtureStart(string mode)
     {
         var info = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "Crossflow.Windows.exe"));
         info.ArgumentList.Add("--session-fixture"); info.ArgumentList.Add(mode); return info;
-    });
+    }
     private sealed class PausableContext : SynchronizationContext
     {
         private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> queue = new();
@@ -48,6 +49,48 @@ internal static class SessionSelfTest
             { try { SessionController.ParseStatus(invalid); throw new Exception("invalid status accepted"); } catch (Exception failure) when (failure.Message != "invalid status accepted") { } }
             checks["invalid_status_rejected"] = true;
             try { SessionController.ValidateEndpoint("example.com:24800"); throw new Exception("DNS accepted"); } catch (InvalidOperationException) { checks["ip_literal_only"] = true; }
+            const string peerId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            var peerRequests = new List<(string Executable, string Directory, string[] Arguments)>();
+            var peer = new SessionController(request =>
+            {
+                peerRequests.Add((request.FileName, request.WorkingDirectory, request.ArgumentList.ToArray()));
+                return FixtureStart("peer"); // Never launches the requested Rust executable.
+            });
+            controllers.Add(peer);
+            string peerDirectory = Path.Combine(directory, "peer logs with spaces");
+            bool rejectedAll = true;
+            foreach (string invalid in new[] { null!, "", peerId[..63], peerId + "0", peerId.ToUpperInvariant(), " " + peerId, peerId + "\n", new string('g', 64), new string('ａ', 64), "--host 127.0.0.1:24800" })
+            {
+                try { await peer.ConnectPeerAsync(invalid, peerDirectory); rejectedAll = false; }
+                catch (InvalidOperationException) { }
+            }
+            checks["peer_id_strict_lower_hex_before_launch"] = rejectedAll && peerRequests.Count == 0 &&
+                !Directory.Exists(peerDirectory) && peer.Snapshot.Generation == 0 && peer.Snapshot.State == "idle";
+            await peer.ConnectPeerAsync(peerId, peerDirectory);
+            var peerRequest = peerRequests.Single();
+            checks["peer_launch_exact_packaged_arguments"] = peerRequest.Executable == Path.Combine(AppContext.BaseDirectory, "crossflow.exe") &&
+                peerRequest.Directory == AppContext.BaseDirectory && peerRequest.Arguments.SequenceEqual(new[]
+                { "desktop-send", "--peer", peerId, "--log", peer.LastLogPath!, "--seconds", "3600", "--max-hz", "1000" }) &&
+                !peerRequest.Arguments.Contains("--host") && !peerRequest.Arguments.Contains("--identity") &&
+                Path.GetDirectoryName(peer.LastLogPath) == peerDirectory;
+            await WaitAsync(() => peer.Snapshot.CanArm);
+            checks["peer_starts_paused"] = peer.Snapshot.State == "paused";
+            bool duplicateRejected = false;
+            try { await peer.ConnectPeerAsync(peerId, peerDirectory); }
+            catch (InvalidOperationException) { duplicateRejected = true; }
+            checks["peer_reuses_single_process_guard"] = duplicateRejected && peerRequests.Count == 1;
+            ulong peerEpoch = peer.Snapshot.Epoch;
+            await peer.ArmAsync(); await WaitAsync(() => peer.Snapshot.State == "sharing" && !peer.Snapshot.CommandPending);
+            checks["peer_arm_uses_reported_epoch"] = peer.Snapshot.Epoch == peerEpoch + 1;
+            await peer.PauseAsync(); await WaitAsync(() => peer.Snapshot.CanArm);
+            checks["peer_pause_requires_manual_rearm"] = peer.Snapshot.State == "paused";
+            checks["peer_graceful_stop_reaped"] = await peer.StopAsync() && peer.Snapshot.State == "stopped" && !peer.Snapshot.ProcessRunning;
+            string? firstPeerLog = peer.LastLogPath;
+            long firstPeerGeneration = peer.Snapshot.Generation;
+            await peer.ConnectPeerAsync(peerId, peerDirectory); await WaitAsync(() => peer.Snapshot.CanArm);
+            checks["peer_reconnect_new_log_and_paused_generation"] = peer.Snapshot.Generation > firstPeerGeneration &&
+                peer.Snapshot.State == "paused" && peer.LastLogPath != firstPeerLog && peerRequests.Count == 2;
+            await peer.StopAsync();
             var normal = Controller("normal"); controllers.Add(normal);
             await normal.ConnectAsync("127.0.0.1:24800", directory, directory);
             await WaitAsync(() => normal.Snapshot.State == "connecting");

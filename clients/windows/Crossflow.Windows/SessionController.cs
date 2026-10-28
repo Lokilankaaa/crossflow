@@ -17,6 +17,7 @@ internal sealed class SessionController
     private readonly object sync = new();
     private readonly SemaphoreSlim commands = new(1, 1);
     private readonly Func<string, string, string, ProcessStartInfo>? fixture;
+    private readonly Func<ProcessStartInfo, ProcessStartInfo>? peerFixture;
     private Run? current;
     private long generation;
     private SessionSnapshot snapshot = new("idle", 0, false, null, 0, false);
@@ -27,6 +28,8 @@ internal sealed class SessionController
     internal SessionController() { }
     // Test-only factory never participates in the production constructor.
     internal SessionController(Func<string, string, string, ProcessStartInfo> fixture) => this.fixture = fixture;
+    // Inspects the actual peer launch request before replacing it with a fixture.
+    internal SessionController(Func<ProcessStartInfo, ProcessStartInfo> peerFixture) => this.peerFixture = peerFixture;
 
     private sealed class Run(Process process, long generation)
     {
@@ -56,6 +59,23 @@ internal sealed class SessionController
         host = ValidateEndpoint(host);
         identity = Path.GetFullPath(identity);
         if (!Directory.Exists(identity)) throw new InvalidOperationException("请选择已有的配对身份文件夹。");
+        await ConnectCoreAsync(log => fixture?.Invoke(host, identity, log) ?? PackagedStart(host, identity, log), logDirectory);
+    }
+
+    internal async Task ConnectPeerAsync(string peerId, string? logDirectory = null)
+    {
+        if (peerId is null || peerId.Length != 64 || peerId.Any(value => !(value is >= '0' and <= '9' or >= 'a' and <= 'f')))
+            throw new InvalidOperationException("已配对设备标识无效，请刷新设备列表后重试。");
+        await ConnectCoreAsync(log =>
+        {
+            var info = PackagedInfo(["desktop-send", "--peer", peerId, "--log", log, "--seconds", "3600", "--max-hz", "1000"]);
+            return peerFixture?.Invoke(info) ?? RequirePackaged(info);
+        }, logDirectory);
+    }
+
+    // Both production entry points share process ownership, pipes and supervision.
+    private async Task ConnectCoreAsync(Func<string, ProcessStartInfo> start, string? logDirectory)
+    {
         await commands.WaitAsync();
         try
         {
@@ -63,7 +83,7 @@ internal sealed class SessionController
             string directory = logDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Crossflow", "Logs");
             Directory.CreateDirectory(directory);
             string log = Path.Combine(directory, $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.jsonl");
-            var info = fixture?.Invoke(host, identity, log) ?? PackagedStart(host, identity, log);
+            var info = start(log);
             info.UseShellExecute = false; info.CreateNoWindow = true;
             info.RedirectStandardInput = true; info.RedirectStandardOutput = true; info.RedirectStandardError = true;
             info.StandardInputEncoding = new UTF8Encoding(false);
@@ -97,11 +117,19 @@ internal sealed class SessionController
     }
 
     private static ProcessStartInfo PackagedStart(string host, string identity, string log)
+        => RequirePackaged(PackagedInfo(["desktop-send", "--host", host, "--identity", identity, "--log", log, "--seconds", "3600", "--max-hz", "1000"]));
+
+    private static ProcessStartInfo PackagedInfo(string[] arguments)
     {
         string executable = Path.Combine(AppContext.BaseDirectory, "crossflow.exe");
-        if (!File.Exists(executable)) throw new InvalidOperationException("缺少随客户端提供的共享内核，请重新构建或安装客户端。");
         var info = new ProcessStartInfo(executable) { WorkingDirectory = AppContext.BaseDirectory };
-        foreach (string value in new[] { "desktop-send", "--host", host, "--identity", identity, "--log", log, "--seconds", "3600", "--max-hz", "1000" }) info.ArgumentList.Add(value);
+        foreach (string value in arguments) info.ArgumentList.Add(value);
+        return info;
+    }
+
+    private static ProcessStartInfo RequirePackaged(ProcessStartInfo info)
+    {
+        if (!File.Exists(info.FileName)) throw new InvalidOperationException("缺少随客户端提供的共享内核，请重新构建或安装客户端。");
         return info;
     }
 
