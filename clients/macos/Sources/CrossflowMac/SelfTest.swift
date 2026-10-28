@@ -4,7 +4,7 @@ import Foundation
 /// receiver, event creation, or event posting is started on this path.
 enum SelfTest {
     static func run(output: URL) async -> Int32 {
-        var checks: [String: Bool] = [:]
+        var checks = DiscoverySelfTest.checks()
         var details: [String: JSONValue] = [:]
         do {
             let bridge = BridgeClient()

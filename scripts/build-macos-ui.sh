@@ -12,7 +12,9 @@ case "$(uname -m)" in
     *) printf '%s\n' 'Unsupported Mac architecture' >&2; exit 1 ;;
 esac
 bridge_library="${CROSSFLOW_BRIDGE_LIBRARY:-$root/target/$native_target/release/libcrossflow_bridge.dylib}"
+core_executable="${CROSSFLOW_CORE_EXECUTABLE:-$root/target/$native_target/release/crossflow}"
 test -f "$bridge_library" || { printf 'Build native Rust bridge first: %s\n' "$bridge_library" >&2; exit 1; }
+test -f "$core_executable" && test -x "$core_executable" || { printf 'Build native Rust core first: %s\n' "$core_executable" >&2; exit 1; }
 test -f "$root/examples/layout-four-screens.json" || { printf '%s\n' 'Missing shared four-screen layout' >&2; exit 1; }
 mkdir -p "$build_root/cache" "$build_root/modules"
 export CLANG_MODULE_CACHE_PATH="$build_root/modules"
@@ -24,6 +26,7 @@ bin_dir=$(swift build --package-path "$root/clients/macos" \
     --configuration release --show-bin-path)
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin_dir/CrossflowMac" "$app/Contents/MacOS/CrossflowMac"
+cp "$core_executable" "$app/Contents/MacOS/crossflow"
 cp "$root/clients/macos/Resources/Info.plist" "$app/Contents/Info.plist"
 cp "$root/clients/design-tokens.json" "$app/Contents/Resources/design-tokens.json"
 cp "$root/examples/layout-two-devices.json" "$app/Contents/Resources/layout-two-devices.json"
@@ -32,5 +35,6 @@ cp "$root/examples/layout-four-screens.json" "$app/Contents/Resources/layout-fou
 mkdir -p "$app/Contents/Frameworks"
 cp "$bridge_library" "$app/Contents/Frameworks/libcrossflow_bridge.dylib"
 codesign --force --sign - "$app/Contents/Frameworks/libcrossflow_bridge.dylib"
+codesign --force --sign - "$app/Contents/MacOS/crossflow"
 codesign --force --sign - "$app"
 printf 'Built native app: %s\n' "$app"
