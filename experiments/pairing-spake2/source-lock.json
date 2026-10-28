@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/google/boringssl",
+  "revision": "3769c110eab4ddbc0c159fadb4f1d0d98b2cf0cc",
+  "archive": "https://codeload.github.com/google/boringssl/zip/3769c110eab4ddbc0c159fadb4f1d0d98b2cf0cc",
+  "sha256": "002c375c3a01586761f97c46c2f06f5903e4bb4ba595e1d9ae203fb073ac2065",
+  "production_dependency": false,
+  "warning": "Functional build experiment, not a cryptographic audit or complete pairing protocol. Verify the archive checksum before supplying BORINGSSL_SOURCE_DIR."
+}

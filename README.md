@@ -39,6 +39,8 @@ Mac 需要 Xcode Command Line Tools 提供系统框架链接能力。Windows GNU
 
 共享内核已加入真实 mDNS/DNS-SD 发布与浏览，可用 `crossflow discover --seconds 5` 做限时浏览诊断。输出中的设备均未认证，不会建立输入会话；空列表也不证明跨机发现已通过。Windows 本机发布/浏览测试已通过，跨机网络、两端原生列表与配对码仍待集成。发现服务使用 `_crossflow._tcp.local.`，限制候选数量，保留 IPv6 接口作用域，不广播配对码或身份密钥。
 
+短码认证的独立依赖试验位于 `experiments/pairing-spake2/`。固定 BoringSSL 源码版本与校验值在 `source-lock.json`；验证下载后，以 `cmake -S experiments/pairing-spake2 -B <项目外构建目录> -DBORINGSSL_SOURCE_DIR=<已校验源码目录>` 配置，再构建 `spake2_test`。Windows GNU 的同码、错码、角色/绑定变化及确认消息篡改测试已通过；结果描述原始临时构建，版本化 CMake 包装另通过配置检查。该试验未链接到产品，不是完整配对协议或安全审计；Rust 接口、真实 Noise 绑定及 Mac 构建仍待验证。
+
 ```powershell
 ./target/release/crossflow.exe pair --out .pairing
 ```
