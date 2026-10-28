@@ -1,0 +1,104 @@
+name: macOS native validation
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'clients/macos/**'
+      - 'clients/design-tokens.json'
+      - 'examples/**'
+      - 'experiments/pairing-spake2/**'
+      - 'scripts/**'
+      - 'Cargo.*'
+      - '.github/workflows/macos-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+      - name: Native toolchain
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+          rustc -vV
+          swift --version
+          xcodebuild -version
+      - name: Core unit tests and native build
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --workspace --release --locked --target aarch64-apple-darwin
+      - name: Build pinned pairing dependency
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, urllib.request, zipfile
+          lock = json.loads(pathlib.Path('experiments/pairing-spake2/source-lock.json').read_text())
+          revision = lock['revision']
+          assert len(revision) == 40 and all(c in '0123456789abcdef' for c in revision)
+          expected_url = f'https://codeload.github.com/google/boringssl/zip/{revision}'
+          assert lock['archive'] == expected_url
+          target = pathlib.Path('target/ci-boringssl')
+          target.mkdir(parents=True, exist_ok=True)
+          archive = target / 'source.zip'
+          urllib.request.urlretrieve(expected_url, archive)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == lock['sha256'], 'Source checksum mismatch'
+          with zipfile.ZipFile(archive) as bundle:
+              for member in bundle.infolist():
+                  destination = (target / member.filename).resolve()
+                  assert destination.is_relative_to(target.resolve()), 'Invalid archive path'
+              bundle.extractall(target)
+          PY
+          revision=$(python3 -c 'import json; print(json.load(open("experiments/pairing-spake2/source-lock.json"))["revision"])')
+          cmake -S experiments/pairing-spake2 -B target/ci-boringssl/build \
+            -DBORINGSSL_SOURCE_DIR="$PWD/target/ci-boringssl/boringssl-$revision" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build target/ci-boringssl/build --target crypto --parallel 3
+          echo "CROSSFLOW_BORINGSSL_LIB_DIR=$PWD/target/ci-boringssl/build/boringssl" >> "$GITHUB_ENV"
+      - name: Native pairing tests and package workers
+        run: |
+          set -euo pipefail
+          manifest=experiments/pairing-spake2/rust-pairing/Cargo.toml
+          cargo fmt --manifest-path "$manifest" --all -- --check
+          cargo test --manifest-path "$manifest" --locked
+          cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings
+          cargo test --manifest-path "$manifest" --locked --lib \
+            host::tests::host_tcp_wrong_code_budget_success_and_handshake_cancel \
+            -- --ignored --test-threads=1
+          sh scripts/build-macos-pairing.sh --offline
+      - name: Native SwiftUI package and tests
+        run: |
+          set -euo pipefail
+          sh scripts/build-macos-ui.sh
+          swift test --package-path clients/macos
+          mkdir -p runs/ci
+          dist/Crossflow.app/Contents/MacOS/CrossflowMac --self-test "$PWD/runs/ci/macos-ui-self-test.json"
+          codesign --verify --deep --strict dist/Crossflow.app
+      - name: Preserve non-secret self-test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-native-self-test
+          path: runs/ci/macos-ui-self-test.json
+          if-no-files-found: ignore
+          retention-days: 7
