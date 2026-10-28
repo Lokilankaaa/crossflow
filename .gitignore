@@ -14,3 +14,4 @@ dist/
 *.log
 target/
 *.secret
+Crossflow-*.lnk

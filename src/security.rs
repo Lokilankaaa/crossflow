@@ -263,22 +263,32 @@ fn write_handshake_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
         !bytes.is_empty() && bytes.len() <= MAX_HANDSHAKE,
         "Invalid handshake record length"
     );
-    stream.write_all(&(bytes.len() as u16).to_be_bytes())?;
-    stream.write_all(bytes)?;
-    stream.flush()?;
+    // Keep the wire format while avoiding a separate tiny header write. This
+    // reduces small-packet waiting; it does not diagnose any LAN failure.
+    let mut frame = Vec::with_capacity(bytes.len() + 2);
+    frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    frame.extend_from_slice(bytes);
+    stream
+        .write_all(&frame)
+        .context("Write handshake frame (header and body)")?;
+    stream.flush().context("Flush handshake frame")?;
     Ok(())
 }
 
 fn read_handshake_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
     let mut header = [0u8; 2];
-    stream.read_exact(&mut header)?;
+    stream
+        .read_exact(&mut header)
+        .context("Read handshake header")?;
     let length = u16::from_be_bytes(header) as usize;
     ensure!(
         length > 0 && length <= MAX_HANDSHAKE,
         "Invalid handshake record length"
     );
     let mut data = vec![0; length];
-    stream.read_exact(&mut data)?;
+    stream
+        .read_exact(&mut data)
+        .context("Read handshake body")?;
     Ok(data)
 }
 
@@ -338,8 +348,13 @@ pub fn handshake(
         .context("Finite handshake write timeout required")?;
     let deadline = Instant::now() + read_timeout.min(write_timeout).min(Duration::from_secs(3));
     // Accepted sockets inherit a nonblocking listener's mode on Windows.
-    stream.set_nonblocking(false)?;
-    let mut state = handshake_state(identity, initiator)?;
+    stream
+        .set_nonblocking(false)
+        .context("Set blocking handshake mode")?;
+    stream
+        .set_nodelay(true)
+        .context("Enable TCP_NODELAY before handshake")?;
+    let mut state = handshake_state(identity, initiator).context("Initialize Noise handshake")?;
     let mut stream = DeadlineIo {
         socket: stream,
         deadline,
@@ -347,26 +362,42 @@ pub fn handshake(
     let mut output = [0u8; MAX_HANDSHAKE];
     let mut payload = [0u8; MAX_HANDSHAKE];
     if initiator {
-        let length = state.write_message(&[], &mut output)?;
-        write_handshake_frame(&mut stream, &output[..length])?;
-        let response = read_handshake_frame(&mut stream)?;
+        let length = state
+            .write_message(&[], &mut output)
+            .context("Create Noise request")?;
+        write_handshake_frame(&mut stream, &output[..length]).context("Send Noise request")?;
+        let response = read_handshake_frame(&mut stream).context("Receive Noise response")?;
         ensure!(
-            state.read_message(&response, &mut payload)? == 0,
+            state
+                .read_message(&response, &mut payload)
+                .context("Authenticate Noise response")?
+                == 0,
             "Handshake payload forbidden"
         );
     } else {
-        let request = read_handshake_frame(&mut stream)?;
+        let request = read_handshake_frame(&mut stream).context("Receive Noise request")?;
         ensure!(
-            state.read_message(&request, &mut payload)? == 0,
+            state
+                .read_message(&request, &mut payload)
+                .context("Authenticate Noise request")?
+                == 0,
             "Handshake payload forbidden"
         );
-        let length = state.write_message(&[], &mut output)?;
-        write_handshake_frame(&mut stream, &output[..length])?;
+        let length = state
+            .write_message(&[], &mut output)
+            .context("Create Noise response")?;
+        write_handshake_frame(&mut stream, &output[..length]).context("Send Noise response")?;
     }
-    remaining_timeout(deadline)?;
-    stream.socket.set_read_timeout(Some(read_timeout))?;
-    stream.socket.set_write_timeout(Some(write_timeout))?;
-    finish_handshake(state, identity)
+    remaining_timeout(deadline).context("Finish handshake within total deadline")?;
+    stream
+        .socket
+        .set_read_timeout(Some(read_timeout))
+        .context("Restore read timeout after handshake")?;
+    stream
+        .socket
+        .set_write_timeout(Some(write_timeout))
+        .context("Restore write timeout after handshake")?;
+    finish_handshake(state, identity).context("Finish local Noise handshake")
 }
 
 pub struct SecureChannel {
@@ -551,6 +582,65 @@ mod tests {
     }
 
     #[test]
+    fn framing_errors_identify_header_body_and_preserve_io_cause() {
+        for (bytes, context) in [
+            (vec![0], "Read handshake header"),
+            (vec![0, 2, 3], "Read handshake body"),
+        ] {
+            let error = read_handshake_frame(&mut Cursor::new(bytes)).unwrap_err();
+            assert_eq!(error.to_string(), context);
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        struct FailedWrite;
+        impl Write for FailedWrite {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "test deadline",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_handshake_frame(&mut FailedWrite, b"abc").unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Write handshake frame (header and body): test deadline"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn handshake_header_and_body_share_one_write_and_keep_wire_format() {
+        #[derive(Default)]
+        struct Recorder {
+            writes: Vec<Vec<u8>>,
+            flushed: bool,
+        }
+        impl Write for Recorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+        let mut recorder = Recorder::default();
+        write_handshake_frame(&mut recorder, b"abc").unwrap();
+        assert_eq!(recorder.writes, vec![vec![0, 3, b'a', b'b', b'c']]);
+        assert!(recorder.flushed);
+    }
+
+    #[test]
     fn expired_total_deadline_has_no_remaining_io_budget() {
         let past = Instant::now() - Duration::from_secs(1);
         assert_eq!(
@@ -614,6 +704,7 @@ mod tests {
             socket.set_read_timeout(Some(Duration::from_secs(3)))?;
             socket.set_write_timeout(Some(Duration::from_secs(3)))?;
             let mut channel = handshake(&mut socket, &server, false)?;
+            ensure!(socket.nodelay()?, "Handshake did not enable TCP_NODELAY");
             let encrypted = read_handshake_frame(&mut socket)?;
             ensure!(
                 channel.decrypt(&encrypted)? == b"probe",
@@ -627,6 +718,7 @@ mod tests {
             socket.set_read_timeout(Some(Duration::from_secs(3)))?;
             socket.set_write_timeout(Some(Duration::from_secs(3)))?;
             let mut channel = handshake(&mut socket, &client, true)?;
+            ensure!(socket.nodelay()?, "Handshake did not enable TCP_NODELAY");
             write_handshake_frame(&mut socket, &channel.encrypt(b"probe")?)?;
             channel.decrypt(&read_handshake_frame(&mut socket)?)
         })();
@@ -674,7 +766,12 @@ mod tests {
                 .unwrap();
             let began = Instant::now();
             let result = handshake(&mut socket, &server, false);
-            (result.is_err(), began.elapsed())
+            let error = result
+                .err()
+                .expect("Drip-fed handshake unexpectedly succeeded");
+            assert!(format!("{error:#}").contains("Read handshake body"));
+            assert!(error.downcast_ref::<std::io::Error>().is_some());
+            began.elapsed()
         });
         let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(3)).unwrap();
         socket
@@ -688,8 +785,7 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         drop(socket);
-        let (failed, elapsed) = worker.join().unwrap();
-        assert!(failed);
+        let elapsed = worker.join().unwrap();
         assert!(
             elapsed < Duration::from_millis(300),
             "Drip-fed handshake exceeded total deadline tolerance: {elapsed:?}"

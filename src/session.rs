@@ -5,10 +5,10 @@ use crate::{
     state::{Motion, ReceiverState},
 };
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -21,6 +21,29 @@ use std::{
 const LEASE_PERIOD: Duration = Duration::from_millis(25);
 const LEASE_TTL_NS: u64 = 150_000_000;
 const SEND_STALL: Duration = Duration::from_millis(100);
+
+/// IDs are local to this log and endpoint. Correlate the two endpoints using
+/// their reversed local/peer socket addresses, not matching attempt numbers.
+struct AttemptTrace {
+    id: u64,
+    endpoint: &'static str,
+    phase: &'static str,
+    local: Option<SocketAddr>,
+    peer: Option<SocketAddr>,
+}
+impl AttemptTrace {
+    fn write(&self, log: &Log, event: &str, mut value: Value) {
+        let fields = value
+            .as_object_mut()
+            .expect("diagnostic fields are objects");
+        fields.insert("attempt_id".into(), self.id.into());
+        fields.insert("endpoint".into(), self.endpoint.into());
+        fields.insert("phase".into(), self.phase.into());
+        fields.insert("local_address".into(), json!(self.local));
+        fields.insert("peer_address".into(), json!(self.peer));
+        log.write(event, value);
+    }
+}
 
 /// One encrypted frame in flight; callers coalesce in shared state, not here.
 struct Peer {
@@ -134,20 +157,56 @@ pub fn send(
     let end = Instant::now() + Duration::from_secs_f64(seconds);
     let interval = Duration::from_secs_f64(1.0 / max_hz as f64);
     let mut connected_once = false;
+    let mut attempt_id = 0u64;
     while !stop.load(Ordering::Relaxed) && Instant::now() < end {
+        attempt_id += 1;
+        let mut trace = AttemptTrace {
+            id: attempt_id,
+            endpoint: "sender",
+            phase: "resolve",
+            local: None,
+            peer: None,
+        };
+        trace.write(&log, "connection_attempt", json!({"target":host}));
         let attempt = (|| -> Result<()> {
             let addr = host
-                .to_socket_addrs()?
+                .to_socket_addrs()
+                .context("Resolve receiver address")?
                 .next()
                 .context("no target address")?;
-            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+            trace.peer = Some(addr);
+            trace.phase = "tcp_connect";
+            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                .context("Connect receiver TCP socket")?;
+            trace.local = Some(
+                stream
+                    .local_addr()
+                    .context("Read sender local socket address")?,
+            );
+            trace.peer = Some(stream.peer_addr().context("Read receiver socket address")?);
+            trace.write(&log, "tcp_connected", json!({}));
+            trace.phase = "socket_setup";
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .context("Set handshake read timeout")?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .context("Set handshake write timeout")?;
+            trace.phase = "handshake";
+            trace.write(&log, "handshake_started", json!({}));
             let channel = security::handshake(&mut stream, &identity, true)?;
-            let mut peer = Peer::new(stream, channel)?;
+            trace.write(
+                &log,
+                "handshake_completed",
+                json!({"completion":"local_only"}),
+            );
+            trace.phase = "transport_setup";
+            let mut peer = Peer::new(stream, channel).context("Configure sender transport")?;
+            trace.phase = "transport";
             connected_once = true;
             motion.lock().unwrap().connected(true);
-            log.write(
+            trace.write(
+                &log,
                 "connected",
                 json!({"target":host,"synthetic":synthetic,"requires_manual_arm":!synthetic}),
             );
@@ -264,11 +323,12 @@ pub fn send(
         })();
         motion.lock().unwrap().connected(false);
         if let Err(e) = attempt {
-            log.write(
+            trace.write(
+                &log,
                 "error",
-                json!({"stage":"sender_session","message":e.to_string()}),
+                json!({"stage":"sender_session","message":format!("{e:#}")}),
             );
-            eprintln!("Connection stopped: {e}. Reconnect stays paused.");
+            eprintln!("Connection stopped: {e:#}. Reconnect stays paused.");
         }
         if !stop.load(Ordering::Relaxed) && Instant::now() < end {
             thread::sleep(Duration::from_millis(500));
@@ -451,6 +511,7 @@ pub fn receive(
         json!({"address":listener.local_addr()?.to_string()}),
     );
     let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut attempt_id = 0u64;
     while Instant::now() < end {
         if sink.emergency_pressed() {
             log.write("emergency_stop", json!({}));
@@ -464,16 +525,39 @@ pub fn receive(
             }
             Err(e) => return Err(e.into()),
         };
+        attempt_id += 1;
+        let mut trace = AttemptTrace {
+            id: attempt_id,
+            endpoint: "receiver",
+            phase: "tcp_accept",
+            local: stream.local_addr().ok(),
+            peer: Some(address),
+        };
+        trace.write(&log, "tcp_accepted", json!({}));
         let attempt = (|| -> Result<()> {
-            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+            trace.phase = "socket_setup";
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .context("Set handshake read timeout")?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .context("Set handshake write timeout")?;
+            trace.phase = "handshake";
+            trace.write(&log, "handshake_started", json!({}));
             let channel = security::handshake(&mut stream, &identity, false)?;
-            let mut peer = Peer::new(stream, channel)?;
+            trace.write(
+                &log,
+                "handshake_completed",
+                json!({"completion":"local_only"}),
+            );
+            trace.phase = "transport_setup";
+            let mut peer = Peer::new(stream, channel).context("Configure receiver transport")?;
+            trace.phase = "transport";
             let mut state = ReceiverState::new(LEASE_TTL_NS);
             let mut lease = 0;
             let mut last_grant = Instant::now() - LEASE_PERIOD;
             let mut last_input = Instant::now();
-            log.write("connected", json!({"peer":address.to_string()}));
+            trace.write(&log, "connected", json!({"peer":address.to_string()}));
             while Instant::now() < end {
                 check_local_stop(sink)?;
                 if !peer.pending() && last_grant.elapsed() >= LEASE_PERIOD {
@@ -504,20 +588,22 @@ pub fn receive(
         if let Err(e) = attempt {
             if let Some(terminal) = e.downcast_ref::<TerminalReceiverFailure>() {
                 if terminal.emergency {
-                    log.write("emergency_stop", json!({"message":e.to_string()}));
+                    trace.write(&log, "emergency_stop", json!({"message":format!("{e:#}")}));
                     return Ok(());
                 }
-                log.write(
+                trace.write(
+                    &log,
                     "error",
-                    json!({"stage":"receiver_terminal","message":e.to_string()}),
+                    json!({"stage":"receiver_terminal","message":format!("{e:#}")}),
                 );
                 return Err(e);
             }
-            log.write(
+            trace.write(
+                &log,
                 "error",
-                json!({"stage":"receiver_session","message":e.to_string()}),
+                json!({"stage":"receiver_session","message":format!("{e:#}")}),
             );
-            eprintln!("Session closed: {e}");
+            eprintln!("Session closed: {e:#}");
         }
     }
     Ok(())
@@ -578,6 +664,44 @@ mod tests {
         let mut state = ReceiverState::new(1_000_000_000);
         state.grant(1, log.ns());
         state
+    }
+
+    #[test]
+    fn attempt_diagnostics_preserve_addresses_phase_and_error_chain() {
+        let (writer, path) = logs();
+        let trace = AttemptTrace {
+            id: 3,
+            endpoint: "sender",
+            phase: "handshake",
+            local: Some("127.0.0.1:50000".parse().unwrap()),
+            peer: Some("127.0.0.1:24800".parse().unwrap()),
+        };
+        let error = anyhow::Error::new(std::io::Error::new(ErrorKind::TimedOut, "test deadline"))
+            .context("Read handshake header")
+            .context("Receive Noise response");
+        trace.write(
+            &writer.log,
+            "error",
+            json!({"stage":"sender_session","message":format!("{error:#}")}),
+        );
+        writer.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let event: Value = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|value| value["event"] == "error")
+            .unwrap();
+        assert_eq!(event["attempt_id"], 3);
+        assert_eq!(event["phase"], "handshake");
+        assert_eq!(event["endpoint"], "sender");
+        assert_eq!(event["local_address"], "127.0.0.1:50000");
+        assert_eq!(event["peer_address"], "127.0.0.1:24800");
+        assert!(event["local_ns"].is_u64());
+        assert_eq!(
+            event["message"],
+            "Receive Noise response: Read handshake header: test deadline"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
