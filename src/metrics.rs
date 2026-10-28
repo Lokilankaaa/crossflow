@@ -133,6 +133,8 @@ pub fn summarize(path: &Path) -> Result<Value> {
     let mut src = vec![];
     let mut recv = vec![];
     let mut inject = vec![];
+    let mut transport = vec![];
+    let mut queued_moves = 0u64;
     let mut cadence_raw = vec![];
     let mut cadence_bursts = vec![];
     let mut last = None;
@@ -178,9 +180,13 @@ pub fn summarize(path: &Path) -> Result<Value> {
             }
         }
         if v["event"] == "sent" {
+            queued_moves += 1;
             if let Some(d) = timing_delta(&v, "t0_ns", "t1_ns", &mut issues) {
                 src.push(d)
             }
+        }
+        if v["event"] == "transport_summary" {
+            transport.push(v.clone());
         }
         if v["event"] == "received" {
             if let Some(d) = timing_delta(&v, "t2_ns", "t3_ns", &mut issues) {
@@ -242,6 +248,9 @@ pub fn summarize(path: &Path) -> Result<Value> {
             "warning":"Cannot distinguish voluntary idle from input stalls without independent motion ground truth. The legacy capture_idle_gaps_over_50ms field does not establish that these gaps were idle."
         },
         "timing_issues":issues,
+        "queued_move_records":queued_moves,
+        "transport_attempts":transport,
+        "send_evidence":"sent records mark local queueing, not socket completion or receiver acknowledgement. Missing transport summaries mean socket completion is unknown; socket completion never proves remote application.",
         "source_processing":distribution(src),"receiver_processing":distribution(recv),
         "injection_call":distribution(inject),"visible_smoothness":"NOT_MEASURED",
         "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized"
@@ -321,6 +330,23 @@ mod tests {
         let result = summarize(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         result
+    }
+
+    #[test]
+    fn legacy_sent_records_do_not_claim_network_delivery() {
+        let result = summarize_text(concat!(
+            "{\"event\":\"sent\",\"t0_ns\":1,\"t1_ns\":2}\n",
+            "{\"event\":\"log_summary\",\"dropped_records\":0}\n"
+        ));
+        assert_eq!(result["queued_move_records"], 1);
+        assert_eq!(result["transport_attempts"], json!([]));
+        assert_eq!(result["source_processing"]["samples"], 1);
+        assert!(
+            result["send_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("unknown")
+        );
     }
 
     #[test]

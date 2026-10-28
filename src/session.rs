@@ -24,6 +24,7 @@ const SEND_STALL: Duration = Duration::from_millis(100);
 
 /// IDs are local to this log and endpoint. Correlate the two endpoints using
 /// their reversed local/peer socket addresses, not matching attempt numbers.
+#[derive(Clone)]
 struct AttemptTrace {
     id: u64,
     endpoint: &'static str,
@@ -45,6 +46,61 @@ impl AttemptTrace {
     }
 }
 
+/// Counts local queueing and full socket writes separately. Neither is a peer
+/// acknowledgement, and a partially-written record is never counted complete.
+#[derive(Default)]
+struct TransportCounts {
+    queued_records: u64,
+    socket_completed_records: u64,
+    queued_moves: u64,
+    socket_completed_moves: u64,
+    last_queued_seq: Option<u64>,
+    last_socket_completed_seq: Option<u64>,
+    last_queued_move_seq: Option<u64>,
+    last_socket_completed_move_seq: Option<u64>,
+    pending: Option<(Kind, u64)>,
+}
+impl TransportCounts {
+    fn queued(&mut self, frame: Frame) {
+        self.queued_records += 1;
+        self.last_queued_seq = Some(frame.seq);
+        if frame.kind == Kind::Move {
+            self.queued_moves += 1;
+            self.last_queued_move_seq = Some(frame.seq);
+        }
+        self.pending = Some((frame.kind, frame.seq));
+    }
+    fn completed(&mut self) {
+        if let Some((kind, seq)) = self.pending.take() {
+            self.socket_completed_records += 1;
+            self.last_socket_completed_seq = Some(seq);
+            if kind == Kind::Move {
+                self.socket_completed_moves += 1;
+                self.last_socket_completed_move_seq = Some(seq);
+            }
+        }
+    }
+    fn snapshot(&self, written: usize, total: usize, unread: usize) -> Value {
+        json!({
+            "completion":"local_socket_write_only", "peer_acknowledged":false,
+            "queued_records":self.queued_records,
+            "socket_completed_records":self.socket_completed_records,
+            "queued_moves":self.queued_moves,
+            "socket_completed_moves":self.socket_completed_moves,
+            "last_queued_seq":self.last_queued_seq,
+            "last_socket_completed_seq":self.last_socket_completed_seq,
+            "last_queued_move_seq":self.last_queued_move_seq,
+            "last_socket_completed_move_seq":self.last_socket_completed_move_seq,
+            "pending_kind":self.pending.map(|(kind,_)|format!("{kind:?}")),
+            "pending_seq":self.pending.map(|(_,seq)|seq),
+            "pending_written_bytes":if self.pending.is_some(){written}else{0},
+            "pending_total_bytes":if self.pending.is_some(){total}else{0},
+            "unparsed_input_bytes":unread,
+            "exit_policy":"discard_pending_without_flush"
+        })
+    }
+}
+
 /// One encrypted frame in flight; callers coalesce in shared state, not here.
 struct Peer {
     socket: TcpStream,
@@ -53,6 +109,8 @@ struct Peer {
     output: Vec<u8>,
     offset: usize,
     pending_since: Instant,
+    counts: TransportCounts,
+    summary: Option<(Log, AttemptTrace)>,
 }
 impl Peer {
     fn new(socket: TcpStream, secure: SecureChannel) -> Result<Self> {
@@ -65,6 +123,8 @@ impl Peer {
             output: vec![],
             offset: 0,
             pending_since: Instant::now(),
+            counts: TransportCounts::default(),
+            summary: None,
         })
     }
     fn pending(&self) -> bool {
@@ -80,13 +140,19 @@ impl Peer {
         self.output.extend_from_slice(&cipher);
         self.offset = 0;
         self.pending_since = Instant::now();
+        self.counts.queued(f);
         Ok(())
     }
     fn pump(&mut self) -> Result<Vec<(Frame, Instant)>> {
         while self.pending() {
             match self.socket.write(&self.output[self.offset..]) {
                 Ok(0) => bail!("peer disconnected during send"),
-                Ok(n) => self.offset += n,
+                Ok(n) => {
+                    self.offset += n;
+                    if !self.pending() {
+                        self.counts.completed();
+                    }
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e.into()),
             }
@@ -98,7 +164,10 @@ impl Peer {
         let mut buffer = [0u8; 4096];
         for _ in 0..8 {
             match self.socket.read(&mut buffer) {
-                Ok(0) => bail!("peer disconnected"),
+                Ok(0) => bail!(
+                    "peer disconnected; discarding {} unparsed input bytes",
+                    self.input.len()
+                ),
                 Ok(n) => self.input.extend_from_slice(&buffer[..n]),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e.into()),
@@ -128,6 +197,20 @@ impl Peer {
         }
         self.input.drain(..consumed);
         Ok(frames)
+    }
+}
+impl Drop for Peer {
+    fn drop(&mut self) {
+        // Runs on normal deadline, explicit stop, and transport error. Never
+        // pump here: stopping must not replay the final queued movement.
+        if let Some((log, trace)) = &self.summary {
+            trace.write(
+                log,
+                "transport_summary",
+                self.counts
+                    .snapshot(self.offset, self.output.len(), self.input.len()),
+            );
+        }
     }
 }
 
@@ -203,6 +286,7 @@ pub fn send(
             trace.phase = "transport_setup";
             let mut peer = Peer::new(stream, channel).context("Configure sender transport")?;
             trace.phase = "transport";
+            peer.summary = Some((log.clone(), trace.clone()));
             connected_once = true;
             motion.lock().unwrap().connected(true);
             trace.write(
@@ -304,7 +388,7 @@ pub fn send(
                         };
                         peer.queue(frame)?;
                         if kind == Kind::Move {
-                            log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":state.captures-last_captures,"lease":lease}));
+                            log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":state.captures-last_captures,"lease":lease,"completion":"queued_local"}));
                             sent = Instant::now();
                         } else {
                             log.write("control", json!({"kind":format!("{kind:?}"),"seq":seq}));
@@ -643,13 +727,16 @@ mod tests {
         }
     }
     fn logs() -> (LogWriter, std::path::PathBuf) {
+        // Windows wall-clock resolution can give parallel tests equal times.
+        static NEXT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "crossflow-session-test-{}-{}.jsonl",
+            "crossflow-session-test-{}-{}-{}.jsonl",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_LOG.fetch_add(1, Ordering::Relaxed)
         ));
         (LogWriter::new(&path, json!({"test":true})).unwrap(), path)
     }
@@ -664,6 +751,130 @@ mod tests {
         let mut state = ReceiverState::new(1_000_000_000);
         state.grant(1, log.ns());
         state
+    }
+
+    #[test]
+    fn transport_accounting_distinguishes_partial_moves_from_completed_controls() {
+        let mut counts = TransportCounts::default();
+        counts.queued(frame(Kind::Arm, 1, 0.).0);
+        counts.completed();
+        counts.queued(frame(Kind::Move, 2, 1.).0);
+        let partial = counts.snapshot(7, 74, 9);
+        assert_eq!(partial["queued_records"], 2);
+        assert_eq!(partial["socket_completed_records"], 1);
+        assert_eq!(partial["queued_moves"], 1);
+        assert_eq!(partial["socket_completed_moves"], 0);
+        assert_eq!(partial["pending_seq"], 2);
+        assert_eq!(partial["pending_kind"], "Move");
+        assert_eq!(partial["pending_written_bytes"], 7);
+        assert_eq!(partial["pending_total_bytes"], 74);
+        assert_eq!(partial["unparsed_input_bytes"], 9);
+        counts.completed();
+        counts.completed(); // Repeated completion cannot count the same record twice.
+        let done = counts.snapshot(74, 74, 0);
+        assert_eq!(done["socket_completed_records"], 2);
+        assert_eq!(done["socket_completed_moves"], 1);
+        assert_eq!(done["last_socket_completed_move_seq"], 2);
+        assert!(done["pending_seq"].is_null());
+        assert_eq!(done["pending_total_bytes"], 0);
+        assert_eq!(done["peer_acknowledged"], false);
+    }
+
+    /// Exercise real encrypted socket writes and both scope-exit paths without
+    /// any input adapter. The last queued move must remain unsent on stop.
+    #[test]
+    #[ignore = "opens localhost sockets; run explicitly"]
+    fn transport_summary_preserves_unsent_tail_on_normal_and_error_exit() -> Result<()> {
+        for fail in [false, true] {
+            let (writer, path) = logs();
+            let identities = path.with_extension("identities");
+            security::create_pair(&identities)?;
+            let initiator = Identity::load(&identities.join("windows"))?;
+            let responder = Identity::load(&identities.join("mac"))?;
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let worker = thread::spawn(move || -> Result<Peer> {
+                let (mut socket, _) = listener.accept()?;
+                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let secure = security::handshake(&mut socket, &responder, false)?;
+                Peer::new(socket, secure)
+            });
+            let mut socket = TcpStream::connect(address)?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let secure = security::handshake(&mut socket, &initiator, true)?;
+            let mut sender = Peer::new(socket, secure)?;
+            let mut receiver = worker.join().expect("handshake worker panicked")?;
+            sender.summary = Some((
+                writer.log.clone(),
+                AttemptTrace {
+                    id: 1,
+                    endpoint: "sender",
+                    phase: "transport",
+                    local: sender.socket.local_addr().ok(),
+                    peer: sender.socket.peer_addr().ok(),
+                },
+            ));
+            // A real fully-written Arm is counted separately from movement.
+            sender.queue(frame(Kind::Arm, 1, 0.).0)?;
+            sender.pump()?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut got_arm = false;
+            while Instant::now() < deadline {
+                let frames = receiver.pump()?;
+                if !frames.is_empty() {
+                    ensure!(frames.len() == 1 && frames[0].0.kind == Kind::Arm);
+                    got_arm = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            ensure!(got_arm, "receiver did not observe the completed control");
+            let result = (move || -> Result<()> {
+                sender.queue(frame(Kind::Move, 2, 1.).0)?;
+                if fail {
+                    bail!("test session failure after queueing")
+                }
+                Ok(()) // No pump: simulate the deadline/stop boundary.
+            })();
+            assert_eq!(result.is_err(), fail);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut saw_eof = false;
+            while Instant::now() < deadline {
+                match receiver.pump() {
+                    Ok(frames) => ensure!(frames.is_empty(), "queued tail reached receiver"),
+                    Err(error) => {
+                        ensure!(error.to_string().contains("peer disconnected"));
+                        ensure!(receiver.input.is_empty(), "tail bytes arrived before EOF");
+                        saw_eof = true;
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            ensure!(saw_eof, "sender socket did not close");
+            writer.finish()?;
+            let text = std::fs::read_to_string(&path)?;
+            let summaries: Vec<Value> = text
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|value| value["event"] == "transport_summary")
+                .collect();
+            assert_eq!(summaries.len(), 1);
+            let summary = &summaries[0];
+            assert_eq!(summary["queued_records"], 2);
+            assert_eq!(summary["socket_completed_records"], 1);
+            assert_eq!(summary["queued_moves"], 1);
+            assert_eq!(summary["socket_completed_moves"], 0);
+            assert_eq!(summary["pending_seq"], 2);
+            assert_eq!(summary["pending_written_bytes"], 0);
+            assert_eq!(summary["pending_total_bytes"], 74);
+            assert_eq!(summary["attempt_id"], 1);
+            std::fs::remove_file(path)?;
+            std::fs::remove_dir_all(identities)?;
+        }
+        Ok(())
     }
 
     #[test]
