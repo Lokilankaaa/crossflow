@@ -114,6 +114,8 @@ Windows 本地键盘和点击仍会作用于本地应用，当前不是无缝焦
 
 独立进程的纯模拟检查（不调用系统输入适配器）：先执行 `cargo build --example worker_fixture --locked`，再执行 `cargo test --test injection_worker_process --locked -- --ignored --test-threads=1`。Windows 可通过 `scripts/cargo-local.ps1 -CargoArgs @(...)` 使用本仓库工具链。正常测试核对清理 ACK 和实际进程退出；强杀测试只杀它自己创建的假主进程。
 
+连接恢复的补充检查：`cargo test --test network_stall --locked -- --ignored --test-threads=1 --nocapture`。真实加密发送/接收器经回环字节中继经历五轮各两秒停顿，仅记录 fake 输入；检查释放、暂停重连、物理持有状态和旧输入不重放，并将原始日志及报告保留在 `runs/network-stall-*`。此工具不修改系统网络，不模拟 TCP 之前的丢包/抖动，不能替代阶段 0 的 T14 实网验收。
+
 终端停止接入同一个退出流程：Windows 的 Ctrl+C / Ctrl+Break，以及 macOS 的 SIGINT / SIGTERM / SIGHUP 请求停止采集和网络循环，接收器清理拥有的输入后结束日志。信号回调只提交停止请求，实际释放在正常线程完成。已经进入系统适配器的调用不能中途抢占；连接／握手、域名解析与日志刷新也可能延后退出，不能承诺固定的毫秒级退出时间。关闭 Windows 控制台只提供有界的尽力清理窗口；任务管理器强制终止、SIGKILL、崩溃和关机不属于此保证。
 
 `--max-hz` 是发送上限，**不是实际输入频率或流畅度保证**。原型不插入平滑缓冲；积压超过设定界限会停止该会话，保留错误证据。
