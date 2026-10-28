@@ -23,6 +23,8 @@ Crossflow 采用 Rust 共享核心和统一客户端架构。Windows、macOS 以
 | `src/arrangement.rs` | 经过校验的逻辑屏幕布局、相邻边缘及单次穿越计算；尚待接入控制权切换 |
 | `src/metrics.rs` | 有界异步日志、采样记录和分位数汇总 |
 | `src/shutdown.rs` | CLI 终端信号转为协作式停止；正常线程释放输入和结束日志 |
+| `crates/crossflow-bridge` / `include/crossflow.h` | 调用方持有缓冲区的版本化 C ABI：只读能力、布局校验、穿越预览；不启动输入或连接 |
+| `clients/windows` / `clients/design-tokens.json` | WinUI 3 原生布局客户端及跨端统一颜色、字号、文案与窗口尺寸资源 |
 | `src/platform/windows.rs` | Raw Input 相对鼠标采集，以及本地启停快捷键 |
 | `src/platform/macos.rs` | CoreGraphics 光标移动、权限检查、显示环境与 Escape 停止检查 |
 
@@ -57,11 +59,13 @@ Windows Raw Input
 
 ## 统一界面方向
 
-用户要求内核与界面分离，以轻量、美观、响应快为界面选型标准，不要求网页技术。桌面首版优先采用 macOS [SwiftUI](https://developer.apple.com/swiftui/) 与 Windows [WinUI 3](https://learn.microsoft.com/en-us/windows/apps/winui/winui3/)；两端共享设计变量、信息结构和交互规则，原生视图分别实现。Electron / Tauri 不作为默认方案；`ui/` 保留为交互草稿，尚未实现正式原生客户端，也没有资源占用或响应速度的实测结论。
+用户要求内核与界面分离，以轻量、美观、响应快为界面选型标准，不要求网页技术。桌面首版采用 macOS [SwiftUI](https://developer.apple.com/swiftui/) 与 Windows [WinUI 3](https://learn.microsoft.com/en-us/windows/apps/winui/winui3/)方向；两端共享设计变量、信息结构和交互规则，原生视图分别实现。Electron / Tauri 不作为默认方案；`ui/` 保留为交互草稿。Windows 原生布局客户端已经编译并通过 C# → Rust 接口自检；Mac 原生视图在独立分支开发，尚未汇入。实际窗口视觉、交互和资源占用未验收。
 
 Rust 核心拥有连接、权限状态、控制权、布局校验、输入与诊断数据；界面只提交配置／操作命令并订阅状态。每个高频键鼠事件都直接走核心与平台适配器，不经过 UI 线程或视图桥接。关闭配置窗口与停止共享是不同的显式操作，后续托盘／菜单栏宿主需要独立管理核心生命周期。
 
-Windows 托盘、macOS 菜单栏、系统权限提示和安装分发由各平台适配，但保持一致的产品流程。当前命令行是阶段 0 测量入口；Windows 另提供原生实验控制窗口，直接反映共享核心的连接和启用状态，支持开始、暂停及停止按钮。这不是完整布局编辑或正式客户端界面。客户端桥接 API、打包和原生页面仍待实现。
+Windows 托盘、macOS 菜单栏、系统权限提示和安装分发由各平台适配，但保持一致的产品流程。当前命令行是阶段 0 测量入口；CLI 的 Windows 原生实验控制窗口直接反映共享核心的连接和启用状态，支持开始、暂停及停止按钮。新的 WinUI 布局客户端与它独立，现有 C ABI 只暴露布局与只读能力；会话控制、托盘生命周期及产品安装分发仍待接入，不能把桥可调用当作远端已连接。
+
+配置通过 JSON 跨语言交换，`serde_json/float_roundtrip` 保持 f64 往返精度，避免把相邻浮点值的缝隙或重叠舍入成相邻边缘。核心继续以精确几何规则判定，不引入吸附容差来掩盖解析误差。高频键鼠传输仍使用二进制帧，不经过这条界面配置路径。
 
 CLI 的终端停止使用平台信号处理器和原子请求标志，工作线程主动退出并清理；`receive_with_stop` 本身不安装进程级信号处理器，未来原生客户端可接入自己的停止令牌。Unix 直接使用已有锁定版本 `libc` 的 `sigaction` 类型与常量（MIT OR Apache-2.0）；Windows 使用 `windows-sys`。不依赖在信号上下文内操作 UI、执行输入释放或写日志。
 
