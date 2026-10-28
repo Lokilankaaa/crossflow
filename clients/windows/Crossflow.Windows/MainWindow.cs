@@ -442,6 +442,7 @@ internal sealed class MainWindow : Window
             sessionDetail.Text = state.StopRequested ? "已请求停止，正在等待内核退出确认。" : state.Error is not null ? (state.State == "error" ? state.Error : "内核拒绝了本次操作，状态已更新。请确认就绪后再试。") :
                 state.State == "paused" ? (state.CaptureReady ? "已就绪。点击“开始共享”才会转发鼠标移动；重连后也需要手动开始。" : "已连接，正在准备鼠标输入。") :
                 state.State == "sharing" ? "正在转发鼠标移动。点击“暂停”可立即请求暂停；关闭窗口会停止连接。" :
+                state.State == "connecting" ? "正在连接设备，请确认另一台设备已打开 Crossflow。连接成功后会保持暂停。" :
                 state.ProcessRunning ? "正在等待共享内核报告状态。" : "打开客户端不会自动连接或启动输入。";
         status.Text = $"{(coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable"))}  ·  {title}  ·  布局尚未应用运行时";
     }
@@ -458,7 +459,7 @@ internal sealed class MainWindow : Window
         SelectPage("settings");
         var page = Page("设置", "本地运行，无需账号。共享状态由统一 Rust 内核提供。");
         page.Children.Add(Text("每轮会话最长一小时。连接恢复后保持暂停，需要你手动开始共享。", secondary: true));
-        page.Children.Add(Text("会话日志保存在当前用户的本地应用数据目录 / Crossflow / Logs。身份文件仅交给内核读取。", secondary: true));
+        page.Children.Add(Text("已保存设备的配对信息由客户端管理。会话日志保存在当前用户的本地应用数据目录 / Crossflow / Logs。", secondary: true));
         page.Children.Add(Text("屏幕布局可独立编辑与导出，目前尚未应用到实际鼠标共享。", secondary: true));
     }
     private void ShowLayout()

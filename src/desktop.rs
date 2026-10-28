@@ -289,6 +289,8 @@ impl ControlIo {
 pub struct Options {
     pub host: String,
     pub identity: std::path::PathBuf,
+    /// Only app-managed pinned peers use unauthenticated LAN routing hints.
+    pub discover_peer: bool,
     pub seconds: f64,
     pub max_hz: u32,
 }
@@ -333,7 +335,12 @@ pub fn run(
     let network_log = writer.log.clone();
     let duration = Duration::from_secs_f64(options.seconds);
     let network = thread::spawn(move || {
-        let result = session::send(
+        let send = if options.discover_peer {
+            session::send_discovered
+        } else {
+            session::send
+        };
+        let result = send(
             session::SendOptions {
                 host: &options.host,
                 bundle: &options.identity,

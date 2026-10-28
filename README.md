@@ -35,7 +35,11 @@ Mac 需要 Xcode Command Line Tools 提供系统框架链接能力。Windows GNU
 
 ## 首次配对（阶段 0 开发诊断）
 
-Windows 内核现有应用管理的已配对设备存储：`crossflow peers` 只返回公开设备信息；原生“设备”页可点选已保存设备连接，无需再次传入目标 IP 或身份目录，仍须通过固定公钥认证且连接后保持暂停。开始、暂停、停止均在正常页面可见，底层使用 `desktop-send --peer <设备ID> --log <日志>`。隐藏的 `peer-import --identity <已有诊断目录> --name <名称> --endpoint <地址:端口>` 仅供开发迁移已有可信身份，使用当前用户 DPAPI 保存到 `LOCALAPPDATA/Crossflow/peers`，保留源文件且不覆盖既有设备。这尚不是首次安装的配对码流程；地址变化后的重新发现和撤销管理仍待实现。Windows 本机 DrySink 的实际界面连接、开始、暂停、停止已验证，不能替代跨机配对或 Mac 输入验收。
+Windows 内核现有应用管理的已配对设备存储：`crossflow peers` 只返回公开设备信息；原生“设备”页可点选已保存设备连接，无需再次传入目标 IP 或身份目录，仍须通过固定公钥认证且连接后保持暂停。开始、暂停、停止均在正常页面可见，底层使用 `desktop-send --peer <设备ID> --log <日志>`。隐藏的 `peer-import --identity <已有诊断目录> --name <名称> --endpoint <地址:端口>` 仅供开发迁移已有可信身份，使用当前用户 DPAPI 保存到 `LOCALAPPDATA/Crossflow/peers`，保留源文件且不覆盖既有设备。这尚不是首次安装的配对码流程；撤销管理仍待实现。Windows 本机 DrySink 的实际界面连接、开始、暂停、停止已验证，不能替代跨机配对或 Mac 输入验收。
+
+已配对设备连接现在先尝试保存地址，失败后后台浏览局域网，并轮换候选地址。所有地址仍使用同一已保存身份进行 Noise 认证，发现名称和随机发现 ID 不授予输入权限；重连后保持暂停。自动候选仅限私有 IPv4、IPv4 link-local、IPv6 ULA 和带作用域的 IPv6 link-local，去重后最多 64 个；公网、回环及 IPv4-mapped 广播候选不会自动尝试。明确保存的诊断地址仍按原配置使用。成功地址仅在当前进程记忆，不修改配对记录；下次启动仍可从旧地址失败后重新发现。
+
+真实 mDNS/TCP 测试已在同一 Windows 主机的两张网卡间完成：错误身份拒绝、发现正确接收器、IP 和端口同时变化、发送端不重启、重连暂停且无移动重放；另验证沉默握手可停止。见 `docs/peer-route-recovery-validation-20261029.json`。这不代表 Windows/Mac 跨机发现或可见光标性能已通过。浏览后台本身若终止，目前记录错误并继续尝试保存/历史认证地址，需要重新启动连接才能重建浏览；不宣称覆盖所有网卡故障。有限连接/握手预算为 250/500ms，慢于预算会重试。
 
 正式客户端的目标流程是“自动发现局域网设备 → 点选 → 双方确认配对码 → 记住设备”，由应用保管身份密钥，不向普通用户索取 IP 或身份文件。Windows 原生“设备”页已接入真实发现；以下文件交换仅为折叠的开发诊断入口，正式配对码与应用密钥保管尚未完成。
 
@@ -49,7 +53,7 @@ Windows 内核现有应用管理的已配对设备存储：`crossflow peers` 只
 
 共享内核已加入真实 mDNS/DNS-SD 发布与浏览，可用 `crossflow discover --seconds 5` 做限时浏览诊断；接收端增加 `--discoverable --device-name '公开设备名称'` 可发布实际监听地址和端口。Windows 设备页在打开及刷新时扫描，本机真实接收器出现、退出后刷新消失均已验证。输出中的设备均未认证，不会建立输入会话；空列表也不证明跨机发现已通过。Mac 原生列表、跨机发现和配对码仍待集成验证。发现服务使用 `_crossflow._tcp.local.`，限制候选数量，保留 IPv6 接口作用域，不广播配对码或身份密钥。
 
-短码认证的独立依赖试验位于 `experiments/pairing-spake2/`。固定 BoringSSL 源码版本与校验值在 `source-lock.json`；验证下载后，以 `cmake -S experiments/pairing-spake2 -B <项目外构建目录> -DBORINGSSL_SOURCE_DIR=<已校验源码目录>` 配置，再构建 `spake2_test`。Windows GNU 的同码、错码、角色/绑定变化及确认消息篡改测试已通过；结果描述原始临时构建，版本化 CMake 包装另通过配置检查。该试验未链接到产品，不是完整配对协议或安全审计；Rust 接口、真实 Noise 绑定及 Mac 构建仍待验证。
+短码认证的独立依赖试验位于 `experiments/pairing-spake2/`。固定 BoringSSL 源码版本与校验值在 `source-lock.json`；验证下载后，以 `cmake -S experiments/pairing-spake2 -B <项目外构建目录> -DBORINGSSL_SOURCE_DIR=<已校验源码目录>` 配置，再构建 `spake2_test`。其 `rust-pairing/` 独立工作区已验证 Rust 接口、真实 localhost TCP/Noise XX 绑定、同码确认，以及错码、绑定变化、篡改、中间人和总时限拒绝；记录见该目录的 `result-windows.json`。该试验未链接到产品，不是完整配对流程或安全审计；邀请码生成与有效期、尝试限制、双端界面、持久化信任提交及 Mac 原生构建仍待完成。
 
 ```powershell
 ./target/release/crossflow.exe pair --out .pairing

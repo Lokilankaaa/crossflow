@@ -24,6 +24,30 @@ use std::{
 const LEASE_PERIOD: Duration = Duration::from_millis(25);
 const LEASE_TTL_NS: u64 = 150_000_000;
 const SEND_STALL: Duration = Duration::from_millis(100);
+const DISCOVERED_CONNECT_BUDGET: Duration = Duration::from_millis(250);
+const DISCOVERED_HANDSHAKE_BUDGET: Duration = Duration::from_millis(500);
+
+fn sender_phase_budget(stop: &AtomicBool, end: Instant, maximum: Duration) -> Result<Duration> {
+    ensure!(
+        !stop.load(Ordering::Acquire),
+        "sender stopped before next phase"
+    );
+    let remaining = end
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .context("sender session deadline reached")?;
+    Ok(remaining.min(maximum))
+}
+
+fn wait_sender_retry(stop: &AtomicBool, end: Instant) {
+    let retry_end = end.min(Instant::now() + Duration::from_millis(500));
+    while !stop.load(Ordering::Acquire) {
+        let Some(remaining) = retry_end.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
 
 /// IDs are local to this log and endpoint. Correlate the two endpoints using
 /// their reversed local/peer socket addresses, not matching attempt numbers.
@@ -295,7 +319,30 @@ pub fn send(
     stop: Arc<AtomicBool>,
     log: Log,
 ) -> Result<()> {
-    send_source(options, SenderSource::Motion(motion), stop, log)
+    send_source(options, SenderSource::Motion(motion), stop, log, None)
+}
+
+/// Retry a previously authorized peer using bounded LAN routing hints. Every
+/// endpoint still authenticates with the same pinned Identity; discovery never
+/// grants trust or arms input. Discovery work stays outside the input loop.
+pub fn send_discovered(
+    options: SendOptions<'_>,
+    motion: Arc<Mutex<Motion>>,
+    stop: Arc<AtomicBool>,
+    log: Log,
+) -> Result<()> {
+    ensure!(!options.synthetic, "discovery routing requires manual arm");
+    let saved = options
+        .host
+        .parse()
+        .context("Saved peer endpoint must be numeric")?;
+    send_source(
+        options,
+        SenderSource::Motion(motion),
+        stop,
+        log,
+        Some(crate::routes::LanRoutes::new(saved)),
+    )
 }
 
 /// Send explicitly armed, ordered physical inputs over the shared connection
@@ -309,7 +356,7 @@ pub fn send_ordered(
     stop: Arc<AtomicBool>,
     log: Log,
 ) -> Result<()> {
-    send_source(options, SenderSource::Ordered(input), stop, log)
+    send_source(options, SenderSource::Ordered(input), stop, log, None)
 }
 
 fn send_source(
@@ -317,6 +364,7 @@ fn send_source(
     source: SenderSource,
     stop: Arc<AtomicBool>,
     log: Log,
+    mut routes: Option<crate::routes::LanRoutes>,
 ) -> Result<()> {
     let SendOptions {
         host,
@@ -330,8 +378,16 @@ fn send_source(
         "ordered input requires synthetic=false"
     );
     ensure!((60..=8000).contains(&max_hz), "max-hz must be 60..8000");
+    ensure!(
+        seconds.is_finite() && seconds > 0.0,
+        "seconds must be finite and >0"
+    );
     let identity = Identity::load(bundle)?;
-    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let duration =
+        Duration::try_from_secs_f64(seconds).context("seconds exceeds duration range")?;
+    let end = Instant::now()
+        .checked_add(duration)
+        .context("session deadline exceeds clock range")?;
     let interval = Duration::from_secs_f64(1.0 / max_hz as f64);
     let mut connected_once = false;
     let mut attempt_id = 0u64;
@@ -344,17 +400,44 @@ fn send_source(
             local: None,
             peer: None,
         };
-        trace.write(&log, "connection_attempt", json!({"target":host}));
+        trace.write(&log, "connection_attempt", json!({"saved_target":host}));
         let attempt = (|| -> Result<()> {
-            let addr = host
-                .to_socket_addrs()
-                .context("Resolve receiver address")?
-                .next()
-                .context("no target address")?;
+            sender_phase_budget(&stop, end, DISCOVERED_CONNECT_BUDGET)?;
+            let addr = if let Some(routes) = routes.as_mut() {
+                routes.next_endpoint(&log)
+            } else {
+                host.to_socket_addrs()
+                    .context("Resolve receiver address")?
+                    .next()
+                    .context("no target address")?
+            };
             trace.peer = Some(addr);
             trace.phase = "tcp_connect";
-            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            trace.write(
+                &log,
+                "target_selected",
+                json!({"target":addr,"discovery_enabled":routes.is_some()}),
+            );
+            let connect_budget = sender_phase_budget(
+                &stop,
+                end,
+                if routes.is_some() {
+                    DISCOVERED_CONNECT_BUDGET
+                } else {
+                    Duration::from_secs(2)
+                },
+            )?;
+            let mut stream = TcpStream::connect_timeout(&addr, connect_budget)
                 .context("Connect receiver TCP socket")?;
+            let handshake_budget = sender_phase_budget(
+                &stop,
+                end,
+                if routes.is_some() {
+                    DISCOVERED_HANDSHAKE_BUDGET
+                } else {
+                    Duration::from_secs(3)
+                },
+            )?;
             trace.local = Some(
                 stream
                     .local_addr()
@@ -364,14 +447,15 @@ fn send_source(
             trace.write(&log, "tcp_connected", json!({}));
             trace.phase = "socket_setup";
             stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
+                .set_read_timeout(Some(handshake_budget))
                 .context("Set handshake read timeout")?;
             stream
-                .set_write_timeout(Some(Duration::from_secs(3)))
+                .set_write_timeout(Some(handshake_budget))
                 .context("Set handshake write timeout")?;
             trace.phase = "handshake";
             trace.write(&log, "handshake_started", json!({}));
             let channel = security::handshake(&mut stream, &identity, true)?;
+            sender_phase_budget(&stop, end, DISCOVERED_HANDSHAKE_BUDGET)?;
             trace.write(
                 &log,
                 "handshake_completed",
@@ -379,6 +463,10 @@ fn send_source(
             );
             trace.phase = "transport_setup";
             let mut peer = Peer::new(stream, channel).context("Configure sender transport")?;
+            sender_phase_budget(&stop, end, DISCOVERED_HANDSHAKE_BUDGET)?;
+            if let Some(routes) = routes.as_mut() {
+                routes.authenticated(addr);
+            }
             trace.phase = "transport";
             peer.summary = Some((log.clone(), trace.clone()));
             connected_once = true;
@@ -386,7 +474,7 @@ fn send_source(
             trace.write(
                 &log,
                 "connected",
-                json!({"target":host,"synthetic":synthetic,"requires_manual_arm":!synthetic}),
+                json!({"target":addr,"synthetic":synthetic,"requires_manual_arm":!synthetic}),
             );
             eprintln!(
                 "Connected. {}",
@@ -594,15 +682,27 @@ fn send_source(
             eprintln!("Connection stopped: {e:#}. Reconnect stays paused.");
         }
         if !stop.load(Ordering::Relaxed) && Instant::now() < end {
-            thread::sleep(Duration::from_millis(500));
+            wait_sender_retry(&stop, end);
         }
     }
-    stop.store(true, Ordering::Relaxed);
+    stop.store(true, Ordering::Release);
+    let cleanup = if let Some(routes) = routes.as_mut() {
+        let result = routes.finish();
+        if let Err(error) = &result {
+            log.write(
+                "error",
+                json!({"stage":"sender_discovery_cleanup","message":format!("{error:#}")}),
+            );
+        }
+        result.context("Confirm discovery shutdown")
+    } else {
+        Ok(())
+    };
     ensure!(
         connected_once,
         "No authenticated receiver connection was established"
     );
-    Ok(())
+    cleanup
 }
 
 /// Same-machine worker timing, only for a successful acknowledged action.
@@ -965,6 +1065,31 @@ pub fn receive_with_stop(
     receive_with_discovery(address, bundle, sink, log, seconds, stop, None)
 }
 
+/// Receive on an already-bound socket, including an OS-assigned ephemeral port.
+/// The caller owns the listener and any discovery advertisement for its actual
+/// local address, and must keep both alive until this call returns. This API
+/// starts no discovery worker and reuses the normal authenticated receive loop.
+pub fn receive_on_listener(
+    listener: &TcpListener,
+    bundle: &Path,
+    sink: &mut dyn MouseSink,
+    log: Log,
+    seconds: f64,
+    stop: &AtomicBool,
+) -> Result<()> {
+    ensure!(
+        seconds.is_finite() && seconds > 0.0,
+        "seconds must be finite and >0"
+    );
+    let identity = Identity::load(bundle)?;
+    listener.set_nonblocking(true)?;
+    log.write(
+        "listening",
+        json!({"address":listener.local_addr()?.to_string()}),
+    );
+    receive_listener_loop(listener, &identity, sink, log, seconds, stop, None)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ReceiveDiscoveryOptions {
     /// Explicit public label. None uses a platform label, never an OS hostname.
@@ -1076,7 +1201,11 @@ fn receive_listener_loop(
     stop: &AtomicBool,
     discovery: Option<&DiscoveryHandle>,
 ) -> Result<()> {
-    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let duration =
+        Duration::try_from_secs_f64(seconds).context("seconds exceeds duration range")?;
+    let end = Instant::now()
+        .checked_add(duration)
+        .context("session deadline exceeds clock range")?;
     let mut discovery_check = Instant::now();
     let mut attempt_id = 0u64;
     while Instant::now() < end {
@@ -1199,6 +1328,94 @@ mod tests {
     use super::*;
     use crate::metrics::LogWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sender_phase_budgets_cap_and_clip_to_session_end() {
+        let stop = AtomicBool::new(false);
+        let long_end = Instant::now() + Duration::from_secs(10);
+        assert_eq!(
+            sender_phase_budget(&stop, long_end, DISCOVERED_CONNECT_BUDGET).unwrap(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            sender_phase_budget(&stop, long_end, DISCOVERED_HANDSHAKE_BUDGET).unwrap(),
+            Duration::from_millis(500)
+        );
+        let short_end = Instant::now() + Duration::from_millis(100);
+        let budget = sender_phase_budget(&stop, short_end, DISCOVERED_HANDSHAKE_BUDGET).unwrap();
+        assert!(!budget.is_zero() && budget <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn sender_stop_and_deadline_prevent_entering_next_phase() {
+        let stop = AtomicBool::new(false);
+        let end = Instant::now() + Duration::from_secs(1);
+        assert!(sender_phase_budget(&stop, end, DISCOVERED_CONNECT_BUDGET).is_ok());
+        stop.store(true, Ordering::Release);
+        assert!(sender_phase_budget(&stop, end, DISCOVERED_HANDSHAKE_BUDGET).is_err());
+        stop.store(false, Ordering::Release);
+        assert!(sender_phase_budget(&stop, Instant::now(), DISCOVERED_HANDSHAKE_BUDGET).is_err());
+    }
+
+    #[test]
+    fn sender_retry_wait_observes_cancellation_without_full_backoff() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            worker_stop.store(true, Ordering::Release);
+        });
+        let start = Instant::now();
+        wait_sender_retry(&stop, start + Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        worker.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "cancelled retry took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn discovered_sender_rejects_synthetic_before_loading_identity_or_network() {
+        let (writer, path) = logs();
+        let result = send_discovered(
+            SendOptions {
+                host: "127.0.0.1:1",
+                bundle: Path::new("missing-identity"),
+                seconds: 1.0,
+                max_hz: 1000,
+                synthetic: true,
+            },
+            Arc::new(Mutex::new(Motion::default())),
+            Arc::new(AtomicBool::new(false)),
+            writer.log.clone(),
+        );
+        assert!(result.unwrap_err().to_string().contains("manual arm"));
+        writer.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sender_rejects_invalid_duration_without_panicking_or_network() {
+        let (writer, path) = logs();
+        for seconds in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            let result = send(
+                SendOptions {
+                    host: "127.0.0.1:1",
+                    bundle: Path::new("missing-identity"),
+                    seconds,
+                    max_hz: 1000,
+                    synthetic: false,
+                },
+                Arc::new(Mutex::new(Motion::default())),
+                Arc::new(AtomicBool::new(false)),
+                writer.log.clone(),
+            );
+            assert!(result.unwrap_err().to_string().contains("seconds"));
+        }
+        writer.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[derive(Default)]
     struct RecordingSink {

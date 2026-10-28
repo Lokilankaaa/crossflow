@@ -229,6 +229,7 @@ fn main() -> Result<()> {
             seconds,
             max_hz,
         } => {
+            let discover_peer = peer.is_some();
             let (host, identity) = if let Some(id) = peer {
                 let (device, bundle) =
                     crossflow::peers::PeerStore::default_store()?.resolve(&id)?;
@@ -244,12 +245,14 @@ fn main() -> Result<()> {
             meta["desktop_control_protocol"] = json!(1);
             meta["duration_seconds"] = json!(seconds);
             meta["max_hz"] = json!(max_hz);
+            meta["peer_route_discovery"] = json!(discover_peer);
             let writer = LogWriter::new(&log, meta)?;
             #[cfg(windows)]
             crossflow::desktop::run(
                 crossflow::desktop::Options {
                     host,
                     identity,
+                    discover_peer,
                     seconds,
                     max_hz,
                 },
@@ -258,7 +261,7 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(windows))]
             {
-                let _ = (host, identity, seconds, max_hz);
+                let _ = (host, identity, seconds, max_hz, discover_peer);
                 writer.finish()?;
                 anyhow::bail!("native client sending currently requires Windows");
             }
