@@ -13,6 +13,8 @@ use std::ffi::{c_int, c_uint, c_void};
 use std::ptr::NonNull;
 use zeroize::Zeroizing;
 
+pub mod invitation;
+
 pub const MESSAGE_BYTES: usize = 32;
 pub const CONFIRMATION_BYTES: usize = 32;
 pub const CODE_BYTES: usize = 8;

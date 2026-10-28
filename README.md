@@ -53,7 +53,7 @@ Windows 内核现有应用管理的已配对设备存储：`crossflow peers` 只
 
 共享内核已加入真实 mDNS/DNS-SD 发布与浏览，可用 `crossflow discover --seconds 5` 做限时浏览诊断；接收端增加 `--discoverable --device-name '公开设备名称'` 可发布实际监听地址和端口。Windows 设备页在打开及刷新时扫描，本机真实接收器出现、退出后刷新消失均已验证。输出中的设备均未认证，不会建立输入会话；空列表也不证明跨机发现已通过。Mac 原生列表、跨机发现和配对码仍待集成验证。发现服务使用 `_crossflow._tcp.local.`，限制候选数量，保留 IPv6 接口作用域，不广播配对码或身份密钥。
 
-短码认证的独立依赖试验位于 `experiments/pairing-spake2/`。固定 BoringSSL 源码版本与校验值在 `source-lock.json`；验证下载后，以 `cmake -S experiments/pairing-spake2 -B <项目外构建目录> -DBORINGSSL_SOURCE_DIR=<已校验源码目录>` 配置，再构建 `spake2_test`。其 `rust-pairing/` 独立工作区已验证 Rust 接口、真实 localhost TCP/Noise XX 绑定、同码确认，以及错码、绑定变化、篡改、中间人和总时限拒绝；记录见该目录的 `result-windows.json`。该试验未链接到产品，不是完整配对流程或安全审计；邀请码生成与有效期、尝试限制、双端界面、持久化信任提交及 Mac 原生构建仍待完成。
+短码认证的独立依赖试验位于 `experiments/pairing-spake2/`。固定 BoringSSL 源码版本与校验值在 `source-lock.json`；验证下载后，以 `cmake -S experiments/pairing-spake2 -B <项目外构建目录> -DBORINGSSL_SOURCE_DIR=<已校验源码目录>` 配置，再构建 `spake2_test`。其 `rust-pairing/` 独立工作区已验证 Rust 接口、真实 localhost TCP/Noise XX 绑定、同码确认，以及错码、绑定变化、篡改、中间人和总时限拒绝；记录见该目录的 `result-windows.json`。后续邀请模块已加入随机八位码、120 秒期限、每码三次及进程级每分钟五次/单一在途限制，取消和换码会使旧请求失效；实际 TCP 验证见 `result-invitation-windows.json`。这些模块未链接到产品，不是完整配对流程或安全审计；双端界面、实际配对监听服务、双方完成确认、持久化信任提交及 Mac 原生构建仍待完成。
 
 ```powershell
 ./target/release/crossflow.exe pair --out .pairing
