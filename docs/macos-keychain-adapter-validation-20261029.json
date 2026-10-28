@@ -1,0 +1,55 @@
+{
+  "date": "2026-10-29",
+  "base_commit": "4de6e00",
+  "status": "implementation and cross-target static validation; native validation pending",
+  "backend": "explicit macOS file-based default Keychain, fixed service plus random account",
+  "storage": {
+    "private_identity": "Keychain generic password data",
+    "local_file": "identity.keychain contains only canonical opaque locator",
+    "no_plaintext_fallback": true,
+    "peer_store_role": "mac",
+    "default_peer_directory": "~/Library/Application Support/Crossflow/peers",
+    "normal_user_selects_identity_file": false
+  },
+  "process": {
+    "helper": "crossflow-keychain",
+    "secret_arguments": false,
+    "ipc": "single bounded binary request/response on inherited pipes, 4096 byte maximum body",
+    "keychain_interaction_policy": "disabled only in dedicated helper process; no system-wide setting or host UI change",
+    "timeout": "10 seconds normal wait, 1 second termination confirmation; unknown stop returns error and retains child in background reaper",
+    "automatically_unlocks_or_changes_acl": false,
+    "input_injection": false
+  },
+  "validation": {
+    "windows_workspace_default": {"core_passed": 168, "cli_passed": 3, "ordinary_process_test_passed": 1, "bridge_passed": 7, "failed": 0},
+    "windows_clippy_all_targets": "passed with warnings denied; environment emitted incremental-cache hardlink warning",
+    "apple_aarch64_check_all_targets": "passed",
+    "apple_aarch64_clippy_all_targets": "passed with warnings denied",
+    "native_keychain_tests": "not run",
+    "mac_app_build_and_signing": "not run for this change",
+    "mac_cross_machine_pairing": "not run",
+    "visible_cursor_comparison": "not run",
+    "local_log": "runs/macos-storage-windows-regression-20261029.txt",
+    "restricted_environment_attempt": "Windows peer metadata rename returned access denied; identical peer tests passed 8/8 with normal host file access, then full workspace passed"
+  },
+  "native_test_entry": "sh scripts/validate-mac-keychain.sh --offline",
+  "execution_channel_check": {
+    "codex_mac_message": "Cannot steer conversation without an active turn id; no task started",
+    "mac_hostname_ssh_probe": "xueweideMacBook-Air.local did not resolve to a usable address",
+    "previous_direct_link_ssh_probe": "TCP port 22 at the previously tested direct-link endpoint refused the connection",
+    "authentication_attempted": false,
+    "remote_settings_changed": false,
+    "interpretation": "No usable native execution channel established; does not prove Mac is offline"
+  },
+  "remaining": [
+    "Execute isolated native Keychain tests, then verify packaged cross-process access and signing/ACL continuity",
+    "Finish Mac invitation worker and native pairing UI",
+    "Recover orphan Keychain items and incomplete metadata commits without replacing established trust",
+    "Validate actual Windows-to-Mac input, emergency stop/release and local/ShareMouse/Crossflow visible comparison"
+  ],
+  "sources": [
+    "https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains",
+    "https://developer.apple.com/documentation/security/seckeychainsetuserinteractionallowed(_:)",
+    "https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_keychain/lib/SecItem.cpp"
+  ]
+}

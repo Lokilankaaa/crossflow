@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Shared native core and phase-zero mouse transport experiment"
 publish = false
+default-run = "crossflow"
 
 [workspace]
 members = ["crates/crossflow-bridge"]

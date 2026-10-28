@@ -1,4 +1,4 @@
-//! Windows app-owned storage for previously authenticated and authorized identities.
+//! App-owned storage for previously authenticated and authorized identities.
 //!
 //! Importing an existing bundle is a migration, NOT short-code pairing. Network
 //! discovery and the saved endpoint never establish trust. The pinned identity
@@ -17,7 +17,8 @@ pub const MAX_PEERS: usize = 64;
 const MAX_METADATA_BYTES: u64 = 4096;
 const COMMIT_FILE: &str = "peer.json";
 const PENDING_FILE: &str = "peer.pending.json";
-const IDENTITY_FILE: &str = "identity.dpapi";
+#[cfg(all(test, windows))]
+const IDENTITY_FILE: &str = crate::security::PROTECTED_FILE;
 
 /// Public display and routing hints only. No private key or storage path.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,8 +45,7 @@ pub struct PeerStore {
 impl PeerStore {
     pub fn default_store() -> Result<Self> {
         supported()?;
-        let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?;
-        let store = Self::at(PathBuf::from(base).join("Crossflow").join("peers"));
+        let store = Self::at(default_root()?);
         store.check_root(false)?;
         Ok(store)
     }
@@ -55,7 +55,7 @@ impl PeerStore {
         Self { root: root.into() }
     }
 
-    /// Migrate an already-authorized Windows sender bundle exactly once.
+    /// Migrate an already-authorized local-platform bundle exactly once.
     /// The source is retained; no new trust or network pairing is performed.
     pub fn remember_existing(
         &self,
@@ -85,8 +85,8 @@ impl PeerStore {
         validate_endpoint(last_endpoint)?;
         identity.validate()?;
         ensure!(
-            identity.role == "windows",
-            "Peer store requires a Windows sender identity"
+            identity.role == local_role(),
+            "Peer store identity has the wrong local platform role"
         );
         let summary = PeerSummary {
             schema: 1,
@@ -196,11 +196,11 @@ impl PeerStore {
         );
         // The OS-protected file is mandatory. A plaintext file beside it cannot
         // act as a fallback, including when the protected file was removed.
-        require_file(&bundle.join(IDENTITY_FILE))?;
+        require_file(&bundle.join(crate::security::PROTECTED_FILE))?;
         let identity = Identity::load(&bundle).context("Cannot open protected peer identity")?;
         ensure!(
-            identity.role == "windows",
-            "Peer store requires a Windows sender identity"
+            identity.role == local_role(),
+            "Peer store identity has the wrong local platform role"
         );
         ensure!(
             identity.peer_public_key_hex() == id,
@@ -256,10 +256,31 @@ impl PeerStore {
 
 fn supported() -> Result<()> {
     ensure!(
-        cfg!(windows),
+        cfg!(any(windows, target_os = "macos")),
         "App-owned peer storage is unsupported on this platform"
     );
     Ok(())
+}
+
+fn default_root() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var_os("HOME").context("Home directory is unavailable")?;
+        Ok(PathBuf::from(base).join("Library/Application Support/Crossflow/peers"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?;
+        Ok(PathBuf::from(base).join("Crossflow").join("peers"))
+    }
+}
+
+fn local_role() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "mac"
+    } else {
+        "windows"
+    }
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -387,7 +408,7 @@ mod tests {
         assert!(validate_endpoint("127.0.0.1:54321".parse().unwrap()).is_ok());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn native_store_is_explicitly_unsupported() {
         assert!(PeerStore::default_store().is_err());

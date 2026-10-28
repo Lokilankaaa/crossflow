@@ -8,6 +8,7 @@ pairing/
 *.pem
 identity.json
 identity.dpapi
+identity.keychain
 runs/
 dist/
 .DS_Store

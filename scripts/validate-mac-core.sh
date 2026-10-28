@@ -75,7 +75,7 @@ run_step unit-and-bridge cargo test --workspace "$@"
 run_step lint cargo clippy --workspace --all-targets "$@" -- -D warnings
 run_step native-release cargo build --workspace --release "$@"
 run_step fake-worker-build cargo build --example worker_fixture "$@"
-run_step security-and-transport cargo test --lib "$@" -- --ignored --test-threads=1
+run_step security-and-transport cargo test --lib "$@" -- --ignored --skip macos_keychain --test-threads=1
 run_step input-and-recovery cargo test --test input_transport --test session_recovery "$@" -- --ignored --test-threads=1
 run_step cooperative-stop cargo test --test shutdown_process "$@" -- --ignored --test-threads=1
 run_step isolated-worker cargo test --test injection_worker_process "$@" -- --ignored --test-threads=1

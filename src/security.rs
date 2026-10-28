@@ -5,7 +5,7 @@
 //! reach only their intended device through a trusted channel. No input is sent
 //! or accepted as handshake payload. Caller supplies socket deadlines and frames
 //! transport records; this module frames handshake records only.
-//! Windows identities can also be stored in a current-user DPAPI envelope;
+//! Identities can be stored using Windows current-user DPAPI or macOS Keychain;
 //! protected storage does not itself perform pairing or establish trust.
 
 use anyhow::{Context, Result, bail, ensure};
@@ -23,7 +23,10 @@ pub const MAX_CIPHERTEXT: usize = 65_535;
 pub const MAX_PLAINTEXT: usize = MAX_CIPHERTEXT - 16;
 const MAX_HANDSHAKE: usize = 1_024;
 const PROLOGUE: &[u8] = b"Crossflow/phase0/pinned-noise/v1/";
-const PROTECTED_FILE: &str = "identity.dpapi";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PROTECTED_FILE: &str = "identity.dpapi";
+#[cfg(target_os = "macos")]
+pub(crate) const PROTECTED_FILE: &str = "identity.keychain";
 const SEALED_HEADER: &[u8; 5] = b"CFID\x01";
 const SEALED_LENGTH: usize = 5 + 1 + 32 + 32 * 3;
 
@@ -109,6 +112,18 @@ impl Identity {
     }
 
     pub fn load(bundle: &Path) -> Result<Self> {
+        // A foreign-platform envelope is also an explicit protected-storage
+        // marker. Moving it between machines must not revive legacy plaintext.
+        let foreign_file = if cfg!(target_os = "macos") {
+            "identity.dpapi"
+        } else {
+            "identity.keychain"
+        };
+        match fs::symlink_metadata(bundle.join(foreign_file)) {
+            Ok(_) => bail!("Identity contains a foreign-platform protected record"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("Cannot inspect protected identity"),
+        }
         // A present but damaged/inaccessible protected identity must fail closed;
         // do not silently fall back to an older plaintext identity beside it.
         let protected = bundle.join(PROTECTED_FILE);
@@ -119,8 +134,7 @@ impl Identity {
                     "Protected identity is not a regular file"
                 );
                 let sealed = read_bounded(&protected, 65_536)?;
-                let plaintext = crate::secret_store::unprotect(&sealed)?;
-                return Self::from_protected_record(plaintext.as_slice());
+                return Self::open_protected_record(&sealed);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => bail!("Cannot access protected identity"),
@@ -148,12 +162,30 @@ impl Identity {
         Ok(identity)
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn open_protected_record(sealed: &[u8]) -> Result<Self> {
+        let plaintext = crate::secret_store::unprotect(sealed)?;
+        Self::from_protected_record(plaintext.as_slice())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_protected_record(locator: &[u8]) -> Result<Self> {
+        let reference = crate::keychain::KeychainReference::from_bytes(locator)?;
+        let plaintext = crate::keychain::load(&reference)?;
+        Self::from_protected_record(&plaintext)
+    }
+
     /// Persist an already authenticated identity using the current user's OS
     /// protection. No plaintext file is written, no existing directory is
     /// overwritten, and the source identity is not deleted. This is storage,
     /// not enrollment: callers must establish peer trust before saving.
     pub fn save_protected(&self, output: &Path) -> Result<()> {
         self.validate()?;
+        let plaintext = self.protected_record();
+        Self::persist_protected_record(output, &plaintext)
+    }
+
+    fn protected_record(&self) -> Zeroizing<Vec<u8>> {
         let mut plaintext = Zeroizing::new(Vec::with_capacity(SEALED_LENGTH));
         plaintext.extend_from_slice(SEALED_HEADER);
         plaintext.push(if self.role == "windows" { 0 } else { 1 });
@@ -161,7 +193,12 @@ impl Identity {
         plaintext.extend_from_slice(&self.private);
         plaintext.extend_from_slice(&self.public);
         plaintext.extend_from_slice(&self.peer);
-        let sealed = crate::secret_store::protect(&plaintext)?;
+        plaintext
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn persist_protected_record(output: &Path, plaintext: &[u8]) -> Result<()> {
+        let sealed = crate::secret_store::protect(plaintext)?;
         // Protection must succeed before creating any persistent state. On an
         // unsupported platform this leaves no empty destination behind.
         private_directory(output)?;
@@ -173,6 +210,62 @@ impl Identity {
         file.write_all(&sealed)
             .context("Cannot write protected identity")?;
         file.sync_all().context("Cannot flush protected identity")?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persist_protected_record(output: &Path, plaintext: &[u8]) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Reserve a new private directory before creating any Keychain item.
+        private_directory(output)?;
+        let reference = match crate::keychain::store(plaintext) {
+            Ok(reference) => reference,
+            Err(error) => {
+                // Only our newly reserved directory, and only if still empty.
+                // A temporary locked Keychain must not block the next attempt.
+                if fs::remove_dir(output).is_err() {
+                    return Err(error).context(
+                        "Keychain store failed; empty directory cleanup could not be confirmed",
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let mut created_locator = false;
+        let saved = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(output.join(PROTECTED_FILE))
+                .context("Cannot create Keychain identity locator")?;
+            created_locator = true;
+            file.write_all(&reference.to_bytes())
+                .context("Cannot write Keychain identity locator")?;
+            file.sync_all()
+                .context("Cannot flush Keychain identity locator")?;
+            fs::File::open(output)?
+                .sync_all()
+                .context("Cannot flush Keychain identity directory")?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            // Delete only the item created by this attempt. A crash between
+            // Keychain add and locator commit still requires orphan recovery.
+            if crate::keychain::remove(&reference).is_err() {
+                return Err(error)
+                    .context("Keychain locator save failed; item cleanup could not be confirmed");
+            }
+            if created_locator && fs::remove_file(output.join(PROTECTED_FILE)).is_err() {
+                return Err(error)
+                    .context("Keychain item removed; locator cleanup could not be confirmed");
+            }
+            if fs::remove_dir(output).is_err() {
+                return Err(error)
+                    .context("Keychain item removed; directory cleanup could not be confirmed");
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -732,6 +825,28 @@ mod tests {
     }
 
     #[test]
+    fn portable_protected_record_validates_both_platform_roles() {
+        let (a, b) = identities();
+        for identity in [&a, &b] {
+            let record = identity.protected_record();
+            let loaded = Identity::from_protected_record(&record).unwrap();
+            assert_eq!(loaded.role, identity.role);
+            assert_eq!(loaded.public, identity.public);
+            assert_eq!(loaded.peer, identity.peer);
+            for offset in [0, 5, 6, 38, 70, 102] {
+                let mut corrupted = Zeroizing::new(record.to_vec());
+                if offset == 102 {
+                    corrupted[102..134].fill(0);
+                } else {
+                    corrupted[offset] ^= 0xff;
+                }
+                assert!(Identity::from_protected_record(&corrupted).is_err());
+            }
+            assert!(Identity::from_protected_record(&record[..record.len() - 1]).is_err());
+        }
+    }
+
+    #[test]
     fn paired_peers_exchange_both_directions() {
         let (a, b) = identities();
         let (mut tx, mut rx) = channels(&a, &b).unwrap();
@@ -905,6 +1020,15 @@ mod tests {
         assert!(!serde_json::to_string(&info).unwrap().contains("private"));
         assert!(!format!("{a:?}").contains(&encode_hex(&a.private)));
         assert!(create_pair(&path).is_err());
+        let foreign = info.windows_bundle.join(if cfg!(target_os = "macos") {
+            "identity.dpapi"
+        } else {
+            "identity.keychain"
+        });
+        fs::write(&foreign, b"foreign protected identity marker").unwrap();
+        assert!(Identity::load(&info.windows_bundle).is_err());
+        fs::remove_file(foreign).unwrap();
+        assert!(Identity::load(&info.windows_bundle).is_ok());
         fs::remove_file(info.windows_bundle.join("identity.json")).unwrap();
         fs::remove_file(info.mac_bundle.join("identity.json")).unwrap();
         fs::remove_dir(info.windows_bundle).unwrap();
@@ -920,6 +1044,86 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit native macOS Keychain test; creates and deletes an isolated item; never injects input"]
+    fn macos_keychain_identity_store_reopens_and_authenticates() -> Result<()> {
+        let (a, b) = identities();
+        let root = std::env::temp_dir().canonicalize()?.join(format!(
+            "crossflow-keychain-identity-{}",
+            crate::discovery::new_public_id()?
+        ));
+        fs::create_dir(&root)?;
+        let store = crate::peers::PeerStore::at(root.join("peers"));
+        let peer_id = b.peer_public_key_hex();
+        let bundle = root.join("peers").join(&peer_id);
+        let checked = (|| -> Result<()> {
+            // Reject an identity belonging to the wrong platform before save.
+            ensure!(
+                store
+                    .remember_authorized(identities().0, "Wrong role", "127.0.0.1:5555".parse()?)
+                    .is_err(),
+                "Wrong local role accepted"
+            );
+            let saved =
+                store.remember_authorized(b, "Keychain test Windows", "127.0.0.1:5555".parse()?)?;
+            let reopened = crate::peers::PeerStore::at(root.join("peers"));
+            ensure!(
+                reopened.list()?.peers == vec![saved],
+                "Stored peer list mismatch"
+            );
+            let (_, resolved) = reopened.resolve(&peer_id)?;
+            let loaded = Identity::load(&resolved)?;
+            ensure!(loaded.role == "mac", "Wrong loaded role");
+            ensure!(
+                !resolved.join("identity.json").exists(),
+                "Unexpected plaintext identity"
+            );
+            ensure!(
+                loaded.save_protected(&resolved).is_err(),
+                "Existing identity overwritten"
+            );
+            let (mut tx, mut rx) = channels(&a, &loaded)?;
+            ensure!(
+                rx.decrypt(&tx.encrypt(b"keychain restored identity")?)?
+                    == b"keychain restored identity",
+                "Restored Noise identity failed"
+            );
+            let locator = fs::read(resolved.join(PROTECTED_FILE))?;
+            fs::write(resolved.join(PROTECTED_FILE), b"invalid keychain locator")?;
+            let rejected = Identity::load(&resolved).is_err();
+            fs::write(resolved.join(PROTECTED_FILE), &locator)?;
+            ensure!(rejected, "Invalid locator accepted");
+            Ok(())
+        })();
+        // Exact cleanup even after an assertion failure; never sweep Keychain.
+        let cleanup = (|| -> Result<()> {
+            if bundle.join(PROTECTED_FILE).is_file() {
+                let reference = crate::keychain::KeychainReference::from_bytes(&fs::read(
+                    bundle.join(PROTECTED_FILE),
+                )?)?;
+                crate::keychain::remove(&reference)?;
+                fs::remove_file(bundle.join(PROTECTED_FILE))?;
+            }
+            for name in ["peer.json", "peer.pending.json"] {
+                let path = bundle.join(name);
+                if path.is_file() {
+                    fs::remove_file(path)?;
+                }
+            }
+            if bundle.is_dir() {
+                fs::remove_dir(&bundle)?;
+            }
+            if root.join("peers").is_dir() {
+                fs::remove_dir(root.join("peers"))?;
+            }
+            fs::remove_dir(&root)?;
+            Ok(())
+        })();
+        cleanup.context("Native Keychain fixture cleanup failed")?;
+        checked
     }
 
     #[test]
