@@ -26,6 +26,12 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Private inherited-pipe input owner. Never connects to the network.
+    #[command(hide = true)]
+    InputWorker {
+        #[arg(long)]
+        gain: f64,
+    },
     /// Create paired static identities. Share only the mac bundle with the Mac.
     Pair {
         #[arg(long, default_value = ".pairing")]
@@ -171,6 +177,19 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
     match args.command {
+        Command::InputWorker { gain } => {
+            // This private child owns its process: do not print panic payloads
+            // (which could contain input) or block cleanup on stderr output.
+            std::panic::set_hook(Box::new(|_| {}));
+            ensure!(
+                gain.is_finite() && gain > 0.0 && gain <= 10.0,
+                "invalid worker gain"
+            );
+            #[cfg(target_os = "macos")]
+            crossflow::injection_worker::run_native(gain)?;
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("native input worker requires macOS");
+        }
         Command::Pair { out } => {
             println!(
                 "{}",
@@ -248,6 +267,19 @@ fn main() -> Result<()> {
             meta["duration_seconds"] = json!(seconds);
             meta["experimental_input_actions"] = json!(inject_actions);
             meta["movement_only"] = json!(inject && !inject_actions);
+            meta["input_worker"] = json!(inject && inject_actions);
+            meta["input_worker_protocol_version"] = json!(if inject && inject_actions {
+                Some(crossflow::worker_protocol::VERSION)
+            } else {
+                None
+            });
+            meta["worker_rpc_failure_logging"] = json!(inject && inject_actions);
+            meta["input_worker_ack"] = json!("adapter_return_only_not_os_or_display");
+            meta["receiver_t3_t4_scope"] = json!(if inject && inject_actions {
+                "worker_rpc_including_adapter_not_isolated_native_injection"
+            } else {
+                "local_adapter_call"
+            });
             #[cfg(target_os = "macos")]
             {
                 meta["platform"] = crossflow::platform::macos::environment();
@@ -257,6 +289,30 @@ fn main() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     (|| -> Result<()> {
+                        if inject_actions {
+                            let mut command = std::process::Command::new(std::env::current_exe()?);
+                            command
+                                .arg("input-worker")
+                                .arg("--gain")
+                                .arg(gain.to_string());
+                            let mut sink =
+                                crossflow::injection_worker::WorkerProxy::spawn(&mut command)?;
+                            sink.attach_failure_log(writer.log.clone());
+                            let result = session::receive_with_stop(
+                                &bind,
+                                &identity,
+                                &mut sink,
+                                writer.log.clone(),
+                                seconds,
+                                &stop,
+                            );
+                            // A normal receiver exit must also confirm the
+                            // input owner's cleanup ACK and actual process exit.
+                            if result.is_ok() {
+                                sink.shutdown()?;
+                            }
+                            return result;
+                        }
                         struct Native(crossflow::platform::macos::MacMouseSink, bool);
                         impl session::MouseSink for Native {
                             fn reset(&mut self) -> Result<()> {

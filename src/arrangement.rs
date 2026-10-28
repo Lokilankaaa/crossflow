@@ -479,4 +479,47 @@ mod tests {
         let encoded = serde_json::to_string(&layout).unwrap();
         assert_eq!(serde_json::from_str::<Layout>(&encoded).unwrap(), layout);
     }
+
+    #[test]
+    fn json_preserves_one_ulp_gaps_and_overlaps() {
+        // Raw decimal input is intentional: parsing must not merge a one-ULP
+        // gap or overlap into the exact shared edge at x=1920.
+        let config = |target_x: &str| {
+            format!(
+                r#"{{"screens":[{{"id":"a","device_id":"win","x":0,"y":0,"width":1920,"height":1080}},{{"id":"b","device_id":"mac","x":{target_x},"y":0,"width":1920,"height":1080}}]}}"#
+            )
+        };
+        let gap: Layout = serde_json::from_str(&config("1920.0000000000002")).unwrap();
+        assert_eq!(gap.screens()[1].x.to_bits(), 1920_f64.to_bits() + 1);
+        assert!(
+            gap.crossing("a", p(960., 540.), p(1921., 540.))
+                .unwrap()
+                .is_none()
+        );
+        assert!(serde_json::from_str::<Layout>(&config("1919.9999999999998")).is_err());
+    }
+
+    #[test]
+    fn layout_json_roundtrip_preserves_coordinate_bits() {
+        let original = Layout::new(vec![screen(
+            "a",
+            f64::from_bits(1920_f64.to_bits() + 1),
+            -f64::from_bits(1920_f64.to_bits() - 1),
+            f64::from_bits(1920_f64.to_bits() - 1),
+            f64::from_bits(1080_f64.to_bits() + 1),
+        )])
+        .unwrap();
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Layout = serde_json::from_str(&encoded).unwrap();
+        let before = &original.screens()[0];
+        let after = &decoded.screens()[0];
+        for (before, after) in [
+            (before.x, after.x),
+            (before.y, after.y),
+            (before.width, after.width),
+            (before.height, after.height),
+        ] {
+            assert_eq!(before.to_bits(), after.to_bits());
+        }
+    }
 }

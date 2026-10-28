@@ -110,7 +110,15 @@ sh scripts/start-mac.sh --bind MAC_LAN_IP:24800 --identity .pairing/mac --second
 
 Windows 本地键盘和点击仍会作用于本地应用，当前不是无缝焦点接管。Mac 支持 ANSI 物理字母／数字／标点、基础导航、F1–F12 和左右修饰键；目标输入法与键盘布局决定字符。Ctrl 保持 Ctrl，GUI 键映射 Command；自定义 Ctrl/Cmd 映射、长按重复、Caps Lock、数字键盘、国际键、Fn/媒体键和双击次数尚不支持。接收端遇到不支持的键会停止并清理当前会话，不能假定所有 Windows 可采集按键都能在 Mac 使用。
 
-按钮／键盘／滚轮不会跨越相邻移动被合并。暂停、Stop、EOF、过期输入、紧急停止及普通错误会尝试释放本会话持有的键与按钮；释放失败终止接收器并报告。自动化测试使用记录适配器，尚不能证明系统实际释放成功；强制杀死接收进程后的释放没有独立监督机制，仍是阻塞缺陷。滚轮暂用 120 原始单位换一行，水平符号、自然滚动、拖动与修饰键行为都待实机核验。
+按钮／键盘／滚轮不会跨越相邻移动被合并。暂停、Stop、EOF、过期输入、紧急停止及普通错误会尝试释放本会话持有的键与按钮；释放失败终止接收器并报告。`--inject-actions` 现使用独立输入进程：主接收进程单独死亡或不再推进时，由输入进程自己的租约触发清理。Windows 模拟进程已验证此机制；Mac 原生构建及真实释放尚未验收。输入进程本身被杀、整个进程树被杀、系统崩溃或原生调用永久卡住时仍不能保证释放。默认仅移动路径不启用该进程，实验动作路径增加的 IPC 耗时和流畅度仍需测试。滚轮暂用 120 原始单位换一行，水平符号、自然滚动、拖动与修饰键行为都待实机核验。
+
+独立进程的纯模拟检查（不调用系统输入适配器）：先执行 `cargo build --example worker_fixture --locked`，再执行 `cargo test --test injection_worker_process --locked -- --ignored --test-threads=1`。Windows 可通过 `scripts/cargo-local.ps1 -CargoArgs @(...)` 使用本仓库工具链。正常测试核对清理 ACK 和实际进程退出；强杀测试只杀它自己创建的假主进程。
+
+连接恢复的补充检查：`cargo test --test network_stall --locked -- --ignored --test-threads=1 --nocapture`。真实加密发送/接收器经回环字节中继经历五轮各两秒停顿，仅记录 fake 输入；检查释放、暂停重连、物理持有状态和旧输入不重放，并将原始日志及报告保留在 `runs/network-stall-*`。此工具不修改系统网络，不模拟 TCP 之前的丢包/抖动，不能替代阶段 0 的 T14 实网验收。
+
+Mac 原生复验可运行 `sh scripts/validate-mac-core.sh`；依赖已缓存时可加 `--offline`。脚本检查原生架构、拒绝 Rosetta，显式使用匹配的 Darwin target，依次检查格式、测试、Clippy、release 构建、fake worker、加密网络、Unix 停止信号及五轮字节流停顿，并读取显示/权限预检。它不调用实际捕获/注入入口或打开界面。逐步输出、构建版本与 Git 状态保存在 `runs/mac-core-validation-*`，任何一步失败即停止；`status.txt` 仅在全部步骤成功后写入 `passed`。部分测试会清理各自的临时目录，因此脚本保留的是逐步命令输出，不保证保留每个测试的全部内部原始日志。该脚本目前只通过语法与非 Mac 拒绝执行检查，尚待 Mac 原生运行；通过后仍需单独验证 Escape、真实按键释放和本地/ShareMouse/Crossflow 可见效果。
+
+该复验使用显式 target，验证产物位于 `target/<Darwin target>/release/crossflow`。后续现场运行时，将脚本末尾显示的绝对路径传给 `start-mac.sh --binary PATH`，以免误用旧的 `target/release/crossflow`；默认启动路径仍兼容原有入口。
 
 终端停止接入同一个退出流程：Windows 的 Ctrl+C / Ctrl+Break，以及 macOS 的 SIGINT / SIGTERM / SIGHUP 请求停止采集和网络循环，接收器清理拥有的输入后结束日志。信号回调只提交停止请求，实际释放在正常线程完成。已经进入系统适配器的调用不能中途抢占；连接／握手、域名解析与日志刷新也可能延后退出，不能承诺固定的毫秒级退出时间。关闭 Windows 控制台只提供有界的尽力清理窗口；任务管理器强制终止、SIGKILL、崩溃和关机不属于此保证。
 
@@ -138,7 +146,17 @@ Windows 本地键盘和点击仍会作用于本地应用，当前不是无缝焦
 
 ### 屏幕布局开发工具
 
-`ui/index.html` 是离线交互草稿，可拖动、调整屏幕属性并导入／导出布局 JSON。界面里的设备是布局草稿，不代表已发现或已连接的真实设备；导出不会改变系统显示排列或开启共享。正式界面以轻量、美观、响应快为目标，优先采用 macOS SwiftUI 与 Windows WinUI 3，共享设计规范并调用同一 Rust 内核；当前尚无这两个正式客户端。HTML 草稿不意味着选定网页技术作为正式界面。
+`ui/index.html` 是离线交互草稿。正式界面以轻量、美观、响应快为目标，采用 macOS SwiftUI 与 Windows WinUI 3 方向，共享设计资源并调用同一 Rust 内核。Windows 已有可编译的原生布局客户端，见 [构建与功能说明](clients/windows/README.md)；Mac 原生客户端正在独立验证聊天中开发，尚未汇入主分支。HTML 草稿不作为正式客户端技术选型。
+
+Windows 原生客户端构建：
+
+```powershell
+./scripts/build-windows-ui.ps1 -BootstrapSdk
+```
+
+该脚本在项目目录内准备 .NET SDK，调用 Rust 桥并构建 WinUI 3 应用，不安装全局开发工具。客户端通过 `crates/crossflow-bridge` 的 C ABI 复用布局校验和穿越计算；不会启动输入共享。示例需明确加载，不代表发现或连接的设备。共享会话控制、设备发现及实时连接状态尚未接入界面，导出布局不会应用到正在运行的会话。
+
+原生构建和七项 C# → Rust 无窗口自检通过；窗口启动、视觉排版、实际拖动、文件对话框及闲置 CPU/内存尚未验证，Computer Use 应用访问授权等待超时。当前自包含构建约 170.54 MiB（含运行库），不是已验收的轻量发行包。
 
 Rust 核心可验证同一份布局，并计算一次边缘穿越：
 

@@ -1,4 +1,5 @@
 pub mod arrangement;
+pub mod injection_worker;
 pub mod input;
 pub mod metrics;
 pub mod platform;
@@ -7,3 +8,4 @@ pub mod security;
 pub mod session;
 pub mod shutdown;
 pub mod state;
+pub mod worker_protocol;

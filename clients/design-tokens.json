@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "product_name": "Crossflow",
+  "colors": {
+    "background": "#F7F8FC",
+    "surface": "#FFFFFF",
+    "surface_subtle": "#F0F2F8",
+    "text": "#1D2333",
+    "text_secondary": "#596174",
+    "border": "#DCE0EA",
+    "accent": "#5260D9",
+    "accent_subtle": "#ECEEFD",
+    "device_secondary": "#157B75",
+    "success": "#187345",
+    "warning": "#805900",
+    "danger": "#B72D42"
+  },
+  "typography": {
+    "title": 26,
+    "section": 17,
+    "body": 14,
+    "caption": 12
+  },
+  "spacing": {
+    "small": 8,
+    "medium": 12,
+    "large": 16,
+    "section": 24
+  },
+  "radii": {
+    "control": 8,
+    "panel": 14
+  },
+  "window": {
+    "width": 1180,
+    "height": 760,
+    "minimum_width": 880,
+    "minimum_height": 600,
+    "sidebar_width": 200,
+    "inspector_width": 260
+  },
+  "copy": {
+    "layout_title": "屏幕排列",
+    "layout_subtitle": "拖动屏幕，匹配你的桌面布局。",
+    "input_title": "输入设置",
+    "connection_title": "连接状态",
+    "draft_label": "布局草稿",
+    "sample_notice": "示例屏幕，不代表已发现的设备。",
+    "session_unavailable": "共享会话尚未接入",
+    "core_ready": "布局内核已就绪",
+    "core_unavailable": "布局内核不可用",
+    "apply_unavailable": "当前可编辑与导出布局，尚未应用到键鼠共享。"
+  }
+}

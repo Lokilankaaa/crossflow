@@ -15,3 +15,7 @@ dist/
 target/
 *.secret
 Crossflow-*.lnk
+clients/**/bin/
+clients/**/obj/
+clients/macos/.build/
+clients/macos/.swiftpm/

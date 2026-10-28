@@ -6,6 +6,7 @@ usage() {
     cat <<'USAGE'
 Usage: sh scripts/start-mac.sh --bind IP:PORT [options]
   --identity DIR     Existing Mac identity bundle (default: .pairing/mac)
+  --binary PATH      Explicit validated binary (default: target/release/crossflow)
   --seconds N        Test duration, integer 1..3600 (default: 180)
   --gain N           Positive decimal <=10 (default: 1; used with --inject)
   --log-dir DIR      Directory for unique logs (default: runs)
@@ -22,6 +23,7 @@ fail() { printf '%s\n' "$*" >&2; exit 2; }
 need_value() { [ "$#" -ge 2 ] && [ -n "$2" ] || fail "Missing value for $1"; }
 
 bind_address=
+binary_argument=
 identity=.pairing/mac
 seconds=180
 gain=1
@@ -32,6 +34,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --bind) need_value "$@"; bind_address=$2; shift 2 ;;
         --identity) need_value "$@"; identity=$2; shift 2 ;;
+        --binary) need_value "$@"; binary_argument=$2; shift 2 ;;
         --seconds) need_value "$@"; seconds=$2; shift 2 ;;
         --gain) need_value "$@"; gain=$2; shift 2 ;;
         --log-dir) need_value "$@"; log_directory=$2; shift 2 ;;
@@ -50,6 +53,12 @@ awk -v value="$gain" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary=$project_root/target/release/crossflow
+if [ -n "$binary_argument" ]; then
+    case "$binary_argument" in
+        /*) binary=$binary_argument ;;
+        *) binary=$project_root/$binary_argument ;;
+    esac
+fi
 [ -f "$binary" ] && [ -x "$binary" ] || fail "Release binary missing or not executable: $binary. Build first with cargo build --release."
 case "$identity" in /*) ;; *) identity=$project_root/$identity ;; esac
 [ -f "$identity/identity.json" ] || fail "Identity bundle is missing: $identity. Supply the existing Mac bundle with --identity."
