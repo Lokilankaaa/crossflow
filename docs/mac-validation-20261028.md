@@ -49,3 +49,24 @@ Mac 日志 `runs/mac-20261028-01/physical-input-01.jsonl` 共 6,134 条，完整
 现已证实 Mac 原生构建、双端认证与 Windows → Mac 数据处理可运行，并取得第一轮真实鼠标控制、注入日志和用户光标观察。上述软件耗时不等于网络延迟或可见光标延迟，DrySink 调用也不是 CoreGraphics 注入。各个停止入口的独立验证、有线异常复查及本地鼠标/ShareMouse 对照仍需完成；阶段 0 未完成。
 
 GitHub 私有仓库：https://github.com/Lokilankaaa/crossflow 。初始两条提交已推送，远端 main 与本机基线一致。
+
+## 2026-10-28 14:42:18–14:47:53：新版原生验证通过，实机首轮未接通
+
+本节为追加记录，时间均为 Asia/Hong_Kong；上文的历史版本、测试结果及结论保留原样。本轮 Mac 为干净的 `83b36be` 合并版本，包含 `99f7b3f`；Windows 使用干净的 `99f7b3f` release。
+
+Mac 已运行 `validate-mac-core.sh --offline`，原生构建及脚本各项检查全部通过。证据目录为 `/Users/xuewei/Downloads/projects/crossflow/runs/mac-core-validation-20261028T064016Z-bFfZi7`。这些检查使用 fake/DrySink，不能替代真实输入验收。只读环境预检的辅助功能、事件发送、输入监控三项均为 `true`；主屏逻辑尺寸为 1470×956，系统声明 60 Hz，实际刷新率未测。
+
+Mac 于 14:42:18 启动限时 300 秒的 movement-only 接收器，绑定 `192.168.1.154:24800`，启用 `--inject`，未启用输入 worker 或键盘、按钮、滚轮共享。Windows 于 14:42:45 启动物理鼠标发送端，捕获运行 240.004 秒，等待握手收尾后总计约 241.972 秒，原始捕获数为 0。发送端出现 69 次握手响应头读取超时（`Read handshake header`，系统错误 `10060`），另有一条最终退出错误，共 70 条错误；认证连接数为 0，排队移动数为 0，最终因从未建立认证连接而以退出码 1 结束。
+
+Windows 日志共 279 条，`complete_log=true`，丢失记录和格式错误均为 0。归档文件为：
+
+- `runs/physical-resume-20261028/windows-input-20261028-064245-846-223ab17e5ab44cef80a1cb85e729949e.jsonl`
+- `runs/physical-resume-20261028/windows-round1-summary.json`
+
+Mac 接收器于 14:47:18 到期结束，退出码 0。完整日志只有 `metadata`、`listening`、`log_summary` 三条记录，TCP accept、认证及移动记录均为 0，没有 Escape 停止记录。归档路径为 `runs/physical-resume-20261028/mac-20261028-064218-Of3joCp1/receiver.jsonl`。运行中日志曾显示 0 行，最终归档表明这是缓冲期间的观察，不能把运行中的空文件当作接收器未启动的证据。
+
+只读进程采样显示 Mac 接收主线程正常处于非阻塞 accept／nanosleep 循环，未观察到卡在 Escape 查询或注入接口。Windows 网络表曾显示本地 `192.168.1.164` 到远端 `192.168.1.154:24800` 的 ESTABLISHED 连接及多个 FIN_WAIT_2；这些状态不能单独证明连接到达了 Mac 的 Crossflow 接收进程。当前证据不足以确定握手未接通的根因，也不据此归因于输入权限、CoreGraphics、代理、路由或防火墙。
+
+Mac 协调端于 14:47:53 报告无残留进程；由于该轮 `lsof`／`pgrep` 检查受限，此处保留报告及其限制，不强化为已独立确认所有相关进程、监听均已清理。接收器到期退出码及最终日志是本轮已取得的结束证据。Windows 于 14:52:57 在可读取实际进程的环境中检查，确认无 Crossflow 进程、24800 端口的 ESTABLISHED 连接或 24801 端口的源码传输监听。
+
+本轮没有建立认证连接，也没有产生可用于手感评估的输入或移动记录，因此是一次未接通的实机尝试，不能判为光标流畅度失败或成功。Mac Escape、实际可见流畅度与本地鼠标／ShareMouse 对照仍未在新版上验证。此后向 Mac 协调会话发送消息持续未返回，尚未开始第二轮；根因复查及下一轮实机测试待继续。
