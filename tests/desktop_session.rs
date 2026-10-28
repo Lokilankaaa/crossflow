@@ -186,14 +186,58 @@ struct DesktopProcess {
     reader: Option<JoinHandle<Result<()>>>,
 }
 impl DesktopProcess {
-    fn start(evidence: &Evidence, address: &str) -> Result<Self> {
+    fn start(evidence: &Evidence, address: &str, managed_peer: bool) -> Result<Self> {
         let stderr = evidence.file("child.stderr.txt")?;
         let mut transcript = evidence.file("control-status.jsonl")?;
-        let child = Command::new(env!("CARGO_BIN_EXE_crossflow"))
-            .arg("desktop-send")
-            .args(["--host", address])
-            .arg("--identity")
-            .arg(evidence.identity("windows"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crossflow"));
+        command.arg("desktop-send");
+        if managed_peer {
+            let appdata = evidence.0.join("identities").join("appdata");
+            let imported = Command::new(env!("CARGO_BIN_EXE_crossflow"))
+                .arg("peer-import")
+                .arg("--identity")
+                .arg(evidence.identity("windows"))
+                .args(["--name", "Local test Mac", "--endpoint", address])
+                .env("LOCALAPPDATA", &appdata)
+                .creation_flags(0x0800_0000)
+                .output()?;
+            ensure!(
+                imported.status.success(),
+                "Diagnostic identity migration failed"
+            );
+            let peer: crossflow::peers::PeerSummary =
+                serde_json::from_slice(&imported.stdout).context("Invalid public peer summary")?;
+            let listed = Command::new(env!("CARGO_BIN_EXE_crossflow"))
+                .arg("peers")
+                .env("LOCALAPPDATA", &appdata)
+                .creation_flags(0x0800_0000)
+                .output()?;
+            ensure!(
+                listed.status.success(),
+                "Fresh process could not list saved peer"
+            );
+            let public: Value = serde_json::from_slice(&listed.stdout)?;
+            ensure!(
+                public["invalid_records"] == 0
+                    && public["peers"]
+                        .as_array()
+                        .is_some_and(|rows| rows.len() == 1)
+                    && public["peers"][0]["id"] == peer.id,
+                "Saved peer did not survive process restart"
+            );
+            // Only this child sees the temporary app store. No real profile,
+            // global environment, or user's existing paired devices are changed.
+            command
+                .env("LOCALAPPDATA", appdata)
+                .arg("--peer")
+                .arg(peer.id);
+        } else {
+            command
+                .args(["--host", address])
+                .arg("--identity")
+                .arg(evidence.identity("windows"));
+        }
+        let child = command
             .arg("--log")
             .arg(evidence.0.join("sender.jsonl"))
             .args(["--seconds", "20", "--max-hz", "1000"])
@@ -328,6 +372,16 @@ fn wait_receiver(label: &str, ready: impl Fn() -> bool) -> Result<()> {
 #[test]
 #[ignore = "REAL Windows Raw Input and global hotkeys; localhost DrySink only; run explicitly on an interactive desktop"]
 fn desktop_process_authenticates_controls_and_exits_cleanly_on_parent_eof() -> Result<()> {
+    exercise_desktop_session(false)
+}
+
+#[test]
+#[ignore = "REAL Windows Raw Input and global hotkeys; app-managed DPAPI peer and localhost DrySink; run explicitly"]
+fn desktop_process_connects_by_saved_peer_without_identity_or_host_arguments() -> Result<()> {
+    exercise_desktop_session(true)
+}
+
+fn exercise_desktop_session(managed_peer: bool) -> Result<()> {
     let evidence = Evidence::new()?;
     eprintln!(
         "Desktop session evidence: {} (temporary keys are removed)",
@@ -341,7 +395,7 @@ fn desktop_process_authenticates_controls_and_exits_cleanly_on_parent_eof() -> R
     drop(reservation);
     let events = Arc::new(ReceiverEvents::default());
     let mut receiver = ReceiverWorker::start(&evidence, address.clone(), events.clone())?;
-    let mut child = DesktopProcess::start(&evidence, &address)?;
+    let mut child = DesktopProcess::start(&evidence, &address, managed_peer)?;
     let paused = child.wait_status("authenticated and capture-ready pause", |s| {
         s.capture_ready && s.state == "paused" && s.error.is_none()
     })?;
@@ -425,6 +479,8 @@ fn desktop_process_authenticates_controls_and_exits_cleanly_on_parent_eof() -> R
         evidence.file("result.json")?,
         &json!({
             "scenario":"authenticated_desktop_controls_parent_eof",
+            "app_managed_peer":managed_peer,
+            "manual_identity_or_host_arguments":!managed_peer,
             "result":"passed", "native_capture":true, "os_injection":false,
             "receiver":"DrySink", "synthetic_input":false,
             "receiver_arms":events.arms.load(Ordering::Acquire),

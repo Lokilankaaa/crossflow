@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod injection_worker;
 pub mod input;
 pub mod metrics;
+pub mod peers;
 pub mod platform;
 pub mod protocol;
 pub mod secret_store;

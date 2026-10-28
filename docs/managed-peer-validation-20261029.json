@@ -1,0 +1,31 @@
+{
+  "date_local": "2026-10-29",
+  "tested_base_revision": "483d7f6ade7af3c55ba84614fb1fffa7bd9e231b",
+  "tested_build_dirty": true,
+  "implementation": "Windows app-owned PeerStore, DPAPI identity, final metadata commit marker; desktop-send resolves --peer without --host or --identity",
+  "trust_source": "one-time migration of an already authorized diagnostic identity, not untrusted discovery or short-code enrollment",
+  "checks": {
+    "peer_store": "6 unit tests passed: persistent restore, non-overwrite, corrupt and partial records, identity mismatch, unsafe IDs/names/routes and capacity boundary",
+    "root_workspace": "all-target tests passed, including 145 library and 2 CLI tests; opt-in network/input tests skipped in that command",
+    "clippy": "workspace all targets, warnings denied, passed",
+    "apple_typecheck": "workspace all targets passed on Windows; app-owned store remains explicitly unsupported on Mac",
+    "real_desktop_process": "both legacy and managed-peer opt-in cases passed in 1.54 seconds total",
+    "managed_route": "real peer-import child persisted a test identity; a fresh peers child returned its public record; desktop-send received only --peer and restored endpoint/identity internally",
+    "controls": "authenticated state stayed paused, stale epoch rejected, explicit arm/pause/rearm observed at DrySink, parent stdin EOF stopped and exited normally",
+    "cleanup": "temporary identities and temporary app-owned store removed; no real LOCALAPPDATA changed",
+    "logs": "complete, zero dropped records; expected peer disconnect at shutdown"
+  },
+  "evidence": [
+    "runs/managed-peer-tests-20261029.txt",
+    "runs/desktop-session-44448-1793206072310508300/result.json",
+    "runs/desktop-session-44448-1793206073031344100/result.json"
+  ],
+  "limits": [
+    "Windows native UI has not yet gained a saved-device selection page",
+    "No short-code pairing, fresh-install onboarding, Mac store, revocation UI or automatic route rediscovery",
+    "Saved endpoint is a routing hint; successful pinned Noise authentication is still required",
+    "Filesystem checks and DPAPI do not isolate malicious processes running as the same local user",
+    "Failed or concurrent import can leave unusable partial records requiring later repair; no overwrite or automatic recovery is claimed",
+    "Real Raw Input/global hotkeys were registered, but the receiver was localhost DrySink; no OS input injection or visible mouse measurement"
+  ]
+}

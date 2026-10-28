@@ -22,6 +22,8 @@
 
 ## 已实现
 
+2026-10-29：Windows 已加入应用管理的设备存储及 `desktop-send --peer` 连接入口。真实子进程验证了已有诊断身份导入、另一个进程列出设备、仅按设备 ID 恢复受保护身份与路由、认证后暂停、显式开启/暂停/再次开启及 EOF 正常退出；临时身份与应用存储已清理。本轮接收器仍是 localhost DrySink，没有 Mac 注入。配对码、原生已配对列表、Mac 存储与地址重新发现仍未接入，详见 [已配对设备验证](managed-peer-validation-20261029.json)。
+
 2026-10-29 补充：Windows 内核已增加当前用户 DPAPI 保护存储，并接入现有身份加载与 Noise KK。真实 DPAPI 往返、损坏拒绝、不覆盖、无明文回退、恢复身份后的加密交换及 localhost TCP 握手通过；全目标测试、Clippy 和 Apple 类型检查通过。这是客户端自动保管身份的基础接口，尚未接入短码配对、应用默认目录或 Mac Keychain，也没有自动迁移或删除现有诊断文件。详见 [受保护身份验证记录](protected-identity-validation-20261029.json)。
 
 短码认证的独立 Rust 实验已连接固定 BoringSSL 原语：7 项单测、2 项单次消费编译期测试，以及 3 项真实 localhost TCP 测试通过。正确短码在两端确认；错误码、改动绑定及真正分别终止两条 Noise XX 连接的中间人转发均在确认校验处被拒绝，逐字节拖延也不能重置总期限。该实验未接入产品，没有邀请码生命周期、客户端确认或信任保存，不代表正式配对功能完成。详见 [实验结果](../experiments/pairing-spake2/rust-pairing/result-windows.json)。

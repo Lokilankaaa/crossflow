@@ -191,6 +191,10 @@ impl Identity {
         encode_hex(&self.public)
     }
 
+    pub fn peer_public_key_hex(&self) -> String {
+        encode_hex(&self.peer)
+    }
+
     fn validate_keys(&self) -> Result<()> {
         let mut dh = DefaultResolver
             .resolve_dh(&snow::params::DHChoice::Curve25519)

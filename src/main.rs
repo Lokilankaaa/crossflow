@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use crossflow::{
     metrics::{LogWriter, summarize},
@@ -29,10 +29,13 @@ enum Command {
     /// Private native-client session; inherited pipes carry controls, not input.
     #[command(hide = true)]
     DesktopSend {
+        #[arg(long, required_unless_present = "peer", conflicts_with = "peer")]
+        host: Option<String>,
+        #[arg(long, required_unless_present = "peer", conflicts_with = "peer")]
+        identity: Option<PathBuf>,
+        /// App-managed trusted device ID; resolves its protected identity and route.
         #[arg(long)]
-        host: String,
-        #[arg(long)]
-        identity: PathBuf,
+        peer: Option<String>,
         #[arg(long)]
         log: PathBuf,
         #[arg(long, default_value_t = 3600.0)]
@@ -50,6 +53,18 @@ enum Command {
     Pair {
         #[arg(long, default_value = ".pairing")]
         out: PathBuf,
+    },
+    /// List app-managed paired devices; no private keys or file paths are returned.
+    Peers,
+    /// Development migration of an existing trusted diagnostic identity.
+    #[command(hide = true)]
+    PeerImport {
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        endpoint: std::net::SocketAddr,
     },
     /// Browse nearby Crossflow services; discovery never grants input permission.
     Discover {
@@ -209,10 +224,21 @@ fn main() -> Result<()> {
         Command::DesktopSend {
             host,
             identity,
+            peer,
             log,
             seconds,
             max_hz,
         } => {
+            let (host, identity) = if let Some(id) = peer {
+                let (device, bundle) =
+                    crossflow::peers::PeerStore::default_store()?.resolve(&id)?;
+                (device.last_endpoint.to_string(), bundle)
+            } else {
+                (
+                    host.context("Target endpoint required")?,
+                    identity.context("Identity required")?,
+                )
+            };
             let mut meta = metadata("native_client_sender");
             meta["host"] = json!(host);
             meta["desktop_control_protocol"] = json!(1);
@@ -255,6 +281,19 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&crossflow::security::create_pair(&out)?)?
             );
+        }
+        Command::Peers => {
+            let devices = crossflow::peers::PeerStore::default_store()?.list()?;
+            println!("{}", serde_json::to_string_pretty(&devices)?);
+        }
+        Command::PeerImport {
+            identity,
+            name,
+            endpoint,
+        } => {
+            let device = crossflow::peers::PeerStore::default_store()?
+                .remember_existing(&identity, &name, endpoint)?;
+            println!("{}", serde_json::to_string_pretty(&device)?);
         }
         Command::Discover { seconds } => {
             ensure!(
@@ -798,6 +837,49 @@ fn run_capture(
 #[cfg(test)]
 mod discovery_cli_tests {
     use super::*;
+
+    #[test]
+    fn desktop_peer_mode_excludes_manual_identity_and_host() {
+        let base = [
+            "crossflow",
+            "desktop-send",
+            "--peer",
+            "0011",
+            "--log",
+            "run.jsonl",
+        ];
+        assert!(Args::try_parse_from(base).is_ok());
+        for extra in [["--host", "127.0.0.1:24800"], ["--identity", "identity"]] {
+            let mut args = base.to_vec();
+            args.extend(extra);
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        assert!(Args::try_parse_from(["crossflow", "desktop-send", "--log", "run.jsonl"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "crossflow",
+                "desktop-send",
+                "--host",
+                "127.0.0.1:24800",
+                "--log",
+                "run.jsonl"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "crossflow",
+                "desktop-send",
+                "--host",
+                "127.0.0.1:24800",
+                "--identity",
+                "identity",
+                "--log",
+                "run.jsonl"
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn discovery_is_explicit_and_name_cannot_enable_it_implicitly() {
