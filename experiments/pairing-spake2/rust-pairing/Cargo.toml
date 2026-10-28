@@ -1,0 +1,15 @@
+[package]
+name = "crossflow-pairing-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately outside the application's production dependency graph.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+zeroize = "1"
+
+[dev-dependencies]
+snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
