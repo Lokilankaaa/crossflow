@@ -100,6 +100,9 @@ enum Command {
         /// Public discovery label; defaults to a generic platform name.
         #[arg(long, requires = "discoverable")]
         device_name: Option<String>,
+        /// Private native-client lifetime supervision; stdin carries stop only.
+        #[arg(long, hide = true)]
+        control_stdio: bool,
     },
     /// Capture Windows Raw Input; Ctrl+Alt+Space arms, Ctrl+Alt+Esc exits.
     Send {
@@ -404,6 +407,7 @@ fn main() -> Result<()> {
             gain,
             discoverable,
             device_name,
+            control_stdio,
         } => {
             valid_duration(seconds)?;
             let identity = if let Some(peer) = peer {
@@ -448,6 +452,36 @@ fn main() -> Result<()> {
                 meta["platform"] = crossflow::platform::macos::environment();
             }
             let writer = LogWriter::new(&log, meta)?;
+            let receiver_control =
+                control_stdio.then(|| crossflow::receiver_control::Control::new(stop.clone()));
+            let supervisor = if let Some(control) = &receiver_control {
+                let (input, output) = crossflow::injection_worker::stdio_files()?;
+                let mut io =
+                    crossflow::receiver_control::ControlIo::start(input, output, control.clone())?;
+                let (finished, result) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+                let worker = thread::Builder::new()
+                    .name("crossflow-receiver-control".into())
+                    .spawn(move || {
+                        loop {
+                            io.tick();
+                            match result.recv_timeout(std::time::Duration::from_millis(50)) {
+                                Ok(result) => return io.finish(result),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    return io.finish(Err(anyhow::anyhow!(
+                                        "receiver owner ended unexpectedly"
+                                    )));
+                                }
+                            }
+                        }
+                    })?;
+                Some((finished, worker))
+            } else {
+                None
+            };
+            let observer = receiver_control
+                .as_ref()
+                .map(|control| control as &dyn session::ReceiveObserver);
             let result = if inject {
                 #[cfg(target_os = "macos")]
                 {
@@ -461,7 +495,7 @@ fn main() -> Result<()> {
                             let mut sink =
                                 crossflow::injection_worker::WorkerProxy::spawn(&mut command)?;
                             sink.attach_failure_log(writer.log.clone());
-                            let result = session::receive_with_discovery(
+                            let result = session::receive_observed(
                                 &bind,
                                 &identity,
                                 &mut sink,
@@ -469,6 +503,7 @@ fn main() -> Result<()> {
                                 seconds,
                                 &stop,
                                 discovery_options.as_ref(),
+                                observer,
                             );
                             // Discovery failure must not skip the input owner's
                             // explicit cleanup ACK and process-exit attempt.
@@ -533,7 +568,7 @@ fn main() -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                             inject_actions,
                         );
-                        session::receive_with_discovery(
+                        session::receive_observed(
                             &bind,
                             &identity,
                             &mut sink,
@@ -541,6 +576,7 @@ fn main() -> Result<()> {
                             seconds,
                             &stop,
                             discovery_options.as_ref(),
+                            observer,
                         )
                     })()
                 }
@@ -552,7 +588,7 @@ fn main() -> Result<()> {
                 }
             } else {
                 let mut sink = session::DrySink::default();
-                let r = session::receive_with_discovery(
+                let r = session::receive_observed(
                     &bind,
                     &identity,
                     &mut sink,
@@ -560,11 +596,14 @@ fn main() -> Result<()> {
                     seconds,
                     &stop,
                     discovery_options.as_ref(),
+                    observer,
                 );
-                eprintln!(
-                    "Dry run: {} movements, final cumulative ({:.2}, {:.2})",
-                    sink.moves, sink.x, sink.y
-                );
+                if !control_stdio {
+                    eprintln!(
+                        "Dry run: {} movements, final cumulative ({:.2}, {:.2})",
+                        sink.moves, sink.x, sink.y
+                    );
+                }
                 r
             };
             if let Err(error) = &result {
@@ -573,8 +612,28 @@ fn main() -> Result<()> {
                     json!({"stage":"receiver_exit","message":format!("{error:#}")}),
                 );
             }
-            writer.finish()?;
-            result?;
+            // A final successful status follows receiver, discovery, native
+            // input owner and logging cleanup. Requesting stop is not success.
+            let log_result = writer.finish();
+            let result = result.and(log_result);
+            if let Some((finished, worker)) = supervisor {
+                finished
+                    .send(result)
+                    .map_err(|_| anyhow::anyhow!("receiver supervisor unavailable"))?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !worker.is_finished() {
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "receiver supervisor exit unconfirmed"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("receiver supervisor panicked"))??;
+            } else {
+                result?;
+            }
         }
         Command::Send {
             host,
@@ -882,6 +941,7 @@ mod discovery_cli_tests {
                 identity: None,
                 peer: Some(_),
                 inject: false,
+                control_stdio: false,
                 ..
             }
         ));

@@ -1,0 +1,41 @@
+{
+  "date_local": "2026-10-29",
+  "head_commit": "26909c206e07f12efe1b88162ee5577f35b86a14",
+  "checkout": "GitHub PR #2 merge ref, head 26909c2 into base ceac92a",
+  "run_url": "https://github.com/Lokilankaaa/crossflow/actions/runs/40758346045",
+  "job_id": 123063198172,
+  "result": "success",
+  "environment": {
+    "runner": "GitHub-hosted macos-15 arm64",
+    "rust": "1.99.1",
+    "swift": "6.1.2",
+    "xcode": "16.4",
+    "user_mac": false
+  },
+  "passed": {
+    "root_core_tests": 148,
+    "root_cli_tests": 4,
+    "ordinary_process_test": 1,
+    "bridge_tests": 7,
+    "pairing_library_tests": 29,
+    "pairing_compile_fail_doctests": 2,
+    "explicit_invitation_host_tcp_test": 1,
+    "swift_xctest": 6,
+    "rust_workspace_and_pairing_clippy": true,
+    "native_pinned_boringssl_archive_build_and_link": true,
+    "release_core_bridge_keychain_invitation_build": true,
+    "swiftui_release_build": true,
+    "packaged_bridge_self_test": true,
+    "app_signature_verification": true
+  },
+  "self_test_artifact": "https://github.com/Lokilankaaa/crossflow/actions/runs/40758346045/artifacts/12847168098",
+  "local_job_log": "runs/mac-ci-job-123063198172.txt",
+  "not_proven": [
+    "Mac invitation worker process runtime and Keychain access",
+    "New receiver stdio supervision (added after this run)",
+    "Discovery/pairing UI integration or native window interaction",
+    "User Mac permissions, local-network discovery and cross-device pairing",
+    "Physical mouse/keyboard behavior, release on failure, and Escape",
+    "Visible motion, physical latency and local/ShareMouse/Crossflow comparison"
+  ]
+}

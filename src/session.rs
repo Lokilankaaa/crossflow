@@ -1087,7 +1087,17 @@ pub fn receive_on_listener(
         "listening",
         json!({"address":listener.local_addr()?.to_string()}),
     );
-    receive_listener_loop(listener, &identity, sink, log, seconds, stop, None)
+    receive_listener_loop(listener, &identity, sink, log, seconds, stop, None, None)
+}
+
+/// Nonblocking lifecycle notifications for a native client supervisor.
+/// These callbacks describe the receiver only; they do not imply worker,
+/// discovery or log cleanup has completed. Implementations must not panic,
+/// perform I/O or wait for the UI, since callbacks run on the input thread.
+pub trait ReceiveObserver: Send + Sync {
+    fn listening(&self, address: SocketAddr);
+    fn connected(&self, connected: bool);
+    fn enabled(&self, enabled: bool);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1123,14 +1133,33 @@ pub fn receive_with_discovery(
     stop: &AtomicBool,
     options: Option<&ReceiveDiscoveryOptions>,
 ) -> Result<()> {
+    receive_observed(address, bundle, sink, log, seconds, stop, options, None)
+}
+
+/// Observe actual listening, authenticated transport and input state without
+/// deriving lifecycle from buffered performance logs. Final completion remains
+/// the caller's responsibility after this function and its input owner finish.
+#[allow(clippy::too_many_arguments)]
+pub fn receive_observed(
+    address: &str,
+    bundle: &Path,
+    sink: &mut dyn MouseSink,
+    log: Log,
+    seconds: f64,
+    stop: &AtomicBool,
+    options: Option<&ReceiveDiscoveryOptions>,
+    observer: Option<&dyn ReceiveObserver>,
+) -> Result<()> {
     let identity = Identity::load(bundle)?;
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     let bound = listener.local_addr()?;
-    eprintln!(
-        "Listening on {}. Press Escape on Mac to stop input; Ctrl+C exits.",
-        bound
-    );
+    if observer.is_none() {
+        eprintln!(
+            "Listening on {}. Press Escape on Mac to stop input; Ctrl+C exits.",
+            bound
+        );
+    }
     log.write("listening", json!({"address":bound.to_string()}));
     let mut discovery = if let Some(options) = options.filter(|_| !stop.load(Ordering::Acquire)) {
         let ad = options.advertisement(bound)?;
@@ -1145,6 +1174,9 @@ pub fn receive_with_discovery(
     } else {
         None
     };
+    if let Some(observer) = observer {
+        observer.listening(bound);
+    }
 
     // All loop exits, including local stop and failed input cleanup, reach the
     // explicit bounded mDNS teardown before dropping the bound listener.
@@ -1156,6 +1188,7 @@ pub fn receive_with_discovery(
         seconds,
         stop,
         discovery.as_ref(),
+        observer,
     );
     let cleanup = if let Some(handle) = &mut discovery {
         let stopped = handle.wait_stopped(Duration::from_secs(3));
@@ -1192,6 +1225,7 @@ fn check_discovery(discovery: Option<&DiscoveryHandle>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receive_listener_loop(
     listener: &TcpListener,
     identity: &Identity,
@@ -1200,6 +1234,7 @@ fn receive_listener_loop(
     seconds: f64,
     stop: &AtomicBool,
     discovery: Option<&DiscoveryHandle>,
+    observer: Option<&dyn ReceiveObserver>,
 ) -> Result<()> {
     let duration =
         Duration::try_from_secs_f64(seconds).context("seconds exceeds duration range")?;
@@ -1233,6 +1268,8 @@ fn receive_listener_loop(
         };
         trace.write(&log, "tcp_accepted", json!({}));
         let mut owned = OwnedSink::new(sink, stop);
+        let mut authenticated = false;
+        let mut reported_enabled = false;
         let attempt = (|| -> Result<()> {
             check_local_stop(&owned)?;
             trace.phase = "socket_setup";
@@ -1258,6 +1295,10 @@ fn receive_listener_loop(
             let mut last_grant = Instant::now() - LEASE_PERIOD;
             let mut last_input = Instant::now();
             trace.write(&log, "connected", json!({"peer":address.to_string()}));
+            authenticated = true;
+            if let Some(observer) = observer {
+                observer.connected(true);
+            }
             while Instant::now() < end {
                 check_local_stop(&owned)?;
                 if discovery_check.elapsed() >= Duration::from_secs(1) {
@@ -1278,7 +1319,16 @@ fn receive_listener_loop(
                 if !frames.is_empty() {
                     last_input = Instant::now();
                 }
-                if process_received_batch(frames, &mut state, &mut owned, &log)? {
+                let ended = process_received_batch(frames, &mut state, &mut owned, &log)?;
+                // Publish only after the complete batch and adapter operations
+                // succeed. An unsuccessful release must not appear paused.
+                if state.active != reported_enabled {
+                    reported_enabled = state.active;
+                    if let Some(observer) = observer {
+                        observer.enabled(state.active);
+                    }
+                }
+                if ended {
                     return Ok(());
                 }
                 ensure!(
@@ -1299,6 +1349,16 @@ fn receive_listener_loop(
             return Err(terminal_sink_failure(error));
         }
         log.write("input_released", json!({"reason":"session_end"}));
+        // These notifications follow successful explicit cleanup, including
+        // errors and local stop. A failed cleanup leaves state unconfirmed.
+        if let Some(observer) = observer {
+            if reported_enabled {
+                observer.enabled(false);
+            }
+            if authenticated {
+                observer.connected(false);
+            }
+        }
         if let Err(e) = attempt {
             if let Some(terminal) = e.downcast_ref::<TerminalReceiverFailure>() {
                 if terminal.emergency {
@@ -1317,7 +1377,9 @@ fn receive_listener_loop(
                 "error",
                 json!({"stage":"receiver_session","message":format!("{e:#}")}),
             );
-            eprintln!("Session closed: {e:#}");
+            if observer.is_none() {
+                eprintln!("Session closed: {e:#}");
+            }
         }
     }
     Ok(())
@@ -1469,6 +1531,210 @@ mod tests {
         let mut state = ReceiverState::new(1_000_000_000);
         state.grant(1, log.ns());
         state
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Observed {
+        Listening(SocketAddr),
+        Connected(bool),
+        Enabled(bool),
+    }
+    #[derive(Default)]
+    struct RecordingObserver(Mutex<Vec<Observed>>);
+    impl ReceiveObserver for RecordingObserver {
+        fn listening(&self, address: SocketAddr) {
+            self.0.lock().unwrap().push(Observed::Listening(address));
+        }
+        fn connected(&self, connected: bool) {
+            self.0.lock().unwrap().push(Observed::Connected(connected));
+        }
+        fn enabled(&self, enabled: bool) {
+            self.0.lock().unwrap().push(Observed::Enabled(enabled));
+        }
+    }
+
+    #[test]
+    fn receiver_observer_does_not_claim_listening_for_invalid_identity() {
+        let (writer, path) = logs();
+        let observer = RecordingObserver::default();
+        let result = receive_observed(
+            "127.0.0.1:0",
+            &path.with_extension("missing-identity"),
+            &mut DrySink::default(),
+            writer.log.clone(),
+            0.1,
+            &AtomicBool::new(false),
+            None,
+            Some(&observer),
+        );
+        assert!(result.is_err());
+        assert!(observer.0.lock().unwrap().is_empty());
+        writer.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "actual encrypted localhost receiver; fake sink only, no OS input or multicast"]
+    fn receiver_observer_reports_authenticated_input_and_confirmed_cleanup() -> Result<()> {
+        struct CleanupSink(Arc<AtomicBool>);
+        impl MouseSink for CleanupSink {
+            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                Ok((x, y))
+            }
+            fn release_owned(&mut self) -> Result<()> {
+                ensure!(!self.0.load(Ordering::Acquire), "fixture cleanup failure");
+                Ok(())
+            }
+        }
+        // Own only this fixture's exact files and threads. Failure or panic must
+        // still stop/join the receiver before closing its log and deleting keys.
+        struct Fixture {
+            stop: Arc<AtomicBool>,
+            receiver: Option<thread::JoinHandle<Result<()>>>,
+            writer: Option<LogWriter>,
+            log_path: std::path::PathBuf,
+            pair_path: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Release);
+                if let Some(receiver) = self.receiver.take() {
+                    let _ = receiver.join();
+                }
+                if let Some(writer) = self.writer.take() {
+                    let _ = writer.finish();
+                }
+                for role in ["mac", "windows"] {
+                    let bundle = self.pair_path.join(role);
+                    let _ = std::fs::remove_file(bundle.join("identity.json"));
+                    let _ = std::fs::remove_dir(bundle);
+                }
+                let _ = std::fs::remove_dir(&self.pair_path);
+                let _ = std::fs::remove_file(&self.log_path);
+            }
+        }
+        fn wait_for(observer: &RecordingObserver, expected: Observed) -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if observer.0.lock().unwrap().last() == Some(&expected) {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            bail!("missing receiver lifecycle event {expected:?}")
+        }
+        for fail_cleanup in [false, true] {
+            let (writer, path) = logs();
+            let pair_path = path.with_extension("pairing");
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut fixture = Fixture {
+                stop: stop.clone(),
+                receiver: None,
+                writer: Some(writer),
+                log_path: path.clone(),
+                pair_path: pair_path.clone(),
+            };
+            let pair = security::create_pair(&pair_path)?;
+            let initiator = Identity::load(&pair.windows_bundle)?;
+            let observer = Arc::new(RecordingObserver::default());
+            let cleanup_failure = Arc::new(AtomicBool::new(false));
+            let receiver = {
+                let observer = observer.clone();
+                let stop = stop.clone();
+                let log = fixture.writer.as_ref().unwrap().log.clone();
+                let cleanup_failure = cleanup_failure.clone();
+                let bundle = pair.mac_bundle.clone();
+                thread::spawn(move || {
+                    receive_observed(
+                        "127.0.0.1:0",
+                        &bundle,
+                        &mut CleanupSink(cleanup_failure),
+                        log,
+                        5.0,
+                        &stop,
+                        None,
+                        Some(observer.as_ref()),
+                    )
+                })
+            };
+            fixture.receiver = Some(receiver);
+            let exercise = (|| -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let address = loop {
+                    if let Some(Observed::Listening(address)) = observer.0.lock().unwrap().first() {
+                        break *address;
+                    }
+                    ensure!(Instant::now() < deadline, "receiver did not become ready");
+                    thread::sleep(Duration::from_millis(1));
+                };
+                let mut socket = TcpStream::connect(address)?;
+                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let secure = security::handshake(&mut socket, &initiator, true)?;
+                let mut peer = Peer::new(socket, secure)?;
+                wait_for(&observer, Observed::Connected(true))?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let lease = loop {
+                    if let Some((frame, _)) = peer
+                        .pump()?
+                        .into_iter()
+                        .find(|(f, _)| f.kind == Kind::Lease)
+                    {
+                        break frame.lease;
+                    }
+                    ensure!(Instant::now() < deadline, "receiver did not grant lease");
+                    thread::sleep(Duration::from_millis(1));
+                };
+                let mut arm = Frame::new(Kind::Arm);
+                arm.seq = 1;
+                arm.lease = lease;
+                peer.queue(arm)?;
+                peer.pump()?;
+                wait_for(&observer, Observed::Enabled(true))?;
+                // Arm first performs reset/release. Only inject the final-cleanup
+                // failure after that successful transition has been observed.
+                cleanup_failure.store(fail_cleanup, Ordering::Release);
+                if !fail_cleanup {
+                    let mut pause = Frame::new(Kind::Pause);
+                    pause.seq = 2;
+                    peer.queue(pause)?;
+                    peer.pump()?;
+                    wait_for(&observer, Observed::Enabled(false))?;
+                }
+                // Stop while the authenticated TCP connection is still open.
+                stop.store(true, Ordering::Release);
+                Ok(())
+            })();
+            stop.store(true, Ordering::Release);
+            let result = fixture
+                .receiver
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| anyhow::anyhow!("receiver fixture panicked"))?;
+            fixture.writer.take().unwrap().finish()?;
+            let events = observer.0.lock().unwrap().clone();
+            for bundle in [pair.mac_bundle, pair.windows_bundle] {
+                std::fs::remove_file(bundle.join("identity.json"))?;
+                std::fs::remove_dir(bundle)?;
+            }
+            std::fs::remove_dir(pair_path)?;
+            std::fs::remove_file(path)?;
+            exercise?;
+            if fail_cleanup {
+                assert!(result.is_err());
+                assert_eq!(
+                    events.last(),
+                    Some(&Observed::Enabled(true)),
+                    "failed release must not claim paused/disconnected"
+                );
+            } else {
+                result?;
+                assert_eq!(events.last(), Some(&Observed::Connected(false)));
+                assert!(events.contains(&Observed::Enabled(false)));
+            }
+        }
+        Ok(())
     }
 
     #[test]

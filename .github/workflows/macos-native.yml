@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'crates/**'
       - 'clients/macos/**'
       - 'clients/design-tokens.json'
@@ -48,6 +49,8 @@ jobs:
           cargo fmt --all -- --check
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --test receiver_stdio --locked -- --ignored --test-threads=1
+          cargo test --lib receiver_observer --locked -- --ignored --test-threads=1
           cargo build --workspace --release --locked --target aarch64-apple-darwin
       - name: Build pinned pairing dependency
         run: |

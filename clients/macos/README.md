@@ -87,6 +87,17 @@ that module, so those XCTest cases have not been executed here.
 
 ## Current scope
 
+Native CI on GitHub's arm64 macOS runner now passes for `26909c2`: release
+SwiftUI/package build, all six XCTest cases, packaged bridge self-test and app
+signature verification. The invitation and Keychain helpers also link natively.
+This updates the earlier build-only limitations above; their native storage and
+invitation-process behavior, and the user's Mac UI/input remain untested.
+See [native CI evidence](../../docs/macos-native-ci-validation-20261029.json).
+
+The core's opt-in [receiver control channel](../../docs/receiver-client-control.md)
+adds parent-EOF stop and actual lifecycle status for the next UI integration.
+The current SwiftUI screen does not yet launch it.
+
 - Select and drag individual screens, edit draft properties, undo/redo, and
   import/export JSON using native file panels.
 - Edits invalidate validation. Late validation responses are discarded, and

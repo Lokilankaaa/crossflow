@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod peers;
 pub mod platform;
 pub mod protocol;
+pub mod receiver_control;
 pub mod routes;
 pub mod secret_store;
 pub mod security;
