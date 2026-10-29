@@ -32,6 +32,13 @@ Mac 原始日志：`~/Library/Application Support/Crossflow/runs/receiver-62F90E
 权限拒绝；不能把普通运行错误或强制退出当作清理成功。修复后仍需原生测试和
 实际 App 权限验收，系统授权由用户亲自完成。
 
+修复 `80e224600c7f0b7f2202096bb337c5333c19d6ab` 已通过
+[原生 Mac CI](https://github.com/Lokilankaaa/crossflow/actions/runs/40803043473)：
+核心、配对组件、SwiftUI 构建、30 项 XCTest、打包自检/签名和隔离 Keychain
+检查均成功。新回归实际覆盖权限拒绝后再次启动、正常退出、非法拒绝和信号退出。
+Windows 的七项接收控制测试和五项真实 DrySink 进程测试也通过。CI 是隔离
+runner，不证明用户 Mac 的 TCC 已开启或新 App 窗口回归通过。
+
 ## 未验证
 
 已配对身份的实际输入连接、暂停/启动/停止、断线和 Escape、物理光标运动及

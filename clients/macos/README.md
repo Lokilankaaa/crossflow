@@ -24,6 +24,22 @@ copied to `Contents/MacOS/crossflow` and signed before the containing app.
 The script does not silently use older `target/release` artifacts.
 Neither script launches input sharing.
 
+## Input permissions belong to the app
+
+The receiver needs Accessibility (including event posting) and Input Monitoring
+for the local Escape stop check. A successful `environment` command launched by
+Codex or Terminal checks that host's context, not the app-launched receiver.
+The user must grant the packaged Crossflow app access in System Settings →
+Privacy & Security → Accessibility and Input Monitoring, then fully quit and
+reopen it. No script or client automatically changes these permissions.
+
+Before creating an input adapter or worker, the receiver now checks its own
+permissions. A denied preflight reports `startup_rejected`; the UI displays the
+missing permission and allows retry/quit after the process exits normally.
+Other errors, malformed status, signal exits and forced cleanup remain
+unconfirmed. Rebuilding an ad-hoc signed app may require checking its permissions
+again; stable signing and access across upgrades are not yet validated.
+
 ## Managed identity storage
 
 The shared Rust core now supports the Mac role in its managed peer store at
