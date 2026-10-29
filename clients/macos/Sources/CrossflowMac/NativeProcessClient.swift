@@ -210,11 +210,12 @@ final class NativeProcessClient: @unchecked Sendable {
         let exited = operation.process?.isRunning != true
         let confirmed = exited && !forced && (operation.process == nil || operation.outputEOF)
         let status = exited ? operation.process?.terminationStatus ?? 0 : -1
+        let ordinaryExit = exited && operation.process?.terminationReason == .exit
         finish(operation, confirmed: confirmed, release: exited)
         if !confirmed { return .failure(NativeProcessError.cleanupUnconfirmed) }
         if operation.isCancelled { return .failure(CancellationError()) }
         if let failure { return .failure(failure) }
-        if let process = operation.process, process.terminationReason != .exit {
+        if !ordinaryExit {
             return .failure(NativeProcessError.failed)
         }
         return .success(status)
