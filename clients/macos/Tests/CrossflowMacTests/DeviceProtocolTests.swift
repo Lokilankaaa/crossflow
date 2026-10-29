@@ -100,6 +100,26 @@ final class DeviceProtocolTests: XCTestCase {
         ] { XCTAssertThrowsError(try DeviceProtocol.receiver(Data(raw.utf8))) }
     }
 
+    func testStartupRejectionRequiresKnownPermissionAndNoListener() throws {
+        for reason in ["accessibility permission required", "input monitoring permission required"] {
+            let status = try DeviceProtocol.receiver(bytes([
+                "protocol": 1, "state": "startup_rejected", "listen_endpoint": NSNull(), "error": reason
+            ]))
+            XCTAssertEqual(status.state, .startupRejected)
+            XCTAssertEqual(status.error, reason)
+        }
+        for (endpoint, reason) in [
+            (NSNull() as Any, NSNull() as Any),
+            (NSNull() as Any, "receiver failed" as Any),
+            (NSNull() as Any, "accessibility permission required " as Any),
+            ("0.0.0.0:24800" as Any, "accessibility permission required" as Any)
+        ] {
+            XCTAssertThrowsError(try DeviceProtocol.receiver(bytes([
+                "protocol": 1, "state": "startup_rejected", "listen_endpoint": endpoint, "error": reason
+            ])))
+        }
+    }
+
     func testCommandsAreBoundedSingleLinesAndValidateBeforeEncoding() throws {
         let begin = try DeviceProtocol.begin(name: "MacBook Air")
         let approve = try DeviceProtocol.approve(attempt: attempt)

@@ -18,6 +18,21 @@ use std::{
 const MAX_LINE: usize = 256;
 const OUTPUT_LEASE: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy)]
+pub enum StartupRejection {
+    Accessibility,
+    InputMonitoring,
+}
+
+impl StartupRejection {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Accessibility => "accessibility permission required",
+            Self::InputMonitoring => "input monitoring permission required",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -39,6 +54,7 @@ struct State {
     enabled: bool,
     finished: bool,
     error: Option<&'static str>,
+    startup_rejection: Option<StartupRejection>,
 }
 
 #[derive(Clone)]
@@ -101,6 +117,22 @@ impl Control {
         self.stop.store(true, Ordering::Release);
     }
 
+    /// Call only when a read-only preflight rejects startup, before constructing
+    /// any input adapter or worker. Process exit still must be confirmed by UI.
+    pub fn reject_startup(&self, reason: StartupRejection) {
+        self.request_stop();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.finished || state.endpoint.is_some() || state.connected || state.enabled {
+            drop(state);
+            self.fail("receiver failed");
+            return;
+        }
+        if state.error.is_none() {
+            state.error = Some(reason.reason());
+            state.startup_rejection = Some(reason);
+        }
+    }
+
     /// Only allow fixed public messages on this UI channel. Raw caller errors
     /// may contain credential paths or other details and are deliberately erased.
     pub fn fail(&self, message: &str) {
@@ -119,6 +151,7 @@ impl Control {
         };
         self.request_stop();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.startup_rejection = None;
         if state.error.is_none() {
             state.error = Some(message);
         }
@@ -127,7 +160,9 @@ impl Control {
     pub fn snapshot(&self) -> Status {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let name = if state.finished {
-            if state.error.is_some() {
+            if state.startup_rejection.is_some() && state.endpoint.is_none() {
+                "startup_rejected"
+            } else if state.error.is_some() {
                 "error"
             } else {
                 "stopped"
@@ -152,7 +187,13 @@ impl Control {
     }
 
     fn complete(&self, result: Result<()>) {
-        if result.is_err() {
+        let rejected = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .startup_rejection
+            .is_some();
+        if result.is_err() && !rejected {
             self.fail("receiver failed");
         }
         self.request_stop();
@@ -373,6 +414,46 @@ mod tests {
         assert_eq!(control.snapshot().error.as_deref(), Some("receiver failed"));
     }
 
+    #[test]
+    fn permission_rejection_is_terminal_only_after_completion() {
+        for rejection in [
+            StartupRejection::Accessibility,
+            StartupRejection::InputMonitoring,
+        ] {
+            let control = Control::new(Arc::new(AtomicBool::new(false)));
+            control.reject_startup(rejection);
+            assert_eq!(control.snapshot().state, "stopping");
+            control.complete(Err(anyhow::anyhow!("permission preflight rejected")));
+            let status = control.snapshot();
+            assert_eq!(status.state, "startup_rejected");
+            assert_eq!(status.error.as_deref(), Some(rejection.reason()));
+            assert!(status.listen_endpoint.is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_and_control_failures_cannot_be_reclassified_as_startup_rejection() {
+        let live = Control::new(Arc::new(AtomicBool::new(false)));
+        live.set_listening("127.0.0.1:24800".into());
+        live.set_connected(true);
+        live.set_enabled(true);
+        live.reject_startup(StartupRejection::Accessibility);
+        live.complete(Err(anyhow::anyhow!("input cleanup failed")));
+        assert_eq!(live.snapshot().state, "error");
+
+        let broken = Control::new(Arc::new(AtomicBool::new(false)));
+        broken.reject_startup(StartupRejection::Accessibility);
+        broken.fail("control output unavailable");
+        broken.complete(Err(anyhow::anyhow!("output failed")));
+        assert_eq!(broken.snapshot().state, "error");
+
+        let malformed = Control::new(Arc::new(AtomicBool::new(false)));
+        malformed.fail("invalid control message");
+        malformed.reject_startup(StartupRejection::InputMonitoring);
+        malformed.complete(Err(anyhow::anyhow!("permission preflight rejected")));
+        assert_eq!(malformed.snapshot().state, "error");
+    }
+
     #[derive(Default)]
     struct Gate {
         open: Mutex<bool>,
@@ -506,6 +587,28 @@ mod tests {
             fixture.control.snapshot().error.as_deref(),
             Some("native client stopped reading status")
         );
+    }
+
+    #[test]
+    fn startup_rejection_is_delivered_as_one_final_error_frame() {
+        let mut fixture = Fixture::new(false);
+        fixture.output.release();
+        fixture
+            .control
+            .reject_startup(StartupRejection::Accessibility);
+        assert!(
+            fixture
+                .io
+                .as_mut()
+                .unwrap()
+                .finish(Err(anyhow::anyhow!("preflight denied")))
+                .is_err()
+        );
+        let bytes = fixture.bytes.lock().unwrap().clone();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["state"], "startup_rejected");
+        assert_eq!(value["error"], "accessibility permission required");
+        assert!(value["listen_endpoint"].is_null());
     }
 
     #[test]

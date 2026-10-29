@@ -214,6 +214,9 @@ final class NativeProcessClient: @unchecked Sendable {
         if !confirmed { return .failure(NativeProcessError.cleanupUnconfirmed) }
         if operation.isCancelled { return .failure(CancellationError()) }
         if let failure { return .failure(failure) }
+        if let process = operation.process, process.terminationReason != .exit {
+            return .failure(NativeProcessError.failed)
+        }
         return .success(status)
     }
 

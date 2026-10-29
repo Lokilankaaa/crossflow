@@ -135,4 +135,94 @@ final class DeviceModelTests: XCTestCase {
             }
         }
     }
+
+    @MainActor private func withReceiverModel(
+        script: String, expectedShutdown: Bool,
+        _ body: @MainActor (DeviceModel, Fixture) async throws -> Void
+    ) async throws {
+        let id = String(repeating: "a", count: 64)
+        let fixture = try Fixture(script: """
+        case "$1" in
+          peers)
+            printf '%s\\n' '{"peers":[{"schema":1,"id":"\(id)","friendly_name":"Fixture Windows","last_endpoint":null}],"invalid_records":0}'
+            exit 0 ;;
+          receive)
+            printf 'receive\\n' >> receiver-launches
+            \(script)
+            ;;
+          *) exit 99 ;;
+        esac
+        """)
+        defer { fixture.remove() }
+        let model = DeviceModel(executables: ["crossflow": fixture.helper],
+                                logDirectory: fixture.folder.appendingPathComponent("logs"))
+        model.devices = [SavedDevice(id: id, name: "Fixture Windows", lastEndpoint: nil)]
+        model.selectedID = id
+        do {
+            try await body(model, fixture)
+            let stopped = await model.shutdown()
+            XCTAssertEqual(stopped, expectedShutdown)
+        } catch {
+            _ = await model.shutdown()
+            throw error
+        }
+    }
+
+    @MainActor func testPermissionRejectionAllowsRetryAndOrdinaryShutdown() async throws {
+        for reason in ["accessibility permission required", "input monitoring permission required"] {
+            let script = """
+            printf '%s\\n' '{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"\(reason)"}'
+            exit 1
+            """
+            try await withReceiverModel(script: script, expectedShutdown: true) { model, fixture in
+                for _ in 0..<2 {
+                    model.receive()
+                    try await self.waitUntil { model.operation == nil && !model.stopPending && !model.loading }
+                    XCTAssertFalse(model.cleanupUnconfirmed)
+                    XCTAssertTrue(model.canStart)
+                    XCTAssertFalse(model.isSharing)
+                    XCTAssertTrue(model.message.contains("系统设置 → 隐私与安全性"))
+                    XCTAssertTrue(model.message.contains("重新打开 App"))
+                    XCTAssertTrue(model.message.contains(reason.hasPrefix("accessibility") ? "辅助功能" : "输入监控"))
+                }
+                let launches = try String(contentsOf: fixture.folder.appendingPathComponent("receiver-launches"), encoding: .utf8)
+                XCTAssertEqual(launches.split(separator: "\n").count, 2, "Retry must actually launch a second receiver fixture")
+            }
+        }
+    }
+
+    @MainActor func testReceiverErrorsAndInvalidRejectionsKeepCleanupGateClosed() async throws {
+        let rejected = #"{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}"#
+        let frames = [
+            #"{"protocol":1,"state":"error","listen_endpoint":null,"error":"receiver failed"}"#,
+            #"{"protocol":1,"state":"startup_rejected","listen_endpoint":"0.0.0.0:24800","error":"accessibility permission required"}"#,
+            #"{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"receiver failed"}"#,
+            #"{"protocol":1,"state":"listening","listen_endpoint":"0.0.0.0:24800","error":null}"# + "\n" + rejected,
+            #"{"protocol":1,"state":"error","listen_endpoint":null,"error":"receiver failed"}"# + "\n" + rejected,
+            #"{"protocol":1,"state":"stopped","listen_endpoint":null,"error":null}"# + "\n" + rejected,
+            rejected + "\n" + #"{"protocol":1,"state":"stopped","listen_endpoint":null,"error":null}"#
+        ]
+        let cases = frames.map { ($0, 1) } + [(rejected, 0)]
+        for (frame, exitCode) in cases {
+            try await withReceiverModel(script: "printf '%s\\n' '\(frame)'\nexit \(exitCode)", expectedShutdown: false) { model, _ in
+                model.receive()
+                try await self.waitUntil { model.operation == nil && !model.stopPending }
+                XCTAssertTrue(model.cleanupUnconfirmed)
+                XCTAssertFalse(model.canStart)
+            }
+        }
+    }
+
+    @MainActor func testSignalExitCannotConfirmStartupRejection() async throws {
+        let script = """
+        printf '%s\\n' '{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
+        kill -TERM $$
+        """
+        try await withReceiverModel(script: script, expectedShutdown: false) { model, _ in
+            model.receive()
+            try await self.waitUntil { model.operation == nil && !model.stopPending }
+            XCTAssertTrue(model.cleanupUnconfirmed)
+            XCTAssertFalse(model.canStart)
+        }
+    }
 }

@@ -25,6 +25,7 @@ enum InvitationEvent: Sendable {
 struct ReceiverStatus: Sendable {
     enum State: String, Sendable {
         case starting, listening, paused, sharing, stopping, stopped, error
+        case startupRejected = "startup_rejected"
     }
     let state: State
     let listenEndpoint: String?
@@ -119,6 +120,10 @@ enum DeviceProtocol {
                   !error.unicodeScalars.contains(where: forbiddenScalar) else { throw invalid }
         }
         guard state != .error || error != nil, state != .stopped || error == nil else { throw invalid }
+        if state == .startupRejected {
+            guard endpoint == nil,
+                  error == "accessibility permission required" || error == "input monitoring permission required" else { throw invalid }
+        }
         return ReceiverStatus(state: state, listenEndpoint: endpoint, error: error)
     }
 

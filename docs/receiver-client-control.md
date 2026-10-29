@@ -29,7 +29,16 @@ States describe actual core lifecycle:
 | `sharing` | The receiver has successfully processed remote enable; the UI must also account for its chosen DrySink/injection mode. |
 | `stopping` | Stop was requested; cleanup is not yet confirmed. |
 | `stopped` | Receiver, discovery, input-owner and log cleanup completed successfully. |
+| `startup_rejected` | Read-only Mac permission preflight rejected startup before any input adapter or worker was created; terminal status, no listening endpoint. |
 | `error` | Final cleanup or control failed; successful release must not be inferred. |
+
+`startup_rejected` permits only the fixed errors `accessibility permission required`
+and `input monitoring permission required`. It is emitted after completion with a
+nonzero process exit. The native UI requires this specific final status, ordinary
+confirmed process exit (not a signal), and no earlier ready/error or later frames
+before allowing retry. Generic `error` is never interpreted as safe startup rejection.
+Permission checks run in the app-spawned receiver's TCC context: a successful
+terminal-host check does not establish that the packaged app has permission.
 
 The UI must drain stdout throughout the session and redirect stderr to a file or
 the null device (or continuously drain it). Repeated session diagnostics are

@@ -55,11 +55,17 @@ final class DeviceModel {
     @ObservationIgnored private var shuttingDown = false
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var expectedPeerID: String?
+    @ObservationIgnored private var startupRejectionMessage: String?
+    @ObservationIgnored private var startupRejectionEligible = true
     @ObservationIgnored private let executableOverrides: [String: URL]?
+    @ObservationIgnored private let logDirectoryOverride: URL?
 
     // Explicit executables support isolated process fixtures; the app uses only
     // helpers adjacent to its own executable.
-    init(executables: [String: URL]? = nil) { executableOverrides = executables }
+    init(executables: [String: URL]? = nil, logDirectory: URL? = nil) {
+        executableOverrides = executables
+        logDirectoryOverride = logDirectory
+    }
 
     var canStart: Bool { operation == nil && !stopPending && !cleanupUnconfirmed && !shuttingDown }
     var isSharing: Bool { operation == .receiver && receiverState == .sharing && !stopping }
@@ -123,7 +129,7 @@ final class DeviceModel {
     func receive() {
         guard canStart, let selected, let executable = executable("crossflow") else { return }
         do {
-            let logs = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            let logs = try logDirectoryOverride ?? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                    appropriateFor: nil, create: true)
                 .appendingPathComponent("Crossflow/runs", isDirectory: true)
             try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
@@ -143,6 +149,7 @@ final class DeviceModel {
         operation = value; receiverState = nil; confirmation = nil; approved = false
         savedID = nil; code = ""; invalidEvent = false; stopping = false
         expectedPeerID = nil
+        startupRejectionMessage = nil; startupRejectionEligible = true
     }
 
     private func run(_ executable: URL, arguments: [String], initialInput: Data? = nil,
@@ -170,6 +177,12 @@ final class DeviceModel {
             if operation == .receiver {
                 if exit == 0 && receiverState == .stopped && !invalidEvent {
                     message = "接收已停止。"
+                } else if exit != 0 && receiverState == .startupRejected && !invalidEvent,
+                          let startupRejectionMessage {
+                    // This dedicated final frame proves preflight rejected the
+                    // operation before an input owner existed. Process.run also
+                    // confirmed ordinary exit, rather than a signal or kill.
+                    message = startupRejectionMessage
                 } else {
                     message = "接收未正常完成，请检查系统权限或运行记录。"
                     cleanupUnconfirmed = true
@@ -225,6 +238,14 @@ final class DeviceModel {
                 }
             } else {
                 let status = try DeviceProtocol.receiver(line)
+                guard receiverState != .startupRejected else { throw DeviceModelError.invalid }
+                if status.state == .startupRejected {
+                    guard startupRejectionEligible else { throw DeviceModelError.invalid }
+                    let permission = status.error == "accessibility permission required" ? "辅助功能" : "输入监控"
+                    startupRejectionMessage = "尚未开始接收。请在系统设置 → 隐私与安全性 → \(permission) 中允许 Crossflow，然后完全退出并重新打开 App。"
+                } else if status.listenEndpoint != nil || status.state == .error || status.state == .stopped {
+                    startupRejectionEligible = false
+                }
                 receiverState = status.state
                 if stopping { return }
                 switch status.state {
@@ -235,6 +256,7 @@ final class DeviceModel {
                 case .stopping: message = "正在停止并释放输入…"
                 case .stopped: message = "接收已停止。"
                 case .error: message = "接收出现错误，请检查系统权限或运行记录。"
+                case .startupRejected: message = "输入权限未开启，正在确认接收进程退出…"
                 }
             }
         } catch { failAndStop("收到无法识别的状态，正在停止…") }

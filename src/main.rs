@@ -486,6 +486,26 @@ fn main() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     (|| -> Result<()> {
+                        // This runs in the app-spawned process's permission
+                        // context, before either a native adapter or child input
+                        // owner exists. Do not infer it from a terminal probe.
+                        if let Err(permission) =
+                            crossflow::platform::macos::preflight_input_permissions()
+                        {
+                            if let Some(control) = &receiver_control {
+                                use crossflow::platform::macos::MissingInputPermission;
+                                use crossflow::receiver_control::StartupRejection;
+                                control.reject_startup(match permission {
+                                    MissingInputPermission::Accessibility => {
+                                        StartupRejection::Accessibility
+                                    }
+                                    MissingInputPermission::InputMonitoring => {
+                                        StartupRejection::InputMonitoring
+                                    }
+                                });
+                            }
+                            anyhow::bail!("{}", permission.message());
+                        }
                         if inject_actions {
                             let mut command = std::process::Command::new(std::env::current_exe()?);
                             command

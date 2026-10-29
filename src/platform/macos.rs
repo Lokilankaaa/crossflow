@@ -340,6 +340,38 @@ impl WheelRemainder {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum MissingInputPermission {
+    Accessibility,
+    InputMonitoring,
+}
+
+impl MissingInputPermission {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Accessibility => {
+                "Crossflow needs Accessibility permission for the receiver or its terminal host. Enable it in System Settings > Privacy & Security > Accessibility, then restart."
+            }
+            Self::InputMonitoring => {
+                "Crossflow needs Input Monitoring permission for its local Escape stop check. Enable it in System Settings > Privacy & Security > Input Monitoring, restart, and verify holding Escape stops the receiver before testing."
+            }
+        }
+    }
+}
+
+/// Checks this process's TCC context without prompting or creating an input owner.
+/// A terminal host's successful check does not establish the packaged app's access.
+pub fn preflight_input_permissions() -> Result<(), MissingInputPermission> {
+    // SAFETY: read-only, no-argument preflight APIs; no permission request is made.
+    if unsafe { AXIsProcessTrusted() == 0 || !CGPreflightPostEventAccess() } {
+        return Err(MissingInputPermission::Accessibility);
+    }
+    if !unsafe { CGPreflightListenEventAccess() } {
+        return Err(MissingInputPermission::InputMonitoring);
+    }
+    Ok(())
+}
+
 pub struct MacMouseSink {
     source: OwnedCf,
     gain: f64,
@@ -356,20 +388,7 @@ impl MacMouseSink {
         if !gain.is_finite() || gain <= 0.0 {
             return Err(failure("Mouse gain must be finite and positive"));
         }
-        // SAFETY: these read-only preflight functions take no arguments. No
-        // permission-prompt/request API is called by this adapter.
-        let accessibility = unsafe { AXIsProcessTrusted() != 0 };
-        let can_post = unsafe { CGPreflightPostEventAccess() };
-        if !accessibility || !can_post {
-            return Err(failure(
-                "Crossflow needs Accessibility permission for the receiver or its terminal host. Enable it in System Settings > Privacy & Security > Accessibility, then restart.",
-            ));
-        }
-        if !unsafe { CGPreflightListenEventAccess() } {
-            return Err(failure(
-                "Crossflow needs Input Monitoring permission for its local Escape stop check. Enable it in System Settings > Privacy & Security > Input Monitoring, restart, and verify holding Escape stops the receiver before testing.",
-            ));
-        }
+        preflight_input_permissions().map_err(|permission| failure(permission.message()))?;
         // SAFETY: successful creation transfers one owned retain to this type.
         let source = OwnedCf::new(
             unsafe { CGEventSourceCreate(PRIVATE_EVENT_SOURCE) },
