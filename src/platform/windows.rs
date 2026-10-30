@@ -181,16 +181,20 @@ pub enum CaptureEvent {
         button: Button,
         down: bool,
         captured_at: Instant,
+        /// Gate observed by the low-level hook; absent for legacy raw capture.
+        remote_at_capture: Option<bool>,
     },
     Key {
         usage: u16,
         down: bool,
         captured_at: Instant,
+        remote_at_capture: Option<bool>,
     },
     Scroll {
         horizontal: i32,
         vertical: i32,
         captured_at: Instant,
+        remote_at_capture: Option<bool>,
     },
     Toggle,
     Stop,
@@ -585,6 +589,11 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
         if self.stop.load(Ordering::Acquire) {
             return;
         }
+        self.emit_callback(event);
+    }
+    // Also used to report an already-latched native emergency stop. It may
+    // bypass the stop guard only for that terminal notification, never input.
+    fn emit_callback(&mut self, event: CaptureEvent) {
         // A panic may not unwind over the Windows callback boundary.
         if catch_unwind(AssertUnwindSafe(|| (self.callback)(event))).is_err() {
             self.error = Some("capture callback panicked; stopped safely".into());
@@ -664,6 +673,25 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
             }
         }
     }
+    fn key_event(
+        &mut self,
+        usage: u16,
+        down: bool,
+        captured_at: Instant,
+        remote_at_capture: Option<bool>,
+    ) {
+        self.stats.keyboard += 1;
+        if self.shortcuts.observe(usage, down) {
+            self.stats.local_shortcuts += 1;
+        } else {
+            self.emit(CaptureEvent::Key {
+                usage,
+                down,
+                captured_at,
+                remote_at_capture,
+            });
+        }
+    }
     fn input_packet(&mut self, packet: InputPacket, captured_at: Instant) {
         match packet {
             InputPacket::Mouse {
@@ -692,6 +720,7 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
                                 button,
                                 down,
                                 captured_at,
+                                remote_at_capture: None,
                             });
                         }
                     }
@@ -702,20 +731,12 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
                         horizontal: if flags & 0x0800 != 0 { wheel } else { 0 },
                         vertical: if flags & 0x0400 != 0 { wheel } else { 0 },
                         captured_at,
+                        remote_at_capture: None,
                     });
                 }
             }
             InputPacket::Key { usage, down } => {
-                self.stats.keyboard += 1;
-                if self.shortcuts.observe(usage, down) {
-                    self.stats.local_shortcuts += 1;
-                } else {
-                    self.emit(CaptureEvent::Key {
-                        usage,
-                        down,
-                        captured_at,
-                    });
-                }
+                self.key_event(usage, down, captured_at, None);
             }
             InputPacket::Absolute => self.stats.absolute += 1,
             InputPacket::DeviceLess => self.stats.device_less += 1,
@@ -817,7 +838,8 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
                                 usage,
                                 down,
                                 captured_at,
-                            } => state.input_packet(InputPacket::Key { usage, down }, captured_at),
+                                remote_at_capture,
+                            } => state.key_event(usage, down, captured_at, remote_at_capture),
                             CaptureEvent::Button { .. } => {
                                 state.stats.buttons += 1;
                                 state.emit(event);
@@ -1370,6 +1392,9 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         }
     }
     state.data.borrow_mut().stats.elapsed = started.elapsed();
+    if routed::take_stop_request() {
+        state.data.borrow_mut().emit_callback(CaptureEvent::Stop);
+    }
     if let Some(error) = routed.as_ref().and_then(routed::RoutedHooks::error) {
         state.data.borrow_mut().error = Some(error);
     }
@@ -1913,9 +1938,9 @@ mod tests {
         );
         assert!(matches!(events.borrow().as_slice(),[
             CaptureEvent::Delta {dx:3,dy:4,captured_at:a},
-            CaptureEvent::Button {button:Button::Left,down:true,captured_at:b},
-            CaptureEvent::Button {button:Button::Left,down:false,captured_at:c},
-            CaptureEvent::Scroll {horizontal:0,vertical:-120,captured_at:d},
+            CaptureEvent::Button {button:Button::Left,down:true,captured_at:b,remote_at_capture:None},
+            CaptureEvent::Button {button:Button::Left,down:false,captured_at:c,remote_at_capture:None},
+            CaptureEvent::Scroll {horizontal:0,vertical:-120,captured_at:d,remote_at_capture:None},
         ] if *a==at && *b==at && *c==at && *d==at));
         state.input_packet(InputPacket::Overrun, at);
         assert!(stop.load(Ordering::Acquire));
@@ -1924,6 +1949,7 @@ mod tests {
             usage: 0x04,
             down: true,
             captured_at: at,
+            remote_at_capture: None,
         });
         assert_eq!(
             events.borrow().len(),

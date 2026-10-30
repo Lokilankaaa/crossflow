@@ -97,6 +97,27 @@
     "failure_report": "macos-cross-screen-worker-timeout-20261030.json",
     "reverse_input": "Mac physical keyboard and mouse are not yet wired as a Windows input source; implementation is in progress"
   },
+  "duplex_development_followup": {
+    "status": "Shared runtime and Windows app wiring implemented; Mac native adapter integration and attended verification pending",
+    "transport": "One pinned Noise connection with CFP1 envelope and existing v4 input frames; both authenticated devices may own physical input",
+    "control": "Two-sided owned-input release acknowledgement before grant; independent owner epoch and layout revision; no automatic re-arm after reconnect",
+    "native_startup": "Both peers validate real monitor inventories and layout, then confirm capture/worker readiness before starting input leases",
+    "screen_query": "Authenticated inventory-only request never constructs capture or an input worker",
+    "validation": {
+      "pair_modules_tests_including_encrypted_loopback_passed": 67,
+      "windows_native_ui_build": "passed, zero warnings/errors; separate output directory, not installed",
+      "windows_oneclick_checks_passed": 17,
+      "windows_layout_checks_passed": 22,
+      "windows_session_checks_passed": 33,
+      "mac_platform_review": "9abf077 and f377df4 developed and natively checked by the Mac agent; no real capture or warp was started"
+    },
+    "limits": [
+      "Existing installed clients have not been replaced with this duplex runtime",
+      "Real Mac physical-source capture, takeover, suppression and Windows injection remain unverified",
+      "Receiver batch coalescing and sustained visible-flow benchmarks remain incomplete",
+      "The initial connector is still Windows and listener Mac; either endpoint may own input within that connection"
+    ]
+  },
   "not_yet_accepted": [
     "Sustained cross-screen stability, local input suppression and remote keyboard/click/wheel acceptance",
     "Physical Mac keyboard and mouse acting as a source for Windows",

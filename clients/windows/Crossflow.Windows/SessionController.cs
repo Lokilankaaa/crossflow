@@ -88,7 +88,7 @@ internal sealed class SessionController
         }
         await ConnectCoreAsync(log =>
         {
-            var info = PackagedInfo(["desktop-send", "--peer", peerId, "--log", log, "--seconds", "3600", "--max-hz", "1000"]);
+            var info = PackagedInfo([runtimeLayoutPath is null ? "desktop-send" : "desktop-pair", "--peer", peerId, "--log", log, "--seconds", "3600", "--max-hz", "1000"]);
             if (runtimeLayoutPath is not null) { info.ArgumentList.Add("--runtime-layout"); info.ArgumentList.Add(runtimeLayoutPath); }
             return peerFixture?.Invoke(info) ?? RequirePackaged(info);
         }, logDirectory, runtimeLayoutPath is not null, startOnInitialReady);

@@ -283,16 +283,19 @@ pub fn capture(
                             button,
                             down,
                             captured_at,
+                            ..
                         } => q.button(button, down, log.at(captured_at)),
                         CaptureEvent::Key {
                             usage,
                             down,
                             captured_at,
+                            ..
                         } => q.key(usage, down, log.at(captured_at)),
                         CaptureEvent::Scroll {
                             horizontal,
                             vertical,
                             captured_at,
+                            ..
                         } => q.scroll(horizontal, vertical, log.at(captured_at)),
                         _ => CaptureOutcome::Ignored,
                     };

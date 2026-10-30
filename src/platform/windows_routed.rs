@@ -318,6 +318,7 @@ struct HookState {
     events: VecDeque<CaptureEvent>,
     wake_posted: bool,
     failed: bool,
+    requested_stop: bool,
 }
 pub(super) const WM_ROUTED_INPUT: u32 = WM_APP + 0x41;
 const EVENT_CAPACITY: usize = 256;
@@ -382,6 +383,14 @@ pub(super) fn drain_events() -> Result<Vec<CaptureEvent>, String> {
     })
 }
 
+pub(super) fn take_stop_request() -> bool {
+    HOOK_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.requested_stop))
+    })
+}
+
 fn with_policy(f: impl FnOnce(&mut HookState) -> Decision) -> bool {
     HOOK_STATE.with(|slot| {
         let Ok(mut value) = slot.try_borrow_mut() else {
@@ -398,6 +407,7 @@ fn with_policy(f: impl FnOnce(&mut HookState) -> Decision) -> bool {
                     // reaches the queue; the core owns remote release/pause.
                     state.focus.store(false, Ordering::Release);
                     if command == STOP {
+                        state.requested_stop = true;
                         state.stop.store(true, Ordering::Release);
                     }
                     if unsafe { PostMessageW(state.hwnd, WM_COMMAND, command, 0) } == 0 {
@@ -445,6 +455,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                             usage,
                             down,
                             captured_at: Instant::now(),
+                            remote_at_capture: Some(remote),
                         });
                     }
                 }
@@ -495,6 +506,7 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                         button,
                         down,
                         captured_at: Instant::now(),
+                        remote_at_capture: Some(remote),
                     });
                     decision
                 } else {
@@ -513,6 +525,7 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                                     0
                                 },
                                 captured_at: Instant::now(),
+                                remote_at_capture: Some(remote),
                             });
                         }
                     }
@@ -566,6 +579,7 @@ impl RoutedHooks {
                 events: VecDeque::with_capacity(EVENT_CAPACITY),
                 wake_posted: false,
                 failed: false,
+                requested_stop: false,
             });
             Ok(())
         })?;
@@ -777,12 +791,14 @@ mod tests {
             events: VecDeque::with_capacity(EVENT_CAPACITY),
             wake_posted: true,
             failed: false,
+            requested_stop: false,
         };
         for _ in 0..EVENT_CAPACITY {
             state.enqueue(CaptureEvent::Key {
                 usage: 4,
                 down: true,
                 captured_at: Instant::now(),
+                remote_at_capture: Some(true),
             });
         }
         assert_eq!(state.events.len(), EVENT_CAPACITY);
@@ -791,6 +807,7 @@ mod tests {
             usage: 4,
             down: false,
             captured_at: Instant::now(),
+            remote_at_capture: Some(true),
         });
         assert!(state.failed);
         assert!(stop.load(Ordering::Acquire));

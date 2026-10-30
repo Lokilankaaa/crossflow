@@ -13,7 +13,7 @@ internal sealed record RuntimeLayoutDocument(LayoutDocument Layout, string Local
 internal sealed class DisplayClient
 {
     private readonly BoundedCoreCommand<List<NativeDisplay>> command;
-    internal DisplayClient(string? peerId = null) => command = new(peerId is null ? ["displays"] : ["peer-displays", "--peer", peerId], Parse, timeout: TimeSpan.FromSeconds(15));
+    internal DisplayClient(string? peerId = null) => command = new(peerId is null ? ["displays"] : ["peer-displays", "--peer", peerId, "--duplex"], Parse, timeout: TimeSpan.FromSeconds(15));
     internal Task<List<NativeDisplay>> ReadAsync() => command.RunAsync();
     internal Task<bool> StopAsync() => command.StopAsync();
 

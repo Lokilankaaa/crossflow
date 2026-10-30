@@ -26,6 +26,20 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Private native-client bidirectional cross-screen session.
+    #[command(hide = true)]
+    DesktopPair {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        runtime_layout: PathBuf,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long, default_value_t = 3600.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 1000)]
+        max_hz: u32,
+    },
     /// Private native-client session; inherited pipes carry controls, not input.
     #[command(hide = true)]
     DesktopSend {
@@ -64,6 +78,9 @@ enum Command {
     PeerDisplays {
         #[arg(long)]
         peer: String,
+        /// Query the native bidirectional session service.
+        #[arg(long)]
+        duplex: bool,
     },
     /// Development migration of an existing trusted diagnostic identity.
     #[command(hide = true)]
@@ -230,6 +247,7 @@ fn main() -> Result<()> {
             | Command::Send { .. }
             | Command::Capture { .. }
             | Command::DesktopSend { .. }
+            | Command::DesktopPair { .. }
             | Command::Discover { .. }
             | Command::PeerDisplays { .. }
     ) {
@@ -240,6 +258,53 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
     match args.command {
+        Command::DesktopPair {
+            peer,
+            runtime_layout,
+            log,
+            seconds,
+            max_hz,
+        } => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(runtime_layout)?
+                .take(1_048_577)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 1_048_576, "runtime layout exceeds limit");
+            let layout: crossflow::screen_runtime::RuntimeLayout = serde_json::from_slice(&bytes)?;
+            layout.validate()?;
+            ensure!(
+                layout.remote_device_id == peer,
+                "runtime target differs from paired device"
+            );
+            let (device, identity) =
+                crossflow::peers::PeerStore::default_store()?.resolve(&peer)?;
+            let endpoint = device
+                .last_endpoint
+                .context("Saved peer has no input listening endpoint")?;
+            let mut meta = metadata("native_pair_session");
+            meta["movement_only"] = json!(false);
+            meta["pair_protocol"] = json!(crossflow::pair_wire::PAIR_VERSION);
+            let writer = LogWriter::new(&log, meta)?;
+            #[cfg(windows)]
+            crossflow::pair_app::run(
+                crossflow::pair_app::Options {
+                    identity,
+                    mode: crossflow::pair_app::Mode::Connect { endpoint, layout },
+                    seconds,
+                    max_hz,
+                },
+                writer,
+                stop,
+                crossflow::pair_native::windows::platform(),
+            )?;
+            #[cfg(not(windows))]
+            {
+                let _ = (identity, endpoint, layout, seconds, max_hz);
+                writer.finish()?;
+                anyhow::bail!("desktop-pair initiator is not installed for this platform");
+            }
+        }
         Command::DesktopSend {
             host,
             identity,
@@ -360,7 +425,7 @@ fn main() -> Result<()> {
             #[cfg(not(any(windows, target_os = "macos")))]
             anyhow::bail!("display enumeration is not implemented for this platform");
         }
-        Command::PeerDisplays { peer } => {
+        Command::PeerDisplays { peer, duplex } => {
             let (device, bundle) = crossflow::peers::PeerStore::default_store()?.resolve(&peer)?;
             let endpoint = device
                 .last_endpoint
@@ -373,8 +438,26 @@ fn main() -> Result<()> {
                     .as_nanos()
             ));
             let writer = LogWriter::new(&temp, metadata("display_query"))?;
-            let result =
-                session::query_displays(&endpoint.to_string(), &bundle, &stop, &writer.log, true);
+            let result = if duplex {
+                #[cfg(windows)]
+                {
+                    crossflow::pair_app::query(
+                        endpoint,
+                        &crossflow::security::Identity::load(&bundle)?,
+                        &crossflow::pair_native::windows::platform(),
+                        &stop,
+                        &writer.log,
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(anyhow::anyhow!(
+                        "duplex display query adapter is not installed"
+                    ))
+                }
+            } else {
+                session::query_displays(&endpoint.to_string(), &bundle, &stop, &writer.log, true)
+            };
             let finished = writer.finish();
             let _ = std::fs::remove_file(&temp);
             finished?;
@@ -893,16 +976,19 @@ fn run_ordered_sender(
                         button,
                         down,
                         captured_at,
+                        ..
                     } => source.button(button, down, log.at(captured_at)),
                     CaptureEvent::Key {
                         usage,
                         down,
                         captured_at,
+                        ..
                     } => source.key(usage, down, log.at(captured_at)),
                     CaptureEvent::Scroll {
                         horizontal,
                         vertical,
                         captured_at,
+                        ..
                     } => source.scroll(horizontal, vertical, log.at(captured_at)),
                     CaptureEvent::Snapshot { buttons, keys } => {
                         if source.seed_physical_held(buttons, keys).is_err() {
