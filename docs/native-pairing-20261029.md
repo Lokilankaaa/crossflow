@@ -29,8 +29,8 @@ Mac 原始日志：`~/Library/Application Support/Crossflow/runs/receiver-62F90E
 
 旧界面把所有 receiver 非零退出都标为“停止结果未确认”，导致重试和正常
 退出被阻止。修复使用专门的 `startup_rejected` 终态，仅涵盖输入拥有者创建前的
-权限拒绝；不能把普通运行错误或强制退出当作清理成功。修复后仍需原生测试和
-实际 App 权限验收，系统授权由用户亲自完成。
+权限拒绝；不能把普通运行错误或强制退出当作清理成功。原生测试结果如下；
+实际 App 系统权限仍由用户亲自开启。
 
 修复 `80e224600c7f0b7f2202096bb337c5333c19d6ab` 已通过
 [原生 Mac CI](https://github.com/Lokilankaaa/crossflow/actions/runs/40803043473)：
@@ -38,6 +38,11 @@ Mac 原始日志：`~/Library/Application Support/Crossflow/runs/receiver-62F90E
 检查均成功。新回归实际覆盖权限拒绝后再次启动、正常退出、非法拒绝和信号退出。
 Windows 的七项接收控制测试和五项真实 DrySink 进程测试也通过。CI 是隔离
 runner，不证明用户 Mac 的 TCC 已开启或新 App 窗口回归通过。
+
+2026-10-30 的条件实机窗口回归已完成，详见
+[实机报告](macos-permission-app-regression-20261030.json)。当前测试包保留了原
+钥匙串辅助程序，权限拒绝后的重试/退出通过；全新重建辅助程序读取旧配对失败，
+正常升级尚未通过。原记录未删除，未重新配对，也未修改钥匙串访问控制。
 
 ## 未验证
 

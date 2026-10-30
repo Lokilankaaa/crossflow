@@ -26,7 +26,7 @@
   "user_device": {
     "first_native_ui_pairing": "passed on prior documented dd0a9a3 / 0a4bb44 builds",
     "old_app_receiver_start": "failed before listener/input due to missing app-context permission",
-    "fixed_app_tcc_and_window_regression": "pending",
+    "fixed_app_tcc_and_window_regression": "2026-10-30 permission-denied retry and exit passed only with the preserved authorized helper; permissions still not granted; see macos-permission-app-regression-20261030.json",
     "visible_motion_comparison": "not performed"
   }
 }
