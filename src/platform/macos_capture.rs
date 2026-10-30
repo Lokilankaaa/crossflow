@@ -841,23 +841,6 @@ mod native {
             wheel: WheelRemainder::default(),
             permission: None,
         });
-        let mut snapshot = HeldSnapshot::default();
-        for key in 0..128 {
-            state.keys[key] = unsafe { CGEventSourceKeyState(1, key as u16) };
-            if state.keys[key] {
-                shared.held.fetch_add(1, Ordering::SeqCst);
-                if let Some(usage) = hid_usage(key as u16) {
-                    snapshot.keys.push(usage);
-                }
-            }
-        }
-        for number in 0..5 {
-            state.buttons[number] = unsafe { CGEventSourceButtonState(1, number as u32) };
-            if state.buttons[number] {
-                shared.held.fetch_add(1, Ordering::SeqCst);
-                snapshot.buttons.push(button(number).unwrap());
-            }
-        }
         let mask = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27]
             .iter()
             .fold(0u64, |m, t| m | (1u64 << t));
@@ -879,6 +862,8 @@ mod native {
             ));
             return;
         }
+        // Keep the new tap disabled while startup permission RPCs may block.
+        unsafe { CGEventTapEnable(port, false) };
         let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null_mut(), port, 0) };
         let loop_ = unsafe { CFRunLoopGetCurrent() };
         let tap = Tap {
@@ -919,6 +904,44 @@ mod native {
         unsafe {
             CFRunLoopAddSource(loop_, source, kCFRunLoopDefaultMode);
             CGEventTapEnable(port, true);
+        }
+        // Enable interception BEFORE sampling held input. A press after its
+        // key was sampled can now only be delivered through our callback, so
+        // no local down can disappear into a snapshot-to-enable gap. The run
+        // loop has not dispatched callbacks yet; this thread owns the arrays.
+        let mut snapshot = HeldSnapshot::default();
+        for key in 0..128 {
+            state.keys[key] = unsafe { CGEventSourceKeyState(1, key as u16) };
+            if state.keys[key] {
+                shared.held.fetch_add(1, Ordering::SeqCst);
+                if let Some(usage) = hid_usage(key as u16) {
+                    snapshot.keys.push(usage);
+                }
+            }
+        }
+        for number in 0..5 {
+            state.buttons[number] = unsafe { CGEventSourceButtonState(1, number as u32) };
+            if state.buttons[number] {
+                shared.held.fetch_add(1, Ordering::SeqCst);
+                snapshot.buttons.push(button(number).unwrap());
+            }
+        }
+        shared.remote(clock.now());
+        if state
+            .permission
+            .as_ref()
+            .is_none_or(|probe| probe.check().is_err())
+        {
+            shared.stop(StopReason::PermissionsLost);
+        }
+        if !unsafe { CGEventTapIsEnabled(port) } {
+            shared.stop(StopReason::TapDisabled);
+        }
+        if shared.stop.load(Ordering::SeqCst) != 0 {
+            let _ = ready.send(Err(
+                "Mac capture stopped during initial input sampling".into()
+            ));
+            return;
         }
         if ready.send(Ok(snapshot)).is_err() {
             shared.stop(StopReason::Requested);
