@@ -188,9 +188,9 @@ remain to be validated.
 - The app declares its local-network use and `_crossflow._tcp` and
   `_crossflow-pair._tcp` Bonjour services.
   IP addresses and identifiers are not part of the nearby-device workflow.
-- The C bridge still exposes layout operations only. Pairing and session control
-  use the packaged Rust processes; applying a draft layout to an input session
-  remains separate work.
+- The C bridge exposes layout operations. Pairing and session control use the
+  packaged Rust processes; the Mac workspace displays the authenticated layout
+  managed by Windows.
 - The packaged build uses the shared light palette. A native screenshot and
   interaction pass for the updated four-screen build remain to be performed.
 
@@ -213,3 +213,67 @@ error clears the session display and focus. Identical snapshots retain stable
 screen IDs; focus changes do not recreate geometry.
 Input/discovery wire is 4; the private input-worker IPC remains 3. Receiver status
 lines allow at most 65,536 bytes; invitation/other process lines retain 2,048 bytes.
+
+## Reproducing the development-signed package
+
+The packaging script still signs ad hoc by default. For subsequent development
+updates, complete the explicit signing steps below before installing the package.
+Use the **same existing Apple Development identity** as the previous development
+package: select its fingerprint from `security find-identity -v -p codesigning`
+and supply it through `CROSSFLOW_DEVELOPMENT_IDENTITY`. Do not create a certificate,
+export its private key, or silently fall back to ad hoc signing. A valid identity
+listing alone does not prove that using its private key will be noninteractive.
+If macOS requests private-key access, let the user handle that prompt.
+
+First build the native core and invitation component from the intended revision
+using the earlier build instructions. Then use a new output directory and preserve
+the exact already-authorized Keychain helper from the installed package:
+
+```sh
+set -eu
+: "${CROSSFLOW_DEVELOPMENT_IDENTITY:?Set the fingerprint of the existing development identity}"
+app="$PWD/dist/development/Crossflow.app"
+helper="$PWD/dist/cross-screen/Crossflow.app/Contents/MacOS/crossflow-keychain"
+helper_before=$(shasum -a 256 "$helper")
+CROSSFLOW_MACOS_APP_PATH="$app" CROSSFLOW_MACOS_KEYCHAIN_HELPER="$helper"   sh scripts/build-macos-ui.sh
+
+codesign --force --sign "$CROSSFLOW_DEVELOPMENT_IDENTITY" --timestamp=none   --identifier local.crossflow.bridge "$app/Contents/Frameworks/libcrossflow_bridge.dylib"
+codesign --force --sign "$CROSSFLOW_DEVELOPMENT_IDENTITY" --timestamp=none   --identifier local.crossflow.core "$app/Contents/MacOS/crossflow"
+codesign --force --sign "$CROSSFLOW_DEVELOPMENT_IDENTITY" --timestamp=none   --identifier local.crossflow.invite "$app/Contents/MacOS/crossflow-invite"
+# Do not sign crossflow-keychain again. Sign the containing app last, without --deep.
+codesign --force --sign "$CROSSFLOW_DEVELOPMENT_IDENTITY" --timestamp=none "$app"
+
+cmp "$helper" "$app/Contents/MacOS/crossflow-keychain"
+test "$helper_before" = "$(shasum -a 256 "$helper")"
+codesign --verify --deep --strict "$app"
+codesign -d -r- "$app"
+"$app/Contents/MacOS/CrossflowMac" --self-test runs/development-package-self-test.json
+```
+
+Here `--deep` is used only for verification. Re-signing the preserved helper can
+break the existing file-based Keychain item's code requirement. For the verified
+2026-10-30 package, the retained helper SHA-256 is
+`ad2746006adb8941296d13921ff2babeb3b48a154eb5bf79fbaaac2fd4af7fa9`.
+This retention is a development continuity measure, not a general helper upgrade
+or Keychain ACL migration solution.
+
+The verified app identifier is `local.crossflow.mac`. Its designated requirement
+uses the Apple anchor, identifier and development certificate identity, rather
+than an ad hoc code hash. Keep those identities stable for future builds. Apple
+explains the distinction in [TN3127: Code Signing Requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+The first migration from the previously authorized ad hoc package still failed
+app-launched TCC preflight on the tested Mac: accessibility, event listening and
+event posting were all false. A successful CLI-host environment query does not
+prove app permission continuity. The user must authorize the development-signed
+app in both **设备控制和数据访问** (Accessibility on older systems) and **输入监控**,
+then quit and reopen it. No build or installation step modifies TCC or the
+Keychain access list. Future development-to-development permission continuity
+remains an attended test, not a claim established by signature verification.
+
+The fixed installation path for this validation is
+`dist/cross-screen/Crossflow.app`; the previous ad hoc package is preserved at
+`dist/backups/20261030-before-development/Crossflow.app`. Copy a verified package
+to the fixed path only after the previous app and receiver/worker have exited;
+compare all installed file bytes with the validated build and verify its
+signature again. Do not rebuild or re-sign the installed package in place.
