@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     #[ignore = "real encrypted localhost readiness race; mock native adapters only"]
-    fn native_readiness_retains_runtime_tail_from_same_encrypted_pump() -> Result<()> {
+    fn native_readiness_retains_runtime_tail_across_encrypted_pump_boundaries() -> Result<()> {
         struct GatedHost {
             pulses: usize,
             go: Sender<()>,
@@ -1049,8 +1049,8 @@ mod tests {
                 bail!("unexpected inventory query")
             };
             // Wait until the client has transmitted Ready, then wait for its
-            // next native pulse before sending both records. This guarantees
-            // one pump sees the boundary and tail without timing-based sleeps.
+            // next native pulse before sending both records. TCP may deliver
+            // them in one pump or separate pumps despite both writes finishing.
             let end = Instant::now() + Duration::from_secs(2);
             while !connection.early_peer_ready {
                 let records = connection.peer.pump()?;
@@ -1101,7 +1101,8 @@ mod tests {
                 go,
                 sent: receive_sent,
             };
-            let tail = connection
+            let started = Instant::now();
+            let mut tail = connection
                 .native_ready(
                     &source,
                     &mut sink,
@@ -1110,10 +1111,32 @@ mod tests {
                     &client_log.log,
                 )?
                 .context("unexpected stop")?;
-            assert_eq!(host.pulses, 2);
+            assert!(host.pulses >= 2);
+            let retained = tail
+                .iter()
+                .map(|record| (record.sequence, record.received_at))
+                .collect::<Vec<_>>();
+            let end = Instant::now() + Duration::from_secs(2);
+            while tail.is_empty() {
+                ensure!(Instant::now() < end, "runtime tail missing after readiness");
+                tail.extend(connection.peer.pump()?);
+                if tail.is_empty() {
+                    thread::yield_now();
+                }
+            }
             assert_eq!(tail.len(), 1);
             assert_eq!(tail[0].message, Message::KeepAlive);
+            // Responder records: Hello, LayoutReady, SessionReady, KeepAlive.
+            assert_eq!(tail[0].sequence, 4);
+            assert!(tail[0].received_at >= started);
             assert!(tail[0].received_at <= Instant::now());
+            assert_eq!(
+                retained,
+                tail.iter()
+                    .take(retained.len())
+                    .map(|record| (record.sequence, record.received_at))
+                    .collect::<Vec<_>>()
+            );
             let mut endpoint = PairEndpoint::new(
                 connection.local_side(),
                 1,

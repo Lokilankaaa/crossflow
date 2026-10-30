@@ -120,7 +120,8 @@
     },
     "integration_fixes": {
       "idle_worker": "Maintain an inactive worker only after endpoint clock and peer/ownership liveness checks; do not Reset or Arm. Three regressions cover 12-second pauses, 12-second local ownership followed by reverse takeover, and stopping maintenance after disconnect or lease expiry.",
-      "readiness_boundary": "Retain the bounded ordered Received tail when SessionReady and later runtime records arrive in the same pump; preserve receive timestamps and reject premature, duplicate, mismatched or oversized batches. Includes a deterministic real encrypted localhost regression with mock native adapters.",
+      "readiness_boundary": "Retain the bounded ordered Received tail when SessionReady and later runtime records arrive in the same pump; preserve receive timestamps and reject premature, duplicate, mismatched or oversized batches. A deterministic batch test covers coalescing; an encrypted localhost test checks no lost records across either legal TCP delivery boundary with mock native adapters.",
+      "mac_test_followup": "The first encrypted boundary test assumed two writes would arrive in one pump and failed once on the real Mac (empty immediate tail). Its correction accepts either legal TCP segmentation and still requires the exact ordered runtime record; no production timeout or authority check is relaxed.",
       "endpoint_tests_passed": 19,
       "session_tests_including_encrypted_loopback_passed": 5,
       "integrated_mac_ci": "https://github.com/Lokilankaaa/crossflow/actions/runs/41063273746",
