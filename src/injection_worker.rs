@@ -119,9 +119,7 @@ pub fn continuous_ns() -> Result<u64> {
         // SAFETY: read-only clock writes one valid u64. Windows 10+ is required.
         // https://learn.microsoft.com/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryinterrupttimeprecise
         unsafe { QueryInterruptTimePrecise(&mut ticks) };
-        ticks
-            .checked_mul(100)
-            .context("clock overflow")
+        ticks.checked_mul(100).context("clock overflow")
     }
     #[cfg(target_os = "linux")]
     {
@@ -255,10 +253,8 @@ pub fn run_native(gain: f64) -> Result<()> {
 #[cfg(windows)]
 pub fn run_native(gain: f64) -> Result<()> {
     let (input, output) = stdio_files()?;
-    let mut sink = crate::platform::windows::WindowsMouseSink::new(
-        gain,
-        Arc::new(AtomicBool::new(false)),
-    )?;
+    let mut sink =
+        crate::platform::windows::WindowsMouseSink::new(gain, Arc::new(AtomicBool::new(false)))?;
     run_worker(input, output, &mut sink)
 }
 
