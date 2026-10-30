@@ -131,6 +131,7 @@ fn distribution(mut v: Vec<f64>) -> Value {
 }
 pub fn summarize(path: &Path) -> Result<Value> {
     let mut worker_timings = WorkerTimingSummary::default();
+    let mut duplex = DuplexSummary::default();
     let mut src = vec![];
     let mut recv = vec![];
     let mut inject = vec![];
@@ -175,6 +176,7 @@ pub fn summarize(path: &Path) -> Result<Value> {
             }
         };
         events += 1;
+        duplex.record(&v);
         if v["event"] == "metadata" {
             worker_timings.failure_logging_declared |=
                 v["data"]["worker_rpc_failure_logging"].as_bool() == Some(true);
@@ -292,9 +294,123 @@ pub fn summarize(path: &Path) -> Result<Value> {
         "receiver_adapter_timing_scopes":adapter_scopes,
         "adapter_timing_warning":"injection_call and action_adapter_call measure t3..t4. With an input worker this includes pipe scheduling and ACK wait, not isolated native injection. Missing or mixed scopes cannot establish isolated injection timing.",
         "worker_timing":worker_timings.finish(),
+        "duplex":duplex.finish(),
         "injection_call":distribution(inject),"visible_smoothness":"NOT_MEASURED",
         "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized"
     }))
+}
+
+#[derive(Default)]
+struct DuplexCalls {
+    records: u64,
+    duration: Vec<f64>,
+    issues: TimingIssues,
+}
+impl DuplexCalls {
+    fn record(&mut self, value: &Value) {
+        self.records += 1;
+        if let Some(d) = timing_delta(value, "t3_ns", "t4_ns", &mut self.issues) {
+            self.duration.push(d);
+        }
+    }
+    fn finish(self) -> Value {
+        json!({"records":self.records,"adapter_call":distribution(self.duration),"timing_issues":self.issues})
+    }
+}
+#[derive(Default)]
+struct DuplexAction {
+    received_records: u64,
+    receive_queue: Vec<f64>,
+    receive_envelope: Vec<f64>,
+    receive_issues: TimingIssues,
+    success: DuplexCalls,
+    failed: DuplexCalls,
+    unknown: DuplexCalls,
+    worker: WorkerTimingSummary,
+}
+#[derive(Default)]
+struct DuplexSummary {
+    actions: std::collections::BTreeMap<&'static str, DuplexAction>,
+    non_action_received: std::collections::BTreeMap<&'static str, u64>,
+    unsupported_call_records: u64,
+}
+impl DuplexSummary {
+    fn record(&mut self, v: &Value) {
+        let event = v["event"].as_str();
+        if !matches!(event, Some("pair_input_received" | "pair_input_call")) {
+            return;
+        }
+        let kind = match v["kind"].as_str() {
+            Some("Move") => "Move",
+            Some("Position") => "Position",
+            Some("Key") => "Key",
+            Some("Button") => "Button",
+            Some("Scroll") => "Scroll",
+            other => {
+                if event == Some("pair_input_call") {
+                    self.unsupported_call_records += 1;
+                } else {
+                    let category = match other {
+                        Some("Arm") => "Arm",
+                        Some("Pause") => "Pause",
+                        Some("Stop") => "Stop",
+                        Some("Heartbeat") => "Heartbeat",
+                        Some("RoutingState") => "RoutingState",
+                        _ => "unknown",
+                    };
+                    *self.non_action_received.entry(category).or_default() += 1;
+                }
+                return;
+            }
+        };
+        let action = self.actions.entry(kind).or_default();
+        if event == Some("pair_input_received") {
+            action.received_records += 1;
+            if let Some(d) = timing_delta(v, "t2_ns", "t3_ns", &mut action.receive_issues) {
+                action.receive_queue.push(d);
+            }
+            if let Some(d) = timing_delta(v, "t3_ns", "t4_ns", &mut action.receive_issues) {
+                action.receive_envelope.push(d);
+            }
+            // This envelope may include a discarded stale frame or native call.
+            // Never count it again as a sink/worker invocation.
+            return;
+        }
+        match v["success"].as_bool() {
+            Some(true) => {
+                action.success.record(v);
+                action
+                    .worker
+                    .record(v.get("worker_timing"), matches!(kind, "Move" | "Position"));
+            }
+            Some(false) => action.failed.record(v),
+            None => action.unknown.record(v),
+        }
+    }
+    fn finish(self) -> Value {
+        let actions: serde_json::Map<String, Value> = self.actions.into_iter().map(|(kind, a)| {
+            (kind.to_owned(), json!({
+                "received_records":a.received_records,
+                "receive_queue":distribution(a.receive_queue),
+                "receive_dispatch_envelope":distribution(a.receive_envelope),
+                "receive_timing_issues":a.receive_issues,
+                "calls":{"success":a.success.finish(),"failed":a.failed.finish(),"unknown_outcome":a.unknown.finish()},
+                "successful_worker_timing":a.worker.finish()
+            }))
+        }).collect();
+        json!({
+            "actions":actions,
+            "non_action_received_records":self.non_action_received,
+            "unsupported_call_records":self.unsupported_call_records,
+            "source_processing":"NOT_MEASURED: duplex records do not include source t0/t1",
+            "visible_smoothness":"NOT_MEASURED",
+            "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized",
+            "missing_call_count":Value::Null,
+            "call_coverage":"UNKNOWN: call records have no owner_epoch/seq correlation. Received records may be stale-discarded; failed dispatches may have no received record. Counts cannot be subtracted to infer missing calls.",
+            "timing_scope":"receive_queue is receiver-local t2..t3; receive_dispatch_envelope is endpoint t3..t4 and is not an additional injection. Only pair_input_call contributes adapter/worker call distributions. Adapter calls include worker RPC/ACK wait when present; none measures OS delivery or visible latency.",
+            "selection_warning":"Success, failure and unknown outcome are separate. Missing or invalid timings are excluded, never zero. Worker timings include successful calls only. Missing/dropped records can hide calls and failures; inspect complete_log and dropped_log_records. Control and metadata are never counted as injection."
+        })
+    }
 }
 
 /// These are elapsed durations within one machine-wide clock, never timestamps
@@ -528,6 +644,152 @@ mod tests {
 
     fn worker_record(event: &str, timing: Value) -> Value {
         json!({"event":event,"t2_ns":0,"t3_ns":1_000_000,"t4_ns":10_000_000,"worker_timing":timing})
+    }
+
+    #[test]
+    fn duplex_envelopes_and_metadata_never_duplicate_native_call_samples() {
+        let timing = worker_sample("mach_continuous_time_ns", 1_000_000, 2_000_000, 1_000_000);
+        let mut records =
+            vec![json!({"event":"metadata","data":{"pair_protocol":1,"movement_only":false}})];
+        for kind in ["Move", "Position", "Key", "Button", "Scroll"] {
+            records.push(json!({"event":"pair_input_call","kind":kind,"success":true,"t3_ns":2_000_000,"t4_ns":6_000_000,"worker_timing":timing}));
+            records.push(json!({"event":"pair_input_received","kind":kind,"owner_epoch":1,"seq":1,"t2_ns":0,"t3_ns":1_000_000,"t4_ns":7_000_000,"worker_timing":timing}));
+        }
+        for kind in ["Arm", "Pause", "Stop", "Heartbeat", "RoutingState"] {
+            records.push(json!({"event":"pair_input_received","kind":kind,"t2_ns":0,"t3_ns":1,"t4_ns":2,"worker_timing":timing}));
+        }
+        // Malformed/unsupported call kinds cannot become successful injections.
+        records.push(json!({"event":"pair_input_call","kind":"RoutingState","success":true,"worker_timing":timing}));
+        let result = summarize_records(records);
+        let duplex = &result["duplex"];
+        assert_eq!(duplex["actions"].as_object().unwrap().len(), 5);
+        for kind in ["Move", "Position", "Key", "Button", "Scroll"] {
+            let a = &duplex["actions"][kind];
+            assert_eq!(a["received_records"], 1);
+            assert_eq!(a["receive_queue"]["p50_ms"], 1.0);
+            assert_eq!(a["receive_dispatch_envelope"]["p50_ms"], 6.0);
+            assert_eq!(a["calls"]["success"]["records"], 1);
+            assert_eq!(a["calls"]["success"]["adapter_call"]["samples"], 1);
+            assert_eq!(a["calls"]["success"]["adapter_call"]["p50_ms"], 4.0);
+            assert_eq!(a["successful_worker_timing"]["valid_records"], 1);
+            assert_eq!(
+                a["successful_worker_timing"]["failure_logging_status"],
+                "unknown"
+            );
+            assert_eq!(a["calls"]["failed"]["records"], 0);
+        }
+        assert_eq!(
+            duplex["non_action_received_records"]
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(duplex["unsupported_call_records"], 1);
+        assert!(duplex["missing_call_count"].is_null());
+        assert!(
+            duplex["call_coverage"]
+                .as_str()
+                .unwrap()
+                .starts_with("UNKNOWN")
+        );
+        assert!(
+            duplex["source_processing"]
+                .as_str()
+                .unwrap()
+                .starts_with("NOT_MEASURED")
+        );
+        assert_eq!(duplex["visible_smoothness"], "NOT_MEASURED");
+        // New events do not contaminate legacy distributions or ACK totals.
+        assert!(result["injection_call"].is_null());
+        assert!(result["action_adapter_call"].is_null());
+        assert_eq!(result["worker_timing"]["valid_records"], 0);
+        assert_eq!(
+            result["receiver_adapter_timing_scopes"],
+            json!(["unspecified"])
+        );
+    }
+
+    #[test]
+    fn duplex_failed_unknown_missing_and_invalid_timings_stay_separate() {
+        let timing = worker_sample("mach_continuous_time_ns", 1, 2, 3);
+        let result = summarize_records(vec![
+            json!({"event":"pair_input_call","kind":"Key","success":false,"t3_ns":0,"t4_ns":31_000_000,"worker_timing":timing}),
+            json!({"event":"pair_input_call","kind":"Key","t3_ns":0,"t4_ns":2_000_000,"worker_timing":timing}),
+            json!({"event":"pair_input_call","kind":"Key","success":"true","t3_ns":4,"t4_ns":3}),
+            json!({"event":"pair_input_call","kind":"Key","success":true,"t3_ns":5}),
+            json!({"event":"pair_input_call","kind":"Key","success":true,"t3_ns":0,"t4_ns":1,"worker_timing":{}}),
+            // A stale-discarded frame may have a received envelope without a call.
+            json!({"event":"pair_input_received","kind":"Position","owner_epoch":1,"seq":99,"t2_ns":5,"t3_ns":4,"t4_ns":null}),
+            worker_record("received", timing),
+        ]);
+        let a = &result["duplex"]["actions"]["Key"];
+        assert_eq!(a["calls"]["failed"]["records"], 1);
+        assert_eq!(a["calls"]["failed"]["adapter_call"]["max_ms"], 31.0);
+        assert_eq!(a["calls"]["unknown_outcome"]["records"], 2);
+        assert_eq!(a["calls"]["unknown_outcome"]["adapter_call"]["samples"], 1);
+        assert_eq!(
+            a["calls"]["unknown_outcome"]["timing_issues"]["invalid_order"],
+            1
+        );
+        assert_eq!(a["calls"]["success"]["records"], 2);
+        assert_eq!(a["calls"]["success"]["adapter_call"]["samples"], 1);
+        assert_eq!(a["calls"]["success"]["timing_issues"]["missing_values"], 1);
+        assert_eq!(a["successful_worker_timing"]["valid_records"], 0);
+        assert_eq!(a["successful_worker_timing"]["invalid_records"], 1);
+        assert_eq!(a["successful_worker_timing"]["unavailable_records"], 1);
+        let p = &result["duplex"]["actions"]["Position"];
+        assert_eq!(p["received_records"], 1);
+        assert_eq!(p["calls"]["success"]["records"], 0);
+        assert_eq!(p["receive_timing_issues"]["invalid_order"], 1);
+        assert_eq!(p["receive_timing_issues"]["malformed_values"], 1);
+        assert!(p["receive_queue"].is_null());
+        assert_eq!(result["worker_timing"]["valid_records"], 1);
+        assert_eq!(result["injection_call"]["samples"], 1);
+    }
+
+    #[test]
+    fn duplex_fixture_written_by_production_logger_keeps_unknown_coverage() {
+        let path = std::env::temp_dir().join(format!(
+            "crossflow-duplex-summary-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let writer =
+            LogWriter::new(&path, json!({"pair_protocol":1,"movement_only":false})).unwrap();
+        writer.log.write(
+            "pair_input_call",
+            json!({"kind":"Position","t3_ns":2,"t4_ns":5,"success":true,"worker_timing":null}),
+        );
+        writer.log.write(
+            "pair_input_received",
+            json!({"kind":"Position","owner_epoch":3,"seq":10,"t2_ns":0,"t3_ns":1,"t4_ns":6}),
+        );
+        writer.log.write(
+            "pair_input_call",
+            json!({"kind":"Key","t3_ns":8,"t4_ns":9,"success":false,"worker_timing":null}),
+        );
+        writer.finish().unwrap();
+        let result = summarize(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result["complete_log"], true);
+        assert_eq!(result["dropped_log_records"], 0);
+        let actions = &result["duplex"]["actions"];
+        assert_eq!(actions["Position"]["calls"]["success"]["records"], 1);
+        assert_eq!(
+            actions["Position"]["successful_worker_timing"]["unavailable_records"],
+            1
+        );
+        assert_eq!(actions["Key"]["calls"]["failed"]["records"], 1);
+        assert_eq!(actions["Key"]["received_records"], 0);
+        assert!(result["duplex"]["missing_call_count"].is_null());
+        assert_eq!(
+            actions["Position"]["successful_worker_timing"]["failure_logging_status"],
+            "unknown"
+        );
     }
 
     #[test]
