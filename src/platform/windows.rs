@@ -5,10 +5,13 @@
 
 #[path = "windows_routed.rs"]
 mod routed;
+#[path = "windows_sink.rs"]
+mod sink;
 pub use routed::{
     CaptureCoordinateDiagnostics, NativeDisplay, capture_coordinate_diagnostics, cursor_position,
     displays, warp_cursor,
 };
+pub use sink::{WindowsMouseSink, receiver_display_id, receiver_displays};
 
 use crate::input::Button;
 use std::{
@@ -366,6 +369,9 @@ fn decode_input(raw: &RAWINPUT, bytes: u32, map_vk: impl Fn(u16) -> u16) -> Inpu
     }
     if raw.header.dwType == 0 {
         let mouse = unsafe { raw.data.mouse };
+        if mouse.ulExtraInformation == sink::INPUT_ORIGIN_TAG as u32 {
+            return InputPacket::DeviceLess;
+        }
         if mouse.usFlags & 1 != 0 {
             return InputPacket::Absolute;
         }
@@ -381,6 +387,9 @@ fn decode_input(raw: &RAWINPUT, bytes: u32, map_vk: impl Fn(u16) -> u16) -> Inpu
         };
     }
     let keyboard = unsafe { raw.data.keyboard };
+    if keyboard.ExtraInformation == sink::INPUT_ORIGIN_TAG as u32 {
+        return InputPacket::DeviceLess;
+    }
     if keyboard.MakeCode == 0xff {
         return InputPacket::Overrun;
     }
@@ -796,7 +805,10 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
                 drop(state);
                 return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             }
-            WM_HOTKEY => state.command(wparam),
+            // Routed hooks recognize shortcuts from non-injected physical
+            // transitions. WM_HOTKEY has no provenance and could be generated
+            // by input received from the other computer.
+            WM_HOTKEY if !state.routed_input => state.command(wparam),
             routed::WM_ROUTED_INPUT => match routed::drain_events() {
                 Ok(events) => {
                     for event in events {
@@ -1245,6 +1257,11 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         (TOGGLE as i32, VK_SPACE, "Ctrl+Alt+Space"),
         (STOP as i32, VK_ESCAPE, "Ctrl+Alt+Escape"),
     ]) {
+        if remote_focus.is_some() {
+            // The routed low-level hook already implements these shortcuts.
+            // Do not let a reverse SendInput sequence activate local controls.
+            continue;
+        }
         let result = if unsafe {
             RegisterHotKey(
                 resources.hwnd,
@@ -1712,6 +1729,21 @@ mod tests {
             ..Default::default()
         };
         raw
+    }
+    #[test]
+    fn receiver_origin_tag_is_never_recaptured_even_with_nonnull_device() {
+        let mut mouse = packet(7, -4);
+        mouse.data.mouse.ulExtraInformation = sink::INPUT_ORIGIN_TAG as u32;
+        assert_eq!(
+            decode_input(&mouse, mouse.header.dwSize, |_| 0),
+            InputPacket::DeviceLess
+        );
+        let mut key = keyboard(0x1e, 0);
+        key.data.keyboard.ExtraInformation = sink::INPUT_ORIGIN_TAG as u32;
+        assert_eq!(
+            decode_input(&key, key.header.dwSize, |_| 0),
+            InputPacket::DeviceLess
+        );
     }
     #[test]
     fn physical_keyboard_mapping_preserves_sides_navigation_and_fkeys() {

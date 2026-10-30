@@ -325,10 +325,10 @@ fn main() -> Result<()> {
                 gain.is_finite() && gain > 0.0 && gain <= 10.0,
                 "invalid worker gain"
             );
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             crossflow::injection_worker::run_native(gain)?;
-            #[cfg(not(target_os = "macos"))]
-            anyhow::bail!("native input worker requires macOS");
+            #[cfg(not(any(target_os = "macos", windows)))]
+            anyhow::bail!("native input worker requires Windows or macOS");
         }
         Command::Pair { out } => {
             println!(

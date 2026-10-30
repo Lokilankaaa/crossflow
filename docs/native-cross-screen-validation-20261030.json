@@ -84,10 +84,21 @@
     "coordinate_change_platform_tests_passed": 27,
     "ci_after_test_fixture_repair": "https://github.com/Lokilankaaa/crossflow/actions/runs/41052583096",
     "ci_conclusion": "success",
-    "physical_crossing_acceptance": "not passed"
+    "physical_crossing_acceptance": "Superseded by coordinate_fix_attended_followup below"
+  },
+  "coordinate_fix_attended_followup": {
+    "windows_core_revision": "8883ea93c28f2a480f0058334b8182974dc02020",
+    "mac_package_revision": "71b01d6aa76afb15368a8203f62a4682708a23c0",
+    "user_result": "Windows physical mouse can cross into the Mac and return",
+    "coordinate_fix": "Capture thread and its HWND use per-monitor DPI awareness v2; primary edge now reports y=2159 for the actual 2160-pixel primary screen",
+    "receiver_successful_calls": { "Position": 882, "Button": 10, "Scroll": 67, "Key": 0 },
+    "stability_result": "Failed: later terminal Position worker RPC timeout; receiver and worker exited. This is not a full cross-screen acceptance pass.",
+    "cleanup_result": "Final owned-button release was not confirmed; process exit is not evidence of OS release",
+    "failure_report": "macos-cross-screen-worker-timeout-20261030.json",
+    "reverse_input": "Mac physical keyboard and mouse are not yet wired as a Windows input source; implementation is in progress"
   },
   "not_yet_accepted": [
-    "Attended native edge crossing, local input suppression and remote keyboard/click/wheel behavior",
+    "Sustained cross-screen stability, local input suppression and remote keyboard/click/wheel acceptance",
     "Physical Mac keyboard and mouse acting as a source for Windows",
     "Transfer of keys or buttons held before crossing; release and press again after crossing",
     "Normal signed application upgrade preserving TCC and Keychain grants",

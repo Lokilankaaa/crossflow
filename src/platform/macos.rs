@@ -15,6 +15,7 @@
 //! https://developer.apple.com/documentation/coregraphics/cgeventsourcestateid/hidsystemstate
 
 use crate::input::Button;
+use crate::permission_probe::{PermissionCheckError, PermissionProbe, ProbeConfig};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -492,6 +493,76 @@ impl WheelRemainder {
     }
 }
 
+// BEGIN PURE SCROLL CHUNKS
+/// Visit every bounded post once. Even a fractional/no-op request visits (0,0)
+/// so the caller still checks emergency, permissions and topology before
+/// retaining its remainder. An error stops immediately; no chunk is replayed.
+fn visit_scroll_chunks<E>(
+    mut wheel1: i32,
+    mut wheel2: i32,
+    mut visit: impl FnMut(i32, i32) -> Result<(), E>,
+) -> Result<(), E> {
+    loop {
+        let y = wheel1.clamp(-10, 10);
+        let x = wheel2.clamp(-10, 10);
+        visit(y, x)?;
+        wheel1 -= y;
+        wheel2 -= x;
+        if wheel1 == 0 && wheel2 == 0 {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod scroll_chunk_tests {
+    use super::visit_scroll_chunks;
+
+    #[test]
+    fn one_check_per_chunk_preserves_signed_totals_and_checks_noop() {
+        for (vertical, horizontal, expected_checks) in [
+            (0, 0, 1),
+            (1, 0, 1),
+            (0, -1, 1),
+            (21, -12, 3),
+            (-274, 274, 28),
+        ] {
+            let mut checks = 0;
+            let mut total = (0, 0);
+            visit_scroll_chunks(vertical, horizontal, |y, x| -> Result<(), ()> {
+                checks += 1;
+                assert!((-10..=10).contains(&y) && (-10..=10).contains(&x));
+                total.0 += y;
+                total.1 += x;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(checks, expected_checks);
+            assert_eq!(total, (vertical, horizontal));
+        }
+    }
+
+    #[test]
+    fn failed_check_stops_before_post_and_never_visits_later_chunks() {
+        for fail_at in [1, 2, 3] {
+            let mut checks = 0;
+            let mut posts = Vec::new();
+            let result = visit_scroll_chunks(25, -25, |y, x| {
+                checks += 1;
+                if checks == fail_at {
+                    return Err("guard failed");
+                }
+                posts.push((y, x));
+                Ok(())
+            });
+            assert_eq!(result, Err("guard failed"));
+            assert_eq!(checks, fail_at);
+            assert_eq!(posts.len(), fail_at - 1);
+        }
+    }
+}
+// END PURE SCROLL CHUNKS
+
 #[derive(Clone, Copy, Debug)]
 pub enum MissingInputPermission {
     Accessibility,
@@ -529,6 +600,7 @@ pub struct MacMouseSink {
     gain: f64,
     snapshot: DisplaySnapshot,
     input_failed: bool,
+    permission_probe: Option<PermissionProbe>,
     position: CGPoint,
     owned_buttons: BTreeSet<Button>,
     owned_keys: BTreeSet<u16>,
@@ -555,6 +627,7 @@ impl MacMouseSink {
                 displays: Vec::new(),
             },
             input_failed: true,
+            permission_probe: None,
             position: CGPoint::default(),
             owned_buttons: BTreeSet::new(),
             owned_keys: BTreeSet::new(),
@@ -567,8 +640,16 @@ impl MacMouseSink {
     /// Rebase on arm/reconnect; never silently warp from another display.
     pub fn reset(&mut self) -> Result<(), AdapterError> {
         self.input_failed = true;
+        // Drop never joins a potentially blocked read-only permission query.
+        // Only an explicit arm/reset may establish a fresh permission epoch.
+        self.permission_probe = None;
         self.release_owned()?;
         preflight_input_permissions().map_err(|permission| failure(permission.message()))?;
+        let permission_probe = PermissionProbe::start_after_success(
+            || preflight_input_permissions().map_err(|_| PermissionCheckError::Denied),
+            ProbeConfig::default(),
+        )
+        .map_err(|reason| failure(reason.message()))?;
         let snapshot = display_snapshot()?;
         let event = OwnedCf::new(
             unsafe { CGEventCreate(std::ptr::null_mut()) },
@@ -582,6 +663,10 @@ impl MacMouseSink {
         }
         self.snapshot = snapshot;
         self.position = position;
+        permission_probe
+            .check()
+            .map_err(|reason| failure(reason.message()))?;
+        self.permission_probe = Some(permission_probe);
         self.input_failed = false;
         Ok(())
     }
@@ -594,6 +679,7 @@ impl MacMouseSink {
             // coordinates even if the topology changes back. Release attempts
             // bypass this guard and retain failed ownership for final cleanup.
             self.input_failed = true;
+            self.permission_probe = None;
             if self.release_owned().is_err() {
                 return Err(failure(
                     "Input stopped; owned input release could not be confirmed",
@@ -615,7 +701,14 @@ impl MacMouseSink {
             )
             .into());
         }
-        preflight_input_permissions().map_err(|permission| failure(permission.message()))?;
+        // CGPreflight calls can each take several milliseconds. Permission
+        // freshness is sampled by a separate read-only monitor; input still
+        // requires its own valid lease and fails closed on expiry/revocation.
+        self.permission_probe
+            .as_ref()
+            .ok_or_else(|| failure("Input permission monitor is not running"))?
+            .check()
+            .map_err(|reason| failure(reason.message()))?;
         if display_snapshot()? != self.snapshot {
             return Err(failure(
                 "Displays changed or slept; remote input stopped, check the layout before re-arming",
@@ -783,15 +876,17 @@ impl MacMouseSink {
     /// Line-based wheel prototype, preserving fractions between wheel events.
     /// This is not touchpad gesture/momentum emulation or native-speed parity.
     pub fn scroll(&mut self, horizontal: i32, vertical: i32) -> Result<(), AdapterError> {
-        self.check_input_ready()?;
         let mut next = self.wheel_remainder;
-        let (mut wheel1, mut wheel2) = next.accumulate(horizontal, vertical)?;
+        let (wheel1, wheel2) = next.accumulate(horizontal, vertical)?;
         // Keep each event in Apple's documented typical small signed range.
         // A raw packet is bounded, so this loop performs at most 28 posts.
-        while wheel1 != 0 || wheel2 != 0 {
+        // One complete guard immediately before each post; the old entry guard
+        // repeated the first post's permission and display enumeration calls.
+        visit_scroll_chunks(wheel1, wheel2, |y, x| -> Result<(), AdapterError> {
             self.check_input_ready()?;
-            let y = wheel1.clamp(-10, 10);
-            let x = wheel2.clamp(-10, 10);
+            if y == 0 && x == 0 {
+                return Ok(());
+            }
             let event = OwnedCf::new(
                 unsafe {
                     CGEventCreateScrollWheelEvent2(
@@ -806,9 +901,8 @@ impl MacMouseSink {
                 "CoreGraphics could not allocate a scroll event",
             )?;
             self.post_marked(&event, modifier_flags(&self.owned_keys));
-            wheel1 -= y;
-            wheel2 -= x;
-        }
+            Ok(())
+        })?;
         self.wheel_remainder = next;
         Ok(())
     }
@@ -843,6 +937,10 @@ impl MacMouseSink {
         // hotplug while a key is held also reaches its owned-input cleanup path.
         emergency_pressed()
             || self.input_failed
+            || self
+                .permission_probe
+                .as_ref()
+                .is_none_or(|probe| probe.check().is_err())
             || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
             || DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
     }
@@ -850,6 +948,7 @@ impl MacMouseSink {
 
 impl Drop for MacMouseSink {
     fn drop(&mut self) {
+        self.permission_probe = None;
         // Explicit session cleanup is responsible for reporting errors. This
         // best-effort fallback also covers ordinary unwinding, never hard kills.
         let _ = self.release_owned();

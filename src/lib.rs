@@ -7,6 +7,8 @@ pub mod keychain;
 pub mod keychain_process;
 pub mod metrics;
 pub mod peers;
+pub mod pair_control;
+pub mod permission_probe;
 pub mod platform;
 pub mod protocol;
 pub mod receiver_control;

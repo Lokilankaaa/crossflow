@@ -72,7 +72,7 @@ fn timing_for_ack(
         clock: if cfg!(target_os = "macos") {
             "mach_continuous_time_ns"
         } else if cfg!(windows) {
-            "GetTickCount64_ms_quantized"
+            "QueryInterruptTimePrecise_100ns"
         } else {
             "CLOCK_BOOTTIME_ns"
         },
@@ -80,8 +80,8 @@ fn timing_for_ack(
 }
 
 /// Same machine-wide clock in both processes, including time spent asleep.
-/// Windows is only used by fake process tests; its millisecond granularity is
-/// not a performance measurement or the macOS input clock.
+/// Windows uses the precise interrupt clock, shared across processes and biased
+/// across sleep. Its 100 ns units are a representation, not an accuracy promise.
 pub fn continuous_ns() -> Result<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -113,11 +113,14 @@ pub fn continuous_ns() -> Result<u64> {
     {
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            fn GetTickCount64() -> u64;
+            fn QueryInterruptTimePrecise(value: *mut u64);
         }
-        // SAFETY: read-only system clock with no arguments.
-        unsafe { GetTickCount64() }
-            .checked_mul(1_000_000)
+        let mut ticks = 0u64;
+        // SAFETY: read-only clock writes one valid u64. Windows 10+ is required.
+        // https://learn.microsoft.com/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryinterrupttimeprecise
+        unsafe { QueryInterruptTimePrecise(&mut ticks) };
+        ticks
+            .checked_mul(100)
             .context("clock overflow")
     }
     #[cfg(target_os = "linux")]
@@ -246,6 +249,16 @@ pub fn run_native(gain: f64) -> Result<()> {
         crate::platform::macos::MacMouseSink::new(gain)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     );
+    run_worker(input, output, &mut sink)
+}
+
+#[cfg(windows)]
+pub fn run_native(gain: f64) -> Result<()> {
+    let (input, output) = stdio_files()?;
+    let mut sink = crate::platform::windows::WindowsMouseSink::new(
+        gain,
+        Arc::new(AtomicBool::new(false)),
+    )?;
     run_worker(input, output, &mut sink)
 }
 
