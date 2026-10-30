@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "date": "2026-10-30",
+  "source_revision": "f205b71e05f89b76aad9039a91e325fab0440b0b",
+  "source_dirty": "false",
+  "unified_core_revision": "85265db9d89d37f4ba3e743cf1ab20f026901632",
+  "wire_version": 3,
+  "native_target": "aarch64-apple-darwin",
+  "validation_script": "scripts/validate-mac-core.sh --offline",
+  "validation_steps": {
+    "source-revision": "passed",
+    "source-status": "passed",
+    "compiler": "passed",
+    "operating-system": "passed",
+    "format": "passed",
+    "unit-and-bridge": "passed",
+    "lint": "passed",
+    "native-release": "passed",
+    "fake-worker-build": "passed",
+    "security-and-transport": "passed",
+    "input-and-recovery": "passed",
+    "cooperative-stop": "passed",
+    "isolated-worker": "passed",
+    "stream-stalls": "passed",
+    "native-environment": "passed",
+    "source-status-after": "passed"
+  },
+  "counts": {
+    "core_library": 176,
+    "cli": 4,
+    "bridge": 7,
+    "encrypted_input_transport": 9,
+    "session_recovery": 2,
+    "worker_process_fake": 5,
+    "cooperative_stop": 3,
+    "stream_stalls": 1,
+    "security_and_transport_opt_in": 8,
+    "mac_adapter_unit_tests": 12,
+    "packaged_self_test": 29
+  },
+  "swift_release_build": "passed; two existing Command Line Tools linker search-path warnings",
+  "xctest": "not run locally: Command Line Tools lack XCTest; use native CI",
+  "packaged_self_test": true,
+  "deep_strict_signature": "passed",
+  "saved_peers": {
+    "valid": 1,
+    "invalid": 0
+  },
+  "package_condition": "Unified cross-screen core/UI/invitation worker with the previously authorized Keychain helper retained unchanged. Not a passing normal signing upgrade.",
+  "old_phase_zero_app_unchanged": true,
+  "packaged_relative_path": "dist/cross-screen/Crossflow.app",
+  "native_displays": [
+    {
+      "height": 956.0,
+      "id": "1",
+      "width": 1470.0,
+      "x": 0.0,
+      "y": 0.0
+    }
+  ],
+  "actual_new_app_preflight": {
+    "accessibility": false,
+    "listen_event": false,
+    "post_event": false,
+    "outcome": "startup rejected; metadata/error/log_summary only; no listener or input",
+    "normal_quit": true
+  },
+  "new_app_cdhash": "d57f209b7dc916ab908281299ed99f65fb44bf24",
+  "agent_changed_tcc": false,
+  "cross_screen_physical_tested": false,
+  "pending": "User must reauthorize this fixed new app for Device Control and Data Access plus Input Monitoring before attended cross-screen keyboard/mouse testing.",
+  "artifact_sha256": {
+    "Contents/MacOS/CrossflowMac": "faec42b60212eeaffa451adda149b7c7c047017f04c4a05a4936c2068f7797a7",
+    "Contents/MacOS/crossflow": "7f04f7f6a71f9358d86ecbd61fe67a66990da7609bca0e2cf2d624b902483a03",
+    "Contents/MacOS/crossflow-keychain": "ad2746006adb8941296d13921ff2babeb3b48a154eb5bf79fbaaac2fd4af7fa9",
+    "Contents/MacOS/crossflow-invite": "161fb921c74dda584731764374a158065b0d5a625cc0c664a7c74269c3634eff",
+    "Contents/Frameworks/libcrossflow_bridge.dylib": "f7e55055f878c938ffa5835614642325ff7ff230cd29fb284990581291e9a83d"
+  }
+}
