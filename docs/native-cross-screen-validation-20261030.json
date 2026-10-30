@@ -105,6 +105,12 @@
     "screen_query": "Authenticated inventory-only request never constructs capture or an input worker",
     "validation": {
       "pair_modules_tests_including_encrypted_loopback_passed": 67,
+      "core_unit_tests_passed": 309,
+      "cli_unit_tests_passed": 4,
+      "bridge_unit_tests_passed": 7,
+      "workspace_clippy_all_targets": "passed",
+      "apple_all_targets_check": "passed",
+      "isolated_fake_input_worker_recovery_tests_passed": 5,
       "windows_native_ui_build": "passed, zero warnings/errors; separate output directory, not installed",
       "windows_oneclick_checks_passed": 17,
       "windows_layout_checks_passed": 22,

@@ -57,10 +57,14 @@ struct NativeHost<'a> {
 }
 impl NativeHost<'_> {
     fn native_command(&mut self) -> Result<Option<Command>> {
-        let Some(shortcut) = self.capture.command() else { return Ok(None); };
+        let Some(shortcut) = self.capture.command() else {
+            return Ok(None);
+        };
         if shortcut == Shortcut::Stop {
             self.stop.store(true, Ordering::Release);
-            if let Some(reason) = self.capture.failure() { bail!(reason); }
+            if let Some(reason) = self.capture.failure() {
+                bail!(reason);
+            }
         }
         Ok(Some(match shortcut {
             Shortcut::Stop => Command::Stop,
@@ -81,14 +85,21 @@ impl Host for NativeHost<'_> {
         }
         result?;
         if let Some(command) = self.native_command()? {
-            ensure!(self.pending.is_none() || matches!(command, Command::Stop), "native shortcut backlog");
+            ensure!(
+                self.pending.is_none() || matches!(command, Command::Stop),
+                "native shortcut backlog"
+            );
             self.pending = Some(command);
         }
         Ok(())
     }
     fn poll_command(&mut self) -> Result<Option<Command>> {
-        if let Some(command) = self.pending.take() { return Ok(Some(command)); }
-        if let Some(command) = self.native_command()? { return Ok(Some(command)); }
+        if let Some(command) = self.pending.take() {
+            return Ok(Some(command));
+        }
+        if let Some(command) = self.native_command()? {
+            return Ok(Some(command));
+        }
         self.ui.poll_command()
     }
     fn publish(&mut self, status: &SessionStatus) -> Result<()> {

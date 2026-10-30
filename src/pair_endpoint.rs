@@ -591,9 +591,13 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
                     layout_revision,
                     frame,
                 } => self.input(source, owner_epoch, layout_revision, frame)?,
-                Message::Hello(_) | Message::Layout { .. } | Message::LayoutAccepted { .. }
-                | Message::LayoutReady { .. } | Message::SessionReady { .. }
-                | Message::QueryInventory | Message::InventoryDone => {
+                Message::Hello(_)
+                | Message::Layout { .. }
+                | Message::LayoutAccepted { .. }
+                | Message::LayoutReady { .. }
+                | Message::SessionReady { .. }
+                | Message::QueryInventory
+                | Message::InventoryDone => {
                     bail!("pair handshake/layout metadata is not accepted during input")
                 }
             }
