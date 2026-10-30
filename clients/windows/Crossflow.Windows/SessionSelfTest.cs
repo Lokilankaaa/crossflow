@@ -42,12 +42,20 @@ internal static class SessionSelfTest
         Directory.CreateDirectory(directory);
         try
         {
-            string Record(string state, bool ready, string? error = null) => JsonSerializer.Serialize(new { protocol = 1, state, epoch = ulong.MaxValue, capture_ready = ready, error });
+            string Record(string state, bool ready, string? error = null) => JsonSerializer.Serialize(new { protocol = 2, state, epoch = ulong.MaxValue, capture_ready = ready, error, route_enabled = false, focus_device_id = (string?)null, focus_screen_id = (string?)null });
             checks["ulong_epoch_and_nonfatal_error"] = SessionController.ParseStatus(Record("paused", true, "state_changed")).CanArm;
             checks["readiness_gate"] = !SessionController.ParseStatus(Record("paused", false)).CanArm && !SessionController.ParseStatus(Record("connecting", true)).CanArm;
-            foreach (string invalid in new[] { "{}", Record("invented", true), Record("paused", true).Replace("\"protocol\":1", "\"protocol\":2"), new string('x', 4096) })
+            foreach (string invalid in new[] { "{}", Record("invented", true), Record("paused", true).Replace("\"protocol\":2", "\"protocol\":1"), new string('x', 4096) })
             { try { SessionController.ParseStatus(invalid); throw new Exception("invalid status accepted"); } catch (Exception failure) when (failure.Message != "invalid status accepted") { } }
             checks["invalid_status_rejected"] = true;
+            string FocusRecord(string? device, string? screen, bool enabled = true) => JsonSerializer.Serialize(new { protocol = 2, state = "sharing", epoch = 7, capture_ready = true, error = (string?)null, route_enabled = enabled, focus_device_id = device, focus_screen_id = screen });
+            var focused = SessionController.ParseStatus(FocusRecord("local", "local-main"));
+            checks["route_enabled_and_focus_are_distinct_state"] = focused.RouteEnabled && focused.FocusDeviceId == "local" && focused.FocusScreenId == "local-main";
+            checks["focus_may_await_screen_location"] = SessionController.ParseStatus(FocusRecord("local", null)).FocusScreenId is null;
+            checks["legacy_mouse_session_has_no_route_focus"] = !SessionController.ParseStatus(Record("sharing", true)).RouteEnabled && SessionController.ParseStatus(Record("sharing", true)).FocusDeviceId is null;
+            foreach (string invalid in new[] { FocusRecord(null, "screen"), FocusRecord("", null), FocusRecord(new string('界', 43), null), FocusRecord("local\n", null), FocusRecord("local", ""), FocusRecord("local", "screen").Replace("\"route_enabled\":true", "\"route_enabled\":1"), FocusRecord("local", null).Replace("\"focus_screen_id\":null", "\"unknown\":null") })
+            { try { SessionController.ParseStatus(invalid); throw new Exception("invalid focus accepted"); } catch (Exception failure) when (failure.Message != "invalid focus accepted") { } }
+            checks["invalid_focus_or_protocol_fields_rejected"] = true;
             try { SessionController.ValidateEndpoint("example.com:24800"); throw new Exception("DNS accepted"); } catch (InvalidOperationException) { checks["ip_literal_only"] = true; }
             const string peerId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
             var peerRequests = new List<(string Executable, string Directory, string[] Arguments)>();
@@ -176,7 +184,7 @@ internal static class SessionSelfTest
         async Task EmitAsync()
         {
             await gate.WaitAsync();
-            try { await output.WriteLineAsync(JsonSerializer.Serialize(new { protocol = 1, state, epoch, capture_ready = ready, error = errorText })); }
+            try { await output.WriteLineAsync(JsonSerializer.Serialize(new { protocol = 2, state, epoch, capture_ready = ready, error = errorText, route_enabled = false, focus_device_id = (string?)null, focus_screen_id = (string?)null })); }
             finally { gate.Release(); }
         }
         if (mode == "eof") return;

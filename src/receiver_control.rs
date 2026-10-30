@@ -1,6 +1,7 @@
 //! Opt-in private native-client supervision for a dedicated receiver process.
 //! Input events and credentials never use this channel. Pipe threads may block;
 //! only use this runtime in a child process that exits after `finish`.
+use crate::session_metadata::{RoutingState, SharedLayout};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -45,6 +46,11 @@ pub struct Status {
     pub state: &'static str,
     pub listen_endpoint: Option<String>,
     pub error: Option<String>,
+    pub route_enabled: bool,
+    pub input_active: bool,
+    pub focus_device_id: Option<String>,
+    pub focus_screen_id: Option<String>,
+    pub shared_layout: Option<SharedLayout>,
 }
 
 #[derive(Default)]
@@ -55,6 +61,8 @@ struct State {
     finished: bool,
     error: Option<&'static str>,
     startup_rejection: Option<StartupRejection>,
+    shared_layout: Option<SharedLayout>,
+    routing: RoutingState,
 }
 
 #[derive(Clone)]
@@ -72,6 +80,20 @@ impl crate::session::ReceiveObserver for Control {
     }
     fn enabled(&self, enabled: bool) {
         self.set_enabled(enabled);
+    }
+    fn shared_layout(&self, layout: SharedLayout) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.connected && !state.finished {
+            state.shared_layout = Some(layout);
+            state.routing = RoutingState::default();
+        }
+    }
+    fn routing_state(&self, routing: RoutingState, input_active: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.connected && !state.finished {
+            state.routing = routing;
+            state.enabled = input_active;
+        }
     }
 }
 
@@ -102,6 +124,8 @@ impl Control {
             state.connected = connected;
             // Every connection starts paused; a previous remote enable is stale.
             state.enabled = false;
+            state.shared_layout = None;
+            state.routing = RoutingState::default();
         }
     }
 
@@ -159,6 +183,18 @@ impl Control {
 
     pub fn snapshot(&self) -> Status {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let route_enabled = state.connected
+            && if state.shared_layout.is_some() {
+                state.routing.enabled
+            } else {
+                state.enabled
+            };
+        // Arm/Pause and routing status are separate ordered records. During
+        // their short transition retain sharing intent, but never report a
+        // focus inconsistent with the input ownership actually applied.
+        let focus = state.shared_layout.as_ref().filter(|layout| {
+            route_enabled && layout.routing_matches_input(&state.routing, state.enabled)
+        });
         let name = if state.finished {
             if state.startup_rejection.is_some() && state.endpoint.is_none() {
                 "startup_rejected"
@@ -173,16 +209,23 @@ impl Control {
             "starting"
         } else if !state.connected {
             "listening"
-        } else if state.enabled {
+        } else if route_enabled {
             "sharing"
         } else {
             "paused"
         };
         Status {
-            protocol: 1,
+            protocol: 2,
             state: name,
             listen_endpoint: state.endpoint.clone(),
             error: state.error.map(str::to_owned),
+            route_enabled,
+            input_active: state.enabled,
+            focus_device_id: focus
+                .and_then(|layout| layout.focus_device(&state.routing))
+                .map(str::to_owned),
+            focus_screen_id: focus.and(state.routing.focus_screen_id.clone()),
+            shared_layout: state.shared_layout.clone(),
         }
     }
 
@@ -201,6 +244,8 @@ impl Control {
         state.finished = true;
         state.connected = false;
         state.enabled = false;
+        state.shared_layout = None;
+        state.routing = RoutingState::default();
     }
 }
 
@@ -357,6 +402,7 @@ impl Drop for ControlIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::ReceiveObserver;
     use std::{
         io::Cursor,
         sync::{
@@ -364,6 +410,55 @@ mod tests {
             mpsc::{Receiver, Sender, channel},
         },
     };
+
+    #[test]
+    fn routed_status_distinguishes_sharing_intent_from_receiver_input_and_clears_on_disconnect() {
+        let control = Control::new(Arc::new(AtomicBool::new(false)));
+        control.set_listening("127.0.0.1:24800".into());
+        control.set_connected(true);
+        let layout = crate::session_metadata::tests::layout();
+        control.shared_layout(layout.clone());
+        let local = RoutingState {
+            source_epoch: 0,
+            enabled: true,
+            focus_screen_id: Some("win-primary".into()),
+        };
+        control.routing_state(local, false);
+        let status = control.snapshot();
+        assert_eq!(status.protocol, 2);
+        assert_eq!(status.state, "sharing");
+        assert!(status.route_enabled);
+        assert!(!status.input_active);
+        assert_eq!(status.focus_device_id, Some(layout.source_device_id));
+        control.set_enabled(true);
+        assert!(control.snapshot().focus_screen_id.is_none());
+        control.routing_state(
+            RoutingState {
+                source_epoch: 0,
+                enabled: true,
+                focus_screen_id: Some("mac-primary".into()),
+            },
+            true,
+        );
+        assert_eq!(
+            control.snapshot().focus_device_id,
+            Some(layout.receiver_device_id)
+        );
+        control.request_stop();
+        let status = control.snapshot();
+        assert_eq!(status.state, "stopping");
+        assert!(status.input_active);
+        control.set_connected(false);
+        control.set_connected(true);
+        let status = control.snapshot();
+        assert!(!status.route_enabled);
+        assert!(!status.input_active);
+        assert!(status.shared_layout.is_none());
+        assert!(status.focus_device_id.is_none());
+        assert!(status.focus_screen_id.is_none());
+        control.complete(Ok(()));
+        assert_eq!(control.snapshot().state, "stopped");
+    }
 
     #[test]
     fn stop_eof_and_malformed_controls_fail_closed() {

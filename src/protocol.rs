@@ -1,10 +1,10 @@
 use crate::input::{Button, InputAction, QueuedInput, is_keyboard_usage};
 use anyhow::{Result, bail, ensure};
 
-/// Version 3 adds absolute Position, intentionally incompatible with v2.
-/// Both peers must be rebuilt before enabling routed inputs.
+/// Version 4 adds authenticated arrangement/routing records to v3 Position.
+/// Both peers must be rebuilt before enabling routed input sessions.
 pub const FRAME_LEN: usize = 72;
-pub const WIRE_VERSION: u8 = 3;
+pub const WIRE_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -23,6 +23,7 @@ pub enum Kind {
     DisplayOrigin = 12,
     DisplaySize = 13,
     DisplayEnd = 14,
+    RoutingState = 15,
 }
 
 pub fn button_code(button: Button) -> u16 {
@@ -141,6 +142,15 @@ impl Frame {
             "coordinate bound"
         );
         match self.kind {
+            Kind::RoutingState => ensure!(
+                self.code <= 32
+                    && (self.down || self.code == 0)
+                    && self.x == 0.0
+                    && self.y == 0.0
+                    && self.wheel_x == 0
+                    && self.wheel_y == 0,
+                "invalid routing state metadata"
+            ),
             Kind::DisplayQuery => ensure!(
                 self.seq == 1
                     && self.t0_ns == 0
@@ -245,7 +255,7 @@ impl Frame {
         ensure!(&data[..4] == b"CFL0", "invalid header");
         ensure!(
             data[4] == WIRE_VERSION,
-            "unsupported wire version {}; protocol v3 requires both peers to rebuild",
+            "unsupported wire version {}; protocol v4 requires both peers to rebuild",
             data[4]
         );
         ensure!(data.len() == FRAME_LEN, "invalid frame length");
@@ -269,6 +279,7 @@ impl Frame {
             12 => Kind::DisplayOrigin,
             13 => Kind::DisplaySize,
             14 => Kind::DisplayEnd,
+            15 => Kind::RoutingState,
             _ => bail!("unknown frame type"),
         };
         let num = |o| u64::from_be_bytes(data[o..o + 8].try_into().unwrap());
@@ -411,7 +422,7 @@ mod tests {
         .unwrap();
         let bytes = frame.encode().unwrap();
         assert_eq!(bytes.len(), 72);
-        assert_eq!(&bytes[..6], &[b'C', b'F', b'L', b'0', 3, 9]);
+        assert_eq!(&bytes[..6], &[b'C', b'F', b'L', b'0', 4, 9]);
         assert_eq!(&bytes[56..60], &[0, 0xE1, 1, 0]);
         assert_eq!(&bytes[60..72], &[0; 12]);
         for offset in [6, 7, 59, 68, 69, 70, 71] {

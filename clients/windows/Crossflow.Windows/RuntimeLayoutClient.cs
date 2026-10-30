@@ -114,10 +114,17 @@ internal static class RuntimeLayouts
         string snapshot = Path.Combine(DirectoryPath, "session-" + Guid.NewGuid().ToString("N") + ".json");
         // The running child receives its own immutable file, never the editable preset.
         File.WriteAllText(snapshot, json, new UTF8Encoding(false));
-        string preset = Path.Combine(DirectoryPath, config.RemoteDeviceId + ".json");
+        SavePreset(config);
+        return snapshot;
+    }
+    internal static void SavePreset(RuntimeLayoutDocument config, string? directory = null)
+    {
+        directory ??= DirectoryPath;
+        Directory.CreateDirectory(directory);
+        string json = JsonSerializer.Serialize(config, CoreBridge.Json);
+        string preset = Path.Combine(directory, config.RemoteDeviceId + ".json");
         string temporary = preset + "." + Guid.NewGuid().ToString("N") + ".tmp";
         File.WriteAllText(temporary, json, new UTF8Encoding(false));
         File.Move(temporary, preset, true);
-        return snapshot;
     }
 }

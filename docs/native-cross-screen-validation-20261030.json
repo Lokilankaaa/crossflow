@@ -39,6 +39,39 @@
     "Validate the complete current monitor set, not only previously configured bindings",
     "Compare queue connection epoch under the same lock used to commit handoff"
   ],
+  "attended_attempt": {
+    "windows_revision": "85265db9d89d37f4ba3e743cf1ab20f026901632",
+    "mac_build_revision": "f205b71e05f89b76aad9039a91e325fab0440b0b",
+    "mac_permissions_confirmed": true,
+    "native_inventory_seen_in_windows": 3,
+    "user_result": "Cursor did not cross the edge",
+    "source_transport_evidence": "Paused/heartbeat traffic only; no Arm or Position in the stopped session",
+    "receiver_evidence": "Authenticated connection and permissions available; no Arm or Position observed",
+    "geometry_note": "The saved Mac was aligned to the top 956 units of a 2160-unit Windows edge. A direction to use the upper half was imprecise. Physical position during the failed attempt was not recorded.",
+    "acceptance": "not passed; bounded source diagnostics added for a subsequent attended attempt"
+  },
+  "followup_ci": {
+    "revision": "49809c24c4e552490a37630680f14d9c951888fc",
+    "run": "https://github.com/Lokilankaaa/crossflow/actions/runs/41049005553",
+    "conclusion": "success",
+    "note": "This validates the previous wire-v3 source, not the subsequent state synchronization changes."
+  },
+  "session_sync_followup": {
+    "input_wire_version": 4,
+    "native_client_status_protocol": 2,
+    "implementation": "Authenticated session layout and routing focus; one-click initial start; real-device-only workbench; pointer-capture drag fix",
+    "core_unit_tests_passed": 213,
+    "main_tests_passed": 4,
+    "bridge_tests_passed": 7,
+    "encrypted_input_transport_tests_passed": 12,
+    "receiver_process_control_tests_passed": 5,
+    "windows_session_checks_passed": 33,
+    "windows_initial_start_and_drag_state_checks_passed": 17,
+    "windows_layout_checks_passed": 22,
+    "windows_discovery_checks_passed": 35,
+    "clippy_all_targets": "passed; compiler emitted only filesystem hard-link fallback warnings",
+    "physical_acceptance": "pending unified package update; automated checks do not verify visible cursor crossing or actual XAML drag"
+  },
   "not_yet_accepted": [
     "Attended native edge crossing, local input suppression and remote keyboard/click/wheel behavior",
     "Physical Mac keyboard and mouse acting as a source for Windows",

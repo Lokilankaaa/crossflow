@@ -16,6 +16,7 @@ pub struct RoutedInput {
     pub remote_gate: Arc<AtomicBool>,
     pub enabled: bool,
     pub generation: u64,
+    pub routing: Arc<Mutex<crate::session_metadata::RoutingState>>,
     focus: Option<Focus>,
     last_local_native: Option<Point>,
     expected_queue_epoch: u64,
@@ -29,6 +30,7 @@ impl RoutedInput {
             remote_gate: Arc::new(AtomicBool::new(false)),
             enabled: false,
             generation: 0,
+            routing: Arc::new(Mutex::new(crate::session_metadata::RoutingState::default())),
             focus: None,
             last_local_native: None,
             expected_queue_epoch: 0,
@@ -38,13 +40,16 @@ impl RoutedInput {
         let q = self.input.lock().unwrap_or_else(|e| e.into_inner());
         let connected = q.is_connected();
         let changed = q.control_epoch() != self.expected_queue_epoch;
+        let epoch = q.control_epoch();
+        drop(q);
         if changed {
-            self.expected_queue_epoch = q.control_epoch();
+            self.expected_queue_epoch = epoch;
             self.enabled = false;
             self.focus = None;
             self.last_local_native = None;
             self.generation = self.generation.saturating_add(1);
             self.remote_gate.store(false, Ordering::Release);
+            self.publish_routing();
         }
         connected
     }
@@ -54,6 +59,7 @@ impl RoutedInput {
         }
         self.enabled = true;
         self.generation = self.generation.saturating_add(1);
+        self.publish_routing();
         true
     }
     pub fn pause(&mut self) {
@@ -65,6 +71,37 @@ impl RoutedInput {
         let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
         q.pause();
         self.expected_queue_epoch = q.control_epoch();
+        drop(q);
+        self.publish_routing();
+    }
+    fn publish_routing(&self) {
+        let focus = if self.enabled {
+            self.focus.clone().or_else(|| {
+                self.last_local_native
+                    .and_then(|p| self.config.local_focus(p))
+            })
+        } else {
+            None
+        };
+        *self.routing.lock().unwrap_or_else(|e| e.into_inner()) =
+            crate::session_metadata::RoutingState {
+                enabled: self.enabled,
+                focus_screen_id: focus.map(|f| f.screen_id),
+                source_epoch: self.expected_queue_epoch,
+            };
+    }
+    pub fn focus_identity(&self) -> (Option<String>, Option<String>) {
+        let state = self.routing.lock().unwrap_or_else(|e| e.into_inner());
+        let screen = state
+            .focus_screen_id
+            .as_ref()
+            .and_then(|id| self.config.screen(id).ok());
+        match screen {
+            Some(screen) if self.enabled => {
+                (Some(screen.device_id.clone()), Some(screen.id.clone()))
+            }
+            _ => (None, None),
+        }
     }
     pub fn outcome(&mut self, outcome: CaptureOutcome) {
         if matches!(outcome, CaptureOutcome::Paused(_)) {
@@ -111,6 +148,7 @@ impl RoutedInput {
                 }
             };
             let Some(f) = candidate else {
+                self.publish_routing();
                 return Ok(None);
             };
             f
@@ -129,8 +167,10 @@ impl RoutedInput {
             }
             q.pause();
             self.expected_queue_epoch = q.control_epoch();
+            drop(q);
             self.focus = None;
             self.last_local_native = Some(point);
+            self.publish_routing();
             Ok(Some(point))
         } else {
             let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
@@ -161,6 +201,7 @@ impl RoutedInput {
             }
             self.focus = Some(next);
             self.remote_gate.store(true, Ordering::Release);
+            self.publish_routing();
             Ok(None)
         }
     }
@@ -182,6 +223,9 @@ pub fn capture(
     let event_control = control.clone();
     let ready_control = control.clone();
     let status_control = control.clone();
+    let stats_log = log.clone();
+    let mut last_sample = std::time::Instant::now();
+    let mut movement_events = 0u64;
     let result = windows::run_routed_input_capture_with_status(
         move |event| {
             if let CaptureEvent::Stop = event {
@@ -202,7 +246,24 @@ pub fn capture(
                 } = event
                 {
                     let (x, y) = windows::cursor_position().map_err(anyhow::Error::msg)?;
-                    r.movement(Point { x, y }, dx as f64, dy as f64, log.at(captured_at))?
+                    let previous = r.last_local_native;
+                    let before = r.remote_gate.load(Ordering::Acquire);
+                    let warp =
+                        r.movement(Point { x, y }, dx as f64, dy as f64, log.at(captured_at))?;
+                    movement_events += 1;
+                    let after = r.remote_gate.load(Ordering::Acquire);
+                    if before != after
+                        || last_sample.elapsed() >= std::time::Duration::from_millis(500)
+                    {
+                        log.write("route_observation",serde_json::json!({
+                            "movement_events":movement_events,"native_x":x,"native_y":y,"raw_dx":dx,"raw_dy":dy,
+                            "previous_native":previous,"enabled":r.enabled,"remote_focus":after,
+                            "focus_changed":before!=after,
+                            "local_screen":r.config.local_focus(Point{x,y}).map(|f|f.screen_id)
+                        }));
+                        last_sample = std::time::Instant::now();
+                    }
+                    warp
                 } else {
                     let mut q = r.input.lock().unwrap_or_else(|e| e.into_inner());
                     let outcome = match event {
@@ -263,6 +324,9 @@ pub fn capture(
         Some(duration),
     );
     control.request_stop();
+    if let Ok(stats) = &result {
+        stats_log.write("routed_capture_summary",serde_json::json!({"packets":stats.packets,"motion":stats.motion,"absolute":stats.absolute,"device_less":stats.device_less,"malformed":stats.malformed,"read_errors":stats.read_errors,"keys":stats.keyboard,"buttons":stats.buttons,"wheel":stats.wheel}));
+    }
     result.map(|_| ()).map_err(anyhow::Error::msg)
 }
 
@@ -285,8 +349,12 @@ mod tests {
     #[test]
     fn remote_focus_keyboard_and_return_revoke_gate_and_queue() {
         let mut r = routed();
+        assert!(r.routing.lock().unwrap().enabled);
+        assert_eq!(r.focus_identity(), (Some("local".into()), Some("w".into())));
+        assert!(!r.input.lock().unwrap().is_active());
         r.movement(Point { x: 99., y: 50. }, 5., 0., 1).unwrap();
         assert!(r.remote_gate.load(Ordering::Acquire));
+        assert_eq!(r.focus_identity(), (Some("peer".into()), Some("m".into())));
         let mut q = r.input.lock().unwrap();
         assert!(q.is_active());
         q.key(4, true, 2);
@@ -299,6 +367,10 @@ mod tests {
         assert!(!r.remote_gate.load(Ordering::Acquire));
         assert!(!r.input.lock().unwrap().is_active());
         assert!(r.enabled);
+        assert_eq!(r.focus_identity(), (Some("local".into()), Some("w".into())));
+        r.pause();
+        assert!(!r.routing.lock().unwrap().enabled);
+        assert_eq!(r.focus_identity(), (None, None));
     }
     #[test]
     fn reconnect_and_external_queue_failure_never_rearm() {
@@ -312,6 +384,8 @@ mod tests {
         assert!(r.sync());
         assert!(!r.enabled);
         assert!(!r.remote_gate.load(Ordering::Acquire));
+        assert!(!r.routing.lock().unwrap().enabled);
+        assert_eq!(r.focus_identity(), (None, None));
         assert!(!r.enable(r.generation.saturating_sub(1)));
     }
     #[test]
@@ -346,5 +420,27 @@ mod tests {
         r.movement(Point { x: 99., y: 54. }, 5., 2., 2).unwrap();
         let f = r.focus.as_ref().unwrap();
         assert_eq!(f.point, Point { x: 105., y: 54. });
+    }
+    #[test]
+    fn real_three_monitor_layout_only_crosses_the_shared_edge() {
+        let config: RuntimeLayout = serde_json::from_str(r#"{"local_device_id":"local","remote_device_id":"peer","layout":{"screens":[{"id":"primary","device_id":"local","x":0,"y":0,"width":3840,"height":2160},{"id":"portrait","device_id":"local","x":-1440,"y":-89,"width":1440,"height":2560},{"id":"mac","device_id":"peer","x":3840,"y":0,"width":1470,"height":956}]},"bindings":[{"screen_id":"primary","native_id":"primary","native":{"x":0,"y":0,"width":3840,"height":2160}},{"screen_id":"portrait","native_id":"portrait","native":{"x":-1440,"y":-89,"width":1440,"height":2560}},{"screen_id":"mac","native_id":"1","native":{"x":0,"y":0,"width":1470,"height":956}}]}"#).unwrap();
+        for (y, should_cross) in [(500., true), (1000., false), (1600., false)] {
+            let mut r = RoutedInput::new(config.clone()).unwrap();
+            {
+                let mut q = r.input.lock().unwrap();
+                q.seed_physical_held([], []).unwrap();
+                q.begin_session();
+            }
+            r.sync();
+            assert!(r.enable(r.generation));
+            r.movement(Point { x: 3839., y }, 1., 0., 1).unwrap();
+            r.movement(Point { x: 3839., y }, 5., 0., 2).unwrap();
+            assert_eq!(r.remote_gate.load(Ordering::Acquire), should_cross);
+            if should_cross {
+                let back = r.movement(Point { x: 3839., y }, -20., 0., 3).unwrap();
+                assert!(back.is_some());
+                assert!(!r.remote_gate.load(Ordering::Acquire));
+            }
+        }
     }
 }

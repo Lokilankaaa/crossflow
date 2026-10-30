@@ -16,6 +16,7 @@ pub mod screen_runtime;
 pub mod secret_store;
 pub mod security;
 pub mod session;
+pub mod session_metadata;
 pub mod shutdown;
 pub mod state;
 pub mod worker_protocol;

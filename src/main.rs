@@ -285,7 +285,7 @@ fn main() -> Result<()> {
             meta["movement_only"] = json!(runtime_layout.is_none());
             meta["screen_routing"] = json!(runtime_layout.is_some());
             meta["host"] = json!(host);
-            meta["desktop_control_protocol"] = json!(1);
+            meta["desktop_control_protocol"] = json!(2);
             meta["duration_seconds"] = json!(seconds);
             meta["max_hz"] = json!(max_hz);
             meta["peer_route_discovery"] = json!(discover_peer);

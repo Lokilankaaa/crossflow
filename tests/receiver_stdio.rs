@@ -54,6 +54,11 @@ struct Status {
     state: String,
     listen_endpoint: Option<String>,
     error: Option<String>,
+    route_enabled: bool,
+    input_active: bool,
+    focus_device_id: Option<String>,
+    focus_screen_id: Option<String>,
+    shared_layout: Option<crossflow::session_metadata::SharedLayout>,
 }
 
 struct ReceiverProcess {
@@ -102,11 +107,11 @@ impl ReceiverProcess {
                 .spawn(move || {
                     let mut reader = BufReader::new(stdout);
                     loop {
-                        let mut bytes = Vec::with_capacity(2049);
-                        let status = match reader.by_ref().take(2049).read_until(b'\n', &mut bytes)
+                        let mut bytes = Vec::with_capacity(65537);
+                        let status = match reader.by_ref().take(65537).read_until(b'\n', &mut bytes)
                         {
                             Ok(0) => break,
-                            Ok(n) if n <= 2048 && bytes.last() == Some(&b'\n') => {
+                            Ok(n) if n <= 65536 && bytes.last() == Some(&b'\n') => {
                                 serde_json::from_slice::<Status>(&bytes)
                                     .map_err(|_| "invalid receiver status")
                             }
@@ -129,7 +134,14 @@ impl ReceiverProcess {
             .recv_timeout(remaining)
             .context("receiver did not publish expected status")?
             .map_err(anyhow::Error::msg)?;
-        ensure!(status.protocol == 1, "unexpected receiver control protocol");
+        ensure!(status.protocol == 2, "unexpected receiver control protocol");
+        ensure!(
+            status.route_enabled == status.input_active
+                && status.shared_layout.is_none()
+                && status.focus_device_id.is_none()
+                && status.focus_screen_id.is_none(),
+            "non-routed status must reflect only applied input"
+        );
         ensure!(
             matches!(
                 status.state.as_str(),
@@ -337,7 +349,7 @@ impl Wire {
             match receiver.output.try_recv() {
                 Ok(Ok(status)) => {
                     ensure!(
-                        status.protocol == 1 && status.error.is_none(),
+                        status.protocol == 2 && status.error.is_none(),
                         "invalid authenticated receiver status"
                     );
                     ensure!(

@@ -4,6 +4,7 @@ use crate::{
     metrics::Log,
     protocol::{Frame, Kind},
     security::{self, Identity, SecureChannel},
+    session_metadata::{MAX_METADATA_BYTES, PREFIX, RoutingState, SharedLayout},
     state::{Motion, ReceiverState},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -382,19 +383,29 @@ impl Peer {
         self.offset < self.output.len()
     }
     fn queue(&mut self, f: Frame) -> Result<()> {
+        self.queue_plain(&f.encode()?)?;
+        self.counts.queued(f);
+        Ok(())
+    }
+    fn queue_plain(&mut self, plain: &[u8]) -> Result<()> {
         ensure!(!self.pending(), "outbound queue already occupied");
-        let cipher = self.secure.encrypt(&f.encode()?)?;
-        ensure!(cipher.len() <= 2048, "record too large");
+        ensure!(plain.len() <= MAX_METADATA_BYTES, "record too large");
+        let cipher = self.secure.encrypt(plain)?;
         self.output.clear();
         self.output
             .extend_from_slice(&(cipher.len() as u16).to_be_bytes());
         self.output.extend_from_slice(&cipher);
         self.offset = 0;
         self.pending_since = Instant::now();
-        self.counts.queued(f);
         Ok(())
     }
     fn pump(&mut self) -> Result<Vec<(Frame, Instant)>> {
+        self.pump_records()?
+            .into_iter()
+            .map(|(plain, at)| Ok((Frame::decode(&plain)?, at)))
+            .collect()
+    }
+    fn pump_records(&mut self) -> Result<Vec<(Vec<u8>, Instant)>> {
         while self.pending() {
             match self.socket.write(&self.output[self.offset..]) {
                 Ok(0) => bail!("peer disconnected during send"),
@@ -434,7 +445,7 @@ impl Peer {
             let len =
                 u16::from_be_bytes(self.input[consumed..consumed + 2].try_into().unwrap()) as usize;
             ensure!(
-                (16..=2048).contains(&len),
+                (16..=MAX_METADATA_BYTES + 16).contains(&len),
                 "invalid encrypted record length"
             );
             if self.input.len() - consumed < 2 + len {
@@ -443,7 +454,7 @@ impl Peer {
             let plain = self
                 .secure
                 .decrypt(&self.input[consumed + 2..consumed + 2 + len])?;
-            frames.push((Frame::decode(&plain)?, read_completed));
+            frames.push((plain, read_completed));
             consumed += 2 + len;
         }
         self.input.drain(..consumed);
@@ -513,7 +524,10 @@ impl SenderSource {
                 // before the next epoch control (notably initial Pause -> Arm).
                 let pending_control = matches!(
                     peer.counts.pending,
-                    Some((Kind::Arm | Kind::Pause | Kind::Heartbeat | Kind::Stop, _))
+                    Some((
+                        Kind::Arm | Kind::Pause | Kind::Heartbeat | Kind::Stop | Kind::RoutingState,
+                        _
+                    ))
                 );
                 ensure!(
                     !peer.pending() || input.control_epoch() == epoch || pending_control,
@@ -543,7 +557,7 @@ pub fn send(
     stop: Arc<AtomicBool>,
     log: Log,
 ) -> Result<()> {
-    send_source(options, SenderSource::Motion(motion), stop, log, None)
+    send_source(options, SenderSource::Motion(motion), stop, log, None, None)
 }
 
 /// Retry a previously authorized peer using bounded LAN routing hints. Every
@@ -566,6 +580,7 @@ pub fn send_discovered(
         stop,
         log,
         Some(crate::routes::LanRoutes::new(saved)),
+        None,
     )
 }
 
@@ -580,7 +595,7 @@ pub fn send_ordered(
     stop: Arc<AtomicBool>,
     log: Log,
 ) -> Result<()> {
-    send_source(options, SenderSource::Ordered(input), stop, log, None)
+    send_source(options, SenderSource::Ordered(input), stop, log, None, None)
 }
 
 /// Ordered inputs with the same pinned-identity LAN route recovery as movement.
@@ -601,6 +616,43 @@ pub fn send_ordered_discovered(
         stop,
         log,
         Some(crate::routes::LanRoutes::new(saved)),
+        None,
+    )
+}
+
+/// Route metadata describes the same authorized session but cannot arm input.
+#[allow(clippy::too_many_arguments)]
+pub fn send_ordered_routed(
+    options: SendOptions<'_>,
+    input: Arc<Mutex<SourceInputQueue>>,
+    stop: Arc<AtomicBool>,
+    log: Log,
+    layout: crate::screen_runtime::RuntimeLayout,
+    routing: Arc<Mutex<RoutingState>>,
+    discover: bool,
+) -> Result<()> {
+    ensure!(
+        !options.synthetic,
+        "routed metadata requires physical input"
+    );
+    layout.validate()?;
+    let routes = if discover {
+        Some(crate::routes::LanRoutes::new(
+            options
+                .host
+                .parse()
+                .context("saved endpoint must be numeric")?,
+        ))
+    } else {
+        None
+    };
+    send_source(
+        options,
+        SenderSource::Ordered(input),
+        stop,
+        log,
+        routes,
+        Some((layout, routing)),
     )
 }
 
@@ -610,6 +662,10 @@ fn send_source(
     stop: Arc<AtomicBool>,
     log: Log,
     mut routes: Option<crate::routes::LanRoutes>,
+    routed: Option<(
+        crate::screen_runtime::RuntimeLayout,
+        Arc<Mutex<RoutingState>>,
+    )>,
 ) -> Result<()> {
     let SendOptions {
         host,
@@ -628,6 +684,14 @@ fn send_source(
         "seconds must be finite and >0"
     );
     let identity = Identity::load(bundle)?;
+    let shared_layout = routed
+        .as_ref()
+        .map(|(layout, _)| SharedLayout::from_runtime(layout, &identity))
+        .transpose()?;
+    let layout_prelude = shared_layout
+        .as_ref()
+        .map(SharedLayout::encode)
+        .transpose()?;
     let duration =
         Duration::try_from_secs_f64(seconds).context("seconds exceeds duration range")?;
     let end = Instant::now()
@@ -715,6 +779,23 @@ fn send_source(
             trace.phase = "transport";
             peer.summary = Some((log.clone(), trace.clone()));
             connected_once = true;
+            if let Some((_, state)) = &routed {
+                *state.lock().unwrap_or_else(|e| e.into_inner()) = RoutingState::default();
+            }
+            if let Some(prelude) = &layout_prelude {
+                peer.queue_plain(prelude)?;
+                while peer.pending() {
+                    sender_phase_budget(&stop, end, SEND_STALL)?;
+                    // Initial leases may arrive while the paused prelude flushes;
+                    // the next grant remains bounded by the normal 25ms cadence.
+                    for (frame, _) in peer.pump()? {
+                        ensure!(frame.kind == Kind::Lease, "unexpected metadata response");
+                    }
+                    if peer.pending() {
+                        thread::sleep(Duration::from_micros(500));
+                    }
+                }
+            }
             source.connected(true);
             trace.write(
                 &log,
@@ -739,6 +820,7 @@ fn send_source(
             let began = Instant::now();
             let mut synthetic_position = (0.0, 0.0);
             let mut synth_armed = false;
+            let mut sent_routing: Option<RoutingState> = None;
             while !stop.load(Ordering::Relaxed) && Instant::now() < end {
                 for (f, received_at) in source.pump(&mut peer, epoch, &log)? {
                     ensure!(f.kind == Kind::Lease, "receiver sent unexpected frame");
@@ -769,6 +851,11 @@ fn send_source(
                     synthetic_position = pos;
                 }
                 if lease > 0 && !peer.pending() {
+                    // Never take the routing mutex while holding the input lock.
+                    // Busy UI/capture state is skipped, not allowed to block input.
+                    let routing_snapshot = routed
+                        .as_ref()
+                        .and_then(|(_, state)| state.try_lock().ok().map(|s| s.clone()));
                     match &source {
                         SenderSource::Motion(motion) => {
                             // Snapshot and drain under the same lock. A capture after
@@ -846,6 +933,12 @@ fn send_source(
                                 );
                             }
                             let mut captures = 0;
+                            let routing_update = routing_snapshot.as_ref().filter(|state| {
+                                sent_routing.as_ref() != Some(state)
+                                    && shared_layout.as_ref().is_some_and(|layout| {
+                                        layout.routing_matches_source(state, &input)
+                                    })
+                            });
                             let next = if input.control_epoch() != epoch {
                                 // Each arm begins at zero even when captures arrived
                                 // before this control frame. Receiver Arm releases
@@ -855,6 +948,13 @@ fn send_source(
                                 } else {
                                     Kind::Pause
                                 }))
+                            } else if let Some(state) = routing_update {
+                                Some(
+                                    shared_layout
+                                        .as_ref()
+                                        .expect("routed layout")
+                                        .routing_frame(state)?,
+                                )
                             } else if input.is_active() && input.front_action().is_some() {
                                 // Never skip a rate-limited Move to send a later
                                 // button/key/wheel event out of order.
@@ -894,6 +994,9 @@ fn send_source(
                                     frame.t1_ns = now;
                                 }
                                 peer.queue(frame)?;
+                                if frame.kind == Kind::RoutingState {
+                                    sent_routing = routing_update.cloned();
+                                }
                                 match frame.kind {
                                     Kind::Move => {
                                         log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":captures,"lease":lease,"completion":"queued_local"}));
@@ -923,6 +1026,9 @@ fn send_source(
             Ok(())
         })();
         source.connected(false);
+        if let Some((_, state)) = &routed {
+            *state.lock().unwrap_or_else(|e| e.into_inner()) = RoutingState::default();
+        }
         if let Err(e) = attempt {
             trace.write(
                 &log,
@@ -1399,6 +1505,28 @@ pub trait ReceiveObserver: Send + Sync {
     fn listening(&self, address: SocketAddr);
     fn connected(&self, connected: bool);
     fn enabled(&self, enabled: bool);
+    fn shared_layout(&self, _layout: SharedLayout) {}
+    fn routing_state(&self, _state: RoutingState, _input_active: bool) {}
+}
+
+fn publish_receiver_batch(
+    observer: Option<&dyn ReceiveObserver>,
+    routing: Option<RoutingState>,
+    active: bool,
+    reported: &mut bool,
+) {
+    if let Some(routing) = routing {
+        if let Some(observer) = observer {
+            observer.routing_state(routing, active);
+        }
+        *reported = active;
+    }
+    if active != *reported {
+        *reported = active;
+        if let Some(observer) = observer {
+            observer.enabled(active);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1596,6 +1724,7 @@ fn receive_listener_loop(
             let mut last_grant = Instant::now() - LEASE_PERIOD;
             let mut last_input = Instant::now();
             let mut first_sender_frame = true;
+            let mut shared_layout: Option<SharedLayout> = None;
             trace.write(&log, "connected", json!({"peer":address.to_string()}));
             authenticated = true;
             if let Some(observer) = observer {
@@ -1617,28 +1746,80 @@ fn receive_listener_loop(
                     peer.queue(f)?;
                     last_grant = Instant::now();
                 }
-                let frames = peer.pump()?;
-                if !frames.is_empty() {
+                let records = peer.pump_records()?;
+                let record_count = records.len();
+                if !records.is_empty() {
                     last_input = Instant::now();
-                    if first_sender_frame && frames[0].0.kind == Kind::DisplayQuery {
+                }
+                let mut frames = Vec::new();
+                let mut ended = false;
+                let mut latest_routing = None;
+                for (plain, received_at) in records {
+                    if plain.starts_with(PREFIX) {
                         ensure!(
-                            frames.len() == 1 && !peer.pending(),
+                            first_sender_frame && shared_layout.is_none() && frames.is_empty(),
+                            "layout must be the only session prelude"
+                        );
+                        let layout = SharedLayout::decode(
+                            &plain,
+                            &identity.peer_public_key_hex(),
+                            &identity.public_key_hex(),
+                        )?;
+                        if let Some(observer) = observer {
+                            observer.shared_layout(layout.clone());
+                        }
+                        shared_layout = Some(layout);
+                        log.write(
+                            "shared_layout_received",
+                            json!({"screens":shared_layout.as_ref().unwrap().screens.len()}),
+                        );
+                        continue;
+                    }
+                    let frame = Frame::decode(&plain)?;
+                    if first_sender_frame && frame.kind == Kind::DisplayQuery {
+                        ensure!(
+                            shared_layout.is_none() && record_count == 1 && !peer.pending(),
                             "invalid display query batch"
                         );
                         log.write("display_query", json!({}));
                         return serve_display_query(&mut peer, &mut owned, end);
                     }
                     first_sender_frame = false;
-                }
-                let ended = process_received_batch(frames, &mut state, &mut owned, &log)?;
-                // Publish only after the complete batch and adapter operations
-                // succeed. An unsuccessful release must not appear paused.
-                if state.active != reported_enabled {
-                    reported_enabled = state.active;
-                    if let Some(observer) = observer {
-                        observer.enabled(state.active);
+                    ensure!(!ended, "input after Stop in a batch");
+                    if frame.kind == Kind::RoutingState {
+                        let layout = shared_layout
+                            .as_ref()
+                            .context("routing state requires authenticated layout")?;
+                        ended = process_received_batch(
+                            std::mem::take(&mut frames),
+                            &mut state,
+                            &mut owned,
+                            &log,
+                        )?;
+                        ensure!(!ended, "routing metadata after Stop");
+                        state.apply(frame, log.ns())?;
+                        let routing = layout.routing_state(&frame)?;
+                        ensure!(
+                            layout.routing_matches_input(&routing, state.active),
+                            "routing metadata conflicts with applied input state"
+                        );
+                        latest_routing = Some(routing.clone());
+                        log.write("routing_state",json!({"enabled":routing.enabled,"focus_screen_id":routing.focus_screen_id,"seq":frame.seq}));
+                    } else {
+                        frames.push((frame, received_at));
                     }
                 }
+                if !ended {
+                    ended = process_received_batch(frames, &mut state, &mut owned, &log)?;
+                }
+                // Publish only after the complete batch and adapter operations
+                // succeed. An unsuccessful release must not appear paused.
+                publish_receiver_batch(
+                    observer,
+                    latest_routing,
+                    state.active,
+                    &mut reported_enabled,
+                );
                 if ended {
                     return Ok(());
                 }
@@ -1698,6 +1879,128 @@ fn receive_listener_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batched_arm_remote_routing_pause_publishes_final_applied_input_state() {
+        let (writer, path) = logs();
+        let mut state = state(&writer.log);
+        let mut sink = RecordingSink::default();
+        let control = crate::receiver_control::Control::new(Arc::new(AtomicBool::new(false)));
+        control.set_listening("127.0.0.1:24800".into());
+        control.set_connected(true);
+        let layout = crate::session_metadata::tests::layout();
+        control.shared_layout(layout.clone());
+        process_received_batch(
+            vec![frame(Kind::Arm, 1, 0.)],
+            &mut state,
+            &mut sink,
+            &writer.log,
+        )
+        .unwrap();
+        let routing = RoutingState {
+            enabled: true,
+            focus_screen_id: Some("mac-primary".into()),
+            source_epoch: 0,
+        };
+        let mut metadata = layout.routing_frame(&routing).unwrap();
+        metadata.seq = 2;
+        metadata.lease = 1;
+        state.apply(metadata, writer.log.ns()).unwrap();
+        assert!(layout.routing_matches_input(&routing, state.active));
+        process_received_batch(
+            vec![frame(Kind::Pause, 3, 0.)],
+            &mut state,
+            &mut sink,
+            &writer.log,
+        )
+        .unwrap();
+        let mut reported = false;
+        publish_receiver_batch(Some(&control), Some(routing), state.active, &mut reported);
+        let status = control.snapshot();
+        assert!(status.route_enabled);
+        assert!(!status.input_active);
+        assert!(status.focus_screen_id.is_none());
+        assert!(!reported);
+        writer.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "opens localhost sockets; fake input queue only"]
+    fn queued_routing_control_survives_arm_and_pause_but_queued_input_does_not() -> Result<()> {
+        for remote in [false, true] {
+            let (writer, path) = logs();
+            let identities = path.with_extension("identities");
+            security::create_pair(&identities)?;
+            let initiator = Identity::load(&identities.join("windows"))?;
+            let responder = Identity::load(&identities.join("mac"))?;
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let worker = thread::spawn(move || -> Result<Peer> {
+                let (mut socket, _) = listener.accept()?;
+                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let secure = security::handshake(&mut socket, &responder, false)?;
+                Peer::new(socket, secure)
+            });
+            let mut socket = TcpStream::connect(address)?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let secure = security::handshake(&mut socket, &initiator, true)?;
+            let mut sender = Peer::new(socket, secure)?;
+            let mut receiver = worker.join().unwrap()?;
+            let mut queue = SourceInputQueue::new();
+            queue.seed_physical_held([], []).unwrap();
+            queue.begin_session();
+            if remote {
+                assert!(queue.arm());
+            }
+            let epoch = queue.control_epoch();
+            let mut routing = Frame::new(Kind::RoutingState);
+            routing.down = true;
+            routing.code = if remote { 2 } else { 1 };
+            sender.queue(routing)?;
+            if remote {
+                queue.pause();
+            } else {
+                assert!(queue.arm());
+            }
+            let queue = Arc::new(Mutex::new(queue));
+            let source = SenderSource::Ordered(queue.clone());
+            source.pump(&mut sender, epoch, &writer.log)?;
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut received = false;
+            while Instant::now() < end {
+                let frames = receiver.pump()?;
+                if !frames.is_empty() {
+                    ensure!(frames.len() == 1 && frames[0].0.kind == Kind::RoutingState);
+                    received = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            ensure!(received, "routing control did not complete");
+            // Unlike observational metadata, physical events must not flush
+            // across a new arm/pause epoch, even if Noise already consumed a nonce.
+            let epoch = queue.lock().unwrap().control_epoch();
+            sender.queue(Frame::new(Kind::Move))?;
+            {
+                let mut q = queue.lock().unwrap();
+                if q.is_active() {
+                    q.pause();
+                } else {
+                    assert!(q.arm());
+                }
+            }
+            assert!(source.pump(&mut sender, epoch, &writer.log).is_err());
+            drop(source);
+            drop(sender);
+            drop(receiver);
+            writer.finish()?;
+            std::fs::remove_file(path)?;
+            std::fs::remove_dir_all(identities)?;
+        }
+        Ok(())
+    }
     use super::*;
     use crate::metrics::LogWriter;
     use std::time::{SystemTime, UNIX_EPOCH};

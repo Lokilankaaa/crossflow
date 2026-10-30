@@ -32,6 +32,9 @@ pub struct Status {
     epoch: u64,
     capture_ready: bool,
     error: Option<String>,
+    route_enabled: bool,
+    focus_device_id: Option<String>,
+    focus_screen_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -133,9 +136,16 @@ impl Control {
         }
     }
     pub fn snapshot(&self, finished: bool) -> Status {
+        let mut route_enabled = false;
+        let mut focus_device_id = None;
+        let mut focus_screen_id = None;
         let motion = if let Some(route) = &self.routed {
             let mut r = route.lock().unwrap_or_else(|e| e.into_inner());
             let connected = r.sync();
+            if !finished && !self.stop.load(Ordering::Acquire) && connected {
+                route_enabled = r.enabled;
+                (focus_device_id, focus_screen_id) = r.focus_identity();
+            }
             Motion {
                 connected,
                 active: r.enabled,
@@ -169,10 +179,13 @@ impl Control {
             "paused"
         };
         Status {
-            protocol: 1,
+            protocol: 2,
             state,
             epoch: motion.epoch,
             capture_ready: ready,
+            route_enabled,
+            focus_device_id,
+            focus_screen_id,
             error: failure.or_else(|| {
                 self.notice
                     .lock()
@@ -392,17 +405,15 @@ pub fn run(
     let duration = Duration::from_secs_f64(options.seconds);
     let network = thread::spawn(move || {
         if let Some(route) = &network_control.routed {
-            let input = route
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .input
-                .clone();
-            let send = if options.discover_peer {
-                session::send_ordered_discovered
-            } else {
-                session::send_ordered
+            let (input, config, routing) = {
+                let route = route.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    route.input.clone(),
+                    route.config.clone(),
+                    route.routing.clone(),
+                )
             };
-            let result = send(
+            let result = session::send_ordered_routed(
                 session::SendOptions {
                     host: &options.host,
                     bundle: &options.identity,
@@ -413,6 +424,9 @@ pub fn run(
                 input,
                 network_control.stop.clone(),
                 network_log,
+                config,
+                routing,
+                options.discover_peer,
             );
             network_control.network_finished(result);
             return;

@@ -6,8 +6,10 @@ use crossflow::{
     input::{Button, CaptureOutcome, SourceInputQueue},
     metrics::{Log, LogWriter},
     protocol::{Frame, Kind, button_code},
+    receiver_control::Control,
     security::{self, Identity, SecureChannel},
     session::{self, MouseSink, SendOptions},
+    session_metadata::{RoutingState, SharedLayout, SharedScreen},
 };
 use serde_json::json;
 use std::{
@@ -115,6 +117,7 @@ struct Harness {
     fail_move: Arc<AtomicBool>,
     fail_key_release: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<()>>>,
+    control: Control,
 }
 impl Harness {
     fn start(label: &str) -> Result<Self> {
@@ -138,6 +141,9 @@ impl Harness {
         let stop = Arc::new(AtomicBool::new(false));
         let fail_move = Arc::new(AtomicBool::new(false));
         let fail_key_release = Arc::new(AtomicBool::new(false));
+        let control = Control::new(stop.clone());
+        let worker_control = control.clone();
+        let worker_stop = stop.clone();
         let mut sink = RecordingSink {
             events: events.clone(),
             stop: stop.clone(),
@@ -148,12 +154,15 @@ impl Harness {
         let identity = fixture.0.join("identities/mac");
         drop(reservation);
         let worker = thread::spawn(move || {
-            let result = session::receive(
+            let result = session::receive_observed(
                 &worker_address,
                 &identity,
                 &mut sink,
                 writer.log.clone(),
                 3.0,
+                &worker_stop,
+                None,
+                Some(&worker_control),
             );
             writer.finish()?;
             result
@@ -166,6 +175,7 @@ impl Harness {
             fail_move,
             fail_key_release,
             worker: Some(worker),
+            control,
         })
     }
     fn connect(&self) -> Result<Wire> {
@@ -321,7 +331,10 @@ impl Wire {
         if frame.lease == 0 {
             frame.lease = self.lease;
         }
-        let encrypted = self.secure.encrypt(&frame.encode()?)?;
+        self.send_plain(&frame.encode()?)
+    }
+    fn send_plain(&mut self, plain: &[u8]) -> Result<()> {
+        let encrypted = self.secure.encrypt(plain)?;
         let mut record = Vec::with_capacity(encrypted.len() + 2);
         record.extend_from_slice(&(encrypted.len() as u16).to_be_bytes());
         record.extend_from_slice(&encrypted);
@@ -480,6 +493,12 @@ struct OrderedSender {
 }
 impl OrderedSender {
     fn start(harness: &Harness) -> Result<Self> {
+        Self::start_with_routing(harness, None)
+    }
+    fn start_with_routing(
+        harness: &Harness,
+        routing: Option<Arc<Mutex<RoutingState>>>,
+    ) -> Result<Self> {
         let writer = LogWriter::new(
             &harness.fixture.0.join("ordered-sender.jsonl"),
             json!({"test":"ordered_input_transport","actual_os_input":false}),
@@ -496,19 +515,60 @@ impl OrderedSender {
             harness.address.clone(),
             harness.fixture.0.join("identities/windows"),
         );
+        let shared = shared_layout(harness)?;
+        let runtime = crossflow::screen_runtime::RuntimeLayout {
+            layout: crossflow::arrangement::Layout::new(
+                shared
+                    .screens
+                    .iter()
+                    .map(|s| crossflow::arrangement::Screen {
+                        id: s.id.clone(),
+                        device_id: s.device_id.clone(),
+                        x: s.x,
+                        y: s.y,
+                        width: s.width,
+                        height: s.height,
+                    })
+                    .collect(),
+            )?,
+            local_device_id: shared.source_device_id,
+            remote_device_id: shared.receiver_device_id,
+            bindings: shared
+                .screens
+                .iter()
+                .map(|s| crossflow::screen_runtime::Binding {
+                    screen_id: s.id.clone(),
+                    native_id: s.native_id.clone(),
+                    native: crossflow::screen_runtime::NativeRect {
+                        x: 0.,
+                        y: 0.,
+                        width: s.width,
+                        height: s.height,
+                    },
+                })
+                .collect(),
+        };
         let worker = thread::spawn(move || {
-            let result = session::send_ordered(
-                SendOptions {
-                    host: &host,
-                    bundle: &bundle,
-                    seconds: 4.0,
-                    max_hz: 1000,
-                    synthetic: false,
-                },
-                thread_queue,
-                thread_stop,
-                writer.log.clone(),
-            );
+            let options = SendOptions {
+                host: &host,
+                bundle: &bundle,
+                seconds: 4.0,
+                max_hz: 1000,
+                synthetic: false,
+            };
+            let result = if let Some(routing) = routing {
+                session::send_ordered_routed(
+                    options,
+                    thread_queue,
+                    thread_stop,
+                    writer.log.clone(),
+                    runtime,
+                    routing,
+                    false,
+                )
+            } else {
+                session::send_ordered(options, thread_queue, thread_stop, writer.log.clone())
+            };
             writer.finish()?;
             result
         });
@@ -873,5 +933,233 @@ fn invalid_lease_down_is_not_injected_and_stale_up_triggers_cleanup() -> Result<
         4,
         "stale Up plus cleanup must not duplicate release"
     );
+    Ok(())
+}
+
+fn shared_layout(harness: &Harness) -> Result<SharedLayout> {
+    let identity = Identity::load(&harness.fixture.0.join("identities/windows"))?;
+    let source = identity.public_key_hex();
+    let receiver = identity.peer_public_key_hex();
+    Ok(SharedLayout {
+        schema: 1,
+        source_device_id: source.clone(),
+        receiver_device_id: receiver.clone(),
+        screens: vec![
+            SharedScreen {
+                id: "win-1".into(),
+                device_id: source.clone(),
+                native_id: "DISPLAY1".into(),
+                x: 0.,
+                y: 0.,
+                width: 1920.,
+                height: 1080.,
+            },
+            SharedScreen {
+                id: "win-2".into(),
+                device_id: source,
+                native_id: "DISPLAY2".into(),
+                x: -1920.,
+                y: 0.,
+                width: 1920.,
+                height: 1080.,
+            },
+            SharedScreen {
+                id: "mac-1".into(),
+                device_id: receiver,
+                native_id: "7".into(),
+                x: 1920.,
+                y: 0.,
+                width: 1470.,
+                height: 956.,
+            },
+        ],
+    })
+}
+fn routing(layout: &SharedLayout, id: Option<&str>) -> Frame {
+    layout
+        .routing_frame(&RoutingState {
+            enabled: id.is_some(),
+            focus_screen_id: id.map(str::to_owned),
+            source_epoch: 0,
+        })
+        .unwrap()
+}
+fn status_until(
+    harness: &Harness,
+    predicate: impl Fn(&crossflow::receiver_control::Status) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(700);
+    while !predicate(&harness.control.snapshot()) {
+        ensure!(
+            Instant::now() < deadline,
+            "status condition not observed: {:?}",
+            harness.control.snapshot()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "opens encrypted localhost sockets; fake adapter only"]
+fn authenticated_layout_and_routing_share_local_focus_without_arming_and_reset_on_reconnect()
+-> Result<()> {
+    let mut harness = Harness::start("shared-layout")?;
+    let layout = shared_layout(&harness)?;
+    let mut wire = harness.connect()?;
+    wire.send_plain(&layout.encode()?)?;
+    wire.fresh_lease()?;
+    wire.send(routing(&layout, Some("win-2")))?;
+    status_until(&harness, |s| {
+        s.state == "sharing" && !s.input_active && s.focus_screen_id.as_deref() == Some("win-2")
+    })?;
+    assert_eq!(
+        harness.control.snapshot().shared_layout.as_ref(),
+        Some(&layout)
+    );
+    assert_eq!(
+        harness.control.snapshot().focus_device_id.as_ref(),
+        Some(&layout.source_device_id)
+    );
+    assert!(
+        harness.observed().is_empty(),
+        "routing status must never inject input"
+    );
+    wire.arm()?;
+    wire.send(routing(&layout, Some("mac-1")))?;
+    wire.send(key(0x04, true))?;
+    harness.until(|events| events.contains(&Event::Key(0x04, true)))?;
+    status_until(&harness, |s| {
+        s.input_active && s.focus_device_id.as_ref() == Some(&layout.receiver_device_id)
+    })?;
+    wire.send(Frame::new(Kind::Pause))?;
+    wire.send(routing(&layout, Some("win-1")))?;
+    status_until(&harness, |s| {
+        s.state == "sharing" && !s.input_active && s.focus_screen_id.as_deref() == Some("win-1")
+    })?;
+    harness.until(|events| events.contains(&Event::Key(0x04, false)))?;
+    drop(wire);
+    status_until(&harness, |s| {
+        s.state == "listening"
+            && !s.route_enabled
+            && !s.input_active
+            && s.shared_layout.is_none()
+            && s.focus_screen_id.is_none()
+    })?;
+    let mut reconnected = harness.connect()?;
+    reconnected.fresh_lease()?;
+    status_until(&harness, |s| {
+        s.state == "paused" && s.shared_layout.is_none() && !s.route_enabled
+    })?;
+    drop(reconnected);
+    harness.finish()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "opens encrypted localhost sockets; fake adapter only"]
+fn malformed_or_unbound_shared_metadata_closes_connection_without_input() -> Result<()> {
+    let mut harness = Harness::start("bad-shared-layout")?;
+    let layout = shared_layout(&harness)?;
+    // A routing frame cannot replace its authenticated arrangement prelude.
+    let mut wire = harness.connect()?;
+    wire.fresh_lease()?;
+    wire.send(routing(&layout, Some("win-1")))?;
+    wire.closed()?;
+    drop(wire);
+    // Valid JSON with the opposite device perspective must not be accepted.
+    let mut wire = harness.connect()?;
+    let mut bad = layout.clone();
+    std::mem::swap(&mut bad.source_device_id, &mut bad.receiver_device_id);
+    wire.send_plain(&bad.encode()?)?;
+    wire.closed()?;
+    drop(wire);
+    // An otherwise valid frame index outside this layout also fails closed.
+    let mut wire = harness.connect()?;
+    wire.send_plain(&layout.encode()?)?;
+    wire.fresh_lease()?;
+    let mut bad = routing(&layout, Some("win-1"));
+    bad.code = 32;
+    wire.send(bad)?;
+    wire.closed()?;
+    drop(wire);
+    // A duplicate prelude is forbidden even before the first input frame.
+    let mut wire = harness.connect()?;
+    wire.send_plain(&layout.encode()?)?;
+    wire.send_plain(&layout.encode()?)?;
+    wire.closed()?;
+    drop(wire);
+    harness.finish()?;
+    assert!(harness.observed().is_empty());
+    assert!(!harness.control.snapshot().input_active);
+    Ok(())
+}
+
+#[test]
+#[ignore = "opens encrypted localhost sockets; fake adapter only"]
+fn ordered_routed_sender_publishes_layout_focus_and_pause_without_arming_from_metadata()
+-> Result<()> {
+    let mut harness = Harness::start("routed-sender")?;
+    let routing = Arc::new(Mutex::new(RoutingState {
+        enabled: true,
+        focus_screen_id: Some("mac-1".into()),
+        source_epoch: 0,
+    }));
+    let mut sender = OrderedSender::start_with_routing(&harness, Some(routing.clone()))?;
+    sender.until_connected()?;
+    status_until(&harness, |s| {
+        s.shared_layout.is_some() && !s.route_enabled && !s.input_active
+    })?;
+    assert!(
+        !routing.lock().unwrap().enabled,
+        "connection must erase stale sharing intent"
+    );
+    let epoch = sender.queue.lock().unwrap().control_epoch();
+    *routing.lock().unwrap() = RoutingState {
+        enabled: true,
+        focus_screen_id: Some("win-1".into()),
+        source_epoch: epoch,
+    };
+    status_until(&harness, |s| {
+        s.state == "sharing" && !s.input_active && s.focus_screen_id.as_deref() == Some("win-1")
+    })?;
+    let remote_epoch = {
+        let mut q = sender.queue.lock().unwrap();
+        assert!(q.arm());
+        q.control_epoch()
+    };
+    *routing.lock().unwrap() = RoutingState {
+        enabled: true,
+        focus_screen_id: Some("mac-1".into()),
+        source_epoch: remote_epoch,
+    };
+    status_until(&harness, |s| {
+        s.input_active && s.focus_screen_id.as_deref() == Some("mac-1")
+    })?;
+    let local_epoch = {
+        let mut q = sender.queue.lock().unwrap();
+        q.pause();
+        q.control_epoch()
+    };
+    *routing.lock().unwrap() = RoutingState {
+        enabled: true,
+        focus_screen_id: Some("win-2".into()),
+        source_epoch: local_epoch,
+    };
+    status_until(&harness, |s| {
+        s.route_enabled && !s.input_active && s.focus_screen_id.as_deref() == Some("win-2")
+    })?;
+    *routing.lock().unwrap() = RoutingState {
+        source_epoch: local_epoch,
+        ..RoutingState::default()
+    };
+    status_until(&harness, |s| {
+        s.state == "paused" && !s.route_enabled && !s.input_active && s.focus_screen_id.is_none()
+    })?;
+    sender.finish()?;
+    assert!(!routing.lock().unwrap().enabled);
+    status_until(&harness, |s| s.shared_layout.is_none() && !s.input_active)?;
+    harness.finish()?;
+    assert!(harness.observed().is_empty());
     Ok(())
 }

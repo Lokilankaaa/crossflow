@@ -8,7 +8,7 @@ namespace Crossflow.Windows;
 internal static class DiscoverySelfTest
 {
     private const string Valid = """
-        {"state":"browsing","candidates":[{"device_id":"0123456789abcdef0123456789abcdef","friendly_name":"测试 Mac","platform":"macos","protocol":2,"compatible":true,"trusted":false,"addresses":["192.168.1.2:24800","[fe80::123%7]:24800"]}],"capacity_limited":false,"error":null}
+        {"state":"browsing","candidates":[{"device_id":"0123456789abcdef0123456789abcdef","friendly_name":"测试 Mac","platform":"macos","protocol":4,"compatible":true,"trusted":false,"addresses":["192.168.1.2:24800","[fe80::123%7]:24800"]}],"capacity_limited":false,"error":null}
         """;
 
     internal static async Task FixtureAsync(string mode)

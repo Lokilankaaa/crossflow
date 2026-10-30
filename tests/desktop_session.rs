@@ -173,6 +173,9 @@ impl Drop for ReceiverWorker {
 #[derive(Debug, Deserialize)]
 struct Status {
     protocol: u8,
+    route_enabled: bool,
+    focus_device_id: Option<String>,
+    focus_screen_id: Option<String>,
     state: String,
     epoch: u64,
     capture_ready: bool,
@@ -301,7 +304,13 @@ impl DesktopProcess {
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .with_context(|| format!("waiting for {label}; inspect child.stderr.txt"))?
                 .map_err(anyhow::Error::msg)?;
-            ensure!(status.protocol == 1, "unexpected control protocol");
+            ensure!(status.protocol == 2, "unexpected control protocol");
+            ensure!(
+                !status.route_enabled
+                    && status.focus_device_id.is_none()
+                    && status.focus_screen_id.is_none(),
+                "movement-only source must not claim routing focus"
+            );
             if predicate(&status) {
                 return Ok(status);
             }

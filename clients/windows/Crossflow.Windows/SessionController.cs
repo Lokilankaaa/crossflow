@@ -6,7 +6,8 @@ using System.Text.Json;
 namespace Crossflow.Windows;
 
 internal sealed record SessionSnapshot(string State, ulong Epoch, bool CaptureReady, string? Error,
-    long Generation, bool ProcessRunning, bool CommandPending = false, bool StopRequested = false)
+    long Generation, bool ProcessRunning, bool CommandPending = false, bool StopRequested = false,
+    bool RouteEnabled = false, string? FocusDeviceId = null, string? FocusScreenId = null)
 {
     internal bool CanArm => ProcessRunning && State == "paused" && CaptureReady && !CommandPending && !StopRequested;
 }
@@ -25,6 +26,7 @@ internal sealed class SessionController
     internal SessionSnapshot Snapshot { get { lock (sync) return snapshot; } }
     internal string? LastLogPath { get; private set; }
     internal bool IsRouted { get; private set; }
+    internal bool IsStartPending { get { lock (sync) return current is { } run && (run.StartOnInitialReady || run.InitialArmEpoch is not null); } }
 
     internal SessionController() { }
     // Test-only factory never participates in the production constructor.
@@ -44,7 +46,11 @@ internal sealed class SessionController
         internal bool SawStopped;
         internal string? Failure;
         internal ulong? PendingEpoch;
+        internal bool StartOnInitialReady;
+        internal bool SawInitialConnection;
+        internal ulong? InitialArmEpoch;
         internal Task Completion = Task.CompletedTask;
+        internal void CancelInitialStart() { StartOnInitialReady = false; InitialArmEpoch = null; }
     }
 
     internal static string ValidateEndpoint(string text)
@@ -63,8 +69,16 @@ internal sealed class SessionController
         await ConnectCoreAsync(log => fixture?.Invoke(host, identity, log) ?? PackagedStart(host, identity, log), logDirectory);
     }
 
-    internal async Task ConnectPeerAsync(string peerId, string? logDirectory = null, string? runtimeLayoutPath = null)
+    internal Task ConnectPeerAsync(string peerId, string? logDirectory = null, string? runtimeLayoutPath = null)
+        => ConnectPeerCoreAsync(peerId, logDirectory, runtimeLayoutPath, false);
+
+    /// One explicit user action authorizes one first-ready arm, never a reconnect.
+    internal Task StartRoutedAsync(string peerId, string runtimeLayoutPath, string? logDirectory = null)
+        => ConnectPeerCoreAsync(peerId, logDirectory, runtimeLayoutPath, true);
+
+    private async Task ConnectPeerCoreAsync(string peerId, string? logDirectory, string? runtimeLayoutPath, bool startOnInitialReady)
     {
+        if (startOnInitialReady && string.IsNullOrWhiteSpace(runtimeLayoutPath)) throw new InvalidOperationException("请先读取并排列屏幕。");
         if (peerId is null || peerId.Length != 64 || peerId.Any(value => !(value is >= '0' and <= '9' or >= 'a' and <= 'f')))
             throw new InvalidOperationException("已配对设备标识无效，请刷新设备列表后重试。");
         if (runtimeLayoutPath is not null)
@@ -77,11 +91,11 @@ internal sealed class SessionController
             var info = PackagedInfo(["desktop-send", "--peer", peerId, "--log", log, "--seconds", "3600", "--max-hz", "1000"]);
             if (runtimeLayoutPath is not null) { info.ArgumentList.Add("--runtime-layout"); info.ArgumentList.Add(runtimeLayoutPath); }
             return peerFixture?.Invoke(info) ?? RequirePackaged(info);
-        }, logDirectory, runtimeLayoutPath is not null);
+        }, logDirectory, runtimeLayoutPath is not null, startOnInitialReady);
     }
 
     // Both production entry points share process ownership, pipes and supervision.
-    private async Task ConnectCoreAsync(Func<string, ProcessStartInfo> start, string? logDirectory, bool routed = false)
+    private async Task ConnectCoreAsync(Func<string, ProcessStartInfo> start, string? logDirectory, bool routed = false, bool startOnInitialReady = false)
     {
         await commands.WaitAsync();
         try
@@ -101,6 +115,7 @@ internal sealed class SessionController
             lock (sync)
             {
                 run = new Run(process, ++generation);
+                run.StartOnInitialReady = startOnInitialReady;
                 current = run;
                 IsRouted = routed;
                 snapshot = new("starting", 0, false, null, generation, true);
@@ -117,7 +132,7 @@ internal sealed class SessionController
             }
             catch
             {
-                lock (sync) { if (current == run) { current = null; snapshot = snapshot with { State = "error", Error = "共享内核无法启动，请检查客户端安装。", ProcessRunning = false }; } }
+                lock (sync) { if (current == run) { current = null; snapshot = snapshot with { State = "error", Error = "共享内核无法启动，请检查客户端安装。", ProcessRunning = false, RouteEnabled = false, FocusDeviceId = null, FocusScreenId = null }; } }
                 process.Dispose(); run.Lifetime.Dispose(); Publish(); throw;
             }
         }
@@ -145,6 +160,7 @@ internal sealed class SessionController
     internal Task PauseAsync() => CommandAsync("pause");
     private async Task CommandAsync(string op)
     {
+        CancelPendingStart();
         await commands.WaitAsync();
         try
         {
@@ -167,6 +183,7 @@ internal sealed class SessionController
 
     internal async Task<bool> StopAsync()
     {
+        CancelPendingStart();
         await commands.WaitAsync();
         try
         {
@@ -190,7 +207,7 @@ internal sealed class SessionController
             {
                 if (current == run)
                 {
-                    snapshot = snapshot with { State = "error", Error = run.Failure ?? "共享内核已结束，退出确认未完整返回。", CaptureReady = false, ProcessRunning = false, CommandPending = false, StopRequested = false };
+                    snapshot = snapshot with { State = "error", Error = run.Failure ?? "共享内核已结束，退出确认未完整返回。", CaptureReady = false, ProcessRunning = false, CommandPending = false, StopRequested = false, RouteEnabled = false, FocusDeviceId = null, FocusScreenId = null };
                     current = null;
                 }
             }
@@ -213,6 +230,7 @@ internal sealed class SessionController
 
     private async Task RequestStopAsync(Run run)
     {
+        lock (sync) run.CancelInitialStart();
         if (Interlocked.Exchange(ref run.StopRequested, 1) != 0) return;
         lock (sync) if (current == run) snapshot = snapshot with { StopRequested = true, CommandPending = true };
         Publish();
@@ -237,7 +255,8 @@ internal sealed class SessionController
         {
             if (current != run) return;
             run.Failure ??= message;
-            snapshot = snapshot with { State = "error", CaptureReady = false, Error = run.Failure };
+            run.CancelInitialStart();
+            snapshot = snapshot with { State = "error", CaptureReady = false, Error = run.Failure, RouteEnabled = false, FocusDeviceId = null, FocusScreenId = null };
         }
         Publish();
     }
@@ -259,7 +278,7 @@ internal sealed class SessionController
             {
                 if (current != run) return;
                 string? error = run.Failure ?? (run.Process.ExitCode != 0 ? "共享内核异常退出，请检查配对与网络后重试。" : !run.SawStopped ? "共享内核提前结束，未收到停止确认。" : null);
-                snapshot = snapshot with { State = error is null ? "stopped" : "error", CaptureReady = false, Error = error, ProcessRunning = false, CommandPending = false, StopRequested = false };
+                snapshot = snapshot with { State = error is null ? "stopped" : "error", CaptureReady = false, Error = error, ProcessRunning = false, CommandPending = false, StopRequested = false, RouteEnabled = false, FocusDeviceId = null, FocusScreenId = null };
                 current = null;
             }
         }
@@ -333,9 +352,9 @@ internal sealed class SessionController
         if (Encoding.UTF8.GetByteCount(line) >= 4096) throw new InvalidDataException();
         using var document = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = 8 });
         var value = document.RootElement;
-        if (value.ValueKind != JsonValueKind.Object || value.EnumerateObject().Count() != 5 ||
-            value.EnumerateObject().Select(property => property.Name).Distinct().Count() != 5) throw new InvalidDataException();
-        if (value.GetProperty("protocol").GetInt32() != 1) throw new InvalidDataException();
+        if (value.ValueKind != JsonValueKind.Object || value.EnumerateObject().Count() != 8 ||
+            value.EnumerateObject().Select(property => property.Name).Distinct().Count() != 8) throw new InvalidDataException();
+        if (value.GetProperty("protocol").GetInt32() != 2) throw new InvalidDataException();
         string? state = value.GetProperty("state").GetString();
         if (state is not ("starting" or "connecting" or "paused" or "sharing" or "stopping" or "stopped" or "error")) throw new InvalidDataException();
         ulong epoch = value.GetProperty("epoch").GetUInt64();
@@ -344,24 +363,82 @@ internal sealed class SessionController
         if (error.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)) throw new InvalidDataException();
         string? errorText = error.GetString();
         if (errorText?.Length > 512) throw new InvalidDataException();
-        return new(state, epoch, ready, errorText, 0, true);
+        bool routeEnabled = value.GetProperty("route_enabled").GetBoolean();
+        string? FocusId(string field)
+        {
+            var item = value.GetProperty(field);
+            if (item.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)) throw new InvalidDataException();
+            string? id = item.GetString();
+            if (id is not null && (id.Length == 0 || Encoding.UTF8.GetByteCount(id) > 128 || id.Any(char.IsControl))) throw new InvalidDataException();
+            return id;
+        }
+        string? focusDevice = FocusId("focus_device_id"), focusScreen = FocusId("focus_screen_id");
+        if (focusScreen is not null && focusDevice is null) throw new InvalidDataException();
+        return new(state, epoch, ready, errorText, 0, true, RouteEnabled: routeEnabled, FocusDeviceId: focusDevice, FocusScreenId: focusScreen);
     }
 
     private void ApplyStatus(Run run, SessionSnapshot status)
     {
         bool fatal;
+        ulong? initialArm = null;
         lock (sync)
         {
             if (current != run || run.Generation != generation) return;
             Interlocked.Exchange(ref run.LastStatus, Stopwatch.GetTimestamp());
             run.SawStopped |= status.State == "stopped";
             fatal = status.State == "error";
+            if (run.StopRequested != 0 || run.Failure is not null || status.Error is not null || status.State is "sharing" or "stopping" or "stopped" or "error")
+                run.CancelInitialStart();
+            else if (run.StartOnInitialReady)
+            {
+                if (status.State == "paused")
+                {
+                    run.SawInitialConnection = true;
+                    if (status.CaptureReady)
+                    {
+                        run.StartOnInitialReady = false;
+                        run.InitialArmEpoch = initialArm = status.Epoch;
+                    }
+                }
+                else if (run.SawInitialConnection && status.State is "starting" or "connecting") run.CancelInitialStart();
+            }
+            else if (run.InitialArmEpoch is ulong scheduled && (status.State != "paused" || status.Epoch != scheduled))
+                run.CancelInitialStart();
             if (run.PendingEpoch is ulong pending && (status.Epoch > pending || status.Error is not null || status.State is "error" or "stopping" or "stopped"))
                 run.PendingEpoch = null;
             if (run.Failure is null) snapshot = status with { Generation = run.Generation, StopRequested = run.StopRequested != 0, CommandPending = run.PendingEpoch is not null || run.StopRequested != 0 };
         }
         Publish();
+        if (initialArm is ulong epoch) _ = ArmInitialReadyAsync(run, epoch);
         if (fatal) _ = FailAndStopAsync(run, status.Error is { Length: > 0 } reason ? "共享内核报告：" + reason : "共享内核报告错误，连接已停止。");
+    }
+
+    internal void CancelPendingStart()
+    {
+        lock (sync) current?.CancelInitialStart();
+    }
+
+    private async Task ArmInitialReadyAsync(Run run, ulong epoch)
+    {
+        await commands.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (sync)
+            {
+                if (current != run || run.Generation != generation || run.InitialArmEpoch != epoch || run.StopRequested != 0 ||
+                    run.Failure is not null || !snapshot.CanArm || snapshot.Epoch != epoch)
+                { run.CancelInitialStart(); return; }
+                // Consume before writing. Repeated ready snapshots, rejection,
+                // disconnect and reconnection cannot retry this user intention.
+                run.CancelInitialStart();
+                run.PendingEpoch = epoch;
+                snapshot = snapshot with { CommandPending = true };
+            }
+            Publish();
+            try { await WriteAsync(run, JsonSerializer.Serialize(new { op = "arm", epoch })).ConfigureAwait(false); }
+            catch { await FailAndStopAsync(run, "开启命令未能送达，共享已停止；请重新开启。").ConfigureAwait(false); }
+        }
+        finally { commands.Release(); }
     }
 
     private void Publish()

@@ -17,6 +17,27 @@ internal static class RuntimeLayoutSelfTest
             var local = DisplayClient.Parse(Encoding.UTF8.GetBytes("[{\"id\":\"left\",\"x\":-1920,\"y\":-200,\"width\":1920,\"height\":1080},{\"id\":\"right\",\"x\":0,\"y\":0,\"width\":2560,\"height\":1440}]"));
             var remote = DisplayClient.Parse(Encoding.UTF8.GetBytes("[{\"id\":\"1\",\"x\":0,\"y\":0,\"width\":1470,\"height\":956},{\"id\":\"2\",\"x\":1470,\"y\":-300,\"width\":1920,\"height\":1080}]"));
             var config = RuntimeLayouts.Create(peerId, local, remote);
+            var history = new LayoutEditHistory();
+            var historyMoved = new LayoutDocument(config.Layout.Screens.Select(s => s with { Y = s.Y + 100 }).ToList());
+            history.Record(config.Layout);
+            checks["history_undo_preserves_native_screen_identity"] = history.Peek(false)!.Screens.SequenceEqual(config.Layout.Screens);
+            history.Complete(false, historyMoved);
+            checks["history_redo_recovers_edited_positions"] = history.CanRedo && history.Peek(true)!.Screens.SequenceEqual(historyMoved.Screens) && !history.CanUndo;
+            history.Complete(true, config.Layout);
+            checks["history_redo_restores_undo"] = history.CanUndo && !history.CanRedo;
+            history.Complete(false, historyMoved); history.Record(config.Layout);
+            checks["new_edit_discards_redo_branch"] = history.CanUndo && !history.CanRedo;
+            history.Clear();
+            checks["topology_refresh_discards_history"] = !history.CanUndo && !history.CanRedo;
+            string presetDirectory = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output))!, "layout-preset-" + Guid.NewGuid().ToString("N"));
+            var savedEdit = RuntimeLayouts.WithLayout(config, historyMoved);
+            CoreBridge.Validate(savedEdit.Layout);
+            RuntimeLayouts.SavePreset(savedEdit, presetDirectory);
+            var loadedPreset = JsonSerializer.Deserialize<RuntimeLayoutDocument>(File.ReadAllText(Path.Combine(presetDirectory, peerId + ".json")), CoreBridge.Json)!;
+            checks["edit_saves_paired_preset_without_session_snapshot"] = RuntimeLayouts.SameInventory(config, loadedPreset) && loadedPreset.Layout.Screens.SequenceEqual(historyMoved.Screens) && Directory.GetFiles(presetDirectory).Length == 1;
+            bool saveFailed = false;
+            try { RuntimeLayouts.SavePreset(config, Path.Combine(presetDirectory, peerId + ".json")); } catch (IOException) { saveFailed = true; }
+            checks["failed_save_does_not_replace_valid_preset"] = saveFailed && JsonSerializer.Deserialize<RuntimeLayoutDocument>(File.ReadAllText(Path.Combine(presetDirectory, peerId + ".json")), CoreBridge.Json)!.Layout.Screens.SequenceEqual(historyMoved.Screens);
             CoreBridge.Validate(config.Layout);
             var left = config.Layout.Screens.Single(x => x.DeviceId == "local" && x.X < 0);
             var r1 = config.Layout.Screens[2]; var r2 = config.Layout.Screens[3];

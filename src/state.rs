@@ -89,7 +89,7 @@ impl ReceiverState {
             self.active = true;
             return Ok(None);
         }
-        if f.kind == Kind::Heartbeat {
+        if matches!(f.kind, Kind::Heartbeat | Kind::RoutingState) {
             return Ok(None);
         }
         ensure!(
