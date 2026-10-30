@@ -51,6 +51,15 @@ struct ReceiverStatus: Sendable, Equatable {
     let focusScreenID: String?
     let sharedLayout: SharedLayout?
     let inputActive: Bool
+
+    // Pair roles describe the negotiated layout, not the current physical
+    // input source. Derive this Mac's identity from its authenticated peer.
+    func localDeviceID(peerID: String?) -> String? {
+        guard let peerID, let layout = sharedLayout else { return nil }
+        if layout.sourceDeviceID == peerID { return layout.receiverDeviceID }
+        if layout.receiverDeviceID == peerID { return layout.sourceDeviceID }
+        return nil
+    }
 }
 
 enum DeviceProtocolError: LocalizedError, Sendable {

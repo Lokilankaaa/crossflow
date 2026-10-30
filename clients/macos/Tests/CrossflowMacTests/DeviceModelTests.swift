@@ -146,7 +146,7 @@ final class DeviceModelTests: XCTestCase {
           peers)
             printf '%s\\n' '{"peers":[{"schema":1,"id":"\(id)","friendly_name":"Fixture Windows","last_endpoint":null}],"invalid_records":0}'
             exit 0 ;;
-          receive)
+          pair-receive)
             printf 'receive\\n' >> receiver-launches
             \(script)
             ;;
@@ -191,28 +191,55 @@ final class DeviceModelTests: XCTestCase {
         }
     }
 
-    @MainActor func testReceiveModeRequiresExplicitStartAndPassesSelectedInputScope() async throws {
+    @MainActor func testDuplexReceiveRequiresExplicitStartAndUsesPairCommand() async throws {
         let script = """
         printf '%s\\n' "$@" > receiver-arguments
         printf '%s\\n' '{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
         exit 1
         """
         try await withReceiverModel(script: script, expectedShutdown: true) { model, fixture in
-            XCTAssertTrue(model.includeKeyboard)
             XCTAssertNil(model.operation)
-            XCTAssertFalse(fixture.launched, "Selecting a default mode must not start input")
-            for includeKeyboard in [true, false] {
-                model.includeKeyboard = includeKeyboard
-                XCTAssertNil(model.operation)
-                model.receive()
-                try await self.waitUntil { model.operation == nil && !model.stopPending && !model.loading }
-                let arguments = try String(contentsOf: fixture.folder.appendingPathComponent("receiver-arguments"), encoding: .utf8)
-                    .split(separator: "\n").map(String.init)
-                XCTAssertTrue(arguments.contains("--inject"))
-                XCTAssertTrue(arguments.contains("--control-stdio"))
-                XCTAssertEqual(arguments.contains("--inject-actions"), includeKeyboard)
-                XCTAssertTrue(model.canStart)
-            }
+            XCTAssertFalse(fixture.launched, "Viewing the model must not start capture")
+            model.receive()
+            try await self.waitUntil { model.operation == nil && !model.stopPending && !model.loading }
+            let arguments = try String(contentsOf: fixture.folder.appendingPathComponent("receiver-arguments"), encoding: .utf8)
+                .split(separator: "\n").map(String.init)
+            XCTAssertEqual(arguments.first, "pair-receive")
+            XCTAssertTrue(arguments.contains("--peer"))
+            XCTAssertTrue(arguments.contains("--discoverable"))
+            XCTAssertFalse(arguments.contains("--inject"))
+            XCTAssertFalse(arguments.contains("--inject-actions"))
+            XCTAssertTrue(model.canStart)
+        }
+    }
+
+    @MainActor func testDuplexLocalFocusAndCooperativeStop() async throws {
+        var packet = ReceiverSelfTest.fixture()
+        packet["focus_device_id"] = ReceiverSelfTest.receiver
+        packet["focus_screen_id"] = "mac-main"
+        packet["input_active"] = false
+        let sharing = String(data: try ReceiverSelfTest.data(packet), encoding: .utf8)!
+        packet["state"] = "stopped"; packet["route_enabled"] = false
+        packet["focus_device_id"] = NSNull(); packet["focus_screen_id"] = NSNull()
+        packet["shared_layout"] = NSNull()
+        let stopped = String(data: try ReceiverSelfTest.data(packet), encoding: .utf8)!
+        let script = """
+        printf '%s\\n' '\(sharing)'
+        while IFS= read -r line; do :; done
+        printf '%s\\n' '\(stopped)'
+        exit 0
+        """
+        try await withReceiverModel(script: script, expectedShutdown: true) { model, _ in
+            model.receive()
+            try await self.waitUntil { model.receiverState == .sharing || model.operation == nil }
+            XCTAssertTrue(model.isSharing)
+            XCTAssertEqual(model.localDeviceID, ReceiverSelfTest.receiver)
+            XCTAssertTrue(model.message.contains("当前控制这台 Mac"))
+            XCTAssertEqual(model.receiverStatus?.inputActive, false)
+            model.stop()
+            try await self.waitUntil { model.operation == nil && !model.stopPending && !model.loading }
+            XCTAssertFalse(model.cleanupUnconfirmed)
+            XCTAssertTrue(model.canStart)
         }
     }
 

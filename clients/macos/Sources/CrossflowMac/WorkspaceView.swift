@@ -23,7 +23,7 @@ struct WorkspaceView: View {
                         if let layout = model.sessionLayout {
                             SessionLayoutView(layout: layout, focusScreenID: model.focusScreenID,
                                               routeEnabled: model.routeEnabled,
-                                              sourceName: devices.devices.first(where: { $0.id == layout.sourceDeviceID })?.name ?? "另一台电脑")
+                                              sourceName: devices.selected?.name ?? "另一台电脑", localDeviceID: devices.localDeviceID)
                         } else {
                             sessionLayout
                         }
@@ -136,7 +136,7 @@ struct WorkspaceView: View {
             }
             Spacer(minLength: 0)
             Text(devices.sessionTitle).fontWeight(.medium)
-            Text("Mac 当前支持接收另一台电脑的键鼠输入。")
+            Text("连接并开启共享后，两台电脑的键鼠均可接管。")
                 .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

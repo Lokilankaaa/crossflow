@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "date": "2026-10-30",
+  "base_checkpoint": "2ab6daf",
+  "branch": "codex/mac-reverse-input",
+  "scope": [
+    "macOS native capture adapter for shared duplex session",
+    "pair-receive native client command",
+    "Swift actual session focus and duplex launch"
+  ],
+  "validation": {
+    "rust_workspace_tests": "PASS",
+    "mac_pair_adapter_fake_tap_tests": 7,
+    "encrypted_localhost_pair_tests": 3,
+    "pair_listener_cli_test": "PASS",
+    "clippy_all_targets": "PASS",
+    "rust_workspace_release_build": "PASS",
+    "swift_release_build": "PASS",
+    "swift_headless_protocol_and_fake_process_checks": 81,
+    "full_xctest": "Requires Xcode-equipped Mac CI; this host has Command Line Tools"
+  },
+  "safety_cases": [
+    "tap exit without queued events remains terminal",
+    "normal Escape differs from capture failure",
+    "cleanup retains failure classification",
+    "queued local discrete actions cannot be replayed across focus change",
+    "local focus precedes one return warp",
+    "startup inventory matches authenticated native bindings",
+    "display epoch change invalidates capture while idle",
+    "permission preflight retains protocol-2 startup rejection before input owners"
+  ],
+  "actual_os_input": false,
+  "actual_event_tap_started": false,
+  "actual_cursor_warp_tested": false,
+  "installed_app_changed": false,
+  "signing_or_keychain_helper_changed": false,
+  "remaining": [
+    "Actual physical provenance/PID filter and high-rate capture contention",
+    "Native key/button/scroll/return-warp behavior on hardware",
+    "Two-machine Windows-to-Mac and Mac-to-Windows acceptance",
+    "Development-signature update and permission continuity after separately coordinated installation"
+  ],
+  "notes": [
+    "Headless Swift checks include a local fixture child for production arguments, local-focus-without-injection display, stdin-EOF cooperative stop, and process exit confirmation.",
+    "No raw input, pairing secrets, or runtime user logs are included.",
+    "Swift release linker retains two known missing Command Line Tools search-path warnings."
+  ]
+}

@@ -25,19 +25,15 @@ struct SessionStatusCard: View {
                 .fixedSize(horizontal: false, vertical: true)
             if model.operation == nil {
                 HStack {
-                    Picker("来自", selection: $model.selectedID) {
+                    Picker("共享设备", selection: $model.selectedID) {
                         Text("选择已配对设备").tag(String?.none)
                         ForEach(model.devices) { device in
                             Text(device.name).tag(Optional(device.id))
                         }
                     }.disabled(!model.canStart || model.loading)
-                    Picker("接收内容", selection: $model.includeKeyboard) {
-                        Text("键盘、鼠标与滚轮").tag(true)
-                        Text("仅鼠标移动").tag(false)
-                    }.disabled(!model.canStart)
-                        .accessibilityIdentifier("device-receive-mode")
+                    Text("键盘、鼠标与滚轮").foregroundStyle(Theme.secondary)
                 }
-                Text("开启后等待另一台电脑连接。跨屏共享由发送端开启，鼠标越过相邻边缘后才在本机接收输入。")
+                Text("开启后等待 Windows 连接并开启共享。两台电脑的键鼠均可接管，鼠标越过相邻边缘后切换控制。")
                     .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
             }
         }

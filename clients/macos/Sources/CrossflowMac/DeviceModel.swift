@@ -32,8 +32,6 @@ final class DeviceModel {
     var devices: [SavedDevice] = []
     var selectedID: String?
     var deviceName = "这台 Mac"
-    // Choosing a mode never starts input; receive() remains an explicit action.
-    var includeKeyboard = true
     var code = ""
     var confirmation: Confirmation?
     var approved = false
@@ -59,6 +57,7 @@ final class DeviceModel {
     @ObservationIgnored private var expectedPeerID: String?
     @ObservationIgnored private var startupRejectionMessage: String?
     @ObservationIgnored private var startupRejectionEligible = true
+    @ObservationIgnored private var receiverPeerID: String?
     @ObservationIgnored private let executableOverrides: [String: URL]?
     @ObservationIgnored private let logDirectoryOverride: URL?
 
@@ -70,7 +69,8 @@ final class DeviceModel {
     }
 
     var canStart: Bool { operation == nil && !stopPending && !cleanupUnconfirmed && !shuttingDown }
-    var isSharing: Bool { operation == .receiver && receiverStatus?.inputActive == true && !stopping && !cleanupUnconfirmed && [.paused, .sharing].contains(receiverState) }
+    var isSharing: Bool { operation == .receiver && receiverStatus?.routeEnabled == true && !stopping && !cleanupUnconfirmed && [.paused, .sharing].contains(receiverState) }
+    var localDeviceID: String? { receiverStatus?.localDeviceID(peerID: receiverPeerID) }
     var sessionTitle: String {
         if cleanupUnconfirmed { return "停止结果待确认" }
         if stopping || stopPending { return "正在停止" }
@@ -80,7 +80,9 @@ final class DeviceModel {
         case .starting, nil: return "正在准备接收"
         case .listening: return "接收已开启 · 等待连接"
         case .paused, .sharing:
-            if isSharing { return "正在本机接收" }
+            if isSharing, let focus = receiverStatus?.focusDeviceID {
+                return focus == localDeviceID ? "正在控制这台 Mac" : "正在控制另一台电脑"
+            }
             return receiverStatus?.routeEnabled == true ? "共享已开启" : "已连接 · 共享已暂停"
         case .stopping: return "正在停止"
         case .stopped: return "已停止"
@@ -153,10 +155,10 @@ final class DeviceModel {
                 .appendingPathComponent("Crossflow/runs", isDirectory: true)
             try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
             let log = logs.appendingPathComponent("receiver-\(UUID().uuidString).jsonl")
-            var arguments = ["receive", "--peer", selected.id, "--bind", "0.0.0.0:\(ports[selected.id] ?? 24800)",
-                             "--seconds", "3600", "--log", log.path, "--control-stdio", "--discoverable", "--inject"]
-            if includeKeyboard { arguments.append("--inject-actions") }
+            let arguments = ["pair-receive", "--peer", selected.id, "--bind", "0.0.0.0:\(ports[selected.id] ?? 24800)",
+                             "--seconds", "3600", "--log", log.path, "--discoverable"]
             beginOperation(.receiver)
+            receiverPeerID = selected.id
             message = "正在准备接收…"
             let current = generation
             task = Task { await run(executable, arguments: arguments, timeout: 3620, generation: current) }
@@ -272,8 +274,8 @@ final class DeviceModel {
                 case .starting: message = "正在准备接收…"
                 case .listening: message = "已准备好，请在 Windows 上连接并开始共享。"
                 case .paused, .sharing:
-                    if status.inputActive { message = "当前控制这台 Mac · 按 Escape 可停止接收。" }
-                    else if !status.routeEnabled { message = "已连接 · 共享已暂停，请在另一台电脑开启共享。" }
+                    if !status.routeEnabled { message = "已连接 · 共享已暂停，请在另一台电脑开启共享。" }
+                    else if let local = localDeviceID, status.focusDeviceID == local { message = "当前控制这台 Mac · 按 Escape 可停止共享。" }
                     else if status.focusDeviceID != nil { message = "共享已开启 · 当前控制另一台电脑，越过相邻边缘后切换。" }
                     else { message = "共享已开启 · 等待光标位置。" }
                 case .stopping: message = "正在停止并释放输入…"

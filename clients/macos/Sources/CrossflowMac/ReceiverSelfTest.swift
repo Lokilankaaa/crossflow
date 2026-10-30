@@ -40,6 +40,10 @@ enum ReceiverSelfTest {
         // Core status can update batch state and actual input separately.
         local["input_active"] = false
         checks["receiver_transient_focus_without_input"] = accepts(local) != nil
+        checks["duplex_local_focus_without_remote_injection"] = accepts(local)?.localDeviceID(peerID: source) == receiver
+            && accepts(local)?.focusDeviceID == receiver && accepts(local)?.inputActive == false
+        checks["duplex_identity_follows_authenticated_peer"] = initial?.localDeviceID(peerID: receiver) == source
+        checks["duplex_unknown_peer_has_no_local_identity"] = initial?.localDeviceID(peerID: String(repeating: "c", count: 64)) == nil
         var stopped = unknown; stopped["state"] = "listening"; stopped["route_enabled"] = false; stopped["shared_layout"] = NSNull()
         checks["receiver_disconnect_clears_metadata"] = accepts(stopped)?.sharedLayout == nil
         var nonrouted = unknown; nonrouted["shared_layout"] = NSNull(); nonrouted["input_active"] = true

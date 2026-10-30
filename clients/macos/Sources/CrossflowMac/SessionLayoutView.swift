@@ -6,6 +6,7 @@ struct SessionLayoutView: View {
     let focusScreenID: String?
     let routeEnabled: Bool
     let sourceName: String
+    let localDeviceID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -28,7 +29,7 @@ struct SessionLayoutView: View {
                     Color.clear
                     ForEach(layout.screens) { screen in
                         let focused = routeEnabled && focusScreenID == screen.id
-                        let local = screen.deviceID == layout.receiverDeviceID
+                        let local = screen.deviceID == localDeviceID
                         let ordinal = layout.screens.prefix(while: { $0.id != screen.id })
                             .filter { $0.deviceID == screen.deviceID }.count + 1
                         RoundedRectangle(cornerRadius: 8)
