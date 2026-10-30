@@ -1,0 +1,328 @@
+//! Source-side focus ownership. The network owns the queue's connection epoch;
+//! any unexpected epoch change revokes routing and local suppression.
+use crate::{
+    arrangement::Point,
+    input::{CaptureOutcome, SourceInputQueue},
+    screen_runtime::{Focus, RuntimeLayout},
+};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+pub struct RoutedInput {
+    pub config: RuntimeLayout,
+    pub input: Arc<Mutex<SourceInputQueue>>,
+    pub remote_gate: Arc<AtomicBool>,
+    pub enabled: bool,
+    pub generation: u64,
+    focus: Option<Focus>,
+    last_local_native: Option<Point>,
+    expected_queue_epoch: u64,
+}
+impl RoutedInput {
+    pub fn new(config: RuntimeLayout) -> anyhow::Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            input: Arc::new(Mutex::new(SourceInputQueue::new())),
+            remote_gate: Arc::new(AtomicBool::new(false)),
+            enabled: false,
+            generation: 0,
+            focus: None,
+            last_local_native: None,
+            expected_queue_epoch: 0,
+        })
+    }
+    pub fn sync(&mut self) -> bool {
+        let q = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        let connected = q.is_connected();
+        let changed = q.control_epoch() != self.expected_queue_epoch;
+        if changed {
+            self.expected_queue_epoch = q.control_epoch();
+            self.enabled = false;
+            self.focus = None;
+            self.last_local_native = None;
+            self.generation = self.generation.saturating_add(1);
+            self.remote_gate.store(false, Ordering::Release);
+        }
+        connected
+    }
+    pub fn enable(&mut self, epoch: u64) -> bool {
+        if !self.sync() || self.enabled || self.generation != epoch {
+            return false;
+        }
+        self.enabled = true;
+        self.generation = self.generation.saturating_add(1);
+        true
+    }
+    pub fn pause(&mut self) {
+        self.remote_gate.store(false, Ordering::Release);
+        self.enabled = false;
+        self.focus = None;
+        self.last_local_native = None;
+        self.generation = self.generation.saturating_add(1);
+        let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        q.pause();
+        self.expected_queue_epoch = q.control_epoch();
+    }
+    pub fn outcome(&mut self, outcome: CaptureOutcome) {
+        if matches!(outcome, CaptureOutcome::Paused(_)) {
+            self.sync();
+        }
+    }
+    /// Returns a local warp only on a real return/handoff. Native local motion
+    /// otherwise remains untouched. Native adapters execute the warp outside
+    /// this lock, after remote_gate has been revoked.
+    pub fn movement(
+        &mut self,
+        native: Point,
+        dx: f64,
+        dy: f64,
+        t0: u64,
+    ) -> anyhow::Result<Option<Point>> {
+        self.sync();
+        if !self.enabled {
+            self.last_local_native = Some(native);
+            return Ok(None);
+        }
+        let next = if let Some(f) = &self.focus {
+            self.config.advance(f, dx, dy)?
+        } else {
+            let previous=self.last_local_native;
+            let segment = if let Some(previous) = previous {
+                self.config.local_segment(previous, native)?
+            } else {
+                None
+            };
+            self.last_local_native = Some(native);
+            let candidate = match segment {
+                Some(f) => Some(f),
+                None => if let Some(p)=previous {
+                    // Only axes already clamped at the edge represent unused
+                    // motion. Native movement along the edge was applied by OS.
+                    let push_x=if p.x==native.x {dx} else {0.0};
+                    let push_y=if p.y==native.y {dy} else {0.0};
+                    self.config.local_exit(native, push_x, push_y)?
+                } else {None},
+            };
+            let Some(f) = candidate else {
+                return Ok(None);
+            };
+            f
+        };
+        self.apply_focus(next,t0)
+    }
+    fn apply_focus(&mut self,next:Focus,t0:u64)->anyhow::Result<Option<Point>> {
+        let point = self.config.native_point(&next)?;
+        if self.config.is_local(&next) {
+            self.remote_gate.store(false, Ordering::Release);
+            let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            if !q.is_connected() || q.control_epoch()!=self.expected_queue_epoch {
+                drop(q); self.sync(); return Ok(None);
+            }
+            q.pause();
+            self.expected_queue_epoch = q.control_epoch();
+            self.focus = None;
+            self.last_local_native = Some(point);
+            Ok(Some(point))
+        } else {
+            let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            if !q.is_connected() || q.control_epoch()!=self.expected_queue_epoch {
+                drop(q); self.sync(); return Ok(None);
+            }
+            if !q.is_active() && !q.arm() {
+                drop(q);
+                self.pause();
+                return Ok(None);
+            }
+            self.expected_queue_epoch = q.control_epoch();
+            let display_id = self
+                .config
+                .bindings
+                .iter()
+                .find(|b| b.screen_id == next.screen_id)
+                .expect("validated binding")
+                .native_id
+                .parse::<u32>()?;
+            let outcome = q.position(point.x, point.y, display_id, t0);
+            drop(q);
+            if matches!(outcome, CaptureOutcome::Paused(_)) {
+                self.sync();
+                return Ok(None);
+            }
+            self.focus = Some(next);
+            self.remote_gate.store(true, Ordering::Release);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn capture(
+    control: crate::desktop::Control,
+    log: crate::metrics::Log,
+    duration: std::time::Duration,
+) -> anyhow::Result<()> {
+    use crate::platform::windows::{self, CaptureEvent, CaptureStatus};
+    let route = control.routed.as_ref().expect("routed control").clone();
+    let gate = route
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remote_gate
+        .clone();
+    let event_control = control.clone();
+    let ready_control = control.clone();
+    let status_control = control.clone();
+    let result = windows::run_routed_input_capture_with_status(
+        move |event| {
+            if let CaptureEvent::Stop = event {
+                event_control.cancel();
+                return;
+            }
+            if let CaptureEvent::Toggle = event {
+                event_control.toggle();
+                return;
+            }
+            let handled = (|| -> anyhow::Result<()> {
+                let mut r = route.lock().unwrap_or_else(|e| e.into_inner());
+                r.sync();
+                let warp = if let CaptureEvent::Delta {
+                    dx,
+                    dy,
+                    captured_at,
+                } = event
+                {
+                    let (x, y) = windows::cursor_position().map_err(anyhow::Error::msg)?;
+                    r.movement(Point { x, y }, dx as f64, dy as f64, log.at(captured_at))?
+                } else {
+                    let mut q = r.input.lock().unwrap_or_else(|e| e.into_inner());
+                    let outcome = match event {
+                        CaptureEvent::Snapshot { buttons, keys } => {
+                            q.seed_physical_held(buttons, keys)
+                                .map_err(|_| anyhow::anyhow!("physical input snapshot failed"))?;
+                            CaptureOutcome::Ignored
+                        }
+                        CaptureEvent::Button {
+                            button,
+                            down,
+                            captured_at,
+                        } => q.button(button, down, log.at(captured_at)),
+                        CaptureEvent::Key {
+                            usage,
+                            down,
+                            captured_at,
+                        } => q.key(usage, down, log.at(captured_at)),
+                        CaptureEvent::Scroll {
+                            horizontal,
+                            vertical,
+                            captured_at,
+                        } => q.scroll(horizontal, vertical, log.at(captured_at)),
+                        _ => CaptureOutcome::Ignored,
+                    };
+                    drop(q);
+                    r.outcome(outcome);
+                    None
+                };
+                drop(r);
+                if let Some(p) = warp {
+                    windows::warp_cursor(p.x, p.y).map_err(anyhow::Error::msg)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = handled {
+                event_control.fail(&format!("{e:#}"));
+            }
+        },
+        move || {
+            let mut r = status_control
+                .routed
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !r.sync() {
+                CaptureStatus::Disconnected
+            } else if r.enabled {
+                CaptureStatus::Active
+            } else {
+                CaptureStatus::Ready
+            }
+        },
+        move || ready_control.capture_ready(),
+        gate,
+        control.stop.clone(),
+        Some(duration),
+    );
+    control.request_stop();
+    result.map(|_| ()).map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn routed() -> RoutedInput {
+        let c=serde_json::from_str(r#"{"local_device_id":"local","remote_device_id":"peer","layout":{"screens":[{"id":"w","device_id":"local","x":0,"y":0,"width":100,"height":100},{"id":"m","device_id":"peer","x":100,"y":0,"width":100,"height":100}]},"bindings":[{"screen_id":"w","native_id":"w","native":{"x":0,"y":0,"width":100,"height":100}},{"screen_id":"m","native_id":"1","native":{"x":0,"y":0,"width":100,"height":100}}]}"#).unwrap();
+        let mut r = RoutedInput::new(c).unwrap();
+        {
+            let mut q = r.input.lock().unwrap();
+            q.seed_physical_held([], []).unwrap();
+            q.begin_session();
+        }
+        r.sync();
+        assert!(r.enable(r.generation));
+        r.movement(Point{x:99.,y:50.},0.,0.,0).unwrap();
+        r
+    }
+    #[test]
+    fn remote_focus_keyboard_and_return_revoke_gate_and_queue() {
+        let mut r = routed();
+        r.movement(Point { x: 99., y: 50. }, 5., 0., 1).unwrap();
+        assert!(r.remote_gate.load(Ordering::Acquire));
+        let mut q = r.input.lock().unwrap();
+        assert!(q.is_active());
+        q.key(4, true, 2);
+        drop(q);
+        let local = r
+            .movement(Point { x: 99., y: 50. }, -10., 0., 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local, Point { x: 95., y: 50. });
+        assert!(!r.remote_gate.load(Ordering::Acquire));
+        assert!(!r.input.lock().unwrap().is_active());
+        assert!(r.enabled);
+    }
+    #[test]
+    fn reconnect_and_external_queue_failure_never_rearm() {
+        let mut r = routed();
+        r.movement(Point { x: 99., y: 50. }, 5., 0., 1).unwrap();
+        {
+            let mut q = r.input.lock().unwrap();
+            q.end_session();
+            q.begin_session();
+        }
+        assert!(r.sync());
+        assert!(!r.enabled);
+        assert!(!r.remote_gate.load(Ordering::Acquire));
+        assert!(!r.enable(r.generation.saturating_sub(1)));
+    }
+    #[test]
+    fn reconnect_between_geometry_and_commit_revokes_both_transitions() {
+        for local in [false,true] {
+            let mut r=routed();
+            r.movement(Point{x:99.,y:50.},5.,0.,1).unwrap();
+            {let mut q=r.input.lock().unwrap();q.end_session();q.begin_session();}
+            let next=Focus{screen_id:if local {"w"}else{"m"}.into(),point:Point{x:if local {90.}else{110.},y:50.}};
+            assert!(r.apply_focus(next,2).unwrap().is_none());
+            assert!(!r.enabled);assert!(!r.remote_gate.load(Ordering::Acquire));assert!(!r.input.lock().unwrap().is_active());
+        }
+    }
+    #[test]
+    fn arriving_at_edge_does_not_repeat_whole_native_packet() {
+        let mut r=routed();r.last_local_native=Some(Point{x:95.,y:50.});
+        r.movement(Point{x:99.,y:52.},5.,2.,1).unwrap();
+        assert!(!r.remote_gate.load(Ordering::Acquire));
+        r.movement(Point{x:99.,y:54.},5.,2.,2).unwrap();
+        let f=r.focus.as_ref().unwrap();assert_eq!(f.point,Point{x:105.,y:54.});
+    }
+}

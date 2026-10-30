@@ -93,11 +93,17 @@ impl ReceiverState {
             return Ok(None);
         }
         ensure!(
-            matches!(f.kind, Kind::Move | Kind::Button | Kind::Scroll | Kind::Key) && self.active,
+            matches!(
+                f.kind,
+                Kind::Move | Kind::Position | Kind::Button | Kind::Scroll | Kind::Key
+            ) && self.active,
             "input before explicit arm"
         );
         ensure!(f.t1_ns - f.t0_ns <= 30_000_000, "source input stale");
-        if matches!(f.kind, Kind::Button | Kind::Scroll | Kind::Key) {
+        if matches!(
+            f.kind,
+            Kind::Position | Kind::Button | Kind::Scroll | Kind::Key
+        ) {
             // Controls are ordered barriers, not displacement baselines.
             // The session layer owns applying/releasing the resulting input.
             return Ok(None);
@@ -136,6 +142,23 @@ mod tests {
             s.apply(frame(Kind::Move, 3, 150.), 13).unwrap(),
             Some((40., 0.))
         );
+    }
+
+    #[test]
+    fn absolute_positions_require_arm_fresh_lease_and_do_not_rebase_relative_motion() {
+        let mut state = ReceiverState::new(150);
+        state.grant(9, 0);
+        assert!(state.apply(frame(Kind::Position, 1, 400.0), 1).is_err());
+        state.apply(frame(Kind::Arm, 2, 0.0), 2).unwrap();
+        state.apply(frame(Kind::Position, 3, 400.0), 3).unwrap();
+        assert_eq!(
+            state.apply(frame(Kind::Move, 4, 3.0), 4).unwrap(),
+            Some((3.0, 0.0))
+        );
+        state.apply(frame(Kind::Pause, 5, 0.0), 5).unwrap();
+        assert!(state.apply(frame(Kind::Position, 6, 1.0), 6).is_err());
+        state.apply(frame(Kind::Arm, 7, 0.0), 7).unwrap();
+        assert!(state.apply(frame(Kind::Position, 8, 1.0), 151).is_err());
     }
     #[test]
     fn cannot_move_before_arm_or_replay() {

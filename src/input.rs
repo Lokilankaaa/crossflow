@@ -24,6 +24,12 @@ pub enum Button {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputAction {
+    /// Absolute target-native desktop coordinates; does not rebase raw displacement.
+    Position {
+        x: f64,
+        y: f64,
+        display_id: u32,
+    },
     /// Cumulative source displacement since the current arm, not screen pixels.
     Move {
         x: f64,
@@ -280,13 +286,15 @@ impl SourceInputQueue {
     }
 
     fn enqueue(&mut self, action: InputAction, now_ns: u64) -> CaptureOutcome {
-        if let InputAction::Move { .. } = action {
-            if let Some(last) = self.queue.back_mut() {
-                if matches!(last.action, InputAction::Move { .. }) {
-                    last.action = action;
-                    last.captures_coalesced = last.captures_coalesced.saturating_add(1);
-                    return CaptureOutcome::Coalesced;
-                }
+        if let Some(last) = self.queue.back_mut() {
+            if matches!(
+                (last.action, action),
+                (InputAction::Move { .. }, InputAction::Move { .. })
+            ) || matches!((last.action, action), (InputAction::Position {display_id:a,..}, InputAction::Position {display_id:b,..}) if a == b)
+            {
+                last.action = action;
+                last.captures_coalesced = last.captures_coalesced.saturating_add(1);
+                return CaptureOutcome::Coalesced;
             }
         }
         if self.queue.len() == INPUT_QUEUE_CAPACITY {
@@ -343,6 +351,22 @@ impl SourceInputQueue {
         self.y = y;
         self.last_move_group_delta = group_delta;
         self.enqueue(InputAction::Move { x, y }, now_ns)
+    }
+
+    /// Ordered absolute positioning. Adjacent positions replace only positions,
+    /// keeping the oldest timestamp so a sustained backlog cannot appear fresh.
+    pub fn position(&mut self, x: f64, y: f64, display_id: u32, now_ns: u64) -> CaptureOutcome {
+        if !self.active {
+            return CaptureOutcome::Ignored;
+        }
+        if let Err(reason) = self.check_capture(now_ns) {
+            return CaptureOutcome::Paused(reason);
+        }
+        if !x.is_finite() || !y.is_finite() || x.abs() > MAX_COORDINATE || y.abs() > MAX_COORDINATE
+        {
+            return self.fail(PauseReason::InvalidMovement);
+        }
+        self.enqueue(InputAction::Position { x, y, display_id }, now_ns)
     }
 
     pub fn button(&mut self, button: Button, down: bool, now_ns: u64) -> CaptureOutcome {
@@ -439,6 +463,88 @@ mod tests {
         queue.begin_session();
         assert!(queue.arm());
         queue
+    }
+
+    #[test]
+    fn positions_preserve_barriers_and_relative_baseline() {
+        let mut queue = armed();
+        queue.move_by(1.0, 2.0, 1);
+        queue.position(-400.0, 500.0, 7, 2);
+        assert_eq!(
+            queue.position(-390.0, 510.0, 7, 3),
+            CaptureOutcome::Coalesced
+        );
+        queue.key(0x04, true, 4);
+        queue.position(10.0, 20.0, 7, 5);
+        queue.move_by(3.0, 4.0, 6);
+        let events: Vec<_> = std::iter::from_fn(|| queue.pop(7).unwrap()).collect();
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].action, InputAction::Move { x: 1.0, y: 2.0 });
+        assert_eq!(
+            events[1].action,
+            InputAction::Position {
+                x: -390.0,
+                y: 510.0,
+                display_id: 7
+            }
+        );
+        assert_eq!(
+            (events[1].captured_at_ns, events[1].captures_coalesced),
+            (2, 2)
+        );
+        assert_eq!(
+            events[2].action,
+            InputAction::Key {
+                usage: 0x04,
+                down: true
+            }
+        );
+        assert_eq!(
+            events[3].action,
+            InputAction::Position {
+                x: 10.0,
+                y: 20.0,
+                display_id: 7
+            }
+        );
+        assert_eq!(events[4].action, InputAction::Move { x: 4.0, y: 6.0 });
+    }
+
+    #[test]
+    fn positions_cannot_refresh_backlog_or_survive_pause() {
+        let mut queue = armed();
+        queue.position(1.0, 2.0, 7, 0);
+        assert_eq!(
+            queue.position(3.0, 4.0, 7, INPUT_MAX_AGE_NS + 1),
+            CaptureOutcome::Paused(PauseReason::StaleInput)
+        );
+        assert_eq!(queue.pending_len(), 0);
+        queue.arm();
+        assert_eq!(
+            queue.position(f64::NAN, 0.0, 7, 1),
+            CaptureOutcome::Paused(PauseReason::InvalidMovement)
+        );
+        queue.arm();
+        queue.position(10.0, 20.0, 7, 2);
+        queue.pause();
+        queue.arm();
+        assert!(queue.pop(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn display_identity_change_is_a_position_barrier() {
+        let mut queue = armed();
+        queue.position(10.0, 20.0, 7, 0);
+        assert_eq!(queue.position(30.0, 40.0, 8, 1), CaptureOutcome::Queued);
+        assert_eq!(queue.pending_len(), 2);
+        assert!(matches!(
+            queue.pop(2).unwrap().unwrap().action,
+            InputAction::Position { display_id: 7, .. }
+        ));
+        assert!(matches!(
+            queue.pop(2).unwrap().unwrap().action,
+            InputAction::Position { display_id: 8, .. }
+        ));
     }
 
     #[test]

@@ -47,7 +47,10 @@ fn timing_for_ack(
             && response.sent_ns <= received_ns,
         "input worker response expired or clock invalid"
     );
-    if !matches!(request.op, Op::Move | Op::Button | Op::Key | Op::Scroll) {
+    if !matches!(
+        request.op,
+        Op::Move | Op::Position | Op::Button | Op::Key | Op::Scroll
+    ) {
         ensure!(
             response.call_start_ns == 0 && response.call_end_ns == 0,
             "input worker control response carries action timing"
@@ -147,11 +150,17 @@ fn guarded<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
 /// a redacting panic hook; the shared core does not replace the host's hook.
 struct Guarded<'a>(&'a mut dyn MouseSink);
 impl MouseSink for Guarded<'_> {
+    fn displays(&self) -> Result<Vec<crate::session::NativeDisplay>> {
+        guarded(|| self.0.displays())
+    }
     fn reset(&mut self) -> Result<()> {
         guarded(|| self.0.reset())
     }
     fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
         guarded(|| self.0.move_by(x, y))
+    }
+    fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+        guarded(|| self.0.position(x, y, display_id))
     }
     fn button(&mut self, button: Button, down: bool) -> Result<()> {
         guarded(|| self.0.button(button, down))
@@ -206,6 +215,11 @@ pub fn run_native(gain: f64) -> Result<()> {
         fn button(&mut self, button: Button, down: bool) -> Result<()> {
             self.0
                 .button(button, down)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+        fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+            self.0
+                .position(x, y, display_id)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
         fn key(&mut self, usage: u16, down: bool) -> Result<()> {
@@ -324,7 +338,10 @@ pub fn run_worker<R: Read + Send + 'static, W: Write + Send + 'static>(
             let mut response = Message::new(Op::Completed);
             response.seq = request.seq;
             response.epoch = request.epoch;
-            let is_action = matches!(request.op, Op::Move | Op::Button | Op::Key | Op::Scroll);
+            let is_action = matches!(
+                request.op,
+                Op::Move | Op::Position | Op::Button | Op::Key | Op::Scroll
+            );
             if is_action {
                 response.call_start_ns = continuous_ns()?;
             }
@@ -332,6 +349,10 @@ pub fn run_worker<R: Read + Send + 'static, W: Write + Send + 'static>(
                 Op::Reset => owned.reset()?,
                 Op::Move => {
                     (response.x, response.y) = owned.move_by(request.x, request.y)?;
+                }
+                Op::Position => {
+                    (response.x, response.y) =
+                        owned.position(request.x, request.y, request.display_id)?;
                 }
                 Op::Button => owned.button(button_from_code(request.code)?, request.down)?,
                 Op::Key => owned.key(request.code, request.down)?,
@@ -388,6 +409,7 @@ pub struct WorkerProxy {
     last_heartbeat: Instant,
     latest_timing: Option<WorkerTiming>,
     failure_log: Option<crate::metrics::Log>,
+    displays: Vec<crate::session::NativeDisplay>,
 }
 impl WorkerProxy {
     pub fn spawn(command: &mut Command) -> Result<Self> {
@@ -428,6 +450,7 @@ impl WorkerProxy {
             last_heartbeat: Instant::now(),
             latest_timing: None,
             failure_log: None,
+            displays: Vec::new(),
         };
         let ready = proxy.responses.recv_timeout(Duration::from_secs(3));
         if !matches!(
@@ -452,6 +475,13 @@ impl WorkerProxy {
     /// from successful timing distributions. Never logs action payloads.
     pub fn attach_failure_log(&mut self, log: crate::metrics::Log) {
         self.failure_log = Some(log);
+    }
+    /// Inventory is sampled by the native receiver before starting a session.
+    /// Position calls still revalidate display state inside the isolated owner.
+    pub fn set_displays(&mut self, displays: Vec<crate::session::NativeDisplay>) -> Result<()> {
+        crate::session::validate_displays(&displays)?;
+        self.displays = displays;
+        Ok(())
     }
 
     /// Explicit normal shutdown, including ACK and actual child exit. Drop is
@@ -552,6 +582,10 @@ impl WorkerProxy {
     }
 }
 impl MouseSink for WorkerProxy {
+    fn displays(&self) -> Result<Vec<crate::session::NativeDisplay>> {
+        crate::session::validate_displays(&self.displays)?;
+        Ok(self.displays.clone())
+    }
     fn take_timing(&mut self) -> Option<WorkerTiming> {
         self.latest_timing.take()
     }
@@ -584,6 +618,14 @@ impl MouseSink for WorkerProxy {
         message.down = down;
         self.rpc(message)?;
         Ok(())
+    }
+    fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+        let mut message = Message::new(Op::Position);
+        message.display_id = display_id;
+        message.x = x;
+        message.y = y;
+        let response = self.rpc(message)?;
+        Ok((response.x, response.y))
     }
     fn key(&mut self, usage: u16, down: bool) -> Result<()> {
         let mut message = Message::new(Op::Key);

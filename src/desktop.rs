@@ -37,6 +37,7 @@ pub struct Status {
 #[derive(Clone)]
 pub struct Control {
     pub motion: Arc<Mutex<Motion>>,
+    pub(crate) routed: Option<Arc<Mutex<crate::routed_desktop::RoutedInput>>>,
     pub stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -48,6 +49,7 @@ impl Control {
     pub fn new(stop: Arc<AtomicBool>) -> Self {
         Self {
             motion: Arc::new(Mutex::new(Motion::default())),
+            routed: None,
             stop,
             ready: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -84,6 +86,10 @@ impl Control {
         self.pause();
     }
     fn pause(&self) {
+        if let Some(route) = &self.routed {
+            route.lock().unwrap_or_else(|e| e.into_inner()).pause();
+            return;
+        }
         let mut motion = self.motion.lock().unwrap_or_else(|e| e.into_inner());
         motion.active = false;
         motion.pending_since_ns = None;
@@ -97,6 +103,17 @@ impl Control {
                 *self.notice.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             Command::Arm { epoch } => {
+                if let Some(route) = &self.routed {
+                    let valid = !self.stop.load(Ordering::Acquire)
+                        && self.ready.load(Ordering::Acquire)
+                        && route
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .enable(epoch);
+                    *self.notice.lock().unwrap_or_else(|e| e.into_inner()) = (!valid)
+                        .then(|| "state_changed: refresh state before starting sharing".into());
+                    return;
+                }
                 let mut motion = self.motion.lock().unwrap_or_else(|e| e.into_inner());
                 let valid = !self.stop.load(Ordering::Acquire)
                     && self.ready.load(Ordering::Acquire)
@@ -116,7 +133,18 @@ impl Control {
         }
     }
     pub fn snapshot(&self, finished: bool) -> Status {
-        let motion = *self.motion.lock().unwrap_or_else(|e| e.into_inner());
+        let motion = if let Some(route) = &self.routed {
+            let mut r = route.lock().unwrap_or_else(|e| e.into_inner());
+            let connected = r.sync();
+            Motion {
+                connected,
+                active: r.enabled,
+                epoch: r.generation,
+                ..Motion::default()
+            }
+        } else {
+            *self.motion.lock().unwrap_or_else(|e| e.into_inner())
+        };
         let failure = self
             .failure
             .lock()
@@ -152,6 +180,16 @@ impl Control {
                     .clone()
             }),
         }
+    }
+    pub fn toggle(&self) {
+        let status = self.snapshot(false);
+        self.apply(if status.state == "sharing" {
+            Command::Pause {}
+        } else {
+            Command::Arm {
+                epoch: status.epoch,
+            }
+        });
     }
 }
 
@@ -293,6 +331,7 @@ pub struct Options {
     pub discover_peer: bool,
     pub seconds: f64,
     pub max_hz: u32,
+    pub runtime_layout: Option<crate::screen_runtime::RuntimeLayout>,
 }
 
 #[cfg(windows)]
@@ -306,25 +345,42 @@ pub fn run(
         session,
     };
     let (input, output) = crate::injection_worker::stdio_files()?;
-    let control = Control::new(stop.clone());
+    let mut control = Control::new(stop.clone());
+    if let Some(config) = options.runtime_layout.clone() {
+        control.routed = Some(Arc::new(Mutex::new(
+            crate::routed_desktop::RoutedInput::new(config)?,
+        )));
+    }
     let mut io = ControlIo::start(input, output, control.clone());
     io.publish(false);
-    let validated = (|| -> anyhow::Result<()> {
-        anyhow::ensure!(
-            options.host.parse::<std::net::SocketAddr>().is_ok(),
-            "target must be an IP address and port"
-        );
-        anyhow::ensure!(
-            options.seconds.is_finite() && options.seconds > 0.0 && options.seconds <= 3600.0,
-            "seconds must be >0 and <=3600"
-        );
-        anyhow::ensure!(
-            (60..=8000).contains(&options.max_hz),
-            "max-hz must be 60..8000"
-        );
-        crate::security::Identity::load(&options.identity)?;
-        Ok(())
-    })();
+    let validated = thread::scope(|scope| {
+        let check = scope.spawn(|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                options.host.parse::<std::net::SocketAddr>().is_ok(),
+                "target must be an IP address and port"
+            );
+            anyhow::ensure!(
+                options.seconds.is_finite() && options.seconds > 0.0 && options.seconds <= 3600.0,
+                "seconds must be >0 and <=3600"
+            );
+            anyhow::ensure!(
+                (60..=8000).contains(&options.max_hz),
+                "max-hz must be 60..8000"
+            );
+            crate::security::Identity::load(&options.identity)?;
+            if let Some(config) = &options.runtime_layout {
+                validate_runtime_inventory(config, &options, &stop, &writer.log)?;
+            }
+            Ok(())
+        });
+        while !check.is_finished() {
+            io.publish(false);
+            thread::sleep(Duration::from_millis(50));
+        }
+        check
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("runtime validation panicked")))
+    });
     if let Err(error) = validated {
         control.fail(&format!("{error:#}"));
         writer.finish()?;
@@ -335,6 +391,32 @@ pub fn run(
     let network_log = writer.log.clone();
     let duration = Duration::from_secs_f64(options.seconds);
     let network = thread::spawn(move || {
+        if let Some(route) = &network_control.routed {
+            let input = route
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .input
+                .clone();
+            let send = if options.discover_peer {
+                session::send_ordered_discovered
+            } else {
+                session::send_ordered
+            };
+            let result = send(
+                session::SendOptions {
+                    host: &options.host,
+                    bundle: &options.identity,
+                    seconds: options.seconds,
+                    max_hz: options.max_hz,
+                    synthetic: false,
+                },
+                input,
+                network_control.stop.clone(),
+                network_log,
+            );
+            network_control.network_finished(result);
+            return;
+        }
         let send = if options.discover_peer {
             session::send_discovered
         } else {
@@ -360,6 +442,15 @@ pub fn run(
     let capture_control = control.clone();
     let capture_log = writer.log.clone();
     let capture = thread::spawn(move || {
+        if capture_control.routed.is_some() {
+            if let Err(e) =
+                crate::routed_desktop::capture(capture_control.clone(), capture_log, duration)
+            {
+                capture_control.fail(&format!("{e:#}"));
+            }
+            capture_control.request_stop();
+            return;
+        }
         let result = run_capture_headless_with_status(
             move |event| match event {
                 CaptureEvent::Delta {
@@ -438,6 +529,71 @@ pub fn run(
     anyhow::ensure!(delivered, "final client status was not delivered");
     if status.state == "error" {
         anyhow::bail!("{}", status.error.unwrap_or_default());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_runtime_inventory(
+    config: &crate::screen_runtime::RuntimeLayout,
+    options: &Options,
+    stop: &AtomicBool,
+    log: &crate::metrics::Log,
+) -> anyhow::Result<()> {
+    use crate::screen_runtime::NativeRect;
+    config.validate()?;
+    let local = crate::platform::windows::displays().map_err(anyhow::Error::msg)?;
+    let remote = crate::session::query_displays(
+        &options.host,
+        &options.identity,
+        stop,
+        log,
+        options.discover_peer,
+    )?;
+    anyhow::ensure!(
+        config
+            .layout
+            .screens()
+            .iter()
+            .filter(|s| s.device_id == config.local_device_id)
+            .count()
+            == local.len()
+            && config
+                .layout
+                .screens()
+                .iter()
+                .filter(|s| s.device_id == config.remote_device_id)
+                .count()
+                == remote.len(),
+        "display inventory changed; refresh all screens before connecting"
+    );
+    for b in &config.bindings {
+        let s = config.screen(&b.screen_id)?;
+        let rect = if s.device_id == config.local_device_id {
+            local
+                .iter()
+                .find(|d| d.id == b.native_id)
+                .map(|d| NativeRect {
+                    x: d.x,
+                    y: d.y,
+                    width: d.width,
+                    height: d.height,
+                })
+        } else {
+            remote
+                .iter()
+                .find(|d| d.id.to_string() == b.native_id)
+                .map(|d| NativeRect {
+                    x: d.x,
+                    y: d.y,
+                    width: d.width,
+                    height: d.height,
+                })
+        };
+        anyhow::ensure!(
+            rect.as_ref() == Some(&b.native),
+            "screen configuration changed; refresh both devices' screens before connecting"
+        );
     }
     Ok(())
 }

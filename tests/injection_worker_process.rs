@@ -337,6 +337,16 @@ fn healthy_parent_maintains_then_releases_without_replay() -> Result<()> {
     let mut parent = OwnedChild::spawn(fixture.command("parent").arg("healthy"))?;
     let observed = fixture.observe_worker()?;
     fixture.held()?;
+    ensure!(
+        fixture.root.join("position-ack").is_file()
+            && fixture
+                .events()
+                .iter()
+                .filter(|event| event.as_str() == "position-display-42")
+                .count()
+                == 1,
+        "native display-bound position was not applied and acknowledged once"
+    );
     // Exercise several active lease periods, not merely an immediate shutdown.
     thread::sleep(Duration::from_millis(450));
     ensure!(

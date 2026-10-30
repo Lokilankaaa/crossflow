@@ -24,6 +24,7 @@ internal sealed class SessionController
     internal event Action<SessionSnapshot>? Changed;
     internal SessionSnapshot Snapshot { get { lock (sync) return snapshot; } }
     internal string? LastLogPath { get; private set; }
+    internal bool IsRouted { get; private set; }
 
     internal SessionController() { }
     // Test-only factory never participates in the production constructor.
@@ -62,19 +63,25 @@ internal sealed class SessionController
         await ConnectCoreAsync(log => fixture?.Invoke(host, identity, log) ?? PackagedStart(host, identity, log), logDirectory);
     }
 
-    internal async Task ConnectPeerAsync(string peerId, string? logDirectory = null)
+    internal async Task ConnectPeerAsync(string peerId, string? logDirectory = null, string? runtimeLayoutPath = null)
     {
         if (peerId is null || peerId.Length != 64 || peerId.Any(value => !(value is >= '0' and <= '9' or >= 'a' and <= 'f')))
             throw new InvalidOperationException("已配对设备标识无效，请刷新设备列表后重试。");
+        if (runtimeLayoutPath is not null)
+        {
+            runtimeLayoutPath = Path.GetFullPath(runtimeLayoutPath);
+            if (!File.Exists(runtimeLayoutPath)) throw new InvalidOperationException("屏幕布局未保存，请重新应用布局。");
+        }
         await ConnectCoreAsync(log =>
         {
             var info = PackagedInfo(["desktop-send", "--peer", peerId, "--log", log, "--seconds", "3600", "--max-hz", "1000"]);
+            if (runtimeLayoutPath is not null) { info.ArgumentList.Add("--runtime-layout"); info.ArgumentList.Add(runtimeLayoutPath); }
             return peerFixture?.Invoke(info) ?? RequirePackaged(info);
-        }, logDirectory);
+        }, logDirectory, runtimeLayoutPath is not null);
     }
 
     // Both production entry points share process ownership, pipes and supervision.
-    private async Task ConnectCoreAsync(Func<string, ProcessStartInfo> start, string? logDirectory)
+    private async Task ConnectCoreAsync(Func<string, ProcessStartInfo> start, string? logDirectory, bool routed = false)
     {
         await commands.WaitAsync();
         try
@@ -95,6 +102,7 @@ internal sealed class SessionController
             {
                 run = new Run(process, ++generation);
                 current = run;
+                IsRouted = routed;
                 snapshot = new("starting", 0, false, null, generation, true);
             }
             Publish();

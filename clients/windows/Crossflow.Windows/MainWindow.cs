@@ -12,7 +12,7 @@ using Windows.Foundation;
 
 namespace Crossflow.Windows;
 
-internal sealed class MainWindow : Window
+internal sealed partial class MainWindow : Window
 {
     private readonly Theme theme;
     private readonly Grid root = new();
@@ -173,7 +173,7 @@ internal sealed class MainWindow : Window
             pairingGeneration++; pairing.Cancel(); pairingDialog?.Hide();
             try
             {
-                var readsStopped = await Task.WhenAll(discovery.StopAsync(), peers.StopAsync(), pairing.StopAsync());
+                var readsStopped = await Task.WhenAll(discovery.StopAsync(), peers.StopAsync(), pairing.StopAsync(), StopDisplayReadsAsync());
                 bool scanStopped = readsStopped.All(stopped => stopped);
                 bool sessionStopped = await session.StopAsync();
                 if (scanStopped && sessionStopped) { allowClose = true; Close(); return; }
@@ -186,8 +186,8 @@ internal sealed class MainWindow : Window
     }
 
     private TextBlock Text(string value, string size = "body", bool secondary = false) => new() { Text = value, FontSize = theme.Number("typography", size), Foreground = theme.Brush(secondary ? "text_secondary" : "text"), TextWrapping = TextWrapping.Wrap };
-    private static string DeviceName(string id) => id switch { "windows-workstation" => "Windows 台式机", "macbook-air" => "MacBook Air", _ => id };
-    private static string ScreenName(string id) => id switch { "windows-main" => "主显示器", "windows-portrait" => "竖屏", "mac-external" => "外接显示器", "mac-built-in" => "内建显示器", _ => id };
+    private string DeviceName(string id) => id == "local" ? "这台 Windows" : runtimePeer?.Id == id ? runtimePeer.Name : id switch { "windows-workstation" => "Windows 台式机", "macbook-air" => "MacBook Air", _ => id };
+    private string ScreenName(string id) => runtimeScreenNames.TryGetValue(id, out var name) ? name : id switch { "windows-main" => "主显示器", "windows-portrait" => "竖屏", "mac-external" => "外接显示器", "mac-built-in" => "内建显示器", _ => id };
     private Border Divider() => new() { Height = 1, Background = theme.Brush("border"), Margin = new Thickness(0, 16, 0, 16) };
     private Button Navigation(string title, string glyph, string page, Action open)
     {
@@ -321,7 +321,7 @@ internal sealed class MainWindow : Window
         diagnostics.Children.Add(identityPicker);
         connectSession = Action("连接", "session-connect", () => RunSessionAction(() => session.ConnectAsync(targetHost, identityDirectory)));
         diagnostics.Children.Add(connectSession);
-        diagnostics.Children.Add(Text("当前实验连接仅共享鼠标移动。键盘、鼠标点击、滚轮与屏幕边缘自动切换尚未接入此入口。布局编辑仍是草稿。", "caption", true));
+        diagnostics.Children.Add(Text("此诊断入口仅共享鼠标移动。需要跨屏键鼠时，请在已配对设备旁选择“排列屏幕”，再应用连接。", "caption", true));
         var advanced = new Expander { Header = "开发诊断", Content = diagnostics, IsExpanded = false, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
         AutomationProperties.SetAutomationId(advanced, "developer-diagnostics");
         page.Children.Add(advanced);
@@ -355,9 +355,13 @@ internal sealed class MainWindow : Window
                 var name = Text(peer.Name, "section"); name.TextWrapping = TextWrapping.NoWrap; name.TextTrimming = TextTrimming.CharacterEllipsis;
                 description.Children.Add(name); description.Children.Add(Text("已保存配对信息", "caption", true));
                 row.Children.Add(description);
-                var connect = Action("连接", "peer-connect-" + peer.Id, () => RunSessionAction(() => session.ConnectPeerAsync(peer.Id)));
+                var connect = Action("排列屏幕", "peer-arrange-" + peer.Id, () => PrepareRuntimeLayout(peer));
                 connect.VerticalAlignment = VerticalAlignment.Center;
-                peerConnectButtons.Add(connect); Grid.SetColumn(connect, 1); row.Children.Add(connect);
+                var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+                actions.Children.Add(connect); peerConnectButtons.Add(connect);
+                var movementOnly = Action("仅鼠标连接", "peer-connect-" + peer.Id, () => RunSessionAction(() => session.ConnectPeerAsync(peer.Id)));
+                actions.Children.Add(movementOnly); peerConnectButtons.Add(movementOnly);
+                Grid.SetColumn(actions, 1); row.Children.Add(actions);
                 savedPeers.Children.Add(new Border { Child = row, BorderBrush = theme.Brush("border"), BorderThickness = new Thickness(0, 0, 0, 1) });
             }
             UpdateSessionUi();
@@ -437,7 +441,7 @@ internal sealed class MainWindow : Window
     }
     private async void BeginPairing(NearbyDevice device, Action removeCompletedInvitation)
     {
-        if (closing || pairingBusy || pairing.IsRunning || session.Snapshot.ProcessRunning || !device.Compatible || activePage != "connection") return;
+        if (closing || runtimeBusy || pairingBusy || pairing.IsRunning || session.Snapshot.ProcessRunning || !device.Compatible || activePage != "connection") return;
         long generation = ++pairingGeneration;
         pairingBusy = true; UpdateSessionUi();
         bool current() => generation == pairingGeneration && !closing && activePage == "connection";
@@ -580,27 +584,27 @@ internal sealed class MainWindow : Window
 
     private async void RunSessionAction(Func<Task> operation)
     {
-        if (sessionAction || pairingBusy || closing) return;
+        if (sessionAction || pairingBusy || runtimeBusy || closing) return;
         sessionAction = true; UpdateSessionUi();
         string? error = null;
         try { await operation(); }
         catch (Exception failure) { error = failure is InvalidOperationException ? failure.Message : "无法完成连接操作，请检查设备与已保存的配对记录。"; }
-        finally { sessionAction = false; UpdateSessionUi(); if (error is not null && sessionDetail is not null) sessionDetail.Text = error; }
+        finally { sessionAction = false; UpdateSessionUi(); if (error is not null) { if (sessionDetail is not null) sessionDetail.Text = error; else if (activePage == "layout") Message(error, true); } }
     }
     private void UpdateSessionUi()
     {
         var state = session.Snapshot;
-        string title = state.State switch { "starting" => "正在启动", "connecting" => "正在连接或重连", "paused" => "已连接 · 已暂停", "sharing" => "鼠标共享中", "stopping" => "正在停止", "stopped" => "已停止", "error" => "连接出现错误", _ => "尚未连接" };
+        string title = state.State switch { "starting" => "正在启动", "connecting" => "正在连接或重连", "paused" => "已连接 · 已暂停", "sharing" => session.IsRouted ? "跨屏键鼠已启用" : "鼠标共享中", "stopping" => "正在停止", "stopped" => "已停止", "error" => "连接出现错误", _ => "尚未连接" };
         if (connectionStatus is not null) connectionStatus.Text = title;
         sidebarState.Text = title;
-        sidebarPrimary.Content = !state.ProcessRunning ? "连接设备" : state.State == "sharing" ? "暂停共享" : state.CanArm ? "开始共享" : "等待就绪";
-        sidebarPrimary.IsEnabled = !pairingBusy && !sessionAction && !closing && (!state.ProcessRunning || state.CanArm || (state.State == "sharing" && !state.CommandPending && !state.StopRequested));
+        sidebarPrimary.Content = !state.ProcessRunning ? "连接设备" : state.State == "sharing" ? "暂停共享" : state.CanArm ? (session.IsRouted ? "开始跨屏共享" : "开始共享") : "等待就绪";
+        sidebarPrimary.IsEnabled = !runtimeBusy && !pairingBusy && !sessionAction && !closing && (!state.ProcessRunning || state.CanArm || (state.State == "sharing" && !state.CommandPending && !state.StopRequested));
         sidebarStop.IsEnabled = state.ProcessRunning && !sessionAction && !closing;
         sidebarStop.Visibility = state.ProcessRunning ? Visibility.Visible : Visibility.Collapsed;
         if (connectSession is not null) connectSession.IsEnabled = !pairingBusy && !state.ProcessRunning && !sessionAction && !closing;
-        foreach (var button in peerConnectButtons) button.IsEnabled = !pairingBusy && !state.ProcessRunning && !sessionAction && !closing;
-        foreach (var pair in pairButtons) pair.Button.IsEnabled = pair.Compatible && PairingController.IsAvailable && !pairingBusy && !pairing.IsRunning && !state.ProcessRunning && !sessionAction && !closing;
-        if (armSession is not null) armSession.IsEnabled = state.CanArm && !sessionAction && !closing;
+        foreach (var button in peerConnectButtons) button.IsEnabled = !runtimeBusy && !pairingBusy && !state.ProcessRunning && !sessionAction && !closing;
+        foreach (var pair in pairButtons) pair.Button.IsEnabled = !runtimeBusy && pair.Compatible && PairingController.IsAvailable && !pairingBusy && !pairing.IsRunning && !state.ProcessRunning && !sessionAction && !closing;
+        if (armSession is not null) { armSession.IsEnabled = !runtimeBusy && state.CanArm && !sessionAction && !closing; armSession.Content = session.IsRouted ? "开始跨屏共享" : "开始共享"; }
         if (pauseSession is not null) pauseSession.IsEnabled = state.State == "sharing" && !state.CommandPending && !state.StopRequested && !sessionAction && !closing;
         if (stopSession is not null) stopSession.IsEnabled = state.ProcessRunning && !sessionAction && !closing;
         if (hostInput is not null) hostInput.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
@@ -608,16 +612,20 @@ internal sealed class MainWindow : Window
         if (identityPicker is not null) identityPicker.IsEnabled = !state.ProcessRunning && !sessionAction && !closing;
         if (sessionDetail is not null)
             sessionDetail.Text = state.StopRequested ? "已请求停止，正在等待内核退出确认。" : state.Error is not null ? (state.State == "error" ? state.Error : "内核拒绝了本次操作，状态已更新。请确认就绪后再试。") :
-                state.State == "paused" ? (state.CaptureReady ? "已就绪。点击“开始共享”才会转发鼠标移动；重连后也需要手动开始。" : "已连接，正在准备鼠标输入。") :
-                state.State == "sharing" ? "正在转发鼠标移动。点击“暂停”可立即请求暂停；关闭窗口会停止连接。" :
+                state.State == "paused" ? (state.CaptureReady ? (session.IsRouted ? "布局已就绪。点击“开始跨屏共享”后，鼠标越过相邻边缘才会切换设备，键盘随焦点转移。" : "已就绪。点击“开始共享”才会转发鼠标移动；重连后也需要手动开始。") : "已连接，正在准备输入。") :
+                state.State == "sharing" ? (session.IsRouted ? "跨屏已启用。移动到相邻屏幕边缘切换设备；Ctrl + Alt + 空格暂停，Ctrl + Alt + Esc 停止。" : "正在转发鼠标移动。点击“暂停”可立即请求暂停；关闭窗口会停止连接。") :
                 state.State == "connecting" ? "正在连接设备，请确认另一台设备已打开 Crossflow。连接成功后会保持暂停。" :
                 state.ProcessRunning ? "正在等待共享内核报告状态。" : "打开客户端不会自动连接或启动输入。";
-        status.Text = $"{(coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable"))}  ·  {title}  ·  布局尚未应用运行时";
+        status.Text = $"{(coreReady ? theme.Copy("core_ready") : theme.Copy("core_unavailable"))}  ·  {title}  ·  {(state.ProcessRunning && session.IsRouted ? "使用已应用的屏幕排列" : "排列更改在应用并连接后生效")}";
+        if (state.Error is null) shownSessionError = null;
+        else if (activePage == "layout" && shownSessionError != (state.Generation, state.Error))
+        { shownSessionError = (state.Generation, state.Error); Message(state.Error, true); }
+        UpdateRuntimeControls();
     }
     private void ShowInput()
     {
         SelectPage("input");
-        var page = Page(theme.Copy("input_title"), "当前连接入口仅共享鼠标移动，其余输入设置尚未接入。");
+        var page = Page(theme.Copy("input_title"), "从屏幕排列应用连接后，鼠标、点击、滚轮和键盘随目标屏幕切换。");
         page.Children.Add(new ToggleSwitch { Header = "Ctrl / Cmd 映射", IsEnabled = false });
         page.Children.Add(new ToggleSwitch { Header = "边缘阻尼", IsEnabled = false });
         page.Children.Add(Text("打开此窗口不会启动键鼠共享，也不会改变系统输入。", secondary: true));
@@ -628,7 +636,7 @@ internal sealed class MainWindow : Window
         var page = Page("设置", "本地运行，无需账号。共享状态由统一 Rust 内核提供。");
         page.Children.Add(Text("每轮会话最长一小时。连接恢复后保持暂停，需要你手动开始共享。", secondary: true));
         page.Children.Add(Text("已保存设备的配对信息由客户端管理。会话日志保存在当前用户的本地应用数据目录 / Crossflow / Logs。", secondary: true));
-        page.Children.Add(Text("屏幕布局可独立编辑与导出，目前尚未应用到实际鼠标共享。", secondary: true));
+        page.Children.Add(Text("在设备页选择“排列屏幕”，读取两端屏幕后拖动排列，再“应用并连接”。每次连接都保持暂停；运行期间停止连接后才能更改布局。", secondary: true));
     }
     private void ShowLayout()
     {
@@ -642,6 +650,7 @@ internal sealed class MainWindow : Window
         workspace.Children.Add(heading);
         var toolbar = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(0, 0, 0, 16) };
         layoutToolbar = toolbar;
+        AddRuntimeToolbar(toolbar);
         toolbar.Children.Add(Action("添加屏幕", "add-screen", AddScreen));
         toolbar.Children.Add(Action("导入布局", "import-layout", Import));
         export.Content = "导出布局"; export.FontSize = theme.Number("typography", "body");
@@ -707,15 +716,16 @@ internal sealed class MainWindow : Window
     {
         UpdateSessionUi();
         export.IsEnabled = coreReady && !busy && layout.Screens.Count > 0;
-        Message(theme.Copy("apply_unavailable") + (sample ? " " + theme.Copy("sample_notice") : ""));
+        Message(sample ? theme.Copy("sample_notice") : runtimeLayout is null ? "选择已配对设备并读取屏幕，将排列应用到实际键鼠共享。也可独立编辑布局草稿。" : session.Snapshot.ProcessRunning && session.IsRouted ? "当前连接使用已应用的排列。停止连接后可以修改；暂停共享可随时恢复本机控制。" : "拖动屏幕使边缘贴合，再点击“应用并连接”。连接后保持暂停，需手动开始跨屏共享。");
     }
     private void Message(string text, bool error = false)
     {
-        notice.Title = theme.Copy("draft_label"); notice.Message = text;
+        notice.Title = runtimeLayout is null || sample ? theme.Copy("draft_label") : "跨屏键鼠"; notice.Message = text;
         notice.Severity = error ? InfoBarSeverity.Error : InfoBarSeverity.Informational; notice.IsOpen = true;
     }
     private async Task<bool> Commit(LayoutDocument candidate, bool isSample = false)
     {
+        if (!CanEditLayout) { Message("请先停止连接，再更改屏幕排列。", true); return false; }
         if (busy || !coreReady) { Message("布局内核未就绪，请确认客户端已完整构建。", true); return false; }
         busy = true; export.IsEnabled = false; long attempt = ++revision;
         try
@@ -769,14 +779,14 @@ internal sealed class MainWindow : Window
             Canvas.SetLeft(tile, screen.X * scale + offsetX); Canvas.SetTop(tile, screen.Y * scale + offsetY); canvas.Children.Add(tile);
             button.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
             {
-                if (busy || !coreReady || !e.GetCurrentPoint(canvas).Properties.IsLeftButtonPressed) return;
+                if (!CanEditLayout || busy || !coreReady || !e.GetCurrentPoint(canvas).Properties.IsLeftButtonPressed) return;
                 selected = screen.Id; Inspect(); RefreshDevices(); button.Focus(FocusState.Pointer);
                 dragOriginal = screen; dragPreview = screen; dragVisual = tile; dragStart = e.GetCurrentPoint(canvas).Position;
                 canvas.CapturePointer(e.Pointer); e.Handled = true;
             }), true);
             button.KeyDown += async (_, e) =>
             {
-                if (busy || !coreReady || e.Key is not (VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down)) return;
+                if (!CanEditLayout || busy || !coreReady || e.Key is not (VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down)) return;
                 selected = screen.Id; e.Handled = true;
                 double step = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0 ? 50 : 10;
                 var next = screen with { X = screen.X + (e.Key == VirtualKey.Left ? -step : e.Key == VirtualKey.Right ? step : 0), Y = screen.Y + (e.Key == VirtualKey.Up ? -step : e.Key == VirtualKey.Down ? step : 0) };
@@ -811,10 +821,12 @@ internal sealed class MainWindow : Window
         var screen = layout.Screens.FirstOrDefault(s => s.Id == selected);
         inspector.Children.Clear(); inspector.Children.Add(Text(screen is null ? "屏幕属性" : ScreenName(screen.Id), "section"));
         if (screen is null) { inspector.Children.Add(Text("选择一块屏幕，编辑位置与尺寸。", secondary: true)); return; }
-        var id = new TextBox { Header = "屏幕标识", Text = screen.Id };
-        var device = new TextBox { Header = "所属设备标识", Text = screen.DeviceId };
+        bool bound = runtimeLayout?.Bindings.Any(b => b.ScreenId == screen.Id) == true;
+        var id = new TextBox { Header = "屏幕标识", Text = screen.Id, IsReadOnly = bound };
+        var device = new TextBox { Header = "所属设备标识", Text = screen.DeviceId, IsReadOnly = bound };
         AutomationProperties.SetAutomationId(id, "property-id"); AutomationProperties.SetAutomationId(device, "property-device");
-        inspector.Children.Add(id); inspector.Children.Add(device);
+        if (bound) { inspector.Children.Add(Text(DeviceName(screen.DeviceId), secondary: true)); inspector.Children.Add(Text("已关联实际显示器，屏幕身份由设备管理。", "caption", true)); }
+        else { inspector.Children.Add(id); inspector.Children.Add(device); }
         NumberBox Number(string title, string aid, double value)
         { var box = new NumberBox { Header = title, Value = value, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact }; AutomationProperties.SetAutomationId(box, aid); inspector.Children.Add(box); return box; }
         var x = Number("水平位置", "property-x", screen.X); var y = Number("垂直位置", "property-y", screen.Y);
@@ -826,6 +838,8 @@ internal sealed class MainWindow : Window
         }));
         inspector.Children.Add(Action("移除屏幕", "remove-screen", async () =>
         {
+            if (!CanEditLayout) { Message("请先停止连接，再更改屏幕排列。", true); return; }
+            if (bound) { Message("这块屏幕来自设备。请连接或移除实际显示器后，点击“重新读取屏幕”。", true); return; }
             var candidate = new LayoutDocument(layout.Screens.Where(s => s.Id != screen.Id).ToList());
             if (candidate.Screens.Count == 0) { layout = candidate; selected = null; sample = false; ++revision; UpdateStatus(); Draw(); Inspect(); RefreshDevices(); }
             else if (await Commit(candidate, sample)) UpdateStatus();
@@ -844,6 +858,7 @@ internal sealed class MainWindow : Window
     }
     private async void AddScreen()
     {
+        if (!CanEditLayout) return;
         var id = new TextBox { Header = "屏幕名称", Text = "屏幕 " + (layout.Screens.Count + 1) };
         var device = new ComboBox { Header = "所属设备（可新增）", IsEditable = true, ItemsSource = layout.Screens.Select(screen => screen.DeviceId).Distinct().ToList(), Text = layout.Screens.FirstOrDefault()?.DeviceId ?? "我的设备", HorizontalAlignment = HorizontalAlignment.Stretch };
         var fields = new StackPanel { Spacing = 12 }; fields.Children.Add(id); fields.Children.Add(device);
@@ -855,6 +870,7 @@ internal sealed class MainWindow : Window
     }
     private async void LoadSample()
     {
+        if (!CanEditLayout) return;
         if (!coreReady) { Message("布局内核未就绪，请确认客户端已完整构建。", true); return; }
         long current = revision;
         try { var candidate = await Task.Run(() => CoreBridge.Parse(File.ReadAllText(System.IO.Path.Combine(AppContext.BaseDirectory, "sample-layout.json")))); if (current != revision) return; if (await Commit(candidate, true)) UpdateStatus(); }
@@ -862,6 +878,7 @@ internal sealed class MainWindow : Window
     }
     private async void Import()
     {
+        if (!CanEditLayout) return;
         if (!coreReady) { Message("布局内核未就绪，请确认客户端已完整构建。", true); return; }
         long current = revision;
         var picker = new FileOpenPicker(); picker.FileTypeFilter.Add(".json");
@@ -887,7 +904,7 @@ internal sealed class MainWindow : Window
             var picker = new FileSavePicker { SuggestedFileName = "Crossflow-布局" }; picker.FileTypeChoices.Add("屏幕布局", new[] { ".json" });
             WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
             var file = await picker.PickSaveFileAsync(); if (file is null) return;
-            await FileIO.WriteTextAsync(file, JsonSerializer.Serialize(snapshot, CoreBridge.Json)); Message("布局已导出，尚未应用到键鼠共享。");
+            await FileIO.WriteTextAsync(file, JsonSerializer.Serialize(snapshot, CoreBridge.Json)); Message("布局已导出。导出操作不改变当前共享状态。");
         }
         catch (Exception error) { Message(Friendly(error), true); }
         finally { busy = false; export.IsEnabled = coreReady && layout.Screens.Count > 0; }

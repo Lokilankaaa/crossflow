@@ -7,6 +7,7 @@ use crate::{
     state::{Motion, ReceiverState},
 };
 use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -26,6 +27,229 @@ const LEASE_TTL_NS: u64 = 150_000_000;
 const SEND_STALL: Duration = Duration::from_millis(100);
 const DISCOVERED_CONNECT_BUDGET: Duration = Duration::from_millis(250);
 const DISCOVERED_HANDSHAKE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Platform-native display geometry; authenticated metadata, never a trust grant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeDisplay {
+    pub id: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+pub fn validate_displays(displays: &[NativeDisplay]) -> Result<()> {
+    ensure!(
+        !displays.is_empty() && displays.len() <= 32,
+        "expected 1..32 native displays"
+    );
+    let mut ids = BTreeSet::new();
+    for display in displays {
+        ensure!(ids.insert(display.id), "duplicate native display ID");
+        ensure!(
+            [display.x, display.y, display.width, display.height]
+                .iter()
+                .all(|n| n.is_finite() && n.abs() <= (1u64 << 48) as f64)
+                && display.width > 0.0
+                && display.height > 0.0
+                && display.x + display.width > display.x
+                && display.y + display.height > display.y,
+            "invalid native display bounds"
+        );
+    }
+    Ok(())
+}
+
+fn display_frames(displays: &[NativeDisplay]) -> Result<Vec<Frame>> {
+    validate_displays(displays)?;
+    let mut frames = Vec::with_capacity(displays.len() * 2 + 1);
+    for (index, display) in displays.iter().enumerate() {
+        let mut origin = Frame::new(Kind::DisplayOrigin);
+        origin.code = index as u16;
+        origin.seq = u64::from(display.id);
+        origin.x = display.x;
+        origin.y = display.y;
+        let mut size = origin;
+        size.kind = Kind::DisplaySize;
+        size.x = display.width;
+        size.y = display.height;
+        frames.extend([origin, size]);
+    }
+    let mut end = Frame::new(Kind::DisplayEnd);
+    end.code = displays.len() as u16;
+    frames.push(end);
+    Ok(frames)
+}
+
+#[derive(Default)]
+struct DisplayReply {
+    displays: Vec<NativeDisplay>,
+    origin: Option<Frame>,
+    ended: bool,
+}
+impl DisplayReply {
+    fn accept(&mut self, frame: Frame) -> Result<()> {
+        frame.encode()?;
+        ensure!(!self.ended, "data after display terminator");
+        match frame.kind {
+            Kind::Lease => {}
+            Kind::DisplayOrigin => {
+                ensure!(
+                    self.origin.is_none()
+                        && usize::from(frame.code) == self.displays.len()
+                        && self.displays.len() < 32,
+                    "display origin out of order"
+                );
+                self.origin = Some(frame);
+            }
+            Kind::DisplaySize => {
+                let origin = self.origin.take().context("display size without origin")?;
+                ensure!(
+                    origin.code == frame.code && origin.seq == frame.seq,
+                    "display identity changed"
+                );
+                self.displays.push(NativeDisplay {
+                    id: u32::try_from(frame.seq)?,
+                    x: origin.x,
+                    y: origin.y,
+                    width: frame.x,
+                    height: frame.y,
+                });
+            }
+            Kind::DisplayEnd => {
+                ensure!(
+                    self.origin.is_none() && usize::from(frame.code) == self.displays.len(),
+                    "incomplete display inventory"
+                );
+                validate_displays(&self.displays)?;
+                self.ended = true;
+            }
+            _ => bail!("unexpected display response"),
+        }
+        Ok(())
+    }
+}
+
+/// Probe display geometry over pinned-identity authentication. The independent
+/// connection never arms input. A normal session must be established afterwards.
+pub fn query_displays(
+    host: &str,
+    bundle: &Path,
+    stop: &AtomicBool,
+    log: &Log,
+    discover: bool,
+) -> Result<Vec<NativeDisplay>> {
+    let identity = Identity::load(bundle)?;
+    let mut routes = if discover {
+        Some(crate::routes::LanRoutes::new(
+            host.parse().context("saved endpoint must be numeric")?,
+        ))
+    } else {
+        None
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = anyhow::anyhow!("display query cancelled");
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        let attempt = (|| -> Result<Vec<NativeDisplay>> {
+            let address = if let Some(routes) = &mut routes {
+                routes.next_endpoint(log)
+            } else {
+                host.to_socket_addrs()?
+                    .next()
+                    .context("no display query address")?
+            };
+            let mut socket = TcpStream::connect_timeout(
+                &address,
+                sender_phase_budget(stop, deadline, Duration::from_millis(250))?,
+            )?;
+            let budget = sender_phase_budget(stop, deadline, Duration::from_secs(1))?;
+            socket.set_read_timeout(Some(budget))?;
+            socket.set_write_timeout(Some(budget))?;
+            let channel = security::handshake(&mut socket, &identity, true)?;
+            let mut peer = Peer::new(socket, channel)?;
+            let mut query = Frame::new(Kind::DisplayQuery);
+            query.seq = 1;
+            peer.queue(query)?;
+            let mut reply = DisplayReply::default();
+            let response_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+            while !stop.load(Ordering::Acquire) && Instant::now() < response_deadline {
+                for (frame, _) in peer.pump()? {
+                    reply.accept(frame)?;
+                }
+                if reply.ended {
+                    ensure!(!peer.pending(), "query response before request completion");
+                    let mut finish = Frame::new(Kind::Stop);
+                    finish.seq = 2;
+                    peer.queue(finish)?;
+                    // Keep the socket open until the receiver consumes Stop.
+                    // Otherwise EOF can deliberately discard unparsed input.
+                    let close_deadline = deadline.min(Instant::now() + Duration::from_millis(250));
+                    while !stop.load(Ordering::Acquire) && Instant::now() < close_deadline {
+                        match peer.pump() {
+                            Err(_) => break,
+                            Ok(frames) => {
+                                ensure!(frames.is_empty(), "unexpected display close response")
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    return Ok(reply.displays);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            bail!("display query timed out or stopped")
+        })();
+        match attempt {
+            Ok(displays) => return Ok(displays),
+            Err(error) => last_error = error,
+        }
+        wait_sender_retry(stop, deadline);
+    }
+    Err(last_error.context("query authenticated peer displays"))
+}
+
+fn serve_display_query(peer: &mut Peer, sink: &mut dyn MouseSink, end: Instant) -> Result<()> {
+    let frames = display_frames(&sink.displays()?)?;
+    let deadline = end.min(Instant::now() + Duration::from_secs(2));
+    for frame in frames {
+        check_local_stop(sink)?;
+        ensure!(!peer.pending(), "display reply overlaps pending data");
+        peer.queue(frame)?;
+        while peer.pending() {
+            ensure!(Instant::now() < deadline, "display response timed out");
+            check_local_stop(sink)?;
+            let inbound = peer.pump()?;
+            if frame.kind == Kind::DisplayEnd && !inbound.is_empty() {
+                ensure!(
+                    inbound.len() == 1 && inbound[0].0.kind == Kind::Stop && inbound[0].0.seq == 2,
+                    "display query must end without input"
+                );
+                return Ok(());
+            }
+            ensure!(
+                inbound.is_empty(),
+                "unexpected input during display response"
+            );
+            if peer.pending() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    while Instant::now() < deadline {
+        check_local_stop(sink)?;
+        let frames = peer.pump()?;
+        if !frames.is_empty() {
+            ensure!(
+                frames.len() == 1 && frames[0].0.kind == Kind::Stop && frames[0].0.seq == 2,
+                "display query must end without input"
+            );
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    bail!("display query close timed out")
+}
 
 fn sender_phase_budget(stop: &AtomicBool, end: Instant, maximum: Duration) -> Result<Duration> {
     ensure!(
@@ -359,6 +583,27 @@ pub fn send_ordered(
     send_source(options, SenderSource::Ordered(input), stop, log, None)
 }
 
+/// Ordered inputs with the same pinned-identity LAN route recovery as movement.
+pub fn send_ordered_discovered(
+    options: SendOptions<'_>,
+    input: Arc<Mutex<SourceInputQueue>>,
+    stop: Arc<AtomicBool>,
+    log: Log,
+) -> Result<()> {
+    ensure!(!options.synthetic, "discovery routing requires manual arm");
+    let saved = options
+        .host
+        .parse()
+        .context("Saved peer endpoint must be numeric")?;
+    send_source(
+        options,
+        SenderSource::Ordered(input),
+        stop,
+        log,
+        Some(crate::routes::LanRoutes::new(saved)),
+    )
+}
+
 fn send_source(
     options: SendOptions<'_>,
     source: SenderSource,
@@ -613,8 +858,10 @@ fn send_source(
                             } else if input.is_active() && input.front_action().is_some() {
                                 // Never skip a rate-limited Move to send a later
                                 // button/key/wheel event out of order.
-                                if matches!(input.front_action(), Some(InputAction::Move { .. }))
-                                    && sent.elapsed() < interval
+                                if matches!(
+                                    input.front_action(),
+                                    Some(InputAction::Move { .. } | InputAction::Position { .. })
+                                ) && sent.elapsed() < interval
                                 {
                                     None
                                 } else {
@@ -652,10 +899,13 @@ fn send_source(
                                         log.write("sent",json!({"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"captures_coalesced":captures,"lease":lease,"completion":"queued_local"}));
                                         sent = Instant::now();
                                     }
-                                    Kind::Button | Kind::Key | Kind::Scroll => {
+                                    Kind::Position | Kind::Button | Kind::Key | Kind::Scroll => {
                                         // Never log key usages, down/up payloads or
                                         // wheel values: only pipeline timing/kind.
                                         log.write("input_queued",json!({"kind":format!("{:?}",frame.kind),"seq":seq,"t0_ns":frame.t0_ns,"t1_ns":now,"completion":"queued_local"}));
+                                        if frame.kind == Kind::Position {
+                                            sent = Instant::now();
+                                        }
                                     }
                                     _ => log.write(
                                         "control",
@@ -719,6 +969,9 @@ pub struct WorkerTiming {
 }
 
 pub trait MouseSink {
+    fn displays(&self) -> Result<Vec<NativeDisplay>> {
+        bail!("display inventory is not supported by this adapter")
+    }
     /// Consume the latest action timing once, before any maintenance/control RPC.
     fn take_timing(&mut self) -> Option<WorkerTiming> {
         None
@@ -732,6 +985,11 @@ pub trait MouseSink {
         Ok(())
     }
     fn move_by(&mut self, dx: f64, dy: f64) -> Result<(f64, f64)>;
+    /// Absolute target-native desktop position. Native adapters validate that
+    /// the point belongs to a currently usable display before posting input.
+    fn position(&mut self, _x: f64, _y: f64, _display_id: u32) -> Result<(f64, f64)> {
+        bail!("absolute positioning is not supported by this adapter")
+    }
     /// Releases (`down=false`) must bypass emergency/display guards that block
     /// new input. Errors must not contain keycodes, typed text or input payloads.
     fn button(&mut self, _button: Button, _down: bool) -> Result<()> {
@@ -760,6 +1018,12 @@ pub struct DrySink {
     pub moves: u64,
 }
 impl MouseSink for DrySink {
+    fn position(&mut self, x: f64, y: f64, _display_id: u32) -> Result<(f64, f64)> {
+        self.x = x;
+        self.y = y;
+        self.moves += 1;
+        Ok((x, y))
+    }
     fn move_by(&mut self, dx: f64, dy: f64) -> Result<(f64, f64)> {
         self.x += dx;
         self.y += dy;
@@ -797,6 +1061,9 @@ impl<'a> OwnedSink<'a> {
     }
 }
 impl MouseSink for OwnedSink<'_> {
+    fn displays(&self) -> Result<Vec<NativeDisplay>> {
+        self.sink.displays()
+    }
     fn take_timing(&mut self) -> Option<WorkerTiming> {
         self.sink.take_timing()
     }
@@ -810,6 +1077,9 @@ impl MouseSink for OwnedSink<'_> {
     }
     fn move_by(&mut self, dx: f64, dy: f64) -> Result<(f64, f64)> {
         self.sink.move_by(dx, dy)
+    }
+    fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+        self.sink.position(x, y, display_id)
     }
     fn button(&mut self, button: Button, down: bool) -> Result<()> {
         if down {
@@ -917,6 +1187,8 @@ fn check_local_stop(sink: &dyn MouseSink) -> Result<()> {
 /// Contiguous moves within a single control epoch are reduced to their net
 /// cumulative displacement. No interpolation or delayed smoothing is added.
 struct MoveGroup {
+    absolute: bool,
+    display_id: u32,
     dx: f64,
     dy: f64,
     first_seq: u64,
@@ -927,8 +1199,13 @@ struct MoveGroup {
 }
 impl MoveGroup {
     fn extend(&mut self, frame: Frame, delta: (f64, f64), t2_ns: u64) {
-        self.dx += delta.0;
-        self.dy += delta.1;
+        if self.absolute {
+            self.dx = delta.0;
+            self.dy = delta.1;
+        } else {
+            self.dx += delta.0;
+            self.dy += delta.1;
+        }
         self.last_seq = frame.seq;
         self.frames += 1;
         self.earliest_t2_ns = self.earliest_t2_ns.min(t2_ns);
@@ -944,21 +1221,33 @@ fn flush_moves(pending: &mut Option<MoveGroup>, sink: &mut dyn MouseSink, log: &
     let t3 = log.ns();
     // Any adapter failure is terminal for the receiver, including an Escape
     // detected between our poll and its native post. Never silently relisten.
-    let (x, y) = sink
-        .move_by(group.dx, group.dy)
-        .map_err(terminal_sink_failure)?;
+    let (x, y) = if group.absolute {
+        sink.position(group.dx, group.dy, group.display_id)
+    } else {
+        sink.move_by(group.dx, group.dy)
+    }
+    .map_err(terminal_sink_failure)?;
     let t4 = log.ns();
     let worker_timing = sink.take_timing();
-    log.write(
-        "received",
-        json!({
-            "seq":group.last_seq,"first_seq":group.first_seq,
-            "t2_ns":group.earliest_t2_ns,"t3_ns":t3,"t4_ns":t4,
-            "x":x,"y":y,"lease":group.last_lease,"frames_coalesced":group.frames,
-            "receive_timestamp_source":"user_space_batch_read_complete",
-            "worker_timing":worker_timing
-        }),
-    );
+    if group.absolute {
+        log.write(
+            "input_applied",
+            json!({"seq":group.last_seq,"first_seq":group.first_seq,
+            "frames_coalesced":group.frames,"kind":"Position","t2_ns":group.earliest_t2_ns,
+            "t3_ns":t3,"t4_ns":t4,"worker_timing":worker_timing}),
+        );
+    } else {
+        log.write(
+            "received",
+            json!({
+                "seq":group.last_seq,"first_seq":group.first_seq,
+                "t2_ns":group.earliest_t2_ns,"t3_ns":t3,"t4_ns":t4,
+                "x":x,"y":y,"lease":group.last_lease,"frames_coalesced":group.frames,
+                "receive_timestamp_source":"user_space_batch_read_complete",
+                "worker_timing":worker_timing
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -977,14 +1266,26 @@ fn process_received_batch(
         let t2 = log.at(received_at);
         // Lease validity uses processing time, not the earlier arrival stamp.
         let delta = state.apply(frame, log.ns())?;
-        if frame.kind != Kind::Move {
+        if !matches!(frame.kind, Kind::Move | Kind::Position)
+            || pending.as_ref().is_some_and(|group| {
+                group.absolute != (frame.kind == Kind::Position)
+                    || (group.absolute && group.display_id != frame.display_id)
+            })
+        {
             flush_moves(&mut pending, sink, log)?;
         }
-        if let Some(delta) = delta {
+        let coordinates = if frame.kind == Kind::Position {
+            Some((frame.x, frame.y))
+        } else {
+            delta
+        };
+        if let Some(delta) = coordinates {
             if let Some(group) = pending.as_mut() {
                 group.extend(frame, delta, t2);
             } else {
                 pending = Some(MoveGroup {
+                    absolute: frame.kind == Kind::Position,
+                    display_id: frame.display_id,
                     dx: delta.0,
                     dy: delta.1,
                     first_seq: frame.seq,
@@ -1294,6 +1595,7 @@ fn receive_listener_loop(
             let mut lease = 0;
             let mut last_grant = Instant::now() - LEASE_PERIOD;
             let mut last_input = Instant::now();
+            let mut first_sender_frame = true;
             trace.write(&log, "connected", json!({"peer":address.to_string()}));
             authenticated = true;
             if let Some(observer) = observer {
@@ -1318,6 +1620,15 @@ fn receive_listener_loop(
                 let frames = peer.pump()?;
                 if !frames.is_empty() {
                     last_input = Instant::now();
+                    if first_sender_frame && frames[0].0.kind == Kind::DisplayQuery {
+                        ensure!(
+                            frames.len() == 1 && !peer.pending(),
+                            "invalid display query batch"
+                        );
+                        log.write("display_query", json!({}));
+                        return serve_display_query(&mut peer, &mut owned, end);
+                    }
+                    first_sender_frame = false;
                 }
                 let ended = process_received_batch(frames, &mut state, &mut owned, &log)?;
                 // Publish only after the complete batch and adapter operations
@@ -1390,6 +1701,100 @@ mod tests {
     use super::*;
     use crate::metrics::LogWriter;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn display_inventory_requires_complete_ordered_finite_unique_geometry() {
+        let inventory = vec![
+            NativeDisplay {
+                id: 1,
+                x: -1920.0,
+                y: -100.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            NativeDisplay {
+                id: 2,
+                x: 0.0,
+                y: 0.0,
+                width: 1470.0,
+                height: 956.0,
+            },
+        ];
+        let frames = display_frames(&inventory).unwrap();
+        let mut reply = DisplayReply::default();
+        for frame in &frames {
+            reply.accept(*frame).unwrap();
+        }
+        assert!(reply.ended);
+        assert_eq!(reply.displays, inventory);
+        assert!(reply.accept(frames[0]).is_err());
+        assert!(DisplayReply::default().accept(frames[1]).is_err());
+        let mut reply = DisplayReply::default();
+        reply.accept(frames[0]).unwrap();
+        assert!(reply.accept(*frames.last().unwrap()).is_err());
+        let mut duplicate = inventory.clone();
+        duplicate[1].id = 1;
+        assert!(display_frames(&duplicate).is_err());
+        let mut invalid = inventory.clone();
+        invalid[0].width = f64::NAN;
+        assert!(display_frames(&invalid).is_err());
+        assert!(display_frames(&[]).is_err());
+    }
+
+    #[test]
+    fn positions_coalesce_without_crossing_relative_or_discrete_barriers() {
+        struct Sink(Vec<(&'static str, f64)>);
+        impl MouseSink for Sink {
+            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                self.0.push(("move", x));
+                Ok((x, y))
+            }
+            fn position(&mut self, x: f64, y: f64, _display_id: u32) -> Result<(f64, f64)> {
+                self.0.push(("position", x));
+                Ok((x, y))
+            }
+            fn key(&mut self, _: u16, _: bool) -> Result<()> {
+                self.0.push(("key", 0.0));
+                Ok(())
+            }
+        }
+        let (writer, path) = logs();
+        let mut state = state(&writer.log);
+        let mut sink = Sink(vec![]);
+        let mut key = frame(Kind::Key, 5, 0.0);
+        key.0.code = 0x04;
+        key.0.down = true;
+        let frames = vec![
+            frame(Kind::Arm, 1, 0.0),
+            frame(Kind::Position, 2, 100.0),
+            frame(Kind::Position, 3, 120.0),
+            frame(Kind::Move, 4, 2.0),
+            key,
+            frame(Kind::Position, 6, -10.0),
+            frame(Kind::Pause, 7, 0.0),
+        ];
+        process_received_batch(frames, &mut state, &mut sink, &writer.log).unwrap();
+        assert_eq!(
+            sink.0,
+            vec![
+                ("position", 120.0),
+                ("move", 2.0),
+                ("key", 0.0),
+                ("position", -10.0)
+            ]
+        );
+        writer.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let position: Value = text
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["kind"] == "Position")
+            .unwrap();
+        assert_eq!(position["first_seq"], 2);
+        assert_eq!(position["seq"], 3);
+        assert_eq!(position["frames_coalesced"], 2);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn sender_phase_budgets_cap_and_clip_to_session_end() {
@@ -2147,6 +2552,8 @@ mod tests {
     #[test]
     fn group_keeps_earliest_arrival_and_latest_sequence() {
         let mut group = MoveGroup {
+            absolute: false,
+            display_id: 0,
             dx: 1.,
             dy: 2.,
             first_seq: 2,

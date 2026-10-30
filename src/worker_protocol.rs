@@ -9,7 +9,7 @@
 use anyhow::{Result, bail, ensure};
 
 pub const FRAME_LEN: usize = 80;
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const ACTIVE_LEASE_NS: u64 = 150_000_000;
 pub const IDLE_LEASE_NS: u64 = 10_000_000_000;
 pub const MAX_REQUEST_AGE_NS: u64 = 30_000_000;
@@ -29,6 +29,7 @@ pub enum Op {
     Shutdown = 9,
     Completed = 10,
     Failed = 11,
+    Position = 12,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,6 +46,7 @@ pub struct Message {
     pub down: bool,
     pub call_start_ns: u64,
     pub call_end_ns: u64,
+    pub display_id: u32,
 }
 
 impl Message {
@@ -62,10 +64,15 @@ impl Message {
             down: false,
             call_start_ns: 0,
             call_end_ns: 0,
+            display_id: 0,
         }
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.op == Op::Position || self.display_id == 0,
+            "unrelated worker target display ID"
+        );
         if self.op == Op::Completed {
             ensure!(
                 self.call_start_ns <= self.call_end_ns && self.call_end_ns <= self.sent_ns,
@@ -85,6 +92,13 @@ impl Message {
         let zero_ab = self.a == 0 && self.b == 0;
         let zero_key = self.code == 0 && !self.down;
         match self.op {
+            Op::Position => {
+                ensure!(
+                    self.x.abs() <= (1u64 << 48) as f64 && self.y.abs() <= (1u64 << 48) as f64,
+                    "worker absolute position exceeds bound"
+                );
+                ensure!(zero_ab && zero_key, "unrelated worker position fields");
+            }
             Op::Move => {
                 ensure!(
                     self.x.abs() <= 20_000.0 && self.y.abs() <= 20_000.0,
@@ -122,8 +136,8 @@ impl Message {
     }
 
     /// Fixed-width big-endian fields. Bytes 7 and 58..64 are reserved zeroes.
-    /// Version 2 adds Completed call start/end timestamps at 64..72/72..80;
-    /// its 80-byte records are intentionally incompatible with version 1.
+    /// Version 3 adds Position and retains v2 Completed call timestamps.
+    /// Records intentionally reject older worker protocol versions.
     pub fn encode(&self) -> Result<[u8; FRAME_LEN]> {
         self.validate()?;
         let mut bytes = [0; FRAME_LEN];
@@ -139,6 +153,7 @@ impl Message {
         bytes[48..52].copy_from_slice(&self.a.to_be_bytes());
         bytes[52..56].copy_from_slice(&self.b.to_be_bytes());
         bytes[56..58].copy_from_slice(&self.code.to_be_bytes());
+        bytes[60..64].copy_from_slice(&self.display_id.to_be_bytes());
         bytes[64..72].copy_from_slice(&self.call_start_ns.to_be_bytes());
         bytes[72..80].copy_from_slice(&self.call_end_ns.to_be_bytes());
         Ok(bytes)
@@ -150,7 +165,7 @@ impl Message {
             "invalid worker protocol header"
         );
         ensure!(
-            bytes[6] <= 1 && bytes[7] == 0 && bytes[58..64].iter().all(|&b| b == 0),
+            bytes[6] <= 1 && bytes[7] == 0 && bytes[58..60].iter().all(|&b| b == 0),
             "invalid worker reserved fields"
         );
         let op = match bytes[5] {
@@ -165,6 +180,7 @@ impl Message {
             9 => Op::Shutdown,
             10 => Op::Completed,
             11 => Op::Failed,
+            12 => Op::Position,
             _ => bail!("unknown worker operation"),
         };
         let message = Self {
@@ -180,6 +196,7 @@ impl Message {
             down: bytes[6] == 1,
             call_start_ns: u64::from_be_bytes(bytes[64..72].try_into().unwrap()),
             call_end_ns: u64::from_be_bytes(bytes[72..80].try_into().unwrap()),
+            display_id: u32::from_be_bytes(bytes[60..64].try_into().unwrap()),
         };
         message.validate()?;
         Ok(message)
@@ -259,7 +276,10 @@ impl WorkerLease {
         } else {
             ensure!(message.epoch == self.epoch, "worker epoch invalid");
         }
-        if matches!(message.op, Op::Move | Op::Button | Op::Key | Op::Scroll) {
+        if matches!(
+            message.op,
+            Op::Move | Op::Position | Op::Button | Op::Key | Op::Scroll
+        ) {
             ensure!(self.active, "worker is not active");
         }
         let next_active = match message.op {
@@ -308,6 +328,7 @@ mod tests {
             Op::Ready,
             Op::Reset,
             Op::Move,
+            Op::Position,
             Op::Button,
             Op::Key,
             Op::Scroll,
@@ -319,7 +340,7 @@ mod tests {
         ] {
             let mut message = request(op, 0x0102030405060708, 7, 99);
             match op {
-                Op::Move => {
+                Op::Move | Op::Position => {
                     message.x = -20_000.;
                     message.y = 0.25;
                 }
@@ -378,6 +399,27 @@ mod tests {
     }
 
     #[test]
+    fn absolute_position_binds_display_and_requires_active_worker() {
+        let mut message = request(Op::Position, 2, 1, 2);
+        message.x = -20000.0;
+        message.y = 123.0;
+        message.display_id = 0x87654321;
+        let bytes = message.encode().unwrap();
+        assert_eq!(&bytes[60..64], &[0x87, 0x65, 0x43, 0x21]);
+        assert_eq!(Message::decode(&bytes).unwrap(), message);
+        let mut forged = bytes;
+        forged[5] = Op::Move as u8;
+        assert!(Message::decode(&forged).is_err());
+        let mut lease = WorkerLease::new(0);
+        lease.accept(&request(Op::Reset, 1, 1, 1), 1).unwrap();
+        lease.accept(&message, 2).unwrap();
+        lease.accept(&request(Op::Release, 3, 1, 3), 3).unwrap();
+        message.seq = 4;
+        message.sent_ns = 4;
+        assert!(lease.accept(&message, 4).is_err());
+    }
+
+    #[test]
     fn only_completed_may_carry_call_timestamps() {
         for op in [
             Op::Ready,
@@ -417,7 +459,7 @@ mod tests {
         let ready = Message::new(Op::Ready);
         assert_eq!((ready.seq, ready.epoch), (0, 0));
         let encoded = ready.encode().unwrap();
-        assert_eq!((encoded.len(), encoded[4]), (80, 2));
+        assert_eq!((encoded.len(), encoded[4]), (80, 3));
         let mut padded_v1 = encoded;
         padded_v1[4] = 1;
         assert!(Message::decode(&padded_v1).is_err());

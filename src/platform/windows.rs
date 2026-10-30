@@ -1,6 +1,11 @@
 //! Windows Raw Input capture. Compatibility entry points capture movement only;
 //! the explicit full-input entry point also captures buttons, wheel and keys.
-//! Local input is never suppressed or confined. Callbacks must be nonblocking.
+//! Legacy entry points never suppress local input. The routed entry point uses
+//! short local-delivery hooks while focus is remote. Callbacks must be nonblocking.
+
+#[path = "windows_routed.rs"]
+mod routed;
+pub use routed::{NativeDisplay, cursor_position, displays, warp_cursor};
 
 use crate::input::Button;
 use std::{
@@ -32,10 +37,11 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, IDC_ARROW,
-    KillTimer, LoadCursorW, MSG, RegisterClassW, SW_SHOWNOACTIVATE, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW, WM_CLOSE,
-    WM_COMMAND, WM_HOTKEY, WM_INPUT, WM_NCCREATE, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_CHILD, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    KillTimer, LoadCursorW, MSG, PBT_APMSUSPEND, RegisterClassW, SW_SHOWNOACTIVATE, SendMessageW,
+    SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW,
+    WM_CLOSE, WM_COMMAND, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_INPUT, WM_NCCREATE,
+    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_SETFONT, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW,
+    WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -510,6 +516,7 @@ struct State<F, S> {
     stats: CaptureStats,
     error: Option<String>,
     full_input: bool,
+    routed_input: bool,
     shortcuts: ShortcutFilter,
 }
 struct CallbackState<F, S> {
@@ -599,6 +606,29 @@ impl<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus> State<F, S> {
             let packet = decode_input(&raw, bytes, |vk| unsafe {
                 MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) as u16
             });
+            // Routed discrete inputs originate in the low-level hook's bounded
+            // ring, independently of legacy suppression. Never duplicate them
+            // if Windows also delivers the corresponding Raw Input record.
+            let packet = if self.routed_input {
+                match packet {
+                    InputPacket::Mouse { dx, dy, .. } => {
+                        if dx != 0 || dy != 0 {
+                            self.stats.motion += 1;
+                            // Both delivery sources enter one ordered ring.
+                            // A queued hook's original timestamp must not be
+                            // delivered after a newer raw-capture timestamp.
+                            routed::enqueue_raw_move(dx, dy, captured_at);
+                        } else {
+                            self.stats.zero_motion += 1;
+                        }
+                        return;
+                    }
+                    InputPacket::Key { .. } | InputPacket::UnsupportedKey => return,
+                    other => other,
+                }
+            } else {
+                packet
+            };
             self.input_packet(packet, captured_at);
             return;
         }
@@ -706,7 +736,17 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
     // They do not need the capture state and must not trip its borrow guard.
     if !matches!(
         message,
-        WM_INPUT | WM_HOTKEY | WM_COMMAND | WM_CLOSE | WM_TIMER
+        WM_INPUT
+            | WM_HOTKEY
+            | WM_COMMAND
+            | WM_CLOSE
+            | WM_TIMER
+            | routed::WM_ROUTED_INPUT
+            | WM_DISPLAYCHANGE
+            | WM_WTSSESSION_CHANGE
+            | WM_POWERBROADCAST
+            | WM_QUERYENDSESSION
+            | WM_ENDSESSION
     ) {
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
@@ -720,6 +760,29 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
             slot.stop.store(true, Ordering::Release);
             return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
         };
+        if state.routed_input && routed_context_invalidated(message, wparam) {
+            routed::abort_input();
+            state.error =
+                Some("Windows display or session changed; reconnect before sharing".into());
+            state.command(STOP);
+            // Never veto Windows logoff/shutdown after relinquishing input.
+            return if message == WM_QUERYENDSESSION || message == WM_POWERBROADCAST {
+                1
+            } else {
+                0
+            };
+        }
+        if matches!(
+            message,
+            WM_DISPLAYCHANGE
+                | WM_WTSSESSION_CHANGE
+                | WM_POWERBROADCAST
+                | WM_QUERYENDSESSION
+                | WM_ENDSESSION
+        ) {
+            drop(state);
+            return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        }
         match message {
             WM_INPUT => {
                 let captured_at = Instant::now();
@@ -731,6 +794,33 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
                 return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             }
             WM_HOTKEY => state.command(wparam),
+            routed::WM_ROUTED_INPUT => match routed::drain_events() {
+                Ok(events) => {
+                    for event in events {
+                        match event {
+                            CaptureEvent::Key {
+                                usage,
+                                down,
+                                captured_at,
+                            } => state.input_packet(InputPacket::Key { usage, down }, captured_at),
+                            CaptureEvent::Button { .. } => {
+                                state.stats.buttons += 1;
+                                state.emit(event);
+                            }
+                            CaptureEvent::Scroll { .. } => {
+                                state.stats.wheel += 1;
+                                state.emit(event);
+                            }
+                            CaptureEvent::Delta { .. } => state.emit(event),
+                            _ => {}
+                        }
+                    }
+                }
+                Err(error) => {
+                    state.error = Some(error);
+                    state.stop.store(true, Ordering::Release);
+                }
+            },
             WM_COMMAND if (wparam >> 16) == 0 => state.command(wparam & 0xffff),
             WM_CLOSE => state.command(STOP),
             WM_TIMER => {}
@@ -747,6 +837,15 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
         return 0;
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn routed_context_invalidated(message: u32, parameter: WPARAM) -> bool {
+    message == WM_DISPLAYCHANGE
+        || message == WM_QUERYENDSESSION
+        || (message == WM_ENDSESSION && parameter != 0)
+        || (message == WM_POWERBROADCAST && parameter == PBT_APMSUSPEND as usize)
+        // Console/remote disconnect, logoff and lock of this session.
+        || (message == WM_WTSSESSION_CHANGE && matches!(parameter, 2 | 4 | 6 | 7))
 }
 
 fn win_error(operation: &str) -> String {
@@ -841,6 +940,7 @@ pub fn run_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStat
         duration,
         false,
         WindowMode::Diagnostics,
+        None,
     )
 }
 
@@ -870,6 +970,7 @@ pub fn run_capture_headless_with_status<
         duration,
         false,
         WindowMode::Headless,
+        None,
     )
 }
 
@@ -890,9 +991,41 @@ pub fn run_input_capture_with_status<F: FnMut(CaptureEvent), S: FnMut() -> Captu
         duration,
         true,
         WindowMode::Diagnostics,
+        None,
     )
 }
 
+/// Full physical capture with local delivery suppressed only while focus is
+/// remote. The caller clears `remote_focus` before warping back and whenever
+/// its queue pauses or transport disconnects. The status callback must return
+/// Active while routing is enabled; Ready/Disconnected clear remote focus.
+/// No global cursor clipping or persistent system setting is changed.
+pub fn run_routed_input_capture_with_status<
+    F: FnMut(CaptureEvent),
+    S: FnMut() -> CaptureStatus,
+    R: FnOnce(),
+>(
+    on_event: F,
+    status_fn: S,
+    on_ready: R,
+    remote_focus: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    duration: Option<Duration>,
+) -> Result<CaptureStats, String> {
+    remote_focus.store(false, Ordering::Release);
+    run_capture_mode(
+        on_event,
+        status_fn,
+        on_ready,
+        stop,
+        duration,
+        true,
+        WindowMode::Headless,
+        Some(remote_focus),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     on_event: F,
     status_fn: S,
@@ -901,6 +1034,7 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     duration: Option<Duration>,
     full_input: bool,
     window_mode: WindowMode,
+    remote_focus: Option<Arc<AtomicBool>>,
 ) -> Result<CaptureStats, String> {
     if stop.load(Ordering::Acquire) {
         return Ok(CaptureStats::default());
@@ -926,6 +1060,7 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
             stats: CaptureStats::default(),
             error: None,
             full_input,
+            routed_input: remote_focus.is_some(),
             shortcuts: ShortcutFilter::default(),
         }),
         controls: Cell::new(None),
@@ -974,7 +1109,18 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
             320,
             null_mut(),
         ),
-        WindowMode::Headless => (0, 0, 0, 0, 0, HWND_MESSAGE),
+        WindowMode::Headless => (
+            0,
+            0,
+            0,
+            0,
+            0,
+            if remote_focus.is_some() {
+                null_mut()
+            } else {
+                HWND_MESSAGE
+            },
+        ),
     };
     resources.hwnd = unsafe {
         CreateWindowExW(
@@ -1128,21 +1274,27 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
             return Err(win_error("SetWindowTextW(shortcut instructions)"));
         }
     }
-    if full_input {
-        // Registration is already live: messages continue queuing while this
-        // bounded startup snapshot is sampled. Never use the unreliable low
-        // "pressed since last call" bit, and never log the actual held keys.
-        let (buttons, keys) = physical_snapshot(
-            |vk| unsafe { GetAsyncKeyState(vk) < 0 },
-            |vk| unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) as u16 },
-        );
-        let mut state = state.data.borrow_mut();
-        state.shortcuts.held.extend(keys.iter().copied());
-        state.emit(CaptureEvent::Snapshot { buttons, keys });
-    }
     resources.timer = unsafe { SetTimer(resources.hwnd, 1, 10, None) };
     if resources.timer == 0 {
         return Err(win_error("SetTimer"));
+    }
+    let routed = remote_focus
+        .map(|focus| routed::RoutedHooks::install(resources.hwnd, focus, state.stop.clone()))
+        .transpose()?;
+    if full_input {
+        // Registration and routed hooks are live before seeding. Both routed
+        // delivery provenance and the core receive the same physical snapshot.
+        let (buttons, keys) = if let Some(hooks) = &routed {
+            hooks.snapshot()
+        } else {
+            physical_snapshot(
+                |vk| unsafe { GetAsyncKeyState(vk) < 0 },
+                |vk| unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) as u16 },
+            )
+        };
+        let mut state = state.data.borrow_mut();
+        state.shortcuts.held.extend(keys.iter().copied());
+        state.emit(CaptureEvent::Snapshot { buttons, keys });
     }
     // Display once without taking focus; never force activation on status updates.
     if window_mode == WindowMode::Diagnostics {
@@ -1157,6 +1309,9 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     let started = Instant::now();
     let mut message = MaybeUninit::<MSG>::zeroed();
     while !state.stop.load(Ordering::Acquire) && !duration.is_some_and(|d| started.elapsed() >= d) {
+        if let Some(hooks) = &routed {
+            hooks.maintain(state.data.borrow_mut().status());
+        }
         let result = unsafe { GetMessageW(message.as_mut_ptr(), null_mut(), 0, 0) };
         if result == -1 {
             state.data.borrow_mut().error = Some(win_error("GetMessageW"));
@@ -1187,6 +1342,10 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         }
     }
     state.data.borrow_mut().stats.elapsed = started.elapsed();
+    if let Some(error) = routed.as_ref().and_then(routed::RoutedHooks::error) {
+        state.data.borrow_mut().error = Some(error);
+    }
+    drop(routed);
     drop(resources);
     if state.reentrant.get() {
         return Err("reentrant capture callback detected; capture stopped".into());
@@ -1201,6 +1360,31 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_display_lock_disconnect_and_suspend_invalidate_without_rearming_on_unlock() {
+        for (message, parameter) in [
+            (WM_DISPLAYCHANGE, 32),
+            (WM_QUERYENDSESSION, 0),
+            (WM_ENDSESSION, 1),
+            (WM_POWERBROADCAST, PBT_APMSUSPEND as usize),
+            (WM_WTSSESSION_CHANGE, 2),
+            (WM_WTSSESSION_CHANGE, 4),
+            (WM_WTSSESSION_CHANGE, 6),
+            (WM_WTSSESSION_CHANGE, 7),
+        ] {
+            assert!(routed_context_invalidated(message, parameter));
+        }
+        for (message, parameter) in [
+            (WM_ENDSESSION, 0),
+            (WM_WTSSESSION_CHANGE, 8),
+            (WM_WTSSESSION_CHANGE, 15),
+            (WM_TIMER, 7),
+            (WM_POWERBROADCAST, 18),
+        ] {
+            assert!(!routed_context_invalidated(message, parameter));
+        }
+    }
 
     #[test]
     fn headless_hotkeys_require_both_successes_and_keep_partial_cleanup() {
@@ -1362,6 +1546,7 @@ mod tests {
                 stats: CaptureStats::default(),
                 error: None,
                 full_input: false,
+                routed_input: false,
                 shortcuts: ShortcutFilter::default(),
             };
             let mut registered = Vec::new();
@@ -1439,6 +1624,7 @@ mod tests {
             stats: CaptureStats::default(),
             error: None,
             full_input: false,
+            routed_input: false,
             shortcuts: ShortcutFilter::default(),
         };
         state.emit(CaptureEvent::Toggle);
@@ -1486,6 +1672,7 @@ mod tests {
             stats: CaptureStats::default(),
             error: None,
             full_input: false,
+            routed_input: false,
             shortcuts: ShortcutFilter::default(),
         };
         state.command(TOGGLE);
@@ -1668,6 +1855,7 @@ mod tests {
             stats: CaptureStats::default(),
             error: None,
             full_input: true,
+            routed_input: false,
             shortcuts: ShortcutFilter::default(),
         };
         let at = Instant::now();

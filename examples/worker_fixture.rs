@@ -57,6 +57,14 @@ impl MouseSink for RecordingSink {
         append(&self.0, "move")?;
         Ok((x, y))
     }
+    fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+        ensure!(
+            (x, y, display_id) == (-123.0, 456.0, 42),
+            "absolute position IPC payload changed"
+        );
+        append(&self.0, "position-display-42")?;
+        Ok((x, y))
+    }
     fn key(&mut self, _: u16, down: bool) -> Result<()> {
         append(&self.0, if down { "key-down" } else { "key-up" })
     }
@@ -138,10 +146,23 @@ fn run(mode: &str, root: &Path, behavior: &str) -> Result<()> {
                 key_timing.request_seq + 1 == button_timing.request_seq,
                 "timing belongs to another RPC"
             );
+            let button_seq = button_timing.request_seq;
             fs::write(
                 root.join("timings.json"),
                 serde_json::to_vec(&[key_timing, button_timing])?,
             )?;
+            if behavior == "healthy" {
+                ensure!(
+                    proxy.position(-123.0, 456.0, 42)? == (-123.0, 456.0),
+                    "position response changed"
+                );
+                let timing = proxy.take_timing().context("position timing missing")?;
+                ensure!(
+                    timing.request_seq == button_seq + 1,
+                    "position timing belongs to another RPC"
+                );
+                fs::write(root.join("position-ack"), b"display-bound")?;
+            }
             fs::write(root.join("parent-ready"), b"held-pair-acknowledged")?;
             match behavior {
                 "ack-failure" => {

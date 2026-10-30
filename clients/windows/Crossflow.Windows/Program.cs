@@ -9,6 +9,7 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--runtime-layout-self-test") { RuntimeLayoutSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--pairing-fixture") { PairingSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--pairing-self-test") { PairingSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--peer-fixture") { PeerSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }

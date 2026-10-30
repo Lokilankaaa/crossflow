@@ -1,10 +1,10 @@
 use crate::input::{Button, InputAction, QueuedInput, is_keyboard_usage};
 use anyhow::{Result, bail, ensure};
 
-/// Version 2 is intentionally incompatible with the movement-only v1 wire
-/// format. Both peers must be rebuilt before enabling the expanded inputs.
+/// Version 3 adds absolute Position, intentionally incompatible with v2.
+/// Both peers must be rebuilt before enabling routed inputs.
 pub const FRAME_LEN: usize = 72;
-pub const WIRE_VERSION: u8 = 2;
+pub const WIRE_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -18,6 +18,11 @@ pub enum Kind {
     Button = 7,
     Scroll = 8,
     Key = 9,
+    Position = 10,
+    DisplayQuery = 11,
+    DisplayOrigin = 12,
+    DisplaySize = 13,
+    DisplayEnd = 14,
 }
 
 pub fn button_code(button: Button) -> u16 {
@@ -54,6 +59,7 @@ pub struct Frame {
     pub down: bool,
     pub wheel_x: i32,
     pub wheel_y: i32,
+    pub display_id: u32,
 }
 
 impl Frame {
@@ -70,6 +76,7 @@ impl Frame {
             down: false,
             wheel_x: 0,
             wheel_y: 0,
+            display_id: 0,
         }
     }
 
@@ -82,6 +89,7 @@ impl Frame {
         );
         let kind = match input.action {
             InputAction::Move { .. } => Kind::Move,
+            InputAction::Position { .. } => Kind::Position,
             InputAction::Button { .. } => Kind::Button,
             InputAction::Scroll { .. } => Kind::Scroll,
             InputAction::Key { .. } => Kind::Key,
@@ -93,6 +101,11 @@ impl Frame {
             InputAction::Move { x, y } => {
                 frame.x = x;
                 frame.y = y;
+            }
+            InputAction::Position { x, y, display_id } => {
+                frame.x = x;
+                frame.y = y;
+                frame.display_id = display_id;
             }
             InputAction::Button { button, down } => {
                 frame.code = button_code(button);
@@ -116,6 +129,10 @@ impl Frame {
 
     fn validate(&self) -> Result<()> {
         ensure!(
+            self.kind == Kind::Position || self.display_id == 0,
+            "unexpected target display ID"
+        );
+        ensure!(
             self.x.is_finite() && self.y.is_finite(),
             "non-finite coordinates"
         );
@@ -124,6 +141,43 @@ impl Frame {
             "coordinate bound"
         );
         match self.kind {
+            Kind::DisplayQuery => ensure!(
+                self.seq == 1
+                    && self.t0_ns == 0
+                    && self.t1_ns == 0
+                    && self.lease == 0
+                    && self.x == 0.0
+                    && self.y == 0.0
+                    && self.code == 0
+                    && !self.down
+                    && self.wheel_x == 0
+                    && self.wheel_y == 0,
+                "invalid display query"
+            ),
+            Kind::DisplayOrigin | Kind::DisplaySize | Kind::DisplayEnd => {
+                ensure!(
+                    self.t0_ns == 0
+                        && self.t1_ns == 0
+                        && self.lease == 0
+                        && !self.down
+                        && self.wheel_x == 0
+                        && self.wheel_y == 0,
+                    "unexpected display metadata fields"
+                );
+                ensure!(
+                    self.code <= 32 && self.seq <= u64::from(u32::MAX),
+                    "display metadata limit"
+                );
+                if self.kind == Kind::DisplaySize {
+                    ensure!(self.x > 0.0 && self.y > 0.0, "invalid display size");
+                }
+                if self.kind == Kind::DisplayEnd {
+                    ensure!(
+                        self.seq == 0 && self.x == 0.0 && self.y == 0.0,
+                        "invalid display terminator"
+                    );
+                }
+            }
             Kind::Button | Kind::Key => {
                 ensure!(
                     self.x == 0.0 && self.y == 0.0,
@@ -183,6 +237,7 @@ impl Frame {
         out[58] = u8::from(self.down);
         out[60..64].copy_from_slice(&self.wheel_x.to_be_bytes());
         out[64..68].copy_from_slice(&self.wheel_y.to_be_bytes());
+        out[68..72].copy_from_slice(&self.display_id.to_be_bytes());
         Ok(out)
     }
     pub fn decode(data: &[u8]) -> Result<Self> {
@@ -190,12 +245,12 @@ impl Frame {
         ensure!(&data[..4] == b"CFL0", "invalid header");
         ensure!(
             data[4] == WIRE_VERSION,
-            "unsupported wire version {}; protocol v2 requires both peers to rebuild",
+            "unsupported wire version {}; protocol v3 requires both peers to rebuild",
             data[4]
         );
         ensure!(data.len() == FRAME_LEN, "invalid frame length");
         ensure!(
-            data[6..8] == [0, 0] && data[59] == 0 && data[68..72] == [0, 0, 0, 0],
+            data[6..8] == [0, 0] && data[59] == 0,
             "nonzero reserved field"
         );
         ensure!(data[58] <= 1, "invalid down flag");
@@ -209,6 +264,11 @@ impl Frame {
             7 => Kind::Button,
             8 => Kind::Scroll,
             9 => Kind::Key,
+            10 => Kind::Position,
+            11 => Kind::DisplayQuery,
+            12 => Kind::DisplayOrigin,
+            13 => Kind::DisplaySize,
+            14 => Kind::DisplayEnd,
             _ => bail!("unknown frame type"),
         };
         let num = |o| u64::from_be_bytes(data[o..o + 8].try_into().unwrap());
@@ -224,6 +284,7 @@ impl Frame {
             down: data[58] == 1,
             wheel_x: i32::from_be_bytes(data[60..64].try_into().unwrap()),
             wheel_y: i32::from_be_bytes(data[64..68].try_into().unwrap()),
+            display_id: u32::from_be_bytes(data[68..72].try_into().unwrap()),
         };
         frame.validate()?;
         Ok(frame)
@@ -267,6 +328,11 @@ mod tests {
     #[test]
     fn all_source_actions_round_trip_with_capture_time_and_no_session_assignment() {
         let mut actions = vec![
+            InputAction::Position {
+                x: -200.0,
+                y: 300.0,
+                display_id: 42,
+            },
             InputAction::Move {
                 x: -123.125,
                 y: 8.5,
@@ -301,6 +367,11 @@ mod tests {
             assert_eq!((frame.t0_ns, frame.t1_ns), (100, 150));
             assert_eq!((frame.seq, frame.lease), (0, 0));
             match action {
+                InputAction::Position { x, y, display_id } => {
+                    assert_eq!(frame.kind, Kind::Position);
+                    assert_eq!(frame.display_id, display_id);
+                    assert_eq!((frame.x, frame.y), (x, y));
+                }
                 InputAction::Move { x, y } => {
                     assert_eq!(frame.kind, Kind::Move);
                     assert_eq!((frame.x, frame.y), (x, y));
@@ -340,7 +411,7 @@ mod tests {
         .unwrap();
         let bytes = frame.encode().unwrap();
         assert_eq!(bytes.len(), 72);
-        assert_eq!(&bytes[..6], &[b'C', b'F', b'L', b'0', 2, 9]);
+        assert_eq!(&bytes[..6], &[b'C', b'F', b'L', b'0', 3, 9]);
         assert_eq!(&bytes[56..60], &[0, 0xE1, 1, 0]);
         assert_eq!(&bytes[60..72], &[0; 12]);
         for offset in [6, 7, 59, 68, 69, 70, 71] {
@@ -366,7 +437,7 @@ mod tests {
         assert_eq!(&scroll[60..64], &(-120i32).to_be_bytes());
         assert_eq!(&scroll[64..68], &15i32.to_be_bytes());
         let mut unknown = bytes;
-        unknown[5] = 10;
+        unknown[5] = 255;
         assert!(Frame::decode(&unknown).is_err());
     }
 
@@ -379,6 +450,25 @@ mod tests {
             assert!(error.contains("unsupported wire version 1"));
             assert!(error.contains("both peers"));
         }
+    }
+
+    #[test]
+    fn position_binds_native_display_and_other_frames_cannot_carry_it() {
+        let mut position = Frame::new(Kind::Position);
+        position.display_id = 0x12345678;
+        position.x = -1920.0;
+        position.y = 200.0;
+        let bytes = position.encode().unwrap();
+        assert_eq!(&bytes[68..72], &[0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(Frame::decode(&bytes).unwrap(), position);
+        for kind in [Kind::Move, Kind::Arm, Kind::Pause, Kind::Heartbeat] {
+            let mut bad = bytes;
+            bad[5] = kind as u8;
+            assert!(Frame::decode(&bad).is_err());
+        }
+        let mut old = bytes;
+        old[4] = 2;
+        assert!(Frame::decode(&old).is_err());
     }
 
     #[test]

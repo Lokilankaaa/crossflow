@@ -346,7 +346,7 @@ fn timing_pair(op: Op) -> (Message, Message) {
 
 #[test]
 fn action_timing_intervals_partition_rpc_and_allow_zero_length_stages() {
-    for op in [Op::Move, Op::Button, Op::Key, Op::Scroll] {
+    for op in [Op::Move, Op::Position, Op::Button, Op::Key, Op::Scroll] {
         let (request, mut response) = timing_pair(op);
         let timing = timing_for_ack(&request, &response, 500).unwrap().unwrap();
         assert_eq!(timing.request_seq, request.seq);
@@ -427,6 +427,9 @@ struct DelayedSink {
     observed: Arc<Mutex<Option<(u64, u64, Duration)>>>,
 }
 impl MouseSink for DelayedSink {
+    fn position(&mut self, x: f64, y: f64, _display_id: u32) -> Result<(f64, f64)> {
+        self.move_by(x, y)
+    }
     fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
         let start = continuous_ns()?;
         let wall = Instant::now();
@@ -470,11 +473,16 @@ fn worker_ack_timestamps_enclose_delayed_sink_call_without_claiming_proxy_latenc
         ack_read.recv_timeout(Duration::from_secs(2)).unwrap().op,
         Op::Ready
     );
-    for (seq, op) in [(1, Op::Reset), (2, Op::Move), (3, Op::Shutdown)] {
+    for (seq, op) in [
+        (1, Op::Reset),
+        (2, Op::Move),
+        (3, Op::Position),
+        (4, Op::Shutdown),
+    ] {
         let mut request = Message::new(op);
         request.seq = seq;
         request.epoch = 1;
-        if op == Op::Move {
+        if matches!(op, Op::Move | Op::Position) {
             request.x = 1.0;
             request.y = -1.0;
         }
@@ -486,7 +494,7 @@ fn worker_ack_timestamps_enclose_delayed_sink_call_without_claiming_proxy_latenc
             (response.op, response.seq, response.epoch),
             (Op::Completed, seq, 1)
         );
-        if op == Op::Move {
+        if matches!(op, Op::Move | Op::Position) {
             let (inner_start, inner_end, wall_elapsed) = observed.lock().unwrap().unwrap();
             assert!(wall_elapsed >= Duration::from_millis(20));
             assert!(request.sent_ns <= response.call_start_ns);

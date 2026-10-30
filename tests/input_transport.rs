@@ -25,6 +25,7 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq)]
 enum Event {
+    Position(f64, f64, u32),
     Move(f64, f64),
     Button(Button, bool),
     Key(u16, bool),
@@ -38,6 +39,31 @@ struct RecordingSink {
     fail_key_release: Arc<AtomicBool>,
 }
 impl MouseSink for RecordingSink {
+    fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(Event::Position(x, y, display_id));
+        Ok((x, y))
+    }
+    fn displays(&self) -> Result<Vec<session::NativeDisplay>> {
+        Ok(vec![
+            session::NativeDisplay {
+                id: 7,
+                x: 0.0,
+                y: 0.0,
+                width: 1470.0,
+                height: 956.0,
+            },
+            session::NativeDisplay {
+                id: 42,
+                x: -1920.0,
+                y: -100.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+        ])
+    }
     fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
         if self.fail_move.load(Ordering::Acquire) {
             bail!("test adapter movement failure");
@@ -340,6 +366,89 @@ fn movement(x: f64, y: f64) -> Frame {
     frame.x = x;
     frame.y = y;
     frame
+}
+fn position(x: f64, y: f64) -> Frame {
+    let mut frame = Frame::new(Kind::Position);
+    frame.display_id = 42;
+    frame.x = x;
+    frame.y = y;
+    frame
+}
+
+#[test]
+#[ignore = "explicit localhost transport; no OS input"]
+fn positions_order_before_keys_and_pause_releases_then_reconnect_requires_arm() -> Result<()> {
+    let mut harness = Harness::start("position")?;
+    let mut wire = harness.connect()?;
+    wire.arm()?;
+    wire.send(movement(2.0, 3.0))?;
+    wire.send(position(-100.0, 400.0))?;
+    wire.send(key(0x04, true))?;
+    wire.send(movement(3.0, 4.0))?;
+    wire.send(Frame::new(Kind::Pause))?;
+    harness.until(|events| events.contains(&Event::Key(0x04, false)))?;
+    assert_eq!(
+        harness.observed(),
+        vec![
+            Event::Move(2.0, 3.0),
+            Event::Position(-100.0, 400.0, 42),
+            Event::Key(0x04, true),
+            Event::Move(1.0, 1.0),
+            Event::Key(0x04, false)
+        ]
+    );
+    wire.send(position(700.0, 800.0))?;
+    wire.closed()?;
+    drop(wire);
+    let mut wire = harness.connect()?;
+    wire.send(position(900.0, 800.0))?;
+    wire.closed()?;
+    assert!(
+        !harness
+            .observed()
+            .iter()
+            .any(|e| matches!(e, Event::Position(x,_,_) if *x > 0.0))
+    );
+    drop(wire);
+    harness.finish()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "explicit localhost transport; no OS input"]
+fn authenticated_inventory_does_not_arm_or_apply_input() -> Result<()> {
+    let mut harness = Harness::start("display-query")?;
+    let writer = LogWriter::new(
+        &harness.fixture.0.join("query.jsonl"),
+        json!({"actual_os_input":false}),
+    )?;
+    let displays = session::query_displays(
+        &harness.address,
+        &harness.fixture.0.join("identities/windows"),
+        &AtomicBool::new(false),
+        &writer.log,
+        false,
+    )?;
+    assert_eq!(displays.len(), 2);
+    assert_eq!(
+        (
+            displays[0].id,
+            displays[0].width,
+            displays[1].id,
+            displays[1].x
+        ),
+        (7, 1470.0, 42, -1920.0)
+    );
+    assert!(harness.observed().is_empty());
+    // A regular session remains available but does not inherit query authority.
+    let mut wire = harness.connect()?;
+    wire.send(position(20.0, 30.0))?;
+    wire.closed()?;
+    assert!(harness.observed().is_empty());
+    drop(wire);
+    harness.finish()?;
+    writer.finish()?;
+    Ok(())
 }
 fn scroll(x: i32, y: i32) -> Frame {
     let mut frame = Frame::new(Kind::Scroll);

@@ -42,6 +42,8 @@ enum Command {
         seconds: f64,
         #[arg(long, default_value_t = 1000)]
         max_hz: u32,
+        #[arg(long, requires = "peer")]
+        runtime_layout: Option<PathBuf>,
     },
     /// Private inherited-pipe input owner. Never connects to the network.
     #[command(hide = true)]
@@ -56,6 +58,13 @@ enum Command {
     },
     /// List app-managed paired devices; no private keys or file paths are returned.
     Peers,
+    /// Enumerate this computer's native screen coordinates.
+    Displays,
+    /// Query screens over an authenticated connection to a saved device.
+    PeerDisplays {
+        #[arg(long)]
+        peer: String,
+    },
     /// Development migration of an existing trusted diagnostic identity.
     #[command(hide = true)]
     PeerImport {
@@ -222,6 +231,7 @@ fn main() -> Result<()> {
             | Command::Capture { .. }
             | Command::DesktopSend { .. }
             | Command::Discover { .. }
+            | Command::PeerDisplays { .. }
     ) {
         Some(crossflow::shutdown::Shutdown::install(stop.clone())?)
     } else {
@@ -237,8 +247,27 @@ fn main() -> Result<()> {
             log,
             seconds,
             max_hz,
+            runtime_layout,
         } => {
             let discover_peer = peer.is_some();
+            let runtime_layout = runtime_layout
+                .map(|path| -> Result<crossflow::screen_runtime::RuntimeLayout> {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)?
+                        .take(1_048_577)
+                        .read_to_end(&mut bytes)?;
+                    ensure!(bytes.len() <= 1_048_576, "runtime layout exceeds limit");
+                    let config: crossflow::screen_runtime::RuntimeLayout =
+                        serde_json::from_slice(&bytes)?;
+                    config.validate()?;
+                    ensure!(
+                        Some(&config.remote_device_id) == peer.as_ref(),
+                        "runtime target differs from paired device"
+                    );
+                    Ok(config)
+                })
+                .transpose()?;
             let (host, identity) = if let Some(id) = peer {
                 let (device, bundle) =
                     crossflow::peers::PeerStore::default_store()?.resolve(&id)?;
@@ -253,6 +282,8 @@ fn main() -> Result<()> {
                 )
             };
             let mut meta = metadata("native_client_sender");
+            meta["movement_only"] = json!(runtime_layout.is_none());
+            meta["screen_routing"] = json!(runtime_layout.is_some());
             meta["host"] = json!(host);
             meta["desktop_control_protocol"] = json!(1);
             meta["duration_seconds"] = json!(seconds);
@@ -267,13 +298,21 @@ fn main() -> Result<()> {
                     discover_peer,
                     seconds,
                     max_hz,
+                    runtime_layout,
                 },
                 writer,
                 stop,
             )?;
             #[cfg(not(windows))]
             {
-                let _ = (host, identity, seconds, max_hz, discover_peer);
+                let _ = (
+                    host,
+                    identity,
+                    seconds,
+                    max_hz,
+                    discover_peer,
+                    runtime_layout,
+                );
                 writer.finish()?;
                 anyhow::bail!("native client sending currently requires Windows");
             }
@@ -300,6 +339,48 @@ fn main() -> Result<()> {
         Command::Peers => {
             let devices = crossflow::peers::PeerStore::default_store()?.list()?;
             println!("{}", serde_json::to_string_pretty(&devices)?);
+        }
+        Command::Displays => {
+            #[cfg(windows)]
+            {
+                let screens =
+                    crossflow::platform::windows::displays().map_err(anyhow::Error::msg)?;
+                let values: Vec<_> = screens
+                    .iter()
+                    .map(|s| json!({"id":s.id,"x":s.x,"y":s.y,"width":s.width,"height":s.height}))
+                    .collect();
+                println!("{}", serde_json::to_string(&values)?);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let screens = crossflow::platform::macos::native_displays()?;
+                let values:Vec<_>=screens.iter().map(|s|json!({"id":s.id.to_string(),"x":s.x,"y":s.y,"width":s.width,"height":s.height})).collect();
+                println!("{}", serde_json::to_string(&values)?);
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            anyhow::bail!("display enumeration is not implemented for this platform");
+        }
+        Command::PeerDisplays { peer } => {
+            let (device, bundle) = crossflow::peers::PeerStore::default_store()?.resolve(&peer)?;
+            let endpoint = device
+                .last_endpoint
+                .context("peer has no receiver endpoint")?;
+            let temp = std::env::temp_dir().join(format!(
+                "crossflow-display-query-{}-{}.jsonl",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            ));
+            let writer = LogWriter::new(&temp, metadata("display_query"))?;
+            let result =
+                session::query_displays(&endpoint.to_string(), &bundle, &stop, &writer.log, true);
+            let finished = writer.finish();
+            let _ = std::fs::remove_file(&temp);
+            finished?;
+            let screens = result?;
+            let values:Vec<_>=screens.iter().map(|s|json!({"id":s.id.to_string(),"x":s.x,"y":s.y,"width":s.width,"height":s.height})).collect();
+            println!("{}", serde_json::to_string(&values)?);
         }
         Command::PeerImport {
             identity,
@@ -514,6 +595,7 @@ fn main() -> Result<()> {
                                 .arg(gain.to_string());
                             let mut sink =
                                 crossflow::injection_worker::WorkerProxy::spawn(&mut command)?;
+                            sink.set_displays(crossflow::platform::macos::native_displays()?)?;
                             sink.attach_failure_log(writer.log.clone());
                             let result = session::receive_observed(
                                 &bind,
@@ -538,6 +620,19 @@ fn main() -> Result<()> {
                         }
                         struct Native(crossflow::platform::macos::MacMouseSink, bool);
                         impl session::MouseSink for Native {
+                            fn displays(&self) -> Result<Vec<session::NativeDisplay>> {
+                                crossflow::platform::macos::native_displays()
+                            }
+                            fn position(
+                                &mut self,
+                                x: f64,
+                                y: f64,
+                                display_id: u32,
+                            ) -> Result<(f64, f64)> {
+                                self.0
+                                    .position(x, y, display_id)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                            }
                             fn reset(&mut self) -> Result<()> {
                                 self.0.reset().map_err(|e| anyhow::anyhow!(e.to_string()))
                             }
