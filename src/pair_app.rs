@@ -459,3 +459,121 @@ pub fn query(
     cleanup?;
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, SyncSender};
+
+    struct HeldInput(Receiver<()>);
+    impl std::io::Read for HeldInput {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+    fn ui(stop: Arc<AtomicBool>) -> (ControlIo, SyncSender<()>) {
+        let (release, input) = mpsc::sync_channel(1);
+        (
+            ControlIo::start(
+                HeldInput(input),
+                std::io::sink(),
+                stop,
+                Role::Sender,
+                "a".repeat(64),
+                None,
+            )
+            .unwrap(),
+            release,
+        )
+    }
+    struct FakeCapture {
+        shortcut: Option<Shortcut>,
+        failure: Option<&'static str>,
+        poll_failed: bool,
+    }
+    impl Capture for FakeCapture {
+        fn poll(&mut self, _: u64) -> Result<()> {
+            ensure!(!self.poll_failed, "capture thread exited unexpectedly");
+            Ok(())
+        }
+        fn command(&mut self) -> Option<Shortcut> {
+            self.shortcut.take()
+        }
+        fn failure(&self) -> Option<&'static str> {
+            self.failure
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn physical_stop_reaches_process_stop_before_another_incoming_record() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (mut ui, _input) = ui(stop.clone());
+        let mut capture = FakeCapture {
+            shortcut: Some(Shortcut::Stop),
+            failure: None,
+            poll_failed: false,
+        };
+        let mut host = NativeHost {
+            capture: &mut capture,
+            ui: &mut ui,
+            stop: &stop,
+            deadline: Instant::now() + Duration::from_secs(1),
+            sharing: true,
+            epoch: 1,
+            pending: None,
+        };
+        host.pulse(1).unwrap();
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(host.poll_command().unwrap(), Some(Command::Stop));
+    }
+
+    #[test]
+    fn capture_fault_and_failed_safety_stop_cannot_become_automatic_reconnects() {
+        for poll_failed in [false, true] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (mut ui, _input) = ui(stop.clone());
+            let mut capture = FakeCapture {
+                shortcut: Some(Shortcut::Stop),
+                failure: Some("capture provenance changed"),
+                poll_failed,
+            };
+            let mut host = NativeHost {
+                capture: &mut capture,
+                ui: &mut ui,
+                stop: &stop,
+                deadline: Instant::now() + Duration::from_secs(1),
+                sharing: true,
+                epoch: 1,
+                pending: None,
+            };
+            assert!(host.pulse(1).is_err());
+            assert!(stop.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn stopped_or_expired_preparation_never_starts_another_native_stage() {
+        for cancelled in [false, true] {
+            let stop = Arc::new(AtomicBool::new(cancelled));
+            let (mut ui, _input) = ui(stop.clone());
+            let deadline = if cancelled {
+                Instant::now() + Duration::from_secs(1)
+            } else {
+                Instant::now() - Duration::from_millis(1)
+            };
+            let started = AtomicBool::new(false);
+            assert!(
+                prepare(&mut ui, &stop, deadline, "starting", || {
+                    started.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert!(!started.load(Ordering::Acquire));
+        }
+    }
+}
