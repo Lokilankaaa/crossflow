@@ -290,6 +290,10 @@ fn main() -> Result<()> {
             let mut meta = metadata("native_pair_listener");
             meta["movement_only"] = json!(false);
             meta["pair_protocol"] = json!(crossflow::pair_wire::PAIR_VERSION);
+            meta["worker_rpc_failure_logging"] = json!(true);
+            meta["input_worker_ack"] = json!("adapter_return_only_not_os_or_display");
+            meta["receiver_t3_t4_scope"] =
+                json!("worker_rpc_including_adapter_not_isolated_native_injection");
             let writer = LogWriter::new(&log, meta)?;
             #[cfg(target_os = "macos")]
             {
@@ -361,6 +365,10 @@ fn main() -> Result<()> {
             let mut meta = metadata("native_pair_session");
             meta["movement_only"] = json!(false);
             meta["pair_protocol"] = json!(crossflow::pair_wire::PAIR_VERSION);
+            meta["worker_rpc_failure_logging"] = json!(true);
+            meta["input_worker_ack"] = json!("adapter_return_only_not_os_or_display");
+            meta["receiver_t3_t4_scope"] =
+                json!("worker_rpc_including_adapter_not_isolated_native_injection");
             let writer = LogWriter::new(&log, meta)?;
             #[cfg(windows)]
             crossflow::pair_app::run(

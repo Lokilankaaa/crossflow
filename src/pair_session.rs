@@ -16,9 +16,10 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    cell::Cell,
     collections::VecDeque,
     net::TcpStream,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -65,6 +66,99 @@ pub enum EstablishOutcome {
 }
 
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct InputTrace {
+    source_side: Side,
+    owner_epoch: u64,
+    layout_revision: u64,
+    seq: u64,
+    kind: Kind,
+    t0_ns: u64,
+    t1_ns: u64,
+}
+impl InputTrace {
+    fn from_message(message: &Message) -> Option<Self> {
+        match message {
+            Message::Input {
+                source,
+                owner_epoch,
+                layout_revision,
+                frame,
+            } => Some(Self {
+                source_side: *source,
+                owner_epoch: *owner_epoch,
+                layout_revision: *layout_revision,
+                seq: frame.seq,
+                kind: frame.kind,
+                t0_ns: frame.t0_ns,
+                t1_ns: frame.t1_ns,
+            }),
+            _ => None,
+        }
+    }
+    fn fields(self, connection_id: u64) -> serde_json::Value {
+        serde_json::json!({"connection_id":connection_id,"source_side":format!("{:?}",self.source_side),
+            "owner_epoch":self.owner_epoch,"layout_revision":self.layout_revision,"seq":self.seq,
+            "kind":format!("{:?}",self.kind),"t0_ns":self.t0_ns,"t1_ns":self.t1_ns})
+    }
+}
+
+// Diagnostic context only; it never participates in input authorization. IDs
+// are process-local, not shared wire session IDs. Reconnect epochs/sequences
+// can repeat, so these records do not uniquely identify a cross-host session.
+struct SessionDiagnostics {
+    connection_id: u64,
+    current: Cell<Option<InputTrace>>,
+    log: Log,
+}
+impl SessionDiagnostics {
+    fn start(connection: &PairConnection, log: Log) -> Self {
+        let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        log.write("pair_session_started",serde_json::json!({
+            "connection_id":connection_id,"connection_id_scope":"process_local",
+            "local_device_id":connection.local_device_id(),"remote_device_id":connection.remote_device_id(),
+            "local_side":format!("{:?}",connection.local_side()),"layout_revision":connection.revision}));
+        Self {
+            connection_id,
+            current: Cell::new(None),
+            log,
+        }
+    }
+    fn queued(&self, trace: Option<InputTrace>, pending: usize) {
+        if let Some(trace) = trace {
+            let mut fields = trace.fields(self.connection_id);
+            fields["stage"] = "transport_queue".into();
+            fields["endpoint_pending_records"] = pending.into();
+            fields["transport_pending_records"] = 1.into();
+            self.log.write("pair_input_queued", fields);
+        }
+    }
+    fn dispatch(
+        &self,
+        trace: Option<InputTrace>,
+        received_at: Instant,
+        receive: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.current.set(trace);
+        let began = self.log.ns();
+        let result = receive();
+        let ended = self.log.ns();
+        self.current.set(None);
+        if let Some(trace) = trace {
+            let mut fields = trace.fields(self.connection_id);
+            fields["stage"] = "endpoint_dispatch".into();
+            fields["t2_ns"] = self.log.at(received_at).into();
+            fields["t3_ns"] = began.into();
+            fields["t4_ns"] = ended.into();
+            // Successful dispatch may discard an old frame without injection.
+            fields["success"] = result.is_ok().into();
+            self.log.write("pair_input_received", fields);
+        }
+        result
+    }
+}
 // A pump can read the peer's readiness marker and its first runtime records
 // together. Keep that ordered tail intact until the local endpoint exists.
 fn accept_ready_batch(
@@ -374,12 +468,23 @@ impl PairConnection {
 struct BorrowedSink<'a> {
     sink: &'a mut dyn MouseSink,
     log: Log,
+    diagnostics: &'a SessionDiagnostics,
 }
 impl BorrowedSink<'_> {
     fn completed(&mut self, kind: &str, start: u64, success: bool) {
         let end = self.log.ns();
         let timing = self.sink.take_timing();
-        self.log.write("pair_input_call",serde_json::json!({"kind":kind,"t3_ns":start,"t4_ns":end,"success":success,"worker_timing":timing}));
+        let mut fields = self.diagnostics.current.get().map_or_else(
+            || serde_json::json!({"connection_id":self.diagnostics.connection_id}),
+            |trace| trace.fields(self.diagnostics.connection_id),
+        );
+        fields["frame_kind"] = fields["kind"].clone();
+        fields["kind"] = kind.into();
+        fields["t3_ns"] = start.into();
+        fields["t4_ns"] = end.into();
+        fields["success"] = success.into();
+        fields["worker_timing"] = serde_json::json!(timing);
+        self.log.write("pair_input_call", fields);
     }
 }
 impl MouseSink for BorrowedSink<'_> {
@@ -488,6 +593,7 @@ impl PairConnection {
         stop: &AtomicBool,
         log: Log,
     ) -> Result<()> {
+        let diagnostics = SessionDiagnostics::start(&self, log.clone());
         let initial = (|| -> Result<Option<Vec<Received>>> {
             ensure!(
                 source.matches_runtime(self.runtime()),
@@ -522,6 +628,7 @@ impl PairConnection {
             BorrowedSink {
                 sink,
                 log: log.clone(),
+                diagnostics: &diagnostics,
             },
             log.ns(),
         );
@@ -611,22 +718,15 @@ impl PairConnection {
                             endpoint.request_local(log.ns())?;
                         }
                     }
-                    if let Message::Input { frame, .. } = &record.message {
-                        if frame.kind == Kind::RoutingState {
-                            self.shared_layout().routing_state(frame)?;
+                    let trace = InputTrace::from_message(&record.message);
+                    diagnostics.dispatch(trace, record.received_at, || {
+                        if let Message::Input { frame, .. } = &record.message {
+                            if frame.kind == Kind::RoutingState {
+                                self.shared_layout().routing_state(frame)?;
+                            }
                         }
-                    }
-                    let timing = match &record.message {
-                        Message::Input {
-                            owner_epoch, frame, ..
-                        } => Some((*owner_epoch, frame.seq, format!("{:?}", frame.kind))),
-                        _ => None,
-                    };
-                    let began = log.ns();
-                    endpoint.receive(record.message, log.ns())?;
-                    if let Some((epoch, seq, kind)) = timing {
-                        log.write("pair_input_received",serde_json::json!({"owner_epoch":epoch,"seq":seq,"kind":kind,"t2_ns":log.at(record.received_at),"t3_ns":began,"t4_ns":log.ns()}));
-                    }
+                        endpoint.receive(record.message, log.ns())
+                    })?;
                 }
                 if self.peer.pending_input() && !endpoint.lease_ready(log.ns()) {
                     bail!("remote revoke discarded pending transport input");
@@ -669,7 +769,9 @@ impl PairConnection {
                 }
                 if !self.peer.pending() {
                     if let Some(message) = endpoint.pop_outbound_at(log.ns())? {
+                        let trace = InputTrace::from_message(&message);
                         self.peer.queue(message)?;
+                        diagnostics.queued(trace, endpoint.pending_outbound());
                     }
                 }
                 let status = self.session_status(&endpoint, source)?;
@@ -797,7 +899,9 @@ mod tests {
             Ok((x, y))
         }
         fn position(&mut self, x: f64, y: f64, _id: u32) -> Result<(f64, f64)> {
-            self.0.lock().unwrap().push("position");
+            let mut events = self.0.lock().unwrap();
+            events.push("position");
+            ensure!(!events.contains(&"fail-position"), "mock position failure");
             Ok((x, y))
         }
         fn key(&mut self, _usage: u16, down: bool) -> Result<()> {
@@ -1248,6 +1352,229 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn diagnostic_context_clears_after_failure_and_dispatch_does_not_imply_a_call() -> Result<()> {
+        let path = std::env::current_dir()?.join("runs").join(format!(
+            "pair-diagnostic-context-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let writer = LogWriter::new(&path, serde_json::json!({"os_input":false}))?;
+        let diagnostics = SessionDiagnostics {
+            connection_id: 17,
+            current: Cell::new(None),
+            log: writer.log.clone(),
+        };
+        let trace = InputTrace {
+            source_side: Side::A,
+            owner_epoch: 2,
+            layout_revision: 1,
+            seq: 5,
+            kind: Kind::Position,
+            t0_ns: 1,
+            t1_ns: 2,
+        };
+        assert!(
+            diagnostics
+                .dispatch(Some(trace), Instant::now(), || bail!(
+                    "mock rejected dispatch"
+                ))
+                .is_err()
+        );
+        assert!(diagnostics.current.get().is_none());
+        diagnostics.dispatch(Some(InputTrace { seq: 6, ..trace }), Instant::now(), || {
+            Ok(())
+        })?;
+        assert!(diagnostics.current.get().is_none());
+        let mut sink = MockSink(Arc::new(Mutex::new(vec![])));
+        let mut borrowed = BorrowedSink {
+            sink: &mut sink,
+            log: writer.log.clone(),
+            diagnostics: &diagnostics,
+        };
+        // An unrelated later call must never inherit the failed input's IDs.
+        borrowed.position(1., 2., 7)?;
+        writer.finish()?;
+        let events = fs::read_to_string(&path)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let received = events
+            .iter()
+            .filter(|v| v["event"] == "pair_input_received")
+            .collect::<Vec<_>>();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0]["success"], false);
+        assert_eq!(received[1]["success"], true);
+        let calls = events
+            .iter()
+            .filter(|v| v["event"] == "pair_input_call")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].get("seq").is_none());
+        assert!(calls[0]["frame_kind"].is_null());
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "encrypted localhost diagnostics/reconnect; simulated capture and mock sinks only"]
+    fn duplex_diagnostics_link_calls_preserve_failures_and_distinguish_reconnects() -> Result<()> {
+        let fixture = fixture()?;
+        let mut previous_ids = None;
+        for fail_position in [false, true] {
+            let initiator = Identity::load(&fixture.0.join("identities/windows"))?;
+            let responder = Identity::load(&fixture.0.join("identities/mac"))?;
+            let initiator_id = initiator.public_key_hex();
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let a_path = fixture.0.join(format!("source-{fail_position}.jsonl"));
+            let b_path = fixture.0.join(format!("target-{fail_position}.jsonl"));
+            let mut b = spawn_runtime(
+                move || Ok(listener.accept()?.0),
+                responder,
+                false,
+                b_path.clone(),
+                stop.clone(),
+                Duration::ZERO,
+            );
+            let mut a = spawn_runtime(
+                move || Ok(TcpStream::connect(address)?),
+                initiator,
+                true,
+                a_path.clone(),
+                stop.clone(),
+                Duration::ZERO,
+            );
+            let outcome = (|| -> Result<()> {
+                let initial = a.wait(|s| s.capture_ready && !s.endpoint.enabled)?;
+                b.wait(|s| s.capture_ready && !s.endpoint.enabled)?;
+                if fail_position {
+                    b.sink.lock().unwrap().push("fail-position");
+                }
+                a.commands.send(Command::Enable {
+                    epoch: initial.endpoint.epoch,
+                })?;
+                a.wait(|s| s.input_source_device_id.as_deref() == Some(&initiator_id))?;
+                b.wait(|s| s.input_source_device_id.as_deref() == Some(&initiator_id))?;
+                a.movement(95., 0.)?;
+                a.movement(99., 4.)?;
+                a.movement(99., 6.)?;
+                b.has("position")?;
+                if fail_position {
+                    let end = Instant::now() + Duration::from_secs(2);
+                    while !b.worker.as_ref().unwrap().is_finished() {
+                        ensure!(Instant::now() < end, "failed sink did not end runtime");
+                        thread::yield_now();
+                    }
+                }
+                Ok(())
+            })();
+            stop.store(true, Ordering::Release);
+            let a_result = a.worker.take().unwrap().join().unwrap();
+            let b_result = b.worker.take().unwrap().join().unwrap();
+            if outcome.is_err() {
+                eprintln!("diagnostics source={a_result:?}, target={b_result:?}");
+            }
+            outcome?;
+            if fail_position {
+                assert!(b_result.is_err());
+            }
+            let read = |path: &PathBuf| -> Result<Vec<serde_json::Value>> {
+                fs::read_to_string(path)?
+                    .lines()
+                    .map(|line| Ok(serde_json::from_str(line)?))
+                    .collect()
+            };
+            let source_events = read(&a_path)?;
+            let target_events = read(&b_path)?;
+            let started = |events: &[serde_json::Value]| -> Result<u64> {
+                let records = events
+                    .iter()
+                    .filter(|v| v["event"] == "pair_session_started")
+                    .collect::<Vec<_>>();
+                ensure!(records.len() == 1);
+                ensure!(records[0]["connection_id_scope"] == "process_local");
+                records[0]["connection_id"]
+                    .as_u64()
+                    .context("missing connection ID")
+            };
+            let ids = (started(&source_events)?, started(&target_events)?);
+            if let Some((a, b)) = previous_ids {
+                assert_ne!(a, ids.0);
+                assert_ne!(b, ids.1);
+            }
+            previous_ids = Some(ids);
+            let queued = source_events
+                .iter()
+                .filter(|v| v["event"] == "pair_input_queued")
+                .collect::<Vec<_>>();
+            assert!(queued.iter().any(|v| v["kind"] == "Position"));
+            for value in queued {
+                assert_eq!(value["connection_id"], ids.0);
+                assert_eq!(value["stage"], "transport_queue");
+                assert_eq!(value["transport_pending_records"], 1);
+                assert!(value["endpoint_pending_records"].as_u64().is_some());
+                assert!(value["t0_ns"].as_u64().unwrap() <= value["t1_ns"].as_u64().unwrap());
+                for forbidden in [
+                    "x", "y", "code", "usage", "text", "down", "wheel_x", "wheel_y",
+                ] {
+                    assert!(value.get(forbidden).is_none());
+                }
+            }
+            let calls = target_events
+                .iter()
+                .filter(|v| v["event"] == "pair_input_call")
+                .collect::<Vec<_>>();
+            assert!(
+                calls
+                    .iter()
+                    .any(|v| v["kind"] == "Position" && v["success"] == !fail_position)
+            );
+            for call in calls {
+                let received = target_events
+                    .iter()
+                    .filter(|v| {
+                        v["event"] == "pair_input_received"
+                            && [
+                                "connection_id",
+                                "source_side",
+                                "owner_epoch",
+                                "layout_revision",
+                                "seq",
+                            ]
+                            .iter()
+                            .all(|field| v[*field] == call[*field])
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    received.len(),
+                    1,
+                    "call must link to exactly one local dispatch"
+                );
+                let received = received[0];
+                assert_eq!(call["connection_id"], ids.1);
+                assert_eq!(received["kind"], call["frame_kind"]);
+                assert_eq!(received["stage"], "endpoint_dispatch");
+                assert!(received["success"].is_boolean());
+                assert!(received["t3_ns"].as_u64().unwrap() <= call["t3_ns"].as_u64().unwrap());
+                assert!(call["t4_ns"].as_u64().unwrap() <= received["t4_ns"].as_u64().unwrap());
+                if call["success"] == false {
+                    assert_eq!(received["success"], false);
+                }
+            }
+            for events in [&source_events, &target_events] {
+                assert!(
+                    events
+                        .iter()
+                        .any(|v| v["event"] == "log_summary" && v["dropped_records"] == 0)
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "authenticated localhost inventory query; never constructs capture or sink"]
     fn inventory_only_query_closes_successfully_without_preparing_input() -> Result<()> {

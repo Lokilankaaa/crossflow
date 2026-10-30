@@ -318,11 +318,73 @@ impl DuplexCalls {
     }
 }
 #[derive(Default)]
+struct DuplexReceive {
+    records: u64,
+    queue: Vec<f64>,
+    envelope: Vec<f64>,
+    issues: TimingIssues,
+}
+impl DuplexReceive {
+    fn record(&mut self, v: &Value) {
+        self.records += 1;
+        if let Some(d) = timing_delta(v, "t2_ns", "t3_ns", &mut self.issues) {
+            self.queue.push(d);
+        }
+        if let Some(d) = timing_delta(v, "t3_ns", "t4_ns", &mut self.issues) {
+            self.envelope.push(d);
+        }
+    }
+    fn finish(self) -> Value {
+        json!({"records":self.records,"receive_queue":distribution(self.queue),
+            "receive_dispatch_envelope":distribution(self.envelope),"timing_issues":self.issues})
+    }
+}
+#[derive(Default)]
+struct DuplexQueued {
+    records: u64,
+    invalid_stage_records: u64,
+    duration: Vec<f64>,
+    issues: TimingIssues,
+    endpoint_peak: Option<u64>,
+    transport_peak: Option<u64>,
+    queue_issues: TimingIssues,
+}
+impl DuplexQueued {
+    fn record(&mut self, v: &Value) {
+        self.records += 1;
+        if v["stage"] != "transport_queue" {
+            self.invalid_stage_records += 1;
+            return;
+        }
+        if let Some(d) = timing_delta(v, "t0_ns", "t1_ns", &mut self.issues) {
+            self.duration.push(d);
+        }
+        for (field, peak) in [
+            ("endpoint_pending_records", &mut self.endpoint_peak),
+            ("transport_pending_records", &mut self.transport_peak),
+        ] {
+            if let Some(count) = timestamp(v, field, &mut self.queue_issues) {
+                *peak = Some(peak.unwrap_or(0).max(count));
+            }
+        }
+    }
+    fn finish(self) -> Value {
+        json!({"records":self.records,"invalid_stage_records":self.invalid_stage_records,
+            "source_processing":distribution(self.duration),"timing_issues":self.issues,
+            "endpoint_pending_records_peak":self.endpoint_peak,
+            "transport_pending_records_peak":self.transport_peak,"queue_field_issues":self.queue_issues})
+    }
+}
+#[derive(Default)]
 struct DuplexAction {
     received_records: u64,
     receive_queue: Vec<f64>,
     receive_envelope: Vec<f64>,
     receive_issues: TimingIssues,
+    receive_success: DuplexReceive,
+    receive_failed: DuplexReceive,
+    receive_unknown: DuplexReceive,
+    queued: DuplexQueued,
     success: DuplexCalls,
     failed: DuplexCalls,
     unknown: DuplexCalls,
@@ -333,12 +395,30 @@ struct DuplexSummary {
     actions: std::collections::BTreeMap<&'static str, DuplexAction>,
     non_action_received: std::collections::BTreeMap<&'static str, u64>,
     unsupported_call_records: u64,
+    queued: DuplexQueued,
+    source_processing: Vec<f64>,
+    source_records: u64,
+    non_action_queued: std::collections::BTreeMap<&'static str, u64>,
+    received_outcomes: [u64; 3],
 }
 impl DuplexSummary {
     fn record(&mut self, v: &Value) {
         let event = v["event"].as_str();
-        if !matches!(event, Some("pair_input_received" | "pair_input_call")) {
+        if !matches!(
+            event,
+            Some("pair_input_received" | "pair_input_call" | "pair_input_queued")
+        ) {
             return;
+        }
+        if event == Some("pair_input_queued") {
+            self.queued.record(v);
+        }
+        if event == Some("pair_input_received") {
+            self.received_outcomes[match v["success"].as_bool() {
+                Some(true) => 0,
+                Some(false) => 1,
+                None => 2,
+            }] += 1;
         }
         let kind = match v["kind"].as_str() {
             Some("Move") => "Move",
@@ -358,13 +438,37 @@ impl DuplexSummary {
                         Some("RoutingState") => "RoutingState",
                         _ => "unknown",
                     };
-                    *self.non_action_received.entry(category).or_default() += 1;
+                    let counts = if event == Some("pair_input_queued") {
+                        &mut self.non_action_queued
+                    } else {
+                        &mut self.non_action_received
+                    };
+                    *counts.entry(category).or_default() += 1;
                 }
                 return;
             }
         };
         let action = self.actions.entry(kind).or_default();
+        if event == Some("pair_input_queued") {
+            self.source_records += 1;
+            action.queued.record(v);
+            if v["stage"] == "transport_queue" {
+                if let Some((a, b)) = v["t0_ns"]
+                    .as_u64()
+                    .zip(v["t1_ns"].as_u64())
+                    .filter(|(a, b)| b >= a)
+                {
+                    self.source_processing.push((b - a) as f64 / 1e6);
+                }
+            }
+            return;
+        }
         if event == Some("pair_input_received") {
+            match v["success"].as_bool() {
+                Some(true) => action.receive_success.record(v),
+                Some(false) => action.receive_failed.record(v),
+                None => action.receive_unknown.record(v),
+            }
             action.received_records += 1;
             if let Some(d) = timing_delta(v, "t2_ns", "t3_ns", &mut action.receive_issues) {
                 action.receive_queue.push(d);
@@ -394,6 +498,8 @@ impl DuplexSummary {
                 "receive_queue":distribution(a.receive_queue),
                 "receive_dispatch_envelope":distribution(a.receive_envelope),
                 "receive_timing_issues":a.receive_issues,
+                "dispatch_outcomes":{"success":a.receive_success.finish(),"failed":a.receive_failed.finish(),"unknown_outcome":a.receive_unknown.finish()},
+                "queued":a.queued.finish(),
                 "calls":{"success":a.success.finish(),"failed":a.failed.finish(),"unknown_outcome":a.unknown.finish()},
                 "successful_worker_timing":a.worker.finish()
             }))
@@ -401,14 +507,18 @@ impl DuplexSummary {
         json!({
             "actions":actions,
             "non_action_received_records":self.non_action_received,
+            "non_action_queued_records":self.non_action_queued,
+            "received_outcomes":{"success":self.received_outcomes[0],"failed":self.received_outcomes[1],"unknown_outcome":self.received_outcomes[2]},
             "unsupported_call_records":self.unsupported_call_records,
-            "source_processing":"NOT_MEASURED: duplex records do not include source t0/t1",
+            "source_processing":if self.source_records == 0 { json!("NOT_MEASURED: no duplex source action queue records") } else { distribution(self.source_processing) },
+            "source_queue":self.queued.finish(),
+            "source_queue_scope":"t1-t0 ends at source endpoint dequeue before transport queueing; transport_queue records prove local queue acceptance only, not write completion, acknowledgement or remote injection. Peaks are snapshots at successful queueing, not global queue maxima; transport_pending_records counts the currently queued transport record. Source processing includes only input actions; source_queue includes control/metadata records too.",
             "visible_smoothness":"NOT_MEASURED",
             "one_way_network_latency":"NOT_MEASURED: clocks are not synchronized",
             "missing_call_count":Value::Null,
-            "call_coverage":"UNKNOWN: call records have no owner_epoch/seq correlation. Received records may be stale-discarded; failed dispatches may have no received record. Counts cannot be subtracted to infer missing calls.",
+            "call_coverage":"UNKNOWN: no record-level correlation is performed. Legacy records may lack connection/owner/sequence identity; received records may be stale-discarded. Counts cannot be subtracted to infer missing calls. connection_id is process-local only; equal IDs across machines or processes must never be joined.",
             "timing_scope":"receive_queue is receiver-local t2..t3; receive_dispatch_envelope is endpoint t3..t4 and is not an additional injection. Only pair_input_call contributes adapter/worker call distributions. Adapter calls include worker RPC/ACK wait when present; none measures OS delivery or visible latency.",
-            "selection_warning":"Success, failure and unknown outcome are separate. Missing or invalid timings are excluded, never zero. Worker timings include successful calls only. Missing/dropped records can hide calls and failures; inspect complete_log and dropped_log_records. Control and metadata are never counted as injection."
+            "selection_warning":"Success, failure and unknown outcome are separate. Received success means endpoint dispatch returned, including stale discard, not injection. received_outcomes includes control/metadata as well as actions. Missing or invalid timings are excluded, never zero. Worker timings include successful calls only. Missing/dropped records can hide calls and failures; inspect complete_log and dropped_log_records. Control and metadata are never counted as injection."
         })
     }
 }
@@ -790,6 +900,99 @@ mod tests {
             actions["Position"]["successful_worker_timing"]["failure_logging_status"],
             "unknown"
         );
+    }
+
+    #[test]
+    fn duplex_source_queue_samples_survive_connection_sequence_resets_without_cross_host_join() {
+        let mut records = vec![];
+        for connection in [1, 2] {
+            records.push(json!({"event":"pair_session_started","connection_id":connection,"connection_id_scope":"process_local","local_device_id":"local","remote_device_id":"remote","local_side":"A","layout_revision":1}));
+            records.push(json!({"event":"pair_input_queued","connection_id":connection,"source_side":"A","owner_epoch":1,"layout_revision":1,"seq":1,"kind":"Position","t0_ns":1_000_000,"t1_ns":connection*1_000_000+1_000_000,"endpoint_pending_records":connection,"transport_pending_records":1,"stage":"transport_queue"}));
+            records.push(json!({"event":"pair_input_call","connection_id":connection,"source_side":"B","owner_epoch":1,"layout_revision":1,"seq":1,"kind":"Key","frame_kind":"Key","t3_ns":4,"t4_ns":5,"success":true}));
+        }
+        records.push(json!({"event":"pair_input_queued","kind":"Heartbeat","t0_ns":0,"t1_ns":900_000_000,"endpoint_pending_records":7,"transport_pending_records":1,"stage":"transport_queue"}));
+        let result = summarize_records(records);
+        let d = &result["duplex"];
+        assert_eq!(d["source_processing"]["samples"], 2);
+        assert_eq!(d["source_processing"]["max_ms"], 2.0);
+        assert_eq!(d["actions"]["Position"]["queued"]["records"], 2);
+        assert_eq!(
+            d["actions"]["Position"]["queued"]["endpoint_pending_records_peak"],
+            2
+        );
+        assert_eq!(d["source_queue"]["endpoint_pending_records_peak"], 7);
+        assert_eq!(d["source_queue"]["transport_pending_records_peak"], 1);
+        assert_eq!(d["source_queue"]["records"], 3);
+        assert_eq!(d["non_action_queued_records"]["Heartbeat"], 1);
+        assert_eq!(d["actions"]["Key"]["calls"]["success"]["records"], 2);
+        assert_eq!(d["actions"]["Position"]["calls"]["success"]["records"], 0);
+        assert!(d["missing_call_count"].is_null());
+        assert!(
+            d["call_coverage"]
+                .as_str()
+                .unwrap()
+                .contains("process-local")
+        );
+        assert!(
+            d["one_way_network_latency"]
+                .as_str()
+                .unwrap()
+                .starts_with("NOT_MEASURED")
+        );
+        assert!(result["source_processing"].is_null());
+    }
+
+    #[test]
+    fn duplex_new_failed_dispatch_and_legacy_unknown_are_not_injections_or_zero_samples() {
+        let result = summarize_records(vec![
+            json!({"event":"pair_input_received","connection_id":1,"owner_epoch":1,"seq":1,"kind":"Key","t2_ns":0,"t3_ns":1_000_000,"t4_ns":4_000_000,"success":false,"stage":"endpoint_dispatch"}),
+            json!({"event":"pair_input_received","connection_id":2,"owner_epoch":1,"seq":1,"kind":"Key","t2_ns":0,"t3_ns":2_000_000,"t4_ns":3_000_000,"success":true,"stage":"endpoint_dispatch"}),
+            json!({"event":"pair_input_received","owner_epoch":1,"seq":1,"kind":"Key","t2_ns":0,"t3_ns":5_000_000,"t4_ns":7_000_000}),
+            json!({"event":"pair_input_received","kind":"Key","success":false,"t2_ns":8,"t3_ns":7}),
+            json!({"event":"pair_input_received","kind":"RoutingState","success":false,"t2_ns":0,"t3_ns":1,"t4_ns":2}),
+            json!({"event":"pair_input_queued","kind":"Key","t0_ns":1,"stage":"transport_queue"}),
+            json!({"event":"pair_input_queued","kind":"Key","t0_ns":9,"t1_ns":8,"endpoint_pending_records":null,"transport_pending_records":"1","stage":"transport_queue"}),
+            json!({"event":"pair_input_queued","kind":"Key","t0_ns":0,"t1_ns":1,"endpoint_pending_records":0,"transport_pending_records":1}),
+            json!({"event":"sent","t0_ns":0,"t1_ns":1_000_000}),
+        ]);
+        let d = &result["duplex"];
+        let a = &d["actions"]["Key"];
+        assert_eq!(
+            d["received_outcomes"],
+            json!({"success":1,"failed":3,"unknown_outcome":1})
+        );
+        assert_eq!(d["non_action_received_records"]["RoutingState"], 1);
+        assert_eq!(a["received_records"], 4);
+        assert_eq!(a["dispatch_outcomes"]["success"]["records"], 1);
+        assert_eq!(
+            a["dispatch_outcomes"]["success"]["receive_queue"]["max_ms"],
+            2.0
+        );
+        assert_eq!(a["dispatch_outcomes"]["failed"]["records"], 2);
+        assert_eq!(
+            a["dispatch_outcomes"]["failed"]["receive_queue"]["samples"],
+            1
+        );
+        assert_eq!(
+            a["dispatch_outcomes"]["failed"]["timing_issues"]["missing_values"],
+            1
+        );
+        assert_eq!(
+            a["dispatch_outcomes"]["failed"]["timing_issues"]["invalid_order"],
+            1
+        );
+        assert_eq!(a["dispatch_outcomes"]["unknown_outcome"]["records"], 1);
+        assert_eq!(a["calls"]["success"]["records"], 0);
+        assert!(d["source_processing"].is_null());
+        assert!(a["queued"]["source_processing"].is_null());
+        assert_eq!(a["queued"]["timing_issues"]["missing_values"], 1);
+        assert_eq!(a["queued"]["timing_issues"]["invalid_order"], 1);
+        assert_eq!(a["queued"]["invalid_stage_records"], 1);
+        assert!(a["queued"]["endpoint_pending_records_peak"].is_null());
+        assert!(a["queued"]["transport_pending_records_peak"].is_null());
+        assert_eq!(a["queued"]["queue_field_issues"]["missing_values"], 2);
+        assert_eq!(a["queued"]["queue_field_issues"]["malformed_values"], 2);
+        assert_eq!(result["source_processing"]["samples"], 1);
     }
 
     #[test]
