@@ -62,7 +62,7 @@ enum BridgeError: LocalizedError {
     case unavailable, protocolMismatch, requestTooLarge, transport(Int32)
     var errorDescription: String? {
         switch self {
-        case .unavailable: "Rust 桥接库尚未加载。可以编辑和导出草稿，布局校验暂不可用。"
+        case .unavailable: "布局内核尚未加载，请检查客户端安装。"
         case .protocolMismatch: "Rust 桥接接口版本不兼容，布局校验暂不可用。"
         case .requestTooLarge: "布局请求超过桥接接口的 1 MiB 限制。"
         case .transport(let code): "Rust 桥接调用失败（状态码 \(code)）。"

@@ -69,10 +69,11 @@ final class NativeProcessClient: @unchecked Sendable {
         arguments: [String],
         initialInput: Data? = nil,
         timeout: TimeInterval,
+        maxLineBytes: Int = 2048,
         onLine: @escaping @Sendable (Data) -> Void
     ) async throws -> Int32 {
         try Task.checkCancellation()
-        guard timeout.isFinite, timeout > 0, timeout <= 86_400 else { throw NativeProcessError.failed }
+        guard timeout.isFinite, timeout > 0, timeout <= 86_400, (1...DeviceProtocol.maxReceiverBytes).contains(maxLineBytes) else { throw NativeProcessError.failed }
         if let initialInput { try Self.validateCommand(initialInput) }
         let operation = Operation()
         if let initialInput { try operation.enqueue(initialInput) }
@@ -85,7 +86,7 @@ final class NativeProcessClient: @unchecked Sendable {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
                     let result = self.supervise(operation, executable: executable, arguments: arguments,
-                                                timeout: timeout, onLine: onLine)
+                                                timeout: timeout, maxLineBytes: maxLineBytes, onLine: onLine)
                     operation.runFinished = true
                     continuation.resume(with: result)
                 }
@@ -135,7 +136,7 @@ final class NativeProcessClient: @unchecked Sendable {
 
     private func supervise(
         _ operation: Operation, executable: URL, arguments: [String],
-        timeout: TimeInterval, onLine: @escaping @Sendable (Data) -> Void
+        timeout: TimeInterval, maxLineBytes: Int, onLine: @escaping @Sendable (Data) -> Void
     ) -> Result<Int32, Error> {
         var failure: Error?
         var forced = false
@@ -186,7 +187,7 @@ final class NativeProcessClient: @unchecked Sendable {
             }
             do {
                 try drain(operation, buffer: &output, rateStarted: &rateStarted, lineCount: &lineCount,
-                          deliver: failure == nil, onLine: onLine)
+                          deliver: failure == nil, maxLineBytes: maxLineBytes, onLine: onLine)
                 if !operation.isStopping { try writeCommand(operation) }
             } catch {
                 if failure == nil { failure = error as? NativeProcessError ?? NativeProcessError.failed }
@@ -251,7 +252,7 @@ final class NativeProcessClient: @unchecked Sendable {
 
     private func drain(
         _ operation: Operation, buffer: inout Data, rateStarted: inout TimeInterval,
-        lineCount: inout Int, deliver: Bool, onLine: @escaping @Sendable (Data) -> Void
+        lineCount: inout Int, deliver: Bool, maxLineBytes: Int, onLine: @escaping @Sendable (Data) -> Void
     ) throws {
         guard !operation.outputEOF, let stdout = operation.output else { return }
         var bytes = [UInt8](repeating: 0, count: 4096)
@@ -273,7 +274,7 @@ final class NativeProcessClient: @unchecked Sendable {
             buffer.append(contentsOf: bytes.prefix(count))
             while let end = buffer.firstIndex(of: 10) {
                 let size = buffer.distance(from: buffer.startIndex, to: end) + 1
-                guard size <= 2048 else { throw NativeProcessError.invalidOutput }
+                guard size <= maxLineBytes else { throw NativeProcessError.invalidOutput }
                 let now = ProcessInfo.processInfo.systemUptime
                 if now - rateStarted >= 1 { rateStarted = now; lineCount = 0 }
                 lineCount += 1
@@ -284,7 +285,7 @@ final class NativeProcessClient: @unchecked Sendable {
                 buffer.removeFirst(size)
                 onLine(line) // Caller must return promptly; never dispatch synchronously to UI.
             }
-            guard buffer.count < 2048 else { throw NativeProcessError.invalidOutput }
+            guard buffer.count < maxLineBytes else { throw NativeProcessError.invalidOutput }
         }
     }
 

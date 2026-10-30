@@ -7,6 +7,12 @@ final class DeviceProtocolTests: XCTestCase {
     private func bytes(_ object: [String: Any]) throws -> Data {
         try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
+    private func receiverBytes(_ object: [String: Any]) throws -> Data {
+        var value: [String: Any] = ["route_enabled": false, "focus_device_id": NSNull(),
+                                  "focus_screen_id": NSNull(), "shared_layout": NSNull(), "input_active": false]
+        value.merge(object) { _, new in new }
+        return try bytes(value)
+    }
     private func peer(endpoint: Any = NSNull()) -> [String: Any] {
         ["schema": 1, "id": id, "friendly_name": "Windows 工作台", "last_endpoint": endpoint]
     }
@@ -71,22 +77,22 @@ final class DeviceProtocolTests: XCTestCase {
     }
 
     func testReceiverStatesDistinguishReadinessAndFinalFailure() throws {
-        let listening = try DeviceProtocol.receiver(bytes(["protocol": 1, "state": "listening", "listen_endpoint": "0.0.0.0:24800", "error": NSNull()]))
+        let listening = try DeviceProtocol.receiver(receiverBytes(["protocol": 2, "state": "listening", "listen_endpoint": "0.0.0.0:24800", "error": NSNull()]))
         XCTAssertEqual(listening.state, .listening)
-        let stopping = try DeviceProtocol.receiver(bytes(["protocol": 1, "state": "stopping", "listen_endpoint": "[::1]:24800", "error": "control output closed"]))
+        let stopping = try DeviceProtocol.receiver(receiverBytes(["protocol": 2, "state": "stopping", "listen_endpoint": "[::1]:24800", "error": "control output closed"]))
         XCTAssertEqual(stopping.state, .stopping)
         XCTAssertNotNil(stopping.error)
-        let failed = try DeviceProtocol.receiver(bytes(["protocol": 1, "state": "error", "listen_endpoint": NSNull(), "error": "receiver failed"]))
+        let failed = try DeviceProtocol.receiver(receiverBytes(["protocol": 2, "state": "error", "listen_endpoint": NSNull(), "error": "receiver failed"]))
         XCTAssertEqual(failed.state, .error)
         let invalidStates: [[String: Any]] = [
-            ["protocol": 1, "state": "connected", "listen_endpoint": "0.0.0.0:24800", "error": NSNull()],
-            ["protocol": 1, "state": "sharing", "listen_endpoint": NSNull(), "error": NSNull()],
-            ["protocol": 1, "state": "error", "listen_endpoint": NSNull(), "error": NSNull()],
-            ["protocol": 1, "state": "stopped", "listen_endpoint": NSNull(), "error": "failed"],
-            ["protocol": 2, "state": "starting", "listen_endpoint": NSNull(), "error": NSNull()],
-            ["protocol": 1, "state": "listening", "listen_endpoint": "[1:2:3]:24800", "error": NSNull()]
+            ["protocol": 2, "state": "connected", "listen_endpoint": "0.0.0.0:24800", "error": NSNull()],
+            ["protocol": 2, "state": "sharing", "listen_endpoint": NSNull(), "error": NSNull()],
+            ["protocol": 2, "state": "error", "listen_endpoint": NSNull(), "error": NSNull()],
+            ["protocol": 2, "state": "stopped", "listen_endpoint": NSNull(), "error": "failed"],
+            ["protocol": 1, "state": "starting", "listen_endpoint": NSNull(), "error": NSNull()],
+            ["protocol": 2, "state": "listening", "listen_endpoint": "[1:2:3]:24800", "error": NSNull()]
         ]
-        for item in invalidStates { XCTAssertThrowsError(try DeviceProtocol.receiver(bytes(item))) }
+        for item in invalidStates { XCTAssertThrowsError(try DeviceProtocol.receiver(receiverBytes(item))) }
     }
 
     func testDuplicateEscapedKeysAndNonIntegerVersionsAreRejected() {
@@ -102,8 +108,8 @@ final class DeviceProtocolTests: XCTestCase {
 
     func testStartupRejectionRequiresKnownPermissionAndNoListener() throws {
         for reason in ["accessibility permission required", "input monitoring permission required"] {
-            let status = try DeviceProtocol.receiver(bytes([
-                "protocol": 1, "state": "startup_rejected", "listen_endpoint": NSNull(), "error": reason
+            let status = try DeviceProtocol.receiver(receiverBytes([
+                "protocol": 2, "state": "startup_rejected", "listen_endpoint": NSNull(), "error": reason
             ]))
             XCTAssertEqual(status.state, .startupRejected)
             XCTAssertEqual(status.error, reason)
@@ -114,8 +120,8 @@ final class DeviceProtocolTests: XCTestCase {
             (NSNull() as Any, "accessibility permission required " as Any),
             ("0.0.0.0:24800" as Any, "accessibility permission required" as Any)
         ] {
-            XCTAssertThrowsError(try DeviceProtocol.receiver(bytes([
-                "protocol": 1, "state": "startup_rejected", "listen_endpoint": endpoint, "error": reason
+            XCTAssertThrowsError(try DeviceProtocol.receiver(receiverBytes([
+                "protocol": 2, "state": "startup_rejected", "listen_endpoint": endpoint, "error": reason
             ])))
         }
     }

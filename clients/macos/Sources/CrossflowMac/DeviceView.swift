@@ -10,23 +10,12 @@ struct DeviceView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 7) {
                         Text("设备").font(.system(size: Theme.titleSize, weight: .semibold))
-                        Text("让电脑自然地连接在一起。 ").foregroundStyle(Theme.secondary)
+                        Text("管理已配对设备，或添加同一局域网中的电脑。").foregroundStyle(Theme.secondary)
                     }
                     Spacer()
-                    StatusBadge(title: model.isSharing ? "共享中" : "本机接收", active: model.isSharing)
+                    StatusBadge(title: model.sessionTitle, active: model.isSharing)
                 }
-                HStack(spacing: 10) {
-                    Image(systemName: model.cleanupUnconfirmed ? "exclamationmark.circle" : "circle.inset.filled")
-                        .foregroundStyle(model.cleanupUnconfirmed ? .orange : Theme.accent)
-                    Text(model.message).fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    if model.operation != nil || model.stopPending {
-                        Button(model.stopping ? "停止中…" : "停止", role: .cancel) { model.stop() }
-                            .disabled(model.stopping || model.stopPending)
-                            .accessibilityIdentifier("device-stop")
-                    }
-                }
-                .padding(16).background(Theme.subtle, in: RoundedRectangle(cornerRadius: 12))
+                SessionStatusCard(model: model)
 
                 pairedCard
                 invitationCard
@@ -49,13 +38,13 @@ struct DeviceView: View {
     private var pairedCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Label("已配对电脑", systemImage: "checkmark.shield").font(.headline)
+                Label("已配对设备", systemImage: "checkmark.shield").font(.headline)
                 Spacer()
                 if model.loading { ProgressView().controlSize(.small) }
                 Button("刷新") { model.refresh() }.buttonStyle(.borderless).disabled(model.loading)
             }
             if model.devices.isEmpty {
-                Text("添加电脑后，会自动记住连接关系。")
+                Text("尚无已配对设备。添加电脑后，会记住配对关系。")
                     .foregroundStyle(Theme.secondary).padding(.vertical, 8)
             }
             ForEach(model.devices) { device in
@@ -75,21 +64,7 @@ struct DeviceView: View {
                 .accessibilityLabel("选择 \(device.name)")
             }
             if !model.listMessage.isEmpty { Text(model.listMessage).font(.caption).foregroundStyle(Theme.secondary) }
-            Divider()
-            Picker("接收内容", selection: $model.includeKeyboard) {
-                Text("键盘、鼠标与滚轮").tag(true)
-                Text("仅鼠标移动").tag(false)
-            }
-            .pickerStyle(.segmented).disabled(!model.canStart)
-            .accessibilityIdentifier("device-receive-mode")
-            HStack {
-                Text(model.includeKeyboard ? "允许已配对电脑发送键盘、点击、拖动与滚轮。跨屏键鼠仍需实机验证。" : "仅接收鼠标移动，不接收键盘、点击或滚轮。")
-                    .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
-                Spacer()
-                Button(model.includeKeyboard ? "接收键盘与鼠标" : "接收鼠标移动", systemImage: "arrow.down.forward") { model.receive() }
-                    .buttonStyle(.borderedProminent).disabled(!model.canStart || model.selected == nil)
-                    .accessibilityIdentifier("device-receive")
-            }
+
         }
         .padding(20).background(Theme.surface, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.border, lineWidth: 1))
@@ -98,7 +73,7 @@ struct DeviceView: View {
     private var invitationCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Label("添加电脑", systemImage: "plus.circle").font(.headline)
+                Label("添加设备", systemImage: "plus.circle").font(.headline)
                 Spacer()
                 if model.operation != .invitation {
                     Button("生成配对码") { model.invite() }

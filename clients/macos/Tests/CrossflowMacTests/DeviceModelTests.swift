@@ -171,7 +171,7 @@ final class DeviceModelTests: XCTestCase {
     @MainActor func testPermissionRejectionAllowsRetryAndOrdinaryShutdown() async throws {
         for reason in ["accessibility permission required", "input monitoring permission required"] {
             let script = """
-            printf '%s\\n' '{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"\(reason)"}'
+            printf '%s\\n' '{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":null,"error":"\(reason)"}'
             exit 1
             """
             try await withReceiverModel(script: script, expectedShutdown: true) { model, fixture in
@@ -194,7 +194,7 @@ final class DeviceModelTests: XCTestCase {
     @MainActor func testReceiveModeRequiresExplicitStartAndPassesSelectedInputScope() async throws {
         let script = """
         printf '%s\\n' "$@" > receiver-arguments
-        printf '%s\\n' '{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
+        printf '%s\\n' '{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
         exit 1
         """
         try await withReceiverModel(script: script, expectedShutdown: true) { model, fixture in
@@ -217,15 +217,15 @@ final class DeviceModelTests: XCTestCase {
     }
 
     @MainActor func testReceiverErrorsAndInvalidRejectionsKeepCleanupGateClosed() async throws {
-        let rejected = #"{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}"#
+        let rejected = #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}"#
         let frames = [
-            #"{"protocol":1,"state":"error","listen_endpoint":null,"error":"receiver failed"}"#,
-            #"{"protocol":1,"state":"startup_rejected","listen_endpoint":"0.0.0.0:24800","error":"accessibility permission required"}"#,
-            #"{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"receiver failed"}"#,
-            #"{"protocol":1,"state":"listening","listen_endpoint":"0.0.0.0:24800","error":null}"# + "\n" + rejected,
-            #"{"protocol":1,"state":"error","listen_endpoint":null,"error":"receiver failed"}"# + "\n" + rejected,
-            #"{"protocol":1,"state":"stopped","listen_endpoint":null,"error":null}"# + "\n" + rejected,
-            rejected + "\n" + #"{"protocol":1,"state":"stopped","listen_endpoint":null,"error":null}"#
+            #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"error","listen_endpoint":null,"error":"receiver failed"}"#,
+            #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":"0.0.0.0:24800","error":"accessibility permission required"}"#,
+            #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":null,"error":"receiver failed"}"#,
+            #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"listening","listen_endpoint":"0.0.0.0:24800","error":null}"# + "\n" + rejected,
+            #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"error","listen_endpoint":null,"error":"receiver failed"}"# + "\n" + rejected,
+            #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"stopped","listen_endpoint":null,"error":null}"# + "\n" + rejected,
+            rejected + "\n" + #"{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"stopped","listen_endpoint":null,"error":null}"#
         ]
         let cases = frames.map { ($0, 1) } + [(rejected, 0)]
         for (frame, exitCode) in cases {
@@ -240,7 +240,7 @@ final class DeviceModelTests: XCTestCase {
 
     @MainActor func testSignalExitCannotConfirmStartupRejection() async throws {
         let script = """
-        printf '%s\\n' '{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
+        printf '%s\\n' '{"protocol":2,"route_enabled":false,"focus_device_id":null,"focus_screen_id":null,"shared_layout":null,"input_active":false,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
         kill -TERM $$
         """
         try await withReceiverModel(script: script, expectedShutdown: false) { model, _ in

@@ -1,9 +1,9 @@
 # Crossflow for macOS
 
-Native SwiftUI layout editor and device connection page, built with SwiftPM and
-packaged as a macOS app. The layout editor remains the default opening page.
-The editor preserves unknown JSON fields for Rust to reject; layout validation
-and crossing decisions run through the bundled `crossflow-bridge` C ABI.
+Native SwiftUI workspace and device connection page, built with SwiftPM and
+packaged as a macOS app. The workspace shows authenticated session screens and
+keyboard/mouse focus. Screen arrangement is managed on Windows; Mac has no
+draft editor, import/export or sample-layout action.
 
 ## Build and verify
 
@@ -92,7 +92,7 @@ Its saved result explicitly reports `input_ready:false`. The core now supports
 an identity file. The device page starts this receiver through its supervised
 control channel and the core executable is packaged beside the UI.
 
-## Cross-screen input integration (wire v3)
+## Cross-screen input integration (wire v4)
 
 The device page offers keyboard/mouse/wheel reception and a separate movement-only
 mode. Full input is the selected mode, but nothing starts until the user clicks
@@ -116,7 +116,7 @@ choose a remote screen from the layout editor or start sharing automatically.
 
 This source change does not rebuild or replace the fixed phase-zero test app,
 re-sign its helpers, alter Keychain access, or solve upgrade signing continuity.
-Native compilation and new tests must run against the merged shared wire-v3 core
+Native compilation and new tests must run against the merged shared wire-v4 core
 before packaging; the standalone Mac branch depends on `session::NativeDisplay`.
 
 The app bundles the canonical `clients/design-tokens.json` and shared layouts
@@ -197,3 +197,19 @@ remain to be validated.
 The SDK 27 Command Line Tools lack the new SwiftUI `State` macro plugin. The
 `ViewState` alias explicitly selects the established property-wrapper type;
 the package retains its macOS 14 deployment target.
+
+## Shared session workspace
+
+The main navigation is 工作台 / 设备, using the same shared design tokens as Windows.
+The workspace starts empty and only displays authenticated session geometry.
+There is no draft editor or import/export flow. Bundled examples are used only
+by the headless ABI regression tests.
+
+Receiver stdout protocol 2 carries shared_layout, route_enabled, focus device/screen
+and input_active over the existing process stream. Only input_active indicates
+input arriving on this Mac; enabled routing can still have focus on Windows.
+Session geometry is read-only on Mac and managed on Windows. Disconnect, stop or
+error clears the session display and focus. Identical snapshots retain stable
+screen IDs; focus changes do not recreate geometry.
+Input/discovery wire is 4; the private input-worker IPC remains 3. Receiver status
+lines allow at most 65,536 bytes; invitation/other process lines retain 2,048 bytes.

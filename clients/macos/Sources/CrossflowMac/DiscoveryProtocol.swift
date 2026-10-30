@@ -31,7 +31,7 @@ enum DiscoveryError: LocalizedError, Sendable {
 
 enum DiscoveryProtocol {
     static let maxOutputBytes = 262_144
-    static let wireVersion: UInt16 = 3
+    static let wireVersion: UInt16 = 4
 
     static func parse(_ data: Data) throws -> DiscoveryResult {
         guard data.count <= maxOutputBytes, String(data: data, encoding: .utf8) != nil else {

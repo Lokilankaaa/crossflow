@@ -42,6 +42,7 @@ final class DeviceModel {
     var loading = false
     var operation: Operation?
     var receiverState: ReceiverStatus.State?
+    var receiverStatus: ReceiverStatus?
     var cleanupUnconfirmed = false
     var stopping = false
     var stopPending = false
@@ -69,7 +70,24 @@ final class DeviceModel {
     }
 
     var canStart: Bool { operation == nil && !stopPending && !cleanupUnconfirmed && !shuttingDown }
-    var isSharing: Bool { operation == .receiver && receiverState == .sharing && !stopping }
+    var isSharing: Bool { operation == .receiver && receiverStatus?.inputActive == true && !stopping && !cleanupUnconfirmed && [.paused, .sharing].contains(receiverState) }
+    var sessionTitle: String {
+        if cleanupUnconfirmed { return "停止结果待确认" }
+        if stopping || stopPending { return "正在停止" }
+        if operation == .invitation { return "正在配对" }
+        guard operation == .receiver else { return "尚未连接" }
+        switch receiverState {
+        case .starting, nil: return "正在准备接收"
+        case .listening: return "接收已开启 · 等待连接"
+        case .paused, .sharing:
+            if isSharing { return "正在本机接收" }
+            return receiverStatus?.routeEnabled == true ? "共享已开启" : "已连接 · 共享已暂停"
+        case .stopping: return "正在停止"
+        case .stopped: return "已停止"
+        case .error: return "连接出现错误"
+        case .startupRejected: return "需要系统权限"
+        }
+    }
     var invitationAvailable: Bool { executable("crossflow-invite") != nil }
     var selected: SavedDevice? { devices.first { $0.id == selectedID } }
 
@@ -147,7 +165,7 @@ final class DeviceModel {
 
     private func beginOperation(_ value: Operation) {
         generation += 1
-        operation = value; receiverState = nil; confirmation = nil; approved = false
+        operation = value; receiverState = nil; receiverStatus = nil; confirmation = nil; approved = false
         savedID = nil; code = ""; invalidEvent = false; stopping = false
         expectedPeerID = nil
         startupRejectionMessage = nil; startupRejectionEligible = true
@@ -167,7 +185,7 @@ final class DeviceModel {
         }
         do {
             let exit = try await process.run(executable: executable, arguments: arguments, initialInput: initialInput,
-                                             timeout: timeout, onLine: { line in
+                                             timeout: timeout, maxLineBytes: operation == .receiver ? DeviceProtocol.maxReceiverBytes : DeviceProtocol.maxLineBytes, onLine: { line in
                 if case .dropped = events.continuation.yield(line) {
                     events.continuation.finish(throwing: DeviceModelError.invalid)
                 }
@@ -209,7 +227,7 @@ final class DeviceModel {
         }
         guard current == generation else { return }
         code = ""; confirmation = nil; approved = false
-        operation = nil; stopping = false; task = nil
+        operation = nil; receiverStatus = nil; stopping = false; task = nil
         if !shuttingDown { refresh() }
     }
 
@@ -247,13 +265,17 @@ final class DeviceModel {
                 } else if status.listenEndpoint != nil || status.state == .error || status.state == .stopped {
                     startupRejectionEligible = false
                 }
+                receiverStatus = status
                 receiverState = status.state
                 if stopping { return }
                 switch status.state {
                 case .starting: message = "正在准备接收…"
                 case .listening: message = "已准备好，请在 Windows 上连接并开始共享。"
-                case .paused: message = "已连接，等待 Windows 开始共享。"
-                case .sharing: message = "正在接收输入 · 本机按 Escape 可停止。"
+                case .paused, .sharing:
+                    if status.inputActive { message = "当前控制这台 Mac · 按 Escape 可停止接收。" }
+                    else if !status.routeEnabled { message = "已连接 · 共享已暂停，请在另一台电脑开启共享。" }
+                    else if status.focusDeviceID != nil { message = "共享已开启 · 当前控制另一台电脑，越过相邻边缘后切换。" }
+                    else { message = "共享已开启 · 等待光标位置。" }
                 case .stopping: message = "正在停止并释放输入…"
                 case .stopped: message = "接收已停止。"
                 case .error: message = "接收出现错误，请检查系统权限或运行记录。"

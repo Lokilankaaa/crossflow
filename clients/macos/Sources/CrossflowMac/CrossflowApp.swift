@@ -31,14 +31,7 @@ struct CrossflowApp: App {
                      height: Theme.number("window", "height", fallback: 760))
         .windowResizability(.contentMinSize)
         .commands {
-            CommandGroup(replacing: .newItem) {
-                Button("导入布局…") { model.importDocument() }.keyboardShortcut("o")
-                Button("导出布局草稿…") { Task { await model.exportDocument() } }.keyboardShortcut("s")
-            }
-            CommandGroup(replacing: .undoRedo) {
-                Button("撤销") { model.undo() }.keyboardShortcut("z").disabled(!model.canUndo)
-                Button("重做") { model.redo() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!model.canRedo)
-            }
+            CommandGroup(replacing: .newItem) { }
         }
     }
 }

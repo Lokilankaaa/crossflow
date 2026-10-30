@@ -5,6 +5,7 @@ import Foundation
 enum SelfTest {
     static func run(output: URL) async -> Int32 {
         var checks = DiscoverySelfTest.checks()
+        checks.merge(ReceiverSelfTest.checks()) { _, new in new }
         var details: [String: JSONValue] = [:]
         do {
             let bridge = BridgeClient()

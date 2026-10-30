@@ -22,7 +22,23 @@ enum InvitationEvent: Sendable {
     case saved(id: String, port: Int)
 }
 
-struct ReceiverStatus: Sendable {
+struct SharedScreen: Sendable, Equatable, Identifiable {
+    let id: String
+    let deviceID: String
+    let nativeID: String
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
+struct SharedLayout: Sendable, Equatable {
+    let sourceDeviceID: String
+    let receiverDeviceID: String
+    let screens: [SharedScreen]
+}
+
+struct ReceiverStatus: Sendable, Equatable {
     enum State: String, Sendable {
         case starting, listening, paused, sharing, stopping, stopped, error
         case startupRejected = "startup_rejected"
@@ -30,6 +46,11 @@ struct ReceiverStatus: Sendable {
     let state: State
     let listenEndpoint: String?
     let error: String?
+    let routeEnabled: Bool
+    let focusDeviceID: String?
+    let focusScreenID: String?
+    let sharedLayout: SharedLayout?
+    let inputActive: Bool
 }
 
 enum DeviceProtocolError: LocalizedError, Sendable {
@@ -42,6 +63,7 @@ enum DeviceProtocolError: LocalizedError, Sendable {
 enum DeviceProtocol {
     static let maxPeerBytes = 1_048_576
     static let maxLineBytes = 2048
+    static let maxReceiverBytes = 65_536
 
     static func savedDevices(_ data: Data) throws -> SavedDevices {
         let root = try object(data, limit: maxPeerBytes)
@@ -107,9 +129,9 @@ enum DeviceProtocol {
     }
 
     static func receiver(_ data: Data) throws -> ReceiverStatus {
-        let value = try object(data, limit: maxLineBytes)
-        try fields(value, ["protocol", "state", "listen_endpoint", "error"])
-        guard try integer(value, "protocol", maximum: 1) == 1,
+        let value = try object(data, limit: maxReceiverBytes)
+        try fields(value, ["protocol", "state", "listen_endpoint", "error", "route_enabled", "focus_device_id", "focus_screen_id", "shared_layout", "input_active"])
+        guard try integer(value, "protocol", maximum: 2) == 2,
               let state = ReceiverStatus.State(rawValue: try string(value, "state")) else { throw invalid }
         let endpoint = try optionalString(value, "listen_endpoint")
         if let endpoint { guard validEndpoint(endpoint) else { throw invalid } }
@@ -124,7 +146,71 @@ enum DeviceProtocol {
             guard endpoint == nil,
                   error == "accessibility permission required" || error == "input monitoring permission required" else { throw invalid }
         }
-        return ReceiverStatus(state: state, listenEndpoint: endpoint, error: error)
+        let enabled = try boolean(value, "route_enabled")
+        let active = try boolean(value, "input_active")
+        let focusDevice = try optionalString(value, "focus_device_id")
+        let focusScreen = try optionalString(value, "focus_screen_id")
+        let layout = try sharedLayout(value["shared_layout"])
+        guard (focusDevice == nil) == (focusScreen == nil), enabled || focusDevice == nil else { throw invalid }
+        if let focusDevice, let focusScreen {
+            guard let layout, layout.screens.contains(where: { $0.id == focusScreen && $0.deviceID == focusDevice }) else { throw invalid }
+        }
+        if layout == nil { guard focusDevice == nil else { throw invalid } }
+        if [.starting, .listening, .stopped, .startupRejected].contains(state) {
+            guard !enabled, !active, layout == nil, focusDevice == nil else { throw invalid }
+        }
+        return ReceiverStatus(state: state, listenEndpoint: endpoint, error: error,
+                              routeEnabled: enabled, focusDeviceID: focusDevice, focusScreenID: focusScreen,
+                              sharedLayout: layout, inputActive: active)
+    }
+
+    private static func sharedLayout(_ value: Value?) throws -> SharedLayout? {
+        if value == .null { return nil }
+        guard case let .object(root)? = value else { throw invalid }
+        try fields(root, ["schema", "source_device_id", "receiver_device_id", "screens"])
+        guard try integer(root, "schema", maximum: 1) == 1 else { throw invalid }
+        let source = try string(root, "source_device_id"), receiver = try string(root, "receiver_device_id")
+        guard hex(source, count: 64), hex(receiver, count: 64), source != receiver,
+              case let .array(items)? = root["screens"], !items.isEmpty, items.count <= 32 else { throw invalid }
+        var ids = Set<String>(), nativeIDs = Set<String>()
+        let screens = try items.map { item -> SharedScreen in
+            guard case let .object(screen) = item else { throw invalid }
+            try fields(screen, ["id", "device_id", "native_id", "x", "y", "width", "height"])
+            let id = try string(screen, "id"), device = try string(screen, "device_id"), native = try string(screen, "native_id")
+            guard validIdentifier(id, bytes: 128), validIdentifier(native, bytes: 256), ids.insert(id).inserted,
+                  [source, receiver].contains(device), nativeIDs.insert(device + ":" + native).inserted else { throw invalid }
+            let x = try number(screen, "x"), y = try number(screen, "y")
+            let width = try number(screen, "width"), height = try number(screen, "height")
+            guard width >= 1, height >= 1, [x, y, width, height].allSatisfy({ abs($0) <= 1_000_000 }) else { throw invalid }
+            return SharedScreen(id: id, deviceID: device, nativeID: native, x: x, y: y, width: width, height: height)
+        }
+        guard screens.contains(where: { $0.deviceID == source }), screens.contains(where: { $0.deviceID == receiver }) else { throw invalid }
+        for (index, first) in screens.enumerated() {
+            for second in screens.dropFirst(index + 1) {
+                guard !(first.x < second.x + second.width && second.x < first.x + first.width
+                        && first.y < second.y + second.height && second.y < first.y + first.height) else { throw invalid }
+            }
+        }
+        return SharedLayout(sourceDeviceID: source, receiverDeviceID: receiver, screens: screens)
+    }
+
+    private static func validIdentifier(_ value: String, bytes: Int) -> Bool {
+        !value.isEmpty && value.utf8.count <= bytes && !value.unicodeScalars.contains(where: forbiddenScalar)
+    }
+
+    private static func boolean(_ value: [String: Value], _ key: String) throws -> Bool {
+        guard case let .bool(result)? = value[key] else { throw invalid }
+        return result
+    }
+    private static func number(_ value: [String: Value], _ key: String) throws -> Double {
+        let result: Double
+        switch value[key] {
+        case let .number(number): result = number
+        case let .integer(integer): result = Double(integer)
+        default: throw invalid
+        }
+        guard result.isFinite else { throw invalid }
+        return result
     }
 
     static func begin(name: String) throws -> Data {
@@ -263,12 +349,13 @@ enum DeviceProtocol {
     }
 
     private enum Value: Decodable, Equatable {
-        case object([String: Value]), array([Value]), string(String), integer(UInt64), bool(Bool), null
+        case object([String: Value]), array([Value]), string(String), integer(UInt64), number(Double), bool(Bool), null
         init(from decoder: Decoder) throws {
             let value = try decoder.singleValueContainer()
             if value.decodeNil() { self = .null }
             else if let result = try? value.decode(Bool.self) { self = .bool(result) }
             else if let result = try? value.decode(UInt64.self) { self = .integer(result) }
+            else if let result = try? value.decode(Double.self) { self = .number(result) }
             else if let result = try? value.decode(String.self) { self = .string(result) }
             else if let result = try? value.decode([Value].self) { self = .array(result) }
             else { self = .object(try value.decode([String: Value].self)) }
@@ -301,7 +388,7 @@ private struct DeviceUniqueJSON {
         }
         throw DeviceProtocolError.invalidResult
     }
-    mutating func value(depth: Int) throws {
+    mutating func value(depth: Int, key: String? = nil) throws {
         whitespace()
         guard depth < 8, index < bytes.count else { throw DeviceProtocolError.invalidResult }
         switch bytes[index] {
@@ -312,11 +399,13 @@ private struct DeviceUniqueJSON {
             if index < bytes.count && bytes[index] == end { index += 1; return }
             var keys = Set<String>()
             while true {
+                var childKey: String?
                 if object {
-                    guard keys.insert(try string()).inserted else { throw DeviceProtocolError.invalidResult }
+                    childKey = try string()
+                    guard keys.insert(childKey!).inserted else { throw DeviceProtocolError.invalidResult }
                     try consume(58)
                 }
-                try value(depth: depth + 1); whitespace()
+                try value(depth: depth + 1, key: childKey); whitespace()
                 guard index < bytes.count else { throw DeviceProtocolError.invalidResult }
                 if bytes[index] == end { index += 1; return }
                 try consume(44)
@@ -329,7 +418,11 @@ private struct DeviceUniqueJSON {
             let token = bytes[start..<index]
             let literal = String(decoding: token, as: UTF8.self)
             if !["true", "false", "null"].contains(literal) {
-                guard token.allSatisfy({ (48...57).contains($0) }), token.count == 1 || token.first != 48 else { throw DeviceProtocolError.invalidResult }
+                if let key, ["x", "y", "width", "height"].contains(key) {
+                    guard let number = try? JSONDecoder().decode(Double.self, from: Data(token)), number.isFinite else { throw DeviceProtocolError.invalidResult }
+                } else {
+                    guard token.allSatisfy({ (48...57).contains($0) }), token.count == 1 || token.first != 48 else { throw DeviceProtocolError.invalidResult }
+                }
             }
         }
     }
