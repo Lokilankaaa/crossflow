@@ -26,6 +26,22 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Private Mac client listener for an authenticated bidirectional session.
+    #[command(hide = true)]
+    PairReceive {
+        #[arg(long)]
+        peer: String,
+        #[arg(long, default_value = "127.0.0.1:24800")]
+        bind: std::net::SocketAddr,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long, default_value_t = 3600.0)]
+        seconds: f64,
+        #[arg(long)]
+        discoverable: bool,
+        #[arg(long, requires = "discoverable")]
+        device_name: Option<String>,
+    },
     /// Private native-client bidirectional cross-screen session.
     #[command(hide = true)]
     DesktopPair {
@@ -244,6 +260,7 @@ fn main() -> Result<()> {
     let _shutdown = if matches!(
         &args.command,
         Command::Receive { .. }
+            | Command::PairReceive { .. }
             | Command::Send { .. }
             | Command::Capture { .. }
             | Command::DesktopSend { .. }
@@ -258,6 +275,65 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
     match args.command {
+        Command::PairReceive {
+            peer,
+            bind,
+            log,
+            seconds,
+            discoverable,
+            device_name,
+        } => {
+            valid_duration(seconds)?;
+            let identity = crossflow::peers::PeerStore::default_store()?
+                .resolve(&peer)?
+                .1;
+            let mut meta = metadata("native_pair_listener");
+            meta["movement_only"] = json!(false);
+            meta["pair_protocol"] = json!(crossflow::pair_wire::PAIR_VERSION);
+            let writer = LogWriter::new(&log, meta)?;
+            #[cfg(target_os = "macos")]
+            {
+                // Preserve the existing protocol-2 startup rejection before
+                // creating a listener, capture tap, or isolated input worker.
+                if let Err(permission) = crossflow::platform::macos::preflight_input_permissions() {
+                    use crossflow::platform::macos::MissingInputPermission;
+                    use crossflow::receiver_control::{Control, ControlIo, StartupRejection};
+                    let control = Control::new(stop.clone());
+                    let (input, output) = crossflow::injection_worker::stdio_files()?;
+                    let mut io = ControlIo::start(input, output, control.clone())?;
+                    control.reject_startup(match permission {
+                        MissingInputPermission::Accessibility => StartupRejection::Accessibility,
+                        MissingInputPermission::InputMonitoring => {
+                            StartupRejection::InputMonitoring
+                        }
+                    });
+                    writer.finish()?;
+                    io.finish(Err(anyhow::anyhow!(permission.message())))?;
+                    anyhow::bail!("{}", permission.message());
+                }
+                crossflow::pair_app::run(
+                    crossflow::pair_app::Options {
+                        identity,
+                        mode: crossflow::pair_app::Mode::Listen {
+                            bind,
+                            discoverable,
+                            device_name,
+                        },
+                        seconds,
+                        max_hz: 1000,
+                    },
+                    writer,
+                    stop,
+                    crossflow::pair_native::macos::platform(),
+                )?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (identity, bind, seconds, discoverable, device_name);
+                writer.finish()?;
+                anyhow::bail!("pair-receive is not installed for this platform");
+            }
+        }
         Command::DesktopPair {
             peer,
             runtime_layout,
@@ -1124,6 +1200,45 @@ fn run_capture(
 #[cfg(test)]
 mod discovery_cli_tests {
     use super::*;
+
+    #[test]
+    fn pair_listener_requires_a_saved_peer_and_keeps_legacy_scope_flags_out() {
+        let args = Args::try_parse_from([
+            "crossflow",
+            "pair-receive",
+            "--peer",
+            &"a".repeat(64),
+            "--log",
+            "test.jsonl",
+            "--bind",
+            "0.0.0.0:24800",
+            "--discoverable",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Command::PairReceive {
+                discoverable: true,
+                seconds: 3600.0,
+                ..
+            }
+        ));
+        assert!(
+            Args::try_parse_from(["crossflow", "pair-receive", "--log", "test.jsonl"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "crossflow",
+                "pair-receive",
+                "--peer",
+                &"a".repeat(64),
+                "--log",
+                "test.jsonl",
+                "--inject-actions"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn receiver_peer_mode_requires_one_identity_source_and_never_enables_injection() {

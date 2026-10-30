@@ -210,6 +210,13 @@ static DISPLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DISPLAY_RECONFIGURING: AtomicBool = AtomicBool::new(false);
 static DISPLAY_CALLBACK: OnceLock<i32> = OnceLock::new();
 
+/// Read only after native_displays() has registered the process-wide callback.
+/// A changed epoch invalidates the capture layout even if geometry changes back.
+pub(crate) fn capture_display_epoch() -> Option<u64> {
+    let epoch = DISPLAY_GENERATION.load(Ordering::SeqCst);
+    (!DISPLAY_RECONFIGURING.load(Ordering::SeqCst)).then_some(epoch)
+}
+
 extern "C" fn display_changed(_display: u32, flags: u32, _user_info: *mut c_void) {
     // Process-lifetime registration: no borrowed pointer, allocation, lock, or
     // CoreGraphics call in the callback. Also detects change-away-and-back.

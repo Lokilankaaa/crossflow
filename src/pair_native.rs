@@ -36,3 +36,7 @@ pub struct Platform {
 #[cfg(windows)]
 #[path = "platform/windows_pair.rs"]
 pub mod windows;
+
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_pair.rs"]
+pub mod macos;
