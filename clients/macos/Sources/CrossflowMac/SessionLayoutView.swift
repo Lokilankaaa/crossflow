@@ -29,6 +29,8 @@ struct SessionLayoutView: View {
                     ForEach(layout.screens) { screen in
                         let focused = routeEnabled && focusScreenID == screen.id
                         let local = screen.deviceID == layout.receiverDeviceID
+                        let ordinal = layout.screens.prefix(while: { $0.id != screen.id })
+                            .filter { $0.deviceID == screen.deviceID }.count + 1
                         RoundedRectangle(cornerRadius: 8)
                             .fill(focused ? Theme.subtle : Theme.background)
                             .overlay(RoundedRectangle(cornerRadius: 8)
@@ -38,7 +40,7 @@ struct SessionLayoutView: View {
                                     VStack(spacing: 5) {
                                         Image(systemName: local ? "laptopcomputer" : "display")
                                         Text(local ? "这台 Mac" : sourceName).fontWeight(.medium).lineLimit(1)
-                                        Text(screen.id).font(.caption).lineLimit(1)
+                                        Text("屏幕 \(ordinal)").font(.caption).lineLimit(1)
                                         if focused { Text("键鼠焦点").font(.caption).foregroundStyle(Theme.accent) }
                                     }.padding(8)
                                     Image(systemName: local ? "laptopcomputer" : "display")
@@ -48,7 +50,7 @@ struct SessionLayoutView: View {
                             .frame(width: screen.width * scale, height: screen.height * scale)
                             .offset(x: originX + (screen.x - left) * scale, y: originY + (screen.y - top) * scale)
                             .accessibilityElement(children: .ignore)
-                            .accessibilityLabel("\(local ? "这台 Mac" : sourceName)，屏幕 \(screen.id)，\(focused ? "当前键鼠焦点" : "非焦点屏幕")")
+                            .accessibilityLabel("\(local ? "这台 Mac" : sourceName)，屏幕 \(ordinal)，\(focused ? "当前键鼠焦点" : "非焦点屏幕")")
                     }
                 }.clipped()
             }.frame(minHeight: 180)
