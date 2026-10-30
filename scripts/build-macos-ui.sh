@@ -3,7 +3,11 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build_root="$root/target/macos-ui"
-app="$root/dist/Crossflow.app"
+app="${CROSSFLOW_MACOS_APP_PATH:-$root/dist/Crossflow.app}"
+case "$app" in
+    /*.app) ;;
+    *) printf '%s\n' 'CROSSFLOW_MACOS_APP_PATH must be an absolute .app path.' >&2; exit 1 ;;
+esac
 test -f "$root/clients/design-tokens.json" || { printf '%s\n' 'Missing shared clients/design-tokens.json' >&2; exit 1; }
 test -f "$root/examples/layout-two-devices.json" || { printf '%s\n' 'Missing shared example layout' >&2; exit 1; }
 case "$(uname -m)" in
@@ -12,10 +16,19 @@ case "$(uname -m)" in
     *) printf '%s\n' 'Unsupported Mac architecture' >&2; exit 1 ;;
 esac
 bridge_library="${CROSSFLOW_BRIDGE_LIBRARY:-$root/target/$native_target/release/libcrossflow_bridge.dylib}"
-keychain_helper="$root/target/$native_target/release/crossflow-keychain"
+keychain_helper="${CROSSFLOW_MACOS_KEYCHAIN_HELPER:-$root/target/$native_target/release/crossflow-keychain}"
+case "$keychain_helper" in
+    /*) ;;
+    *) printf '%s\n' 'CROSSFLOW_MACOS_KEYCHAIN_HELPER must be an absolute path.' >&2; exit 1 ;;
+esac
 core_executable="${CROSSFLOW_CORE_EXECUTABLE:-$root/target/$native_target/release/crossflow}"
 test -f "$bridge_library" || { printf 'Build native Rust bridge first: %s\n' "$bridge_library" >&2; exit 1; }
 test -f "$keychain_helper" || { printf 'Build native Rust Keychain helper first: %s\n' "$keychain_helper" >&2; exit 1; }
+if [ -n "${CROSSFLOW_MACOS_KEYCHAIN_HELPER:-}" ]; then
+    # Explicit diagnostic use only: preserve an already authorized helper's
+    # exact signature. This is not a solution for normal upgrade continuity.
+    codesign --verify --strict "$keychain_helper"
+fi
 test -f "$core_executable" && test -x "$core_executable" || { printf 'Build native Rust core first: %s\n' "$core_executable" >&2; exit 1; }
 test -f "$root/examples/layout-four-screens.json" || { printf '%s\n' 'Missing shared four-screen layout' >&2; exit 1; }
 mkdir -p "$build_root/cache" "$build_root/modules"
@@ -46,7 +59,9 @@ cp "$root/examples/layout-four-screens.json" "$app/Contents/Resources/layout-fou
 mkdir -p "$app/Contents/Frameworks"
 cp "$bridge_library" "$app/Contents/Frameworks/libcrossflow_bridge.dylib"
 codesign --force --sign - "$app/Contents/Frameworks/libcrossflow_bridge.dylib"
-codesign --force --sign - "$app/Contents/MacOS/crossflow-keychain"
+if [ -z "${CROSSFLOW_MACOS_KEYCHAIN_HELPER:-}" ]; then
+    codesign --force --sign - "$app/Contents/MacOS/crossflow-keychain"
+fi
 codesign --force --sign - "$app/Contents/MacOS/crossflow"
 codesign --force --sign - "$app"
 printf 'Built native app: %s\n' "$app"
