@@ -17,7 +17,7 @@ final class LayoutTests: XCTestCase {
         XCTAssertEqual(doc.screens[0].screenID, doc.screens[1].screenID)
     }
     func testNumericTransportPreservesNextRepresentableDouble() throws {
-        var document = fixture()
+        var document = LayoutDocument(screens: [ScreenDraft(screenID: "a", deviceID: "d", x: 0, y: 0, width: 10, height: 10)])
         document.screens[0].x = 1920.0.nextDown
         let roundTrip = try LayoutDocument(data: document.json.data())
         XCTAssertEqual(roundTrip.screens[0].x, 1920.0.nextDown)
