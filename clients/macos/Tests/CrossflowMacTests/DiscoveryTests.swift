@@ -6,7 +6,9 @@ final class DiscoveryTests: XCTestCase {
 
     func testStrictUntrustedDiscoveryBoundary() throws {
         let checks = DiscoverySelfTest.checks()
-        XCTAssertEqual(checks.count, 17)
+        XCTAssertEqual(checks.count, 19)
+        XCTAssertEqual(checks["discovery_legacy_wire_incompatible"], true)
+        XCTAssertEqual(checks["discovery_future_wire_incompatible"], true)
         for (name, passed) in checks { XCTAssertTrue(passed, name) }
     }
 

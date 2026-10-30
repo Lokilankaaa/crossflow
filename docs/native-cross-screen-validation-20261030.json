@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "date": "2026-10-30",
+  "core_revision": "85265db9d89d37f4ba3e743cf1ab20f026901632",
+  "scope": "Windows physical keyboard and mouse routed by screen edges to a paired Mac and back to Windows",
+  "wire_version": 3,
+  "worker_protocol_version": 3,
+  "implemented": [
+    "Authenticated remote display inventory with native monitor identities",
+    "Native layout editor binds every local and remote monitor to actual geometry",
+    "Explicit application of an immutable layout snapshot and manual enabling",
+    "Absolute positioning bound to the target Mac display ID",
+    "Ordered keyboard, buttons and wheel input following remote cursor focus",
+    "Windows local delivery suppression while remote focus is active",
+    "Return to local screen releases remote ownership and clears local suppression",
+    "Unexpected connection or queue epoch changes revoke routing, including a reconnect between geometry calculation and queue commit",
+    "Display change, Windows session lock and suspension stop capture"
+  ],
+  "windows_validation": {
+    "workspace_core_tests_passed": 205,
+    "main_tests_passed": 4,
+    "bridge_tests_passed": 7,
+    "encrypted_fake_input_transport_tests_passed": 9,
+    "isolated_fake_input_worker_tests_passed": 5,
+    "runtime_layout_native_client_fixtures_passed": 13,
+    "existing_native_session_fixtures_passed": 29,
+    "packaged_bridge_checks_passed": 8,
+    "native_client_build_warnings": 0,
+    "native_client_build_errors": 0,
+    "apple_all_targets_type_check": "passed",
+    "real_native_windows_displays_detected": 2,
+    "real_window_contains_apply_and_connect": true,
+    "automatic_window_click": "unavailable: coordinate input geometry is unavailable",
+    "sandbox_test_note": "Isolated DPAPI/file-commit tests require host execution; restricted execution failures were rerun successfully."
+  },
+  "review_fixes": [
+    "Trace previous native position when an arranged remote monitor sits between two physically adjacent Windows monitors",
+    "Do not apply a native movement packet twice when it has only just reached an edge",
+    "Validate the complete current monitor set, not only previously configured bindings",
+    "Compare queue connection epoch under the same lock used to commit handoff"
+  ],
+  "not_yet_accepted": [
+    "Attended native edge crossing, local input suppression and remote keyboard/click/wheel behavior",
+    "Physical Mac keyboard and mouse acting as a source for Windows",
+    "Transfer of keys or buttons held before crossing; release and press again after crossing",
+    "Normal signed application upgrade preserving TCC and Keychain grants",
+    "High refresh rate or visible latency benchmark"
+  ]
+}
