@@ -224,6 +224,13 @@ pub fn capture(
     let ready_control = control.clone();
     let status_control = control.clone();
     let stats_log = log.clone();
+    let ready_log = log.clone();
+    log.write(
+        "capture_coordinate_context",
+        serde_json::json!({
+            "phase":"before_capture", "diagnostics":windows::capture_coordinate_diagnostics()
+        }),
+    );
     let mut last_sample = std::time::Instant::now();
     let mut movement_events = 0u64;
     let result = windows::run_routed_input_capture_with_status(
@@ -318,7 +325,15 @@ pub fn capture(
                 CaptureStatus::Ready
             }
         },
-        move || ready_control.capture_ready(),
+        move || {
+            ready_log.write(
+                "capture_coordinate_context",
+                serde_json::json!({
+                    "phase":"capture_ready", "diagnostics":windows::capture_coordinate_diagnostics()
+                }),
+            );
+            ready_control.capture_ready();
+        },
         gate,
         control.stop.clone(),
         Some(duration),

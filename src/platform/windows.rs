@@ -5,7 +5,10 @@
 
 #[path = "windows_routed.rs"]
 mod routed;
-pub use routed::{NativeDisplay, cursor_position, displays, warp_cursor};
+pub use routed::{
+    CaptureCoordinateDiagnostics, NativeDisplay, capture_coordinate_diagnostics, cursor_position,
+    displays, warp_cursor,
+};
 
 use crate::input::Button;
 use std::{
@@ -1049,6 +1052,14 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
         return Err("only one Windows capture loop may run per process".into());
     }
     let _active = ActiveGuard;
+    // Establish awareness before creating the hidden HWND: Windows dispatches
+    // callbacks in its creation context. Keep it until hooks and HWND are gone,
+    // then restore the caller's context without changing process/UI awareness.
+    let _routed_dpi = if remote_focus.is_some() {
+        Some(routed::DpiScope::physical()?)
+    } else {
+        None
+    };
     let state = Box::new(CallbackState {
         data: RefCell::new(State {
             callback: on_event,

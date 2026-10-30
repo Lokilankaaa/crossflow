@@ -72,6 +72,20 @@
     "clippy_all_targets": "passed; compiler emitted only filesystem hard-link fallback warnings",
     "physical_acceptance": "pending unified package update; automated checks do not verify visible cursor crossing or actual XAML drag"
   },
+  "unified_package_live_followup": {
+    "windows_and_mac_package_revision": "71b01d6aa76afb15368a8203f62a4682708a23c0",
+    "mac_app_permissions_after_user_authorization": "accessibility, listen_event and post_event all true",
+    "layout_synchronization": "Mac received three authenticated screens; native UI shows the portrait Windows screen left of the primary and the Mac below the primary, matching the current Windows layout",
+    "state_synchronization": "Both clients show routing enabled with the Windows primary screen as input target; Mac is not actively receiving input",
+    "second_crossing_attempt": "User again reported no crossing; Windows captured real relative movement and remained routing-enabled, but emitted no Arm or Position",
+    "coordinate_observation": "Current primary binding is 3840x2160 and Mac begins at y=2160. Multiple outward downward pushes were sampled at reported primary native_y=1080. No scaling factor or cause has yet been proven.",
+    "next_change": "Scope the entire routed capture thread including HWND creation to per-monitor DPI awareness v2; log read-only before/ready cursor, clipping and monitor diagnostics. No ClipCursor change or hardcoded coordinate scale.",
+    "coordinate_change_core_tests_passed": 214,
+    "coordinate_change_platform_tests_passed": 27,
+    "ci_after_test_fixture_repair": "https://github.com/Lokilankaaa/crossflow/actions/runs/41052583096",
+    "ci_conclusion": "success",
+    "physical_crossing_acceptance": "not passed"
+  },
   "not_yet_accepted": [
     "Attended native edge crossing, local input suppression and remote keyboard/click/wheel behavior",
     "Physical Mac keyboard and mouse acting as a source for Windows",

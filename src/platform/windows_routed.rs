@@ -35,18 +35,19 @@ use windows_sys::Win32::{
     },
     UI::{
         HiDpi::{
-            DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-            SetThreadDpiAwarenessContext,
+            AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetAwarenessFromDpiAwarenessContext,
+            GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
         },
         Input::KeyboardAndMouse::{GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW},
         WindowsAndMessaging::{
-            CallNextHookEx, GetPhysicalCursorPos, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-            LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLKHF_UP, LLMHF_INJECTED,
-            LLMHF_LOWER_IL_INJECTED, MSLLHOOKSTRUCT, PostMessageW, SetPhysicalCursorPos,
-            SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
-            WM_COMMAND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
-            WM_XBUTTONUP,
+            CallNextHookEx, GetClipCursor, GetCursorPos, GetPhysicalCursorPos, HHOOK,
+            KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLKHF_UP,
+            LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSLLHOOKSTRUCT, PostMessageW,
+            SetPhysicalCursorPos, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+            WH_MOUSE_LL, WM_APP, WM_COMMAND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+            WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
         },
     },
 };
@@ -61,6 +62,9 @@ pub struct NativeDisplay {
 }
 
 pub fn cursor_position() -> Result<(f64, f64), String> {
+    // The same per-monitor context is used by display inventory, the capture
+    // window, reads and return warps. Do not infer a scale from display sizes.
+    let _dpi = DpiScope::physical()?;
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetPhysicalCursorPos(&mut point) } == 0 {
         return Err(win_error("GetPhysicalCursorPos"));
@@ -79,21 +83,74 @@ fn integer_coordinate(value: f64) -> Result<i32, String> {
 /// coordinates or changes acceleration, confinement or cursor visibility.
 pub fn warp_cursor(x: f64, y: f64) -> Result<(), String> {
     let (x, y) = (integer_coordinate(x)?, integer_coordinate(y)?);
+    let _dpi = DpiScope::physical()?;
     if unsafe { SetPhysicalCursorPos(x, y) } == 0 {
         return Err(win_error("SetPhysicalCursorPos"));
     }
     Ok(())
 }
 
-struct DpiScope(DPI_AWARENESS_CONTEXT);
+pub(super) struct DpiScope(DPI_AWARENESS_CONTEXT);
 impl DpiScope {
-    fn physical() -> Result<Self, String> {
+    pub(super) fn physical() -> Result<Self, String> {
         let previous =
             unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         if previous.is_null() {
             return Err(win_error("SetThreadDpiAwarenessContext"));
         }
         Ok(Self(previous))
+    }
+}
+
+/// Startup-only coordinate evidence. Cursor and clip reads use the caller's
+/// current context; monitor inventory is explicitly in physical PMv2 pixels.
+/// The cursor samples are sequential, not an atomic snapshot of moving input.
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptureCoordinateDiagnostics {
+    pub thread_awareness: i32,
+    pub per_monitor_v2: bool,
+    pub cursor: Result<(i32, i32), String>,
+    pub physical_cursor: Result<(i32, i32), String>,
+    /// Left, top, right (exclusive), bottom (exclusive). Read only: this never
+    /// changes or clears another application's cursor confinement.
+    pub clip_rect: Result<[i32; 4], String>,
+    pub monitors: Result<Vec<NativeDisplay>, String>,
+}
+
+pub fn capture_coordinate_diagnostics() -> CaptureCoordinateDiagnostics {
+    let context = unsafe { GetThreadDpiAwarenessContext() };
+    let mut logical = POINT { x: 0, y: 0 };
+    let cursor = if unsafe { GetCursorPos(&mut logical) } != 0 {
+        Ok((logical.x, logical.y))
+    } else {
+        Err(win_error("GetCursorPos"))
+    };
+    let mut physical = POINT { x: 0, y: 0 };
+    let physical_cursor = if unsafe { GetPhysicalCursorPos(&mut physical) } != 0 {
+        Ok((physical.x, physical.y))
+    } else {
+        Err(win_error("GetPhysicalCursorPos"))
+    };
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let clip_rect = if unsafe { GetClipCursor(&mut rect) } != 0 {
+        Ok([rect.left, rect.top, rect.right, rect.bottom])
+    } else {
+        Err(win_error("GetClipCursor"))
+    };
+    CaptureCoordinateDiagnostics {
+        thread_awareness: unsafe { GetAwarenessFromDpiAwarenessContext(context) },
+        per_monitor_v2: unsafe {
+            AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0
+        },
+        cursor,
+        physical_cursor,
+        clip_rect,
+        monitors: displays(),
     }
 }
 impl Drop for DpiScope {
@@ -646,6 +703,47 @@ mod tests {
         assert!(!policy.transition(0xa3, false, false, true).suppress);
         assert!(!policy.transition(0xa5, false, false, true).suppress);
     }
+    #[test]
+    fn physical_context_is_nested_and_restored_after_unwind_without_input() {
+        // An isolated thread changes only its DPI context. No hooks, windows,
+        // cursor reads/warps or synthetic input are involved in this test.
+        std::thread::spawn(|| {
+            let original = unsafe { GetThreadDpiAwarenessContext() };
+            let unwound = catch_unwind(|| {
+                let _outer = DpiScope::physical().unwrap();
+                assert_ne!(
+                    unsafe {
+                        AreDpiAwarenessContextsEqual(
+                            GetThreadDpiAwarenessContext(),
+                            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                        )
+                    },
+                    0
+                );
+                {
+                    let _inner = DpiScope::physical().unwrap();
+                }
+                assert_ne!(
+                    unsafe {
+                        AreDpiAwarenessContextsEqual(
+                            GetThreadDpiAwarenessContext(),
+                            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                        )
+                    },
+                    0
+                );
+                panic!("exercise DPI restoration on failure");
+            });
+            assert!(unwound.is_err());
+            assert_ne!(
+                unsafe { AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), original) },
+                0
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
     #[test]
     fn coordinates_reject_nonfinite_and_overflow_before_native_call() {
         for value in [
