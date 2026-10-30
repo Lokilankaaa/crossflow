@@ -423,56 +423,33 @@ fn control_ack_has_no_action_timing_and_rejects_nonzero_stages() {
     }
 }
 
-struct DelayedSink {
-    observed: Arc<Mutex<Option<(u64, u64, Duration)>>>,
+// Only this fixture advances its logical clock; scheduler pauses cannot expire
+// a valid request. Real inherited pipes and process recovery have separate tests.
+struct ControlledTimeSink {
+    clock: Arc<AtomicU64>,
+    observed: Option<(u64, u64)>,
 }
-impl MouseSink for DelayedSink {
-    fn position(&mut self, x: f64, y: f64, _display_id: u32) -> Result<(f64, f64)> {
+impl MouseSink for ControlledTimeSink {
+    fn position(&mut self, x: f64, y: f64, display_id: u32) -> Result<(f64, f64)> {
+        ensure!(display_id == 42, "position lost its display identity");
         self.move_by(x, y)
     }
     fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
-        let start = continuous_ns()?;
-        let wall = Instant::now();
-        thread::sleep(Duration::from_millis(20));
-        let elapsed = wall.elapsed();
-        let end = continuous_ns()?;
-        *self.observed.lock().unwrap() = Some((start, end, elapsed));
+        let start = self.clock.fetch_add(20_000_000, Ordering::SeqCst);
+        let end = self.clock.load(Ordering::SeqCst);
+        self.observed = Some((start, end));
         Ok((x, y))
     }
 }
 
 #[test]
-fn worker_ack_timestamps_enclose_delayed_sink_call_without_claiming_proxy_latency() {
-    let (requests, request_read) = mpsc::channel();
-    let (acks, ack_read) = mpsc::channel();
-    let (blocked, _blocked_read) = mpsc::channel();
-    let (reader_finished, reader_done) = mpsc::channel();
-    let (writer_finished, writer_done) = mpsc::channel();
-    let gate = Arc::new(Gate::default());
-    gate.unblock();
-    let input = ChannelRead {
-        receive: request_read,
-        pending: None,
-        finished: reader_finished,
+fn worker_ack_timestamps_enclose_controlled_sink_call_without_claiming_proxy_latency() {
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let mut sink = ControlledTimeSink {
+        clock: clock.clone(),
+        observed: None,
     };
-    let output = BlockingWrite {
-        gate,
-        blocked,
-        acks,
-        finished: writer_finished,
-    };
-    let observed = Arc::new(Mutex::new(None));
-    let mut sink = DelayedSink {
-        observed: observed.clone(),
-    };
-    let (finished, done) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        let _ = finished.send(run_worker(input, output, &mut sink));
-    });
-    assert_eq!(
-        ack_read.recv_timeout(Duration::from_secs(2)).unwrap().op,
-        Op::Ready
-    );
+    let mut lease = WorkerLease::new(clock.load(Ordering::SeqCst));
     for (seq, op) in [
         (1, Op::Reset),
         (2, Op::Move),
@@ -486,41 +463,76 @@ fn worker_ack_timestamps_enclose_delayed_sink_call_without_claiming_proxy_latenc
             request.x = 1.0;
             request.y = -1.0;
         }
-        request.sent_ns = continuous_ns().unwrap();
-        requests.send(request.encode().unwrap()).unwrap();
-        let response = ack_read.recv_timeout(Duration::from_secs(2)).unwrap();
-        let received = continuous_ns().unwrap();
+        if op == Op::Position {
+            request.display_id = 42;
+        }
+        request.sent_ns = clock.fetch_add(100, Ordering::SeqCst);
+        // Exercise the same lease and fixed-width request validation used by
+        // run_worker, without asking the CI scheduler to meet a 30ms deadline.
+        let request = Message::decode(&request.encode().unwrap()).unwrap();
+        lease
+            .accept(&request, clock.load(Ordering::SeqCst))
+            .unwrap();
+        let response = dispatch_request(&mut sink, &request, || {
+            Ok(clock.fetch_add(1, Ordering::SeqCst))
+        })
+        .unwrap();
+        if op != Op::Shutdown {
+            lease.check(response.sent_ns).unwrap();
+        }
+        let response = Message::decode(&response.encode().unwrap()).unwrap();
+        let received = clock.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             (response.op, response.seq, response.epoch),
             (Op::Completed, seq, 1)
         );
+        let timing = timing_for_ack(&request, &response, received).unwrap();
         if matches!(op, Op::Move | Op::Position) {
-            let (inner_start, inner_end, wall_elapsed) = observed.lock().unwrap().unwrap();
-            assert!(wall_elapsed >= Duration::from_millis(20));
-            assert!(request.sent_ns <= response.call_start_ns);
-            assert!(response.call_start_ns <= inner_start && inner_start <= inner_end);
-            assert!(inner_end <= response.call_end_ns && response.call_end_ns <= response.sent_ns);
-            assert!(response.sent_ns <= received);
-            if cfg!(windows) {
-                // GetTickCount64 is quantized; a 20ms sleep is not asserted to
-                // equal 20ms in this clock, nor to fit the proxy's 30ms budget.
-                for time in [
-                    inner_start,
-                    inner_end,
-                    response.call_start_ns,
-                    response.call_end_ns,
-                ] {
-                    assert_eq!(time % 1_000_000, 0);
-                }
-            }
+            let (inner_start, inner_end) = sink.observed.unwrap();
+            assert_eq!(inner_end - inner_start, 20_000_000);
+            assert!(request.sent_ns < response.call_start_ns);
+            assert!(response.call_start_ns < inner_start && inner_start < inner_end);
+            assert!(inner_end <= response.call_end_ns && response.call_end_ns == response.sent_ns);
+            assert!(response.sent_ns < received);
+            assert_eq!(timing.unwrap().sink_call_ns, 20_000_001);
             assert_eq!((response.x, response.y), (1.0, -1.0));
         } else {
             assert_eq!((response.call_start_ns, response.call_end_ns), (0, 0));
+            assert!(timing.is_none());
         }
     }
-    done.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-    worker.join().unwrap();
-    drop(requests);
-    reader_done.recv_timeout(Duration::from_secs(2)).unwrap();
-    writer_done.recv_timeout(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn controlled_clock_expiry_still_rejects_delayed_requests_and_slow_calls() {
+    // A delayed request must terminate before dispatch, even if all fields are
+    // valid. This is one possible legitimate failure hidden by the old fixture's
+    // ACK-channel unwrap; the CI log alone did not identify the worker error.
+    let mut request = Message::new(Op::Reset);
+    request.seq = 1;
+    request.epoch = 1;
+    request.sent_ns = 1_000;
+    let mut lease = WorkerLease::new(1_000);
+    let expired = request.sent_ns + crate::worker_protocol::MAX_REQUEST_AGE_NS;
+    assert!(
+        lease
+            .accept(&request, expired)
+            .unwrap_err()
+            .to_string()
+            .contains("request time invalid")
+    );
+    assert!(!lease.active());
+
+    let mut lease = WorkerLease::new(1_000);
+    lease.accept(&request, 1_000).unwrap();
+    request.op = Op::Move;
+    request.seq = 2;
+    lease.accept(&request, 1_000).unwrap();
+    // Exact active deadline remains terminal, including after an adapter call.
+    assert!(
+        lease
+            .check(1_000 + crate::worker_protocol::ACTIVE_LEASE_NS)
+            .is_err()
+    );
+    assert!(!lease.active());
 }

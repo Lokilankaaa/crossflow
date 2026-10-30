@@ -335,36 +335,7 @@ pub fn run_worker<R: Read + Send + 'static, W: Write + Send + 'static>(
             );
             ensure!(!owned.emergency_pressed(), "worker local emergency stop");
             lease.accept(&request, continuous_ns()?)?;
-            let mut response = Message::new(Op::Completed);
-            response.seq = request.seq;
-            response.epoch = request.epoch;
-            let is_action = matches!(
-                request.op,
-                Op::Move | Op::Position | Op::Button | Op::Key | Op::Scroll
-            );
-            if is_action {
-                response.call_start_ns = continuous_ns()?;
-            }
-            match request.op {
-                Op::Reset => owned.reset()?,
-                Op::Move => {
-                    (response.x, response.y) = owned.move_by(request.x, request.y)?;
-                }
-                Op::Position => {
-                    (response.x, response.y) =
-                        owned.position(request.x, request.y, request.display_id)?;
-                }
-                Op::Button => owned.button(button_from_code(request.code)?, request.down)?,
-                Op::Key => owned.key(request.code, request.down)?,
-                Op::Scroll => owned.scroll(request.a, request.b)?,
-                Op::Heartbeat => {}
-                Op::Release | Op::Shutdown => owned.release_owned()?,
-                _ => bail!("worker received a response as a request"),
-            }
-            response.sent_ns = continuous_ns()?;
-            if is_action {
-                response.call_end_ns = response.sent_ns;
-            }
+            let response = dispatch_request(&mut owned, &request, continuous_ns)?;
             // Lease expiry during a native call is terminal, even if the call
             // already posted input. That uncertain result is never replayed.
             if request.op != Op::Shutdown {
@@ -394,6 +365,46 @@ pub fn run_worker<R: Read + Send + 'static, W: Write + Send + 'static>(
         }
     }
     outcome
+}
+
+/// Keep acknowledgement timestamps immediately around adapter dispatch. The
+/// clock parameter lets timing tests control logical time without weakening
+/// the worker's production request-age, lease or pipe-shutdown deadlines.
+fn dispatch_request(
+    owned: &mut dyn MouseSink,
+    request: &Message,
+    mut now: impl FnMut() -> Result<u64>,
+) -> Result<Message> {
+    let mut response = Message::new(Op::Completed);
+    response.seq = request.seq;
+    response.epoch = request.epoch;
+    let is_action = matches!(
+        request.op,
+        Op::Move | Op::Position | Op::Button | Op::Key | Op::Scroll
+    );
+    if is_action {
+        response.call_start_ns = now()?;
+    }
+    match request.op {
+        Op::Reset => owned.reset()?,
+        Op::Move => {
+            (response.x, response.y) = owned.move_by(request.x, request.y)?;
+        }
+        Op::Position => {
+            (response.x, response.y) = owned.position(request.x, request.y, request.display_id)?;
+        }
+        Op::Button => owned.button(button_from_code(request.code)?, request.down)?,
+        Op::Key => owned.key(request.code, request.down)?,
+        Op::Scroll => owned.scroll(request.a, request.b)?,
+        Op::Heartbeat => {}
+        Op::Release | Op::Shutdown => owned.release_owned()?,
+        _ => bail!("worker received a response as a request"),
+    }
+    response.sent_ns = now()?;
+    if is_action {
+        response.call_end_ns = response.sent_ns;
+    }
+    Ok(response)
 }
 
 /// One in-flight RPC; terminal errors cannot create a replacement worker or
