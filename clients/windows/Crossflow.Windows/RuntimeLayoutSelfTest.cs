@@ -21,11 +21,20 @@ internal static class RuntimeLayoutSelfTest
             var left = config.Layout.Screens.Single(x => x.DeviceId == "local" && x.X < 0);
             var r1 = config.Layout.Screens[2]; var r2 = config.Layout.Screens[3];
             checks["all_displays_and_negative_native_origin"] = config.Layout.Screens.Count == 4 && config.Bindings.Count == 4 && left.X == -1920 && left.Y == -200;
-            checks["remote_group_native_offsets_preserved"] = r1.X == 2560 && r1.Y == 0 && r2.X - r1.X == 1470 && r2.Y - r1.Y == -300;
+            checks["remote_group_native_offsets_preserved"] = r1.X == 2560 && r1.Y == 242 && r2.X - r1.X == 1470 && r2.Y - r1.Y == -300;
             checks["native_coordinates_not_replaced_by_arrangement"] = config.Bindings[2].Native.X == 0 && config.Bindings[2].NativeId == "1" && config.Bindings[3].Native.Y == -300;
             var moved = new LayoutDocument(config.Layout.Screens.Select(s => s.DeviceId == peerId ? s with { Y = s.Y + 200 } : s).ToList());
             var applied = RuntimeLayouts.WithLayout(config, moved);
-            checks["layout_edit_keeps_native_bindings"] = applied.Layout.Screens[2].Y == 200 && applied.Bindings.SequenceEqual(config.Bindings);
+            checks["layout_edit_keeps_native_bindings"] = applied.Layout.Screens[2].Y == 442 && applied.Bindings.SequenceEqual(config.Bindings);
+            var actualGeometry = RuntimeLayouts.Create(peerId,
+                [new("main", 0, 0, 3840, 2160), new("portrait", -1440, -89, 1440, 2560)],
+                [new("mac", 0, 0, 1470, 956)]);
+            CoreBridge.Validate(actualGeometry.Layout);
+            var mainScreen = actualGeometry.Layout.Screens[0]; var macScreen = actualGeometry.Layout.Screens[2];
+            checks["actual_two_windows_mac_center_edge_connected"] = macScreen.X == 3840 && macScreen.Y == 602 &&
+                macScreen.Y < 1080 && macScreen.Y + macScreen.Height > 1080 &&
+                CoreBridge.Crossing(actualGeometry.Layout, mainScreen, "右").GetProperty("crossing").GetProperty("target_screen_id").GetString() == macScreen.Id;
+            checks["centered_group_keeps_native_origins"] = actualGeometry.Bindings[2].Native.Y == 0 && actualGeometry.Layout.Screens[1].Y == -89;
             var reRead = RuntimeLayouts.Create(peerId, local.AsEnumerable().Reverse().ToList(), remote.AsEnumerable().Reverse().ToList());
             checks["enumeration_order_does_not_change_identity"] = RuntimeLayouts.SameInventory(config, reRead);
             var hotplug = RuntimeLayouts.Create(peerId, local, [remote[0] with { Id = "replacement" }, remote[1]]);

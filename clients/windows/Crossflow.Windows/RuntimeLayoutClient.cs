@@ -62,7 +62,9 @@ internal static class RuntimeLayouts
         var localEdge = local.OrderByDescending(x => x.X + x.Width).ThenBy(x => x.Y).First();
         var remoteEdge = remote.OrderBy(x => x.X).ThenBy(x => x.Y).First();
         double remoteOffsetX = localEdge.X + localEdge.Width - remoteEdge.X;
-        double remoteOffsetY = localEdge.Y - remoteEdge.Y;
+        // Align the adjoining screens' vertical centers. A tall portrait
+        // display elsewhere on Windows must not pull the remote entry edge up.
+        double remoteOffsetY = localEdge.Y + (localEdge.Height - remoteEdge.Height) / 2 - remoteEdge.Y;
         void Add(IEnumerable<NativeDisplay> displays, string device, double offsetX, double offsetY)
         {
             foreach (var display in displays)
