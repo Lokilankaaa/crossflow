@@ -92,6 +92,33 @@ Its saved result explicitly reports `input_ready:false`. The core now supports
 an identity file. The device page starts this receiver through its supervised
 control channel and the core executable is packaged beside the UI.
 
+## Cross-screen input integration (wire v3)
+
+The device page offers keyboard/mouse/wheel reception and a separate movement-only
+mode. Full input is the selected mode, but nothing starts until the user clicks
+the labeled receive button. Keyboard input remains the physical ANSI subset;
+cross-screen keyboard, dragging and scroll behavior still require attended native
+acceptance. Discovery marks other wire versions incompatible. macOS 27's privacy
+pane is labeled “设备控制和数据访问” on the tested Chinese system; older systems
+use the Accessibility label.
+
+The native adapter enumerates up to 32 awake active displays in global logical
+points, keyed by `CGDirectDisplayID`. Absolute positioning must match both a live
+display ID and its bounds; relative movement crosses adjacent screens and clamps
+gaps to a real display. Moving across monitors does not release held keys/buttons.
+Each arm captures a display snapshot. A configuration callback plus current bounds
+checks stop new input after topology changes, including a change away and back.
+The session/worker must poll `emergency_pressed` while idle and perform cleanup;
+the adapter also attempts owned-input releases when its readiness checks fail.
+The authenticated layout snapshot and worker display binding must be validated by
+the shared core before accepting absolute positions. This code does not itself
+choose a remote screen from the layout editor or start sharing automatically.
+
+This source change does not rebuild or replace the fixed phase-zero test app,
+re-sign its helpers, alter Keychain access, or solve upgrade signing continuity.
+Native compilation and new tests must run against the merged shared wire-v3 core
+before packaging; the standalone Mac branch depends on `session::NativeDisplay`.
+
 The app bundles the canonical `clients/design-tokens.json` and shared layouts
 from `examples/`. The four-screen example contains two devices; these are
 sample entries, not discovered devices. The two-screen example also ships for

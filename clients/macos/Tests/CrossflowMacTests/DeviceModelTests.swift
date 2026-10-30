@@ -191,6 +191,31 @@ final class DeviceModelTests: XCTestCase {
         }
     }
 
+    @MainActor func testReceiveModeRequiresExplicitStartAndPassesSelectedInputScope() async throws {
+        let script = """
+        printf '%s\\n' "$@" > receiver-arguments
+        printf '%s\\n' '{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}'
+        exit 1
+        """
+        try await withReceiverModel(script: script, expectedShutdown: true) { model, fixture in
+            XCTAssertTrue(model.includeKeyboard)
+            XCTAssertNil(model.operation)
+            XCTAssertFalse(fixture.launched, "Selecting a default mode must not start input")
+            for includeKeyboard in [true, false] {
+                model.includeKeyboard = includeKeyboard
+                XCTAssertNil(model.operation)
+                model.receive()
+                try await self.waitUntil { model.operation == nil && !model.stopPending && !model.loading }
+                let arguments = try String(contentsOf: fixture.folder.appendingPathComponent("receiver-arguments"), encoding: .utf8)
+                    .split(separator: "\n").map(String.init)
+                XCTAssertTrue(arguments.contains("--inject"))
+                XCTAssertTrue(arguments.contains("--control-stdio"))
+                XCTAssertEqual(arguments.contains("--inject-actions"), includeKeyboard)
+                XCTAssertTrue(model.canStart)
+            }
+        }
+    }
+
     @MainActor func testReceiverErrorsAndInvalidRejectionsKeepCleanupGateClosed() async throws {
         let rejected = #"{"protocol":1,"state":"startup_rejected","listen_endpoint":null,"error":"accessibility permission required"}"#
         let frames = [

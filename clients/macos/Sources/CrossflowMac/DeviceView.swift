@@ -31,7 +31,7 @@ struct DeviceView: View {
                 pairedCard
                 invitationCard
                 nearbyCard
-                Text("本机按 Escape 可紧急停止。关闭窗口也会停止接收。首次接收需要在系统设置中允许辅助功能与输入监控。")
+                Text("本机按 Escape 可紧急停止。关闭窗口也会停止接收。首次接收需要在隐私与安全性中允许设备控制和数据访问（旧版系统称辅助功能）与输入监控。")
                     .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                 if model.cleanupUnconfirmed {
                     Text("停止结果未确认，暂不能再次开启。请检查本机输入并重新打开 Crossflow。")
@@ -76,11 +76,17 @@ struct DeviceView: View {
             }
             if !model.listMessage.isEmpty { Text(model.listMessage).font(.caption).foregroundStyle(Theme.secondary) }
             Divider()
+            Picker("接收内容", selection: $model.includeKeyboard) {
+                Text("键盘、鼠标与滚轮").tag(true)
+                Text("仅鼠标移动").tag(false)
+            }
+            .pickerStyle(.segmented).disabled(!model.canStart)
+            .accessibilityIdentifier("device-receive-mode")
             HStack {
-                Toggle("同时接收键盘、点击与滚轮（实验）", isOn: $model.includeKeyboard)
-                    .toggleStyle(.checkbox).disabled(!model.canStart)
+                Text(model.includeKeyboard ? "允许已配对电脑发送键盘、点击、拖动与滚轮。跨屏键鼠仍需实机验证。" : "仅接收鼠标移动，不接收键盘、点击或滚轮。")
+                    .font(.system(size: Theme.captionSize)).foregroundStyle(Theme.secondary)
                 Spacer()
-                Button(model.includeKeyboard ? "接收键鼠" : "接收鼠标移动", systemImage: "arrow.down.forward") { model.receive() }
+                Button(model.includeKeyboard ? "接收键盘与鼠标" : "接收鼠标移动", systemImage: "arrow.down.forward") { model.receive() }
                     .buttonStyle(.borderedProminent).disabled(!model.canStart || model.selected == nil)
                     .accessibilityIdentifier("device-receive")
             }

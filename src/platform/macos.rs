@@ -3,8 +3,8 @@
 //! Requires macOS 10.15+ and user-granted Accessibility/Input Monitoring access.
 //! A successful post is not evidence of a visibly rendered cursor update.
 //! `gain` maps raw Windows mouse counts linearly to logical display points; this
-//! does not reproduce macOS's native acceleration curve. Only the main display
-//! is supported. Call `reset()` on every new ARM/session.
+//! does not reproduce macOS's native acceleration curve. Coordinates span awake
+//! active displays in global logical points. Call `reset()` on every new ARM.
 //! Expanded keyboard/button methods are not enabled by their presence here.
 //! The caller must explicitly select them and handle session cleanup.
 //!
@@ -21,6 +21,8 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::io;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub type AdapterError = Box<dyn Error + Send + Sync>;
 const PRIVATE_EVENT_SOURCE: i32 = -1;
@@ -78,6 +80,10 @@ unsafe extern "C" {
     fn CGDisplayIsAsleep(display: u32) -> u32;
     fn CGDisplayIsBuiltin(display: u32) -> u32;
     fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayRegisterReconfigurationCallback(
+        callback: extern "C" fn(u32, u32, *mut c_void),
+        user_info: *mut c_void,
+    ) -> i32;
     fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
     fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
     fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
@@ -172,6 +178,10 @@ impl Bounds {
             .all(|v| v.is_finite())
             || bounds.width < 1.0
             || bounds.height < 1.0
+            || !(bounds.left + bounds.width).is_finite()
+            || !(bounds.top + bounds.height).is_finite()
+            || bounds.left + bounds.width <= bounds.left
+            || bounds.top + bounds.height <= bounds.top
         {
             return Err(failure("CoreGraphics returned invalid display bounds"));
         }
@@ -193,12 +203,154 @@ impl Bounds {
     }
 }
 
+const MAX_DISPLAYS: usize = 32;
+static DISPLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static DISPLAY_RECONFIGURING: AtomicBool = AtomicBool::new(false);
+static DISPLAY_CALLBACK: OnceLock<i32> = OnceLock::new();
+
+extern "C" fn display_changed(_display: u32, flags: u32, _user_info: *mut c_void) {
+    // Process-lifetime registration: no borrowed pointer, allocation, lock, or
+    // CoreGraphics call in the callback. Also detects change-away-and-back.
+    DISPLAY_RECONFIGURING.store(flags & 1 != 0, Ordering::SeqCst);
+    DISPLAY_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Display {
+    id: u32,
+    bounds: Bounds,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DisplaySnapshot {
+    generation: u64,
+    displays: Vec<Display>,
+}
+
+fn validate_displays(mut displays: Vec<Display>) -> Result<Vec<Display>, AdapterError> {
+    if displays.is_empty() || displays.len() > MAX_DISPLAYS {
+        return Err(failure("Expected 1 to 32 awake active displays"));
+    }
+    displays.sort_by_key(|display| display.id);
+    let mut previous = 0;
+    for display in &displays {
+        if display.id == 0 || display.id == previous {
+            return Err(failure("Display identifiers must be nonzero and unique"));
+        }
+        let b = display.bounds;
+        Bounds::from_rect(CGRect {
+            origin: CGPoint {
+                x: b.left,
+                y: b.top,
+            },
+            size: CGSize {
+                width: b.width,
+                height: b.height,
+            },
+        })?;
+        previous = display.id;
+    }
+    Ok(displays)
+}
+
+fn display_snapshot() -> Result<DisplaySnapshot, AdapterError> {
+    let registration = DISPLAY_CALLBACK.get_or_init(|| unsafe {
+        CGDisplayRegisterReconfigurationCallback(display_changed, std::ptr::null_mut())
+    });
+    if *registration != 0 {
+        return Err(failure("Could not monitor display configuration changes"));
+    }
+    let generation = DISPLAY_GENERATION.load(Ordering::SeqCst);
+    if DISPLAY_RECONFIGURING.load(Ordering::SeqCst) {
+        return Err(failure("Display reconfiguration is still in progress"));
+    }
+    // One extra slot detects overflow instead of silently truncating topology.
+    let mut ids = [0; MAX_DISPLAYS + 1];
+    let mut count = 0;
+    let code = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if code != 0 || count == 0 || count as usize > MAX_DISPLAYS {
+        return Err(failure("Could not enumerate a bounded active display set"));
+    }
+    let mut displays = Vec::new();
+    for &id in &ids[..count as usize] {
+        if id == 0 || unsafe { CGDisplayIsActive(id) == 0 } {
+            return Err(failure("Active display set changed during enumeration"));
+        }
+        if unsafe { CGDisplayIsAsleep(id) != 0 } {
+            continue;
+        }
+        displays.push(Display {
+            id,
+            bounds: Bounds::from_rect(unsafe { CGDisplayBounds(id) })?,
+        });
+    }
+    let displays = validate_displays(displays)?;
+    if DISPLAY_GENERATION.load(Ordering::SeqCst) != generation
+        || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
+    {
+        return Err(failure("Display configuration changed during enumeration"));
+    }
+    Ok(DisplaySnapshot {
+        generation,
+        displays,
+    })
+}
+
+/// Read-only physical display discovery for the authenticated session protocol.
+/// IDs are CGDirectDisplayID, not UI layout labels or array indexes.
+pub fn native_displays() -> anyhow::Result<Vec<crate::session::NativeDisplay>> {
+    let snapshot = display_snapshot().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(snapshot
+        .displays
+        .into_iter()
+        .map(|display| crate::session::NativeDisplay {
+            id: display.id,
+            x: display.bounds.left,
+            y: display.bounds.top,
+            width: display.bounds.width,
+            height: display.bounds.height,
+        })
+        .collect())
+}
+
+fn contains_point(displays: &[Display], point: CGPoint) -> bool {
+    displays
+        .iter()
+        .any(|display| display.bounds.contains(point))
+}
+
+fn display_contains_point(displays: &[Display], id: u32, point: CGPoint) -> bool {
+    displays
+        .iter()
+        .any(|display| display.id == id && display.bounds.contains(point))
+}
+
+fn clamp_to_displays(displays: &[Display], point: CGPoint) -> Result<CGPoint, AdapterError> {
+    if !point.x.is_finite() || !point.y.is_finite() || displays.is_empty() {
+        return Err(failure("Cursor position and display set must be valid"));
+    }
+    if contains_point(displays, point) {
+        return Ok(point);
+    }
+    // Project gaps and out-of-desktop movement onto a real screen, never onto
+    // the bounding rectangle's empty space. Ties use the stable display order.
+    displays
+        .iter()
+        .map(|display| display.bounds.clamp(point))
+        .min_by(|a, b| {
+            (point.x - a.x)
+                .hypot(point.y - a.y)
+                .total_cmp(&(point.x - b.x).hypot(point.y - b.y))
+        })
+        .ok_or_else(|| failure("No awake screen can receive cursor movement"))
+}
+
 fn next_point(
     current: CGPoint,
     dx: f64,
     dy: f64,
     gain: f64,
-    bounds: Bounds,
+    displays: &[Display],
 ) -> Result<CGPoint, AdapterError> {
     if !dx.is_finite() || !dy.is_finite() || !gain.is_finite() || gain <= 0.0 {
         return Err(failure(
@@ -212,7 +364,7 @@ fn next_point(
     if !p.x.is_finite() || !p.y.is_finite() {
         return Err(failure("Scaled mouse movement overflowed"));
     }
-    Ok(bounds.clamp(p))
+    clamp_to_displays(displays, p)
 }
 
 /// USB HID Keyboard page -> physical ANSI position in HIToolbox/Events.h.
@@ -375,8 +527,8 @@ pub fn preflight_input_permissions() -> Result<(), MissingInputPermission> {
 pub struct MacMouseSink {
     source: OwnedCf,
     gain: f64,
-    display_id: u32,
-    bounds: Bounds,
+    snapshot: DisplaySnapshot,
+    input_failed: bool,
     position: CGPoint,
     owned_buttons: BTreeSet<Button>,
     owned_keys: BTreeSet<u16>,
@@ -398,13 +550,11 @@ impl MacMouseSink {
         let mut sink = Self {
             source,
             gain,
-            display_id: 0,
-            bounds: Bounds {
-                left: 0.0,
-                top: 0.0,
-                width: 1.0,
-                height: 1.0,
+            snapshot: DisplaySnapshot {
+                generation: 0,
+                displays: Vec::new(),
             },
+            input_failed: true,
             position: CGPoint::default(),
             owned_buttons: BTreeSet::new(),
             owned_keys: BTreeSet::new(),
@@ -416,48 +566,59 @@ impl MacMouseSink {
 
     /// Rebase on arm/reconnect; never silently warp from another display.
     pub fn reset(&mut self) -> Result<(), AdapterError> {
+        self.input_failed = true;
         self.release_owned()?;
-        let display = unsafe { CGMainDisplayID() };
-        if display == 0
-            || unsafe { CGDisplayIsActive(display) == 0 || CGDisplayIsAsleep(display) != 0 }
-        {
-            return Err(failure(
-                "No awake active main display; remote input stopped",
-            ));
-        }
-        let bounds = Bounds::from_rect(unsafe { CGDisplayBounds(display) })?;
+        preflight_input_permissions().map_err(|permission| failure(permission.message()))?;
+        let snapshot = display_snapshot()?;
         let event = OwnedCf::new(
             unsafe { CGEventCreate(std::ptr::null_mut()) },
             "CoreGraphics could not read the current cursor position",
         )?;
         let position = unsafe { CGEventGetLocation(event.as_ptr()) };
-        if !bounds.contains(position) {
+        if !contains_point(&snapshot.displays, position) {
             return Err(failure(
-                "Move the local cursor onto the main display before arming this main-display-only prototype",
+                "Local cursor is not on an awake active display; remote input stopped",
             ));
         }
-        self.display_id = display;
-        self.bounds = bounds;
-        self.position = bounds.clamp(position);
+        self.snapshot = snapshot;
+        self.position = position;
+        self.input_failed = false;
         Ok(())
     }
 
     /// Checks apply only to new input; release calls deliberately bypass them.
-    fn check_input_ready(&self) -> Result<(), AdapterError> {
-        if self.emergency_pressed() {
+    fn check_input_ready(&mut self) -> Result<(), AdapterError> {
+        let result = self.input_ready();
+        if let Err(error) = result {
+            // Latch before releasing: no subsequent input can reuse stale display
+            // coordinates even if the topology changes back. Release attempts
+            // bypass this guard and retain failed ownership for final cleanup.
+            self.input_failed = true;
+            if self.release_owned().is_err() {
+                return Err(failure(
+                    "Input stopped; owned input release could not be confirmed",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn input_ready(&self) -> Result<(), AdapterError> {
+        if self.input_failed {
+            return Err(failure("Input adapter requires a fresh arm after failure"));
+        }
+        if emergency_pressed() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Local Escape requested an emergency stop",
             )
             .into());
         }
-        let display = unsafe { CGMainDisplayID() };
-        if display != self.display_id
-            || unsafe { CGDisplayIsActive(display) == 0 || CGDisplayIsAsleep(display) != 0 }
-            || Bounds::from_rect(unsafe { CGDisplayBounds(display) })? != self.bounds
-        {
+        preflight_input_permissions().map_err(|permission| failure(permission.message()))?;
+        if display_snapshot()? != self.snapshot {
             return Err(failure(
-                "Main display changed or slept; stop and re-arm after checking it",
+                "Displays changed or slept; remote input stopped, check the layout before re-arming",
             ));
         }
         Ok(())
@@ -477,7 +638,33 @@ impl MacMouseSink {
     /// CGEventPost returns void; its completion does not establish visibility.
     pub fn move_by(&mut self, dx: f64, dy: f64) -> Result<(f64, f64), AdapterError> {
         self.check_input_ready()?;
-        let point = next_point(self.position, dx, dy, self.gain, self.bounds)?;
+        let point = next_point(self.position, dx, dy, self.gain, &self.snapshot.displays)?;
+        self.post_position(point)
+    }
+
+    /// Position on the expected CGDirectDisplayID in global logical points,
+    /// without gain. A coordinate inside a different screen is still rejected.
+    /// Crossing displays preserves held keys/buttons and posts the corresponding
+    /// drag event. Invalid absolute targets are rejected, never clamped/warped.
+    pub fn position(
+        &mut self,
+        x: f64,
+        y: f64,
+        display_id: u32,
+    ) -> Result<(f64, f64), AdapterError> {
+        self.check_input_ready()?;
+        let point = CGPoint { x, y };
+        if !display_contains_point(&self.snapshot.displays, display_id, point) {
+            self.input_failed = true;
+            self.release_owned()?;
+            return Err(failure(
+                "Absolute cursor position does not match the expected awake display",
+            ));
+        }
+        self.post_position(point)
+    }
+
+    fn post_position(&mut self, point: CGPoint) -> Result<(f64, f64), AdapterError> {
         if point.x == self.position.x && point.y == self.position.y {
             return Ok((point.x, point.y));
         }
@@ -652,7 +839,12 @@ impl MacMouseSink {
     /// Caller must poll at most every 10 ms and latch a true result. An entire
     /// press shorter than the polling gap can be missed; hold Escape.
     pub fn emergency_pressed(&self) -> bool {
+        // The worker/session polls this while idle as well as during input, so
+        // hotplug while a key is held also reaches its owned-input cleanup path.
         emergency_pressed()
+            || self.input_failed
+            || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
+            || DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
     }
 }
 
@@ -718,8 +910,8 @@ pub fn environment() -> Value {
         }
     }
     json!({
-        "adapter": "CoreGraphics movement with opt-in experimental input actions",
-        "capabilities": ["movement", "buttons", "drag", "ansi_keyboard_subset", "line_scroll"],
+        "adapter": "CoreGraphics multi-display input with explicit receiver activation",
+        "capabilities": ["movement", "absolute_position", "buttons", "drag", "ansi_keyboard_subset", "line_scroll"],
         "hardware_model": hardware_model,
         "architecture": std::env::consts::ARCH,
         "permissions": {
@@ -727,7 +919,7 @@ pub fn environment() -> Value {
             "post_event": unsafe { CGPreflightPostEventAccess() },
             "listen_event": unsafe { CGPreflightListenEventAccess() }
         },
-        "display_scope": "main display only", "coordinate_space": "logical display points",
+        "display_scope": "awake active displays, fixed for each arm", "coordinate_space": "global logical display points",
         "displays": displays,
         "display_query_error": if result == 0 { None } else { Some(result) },
         "actual_refresh_hz": null,
@@ -748,6 +940,13 @@ mod tests {
         }
     }
 
+    fn displays() -> Vec<Display> {
+        vec![Display {
+            id: 1,
+            bounds: bounds(),
+        }]
+    }
+
     #[test]
     fn coregraphics_structs_match_64_bit_c_abi() {
         assert_eq!(std::mem::size_of::<CGPoint>(), 16);
@@ -765,18 +964,153 @@ mod tests {
     #[test]
     fn gain_preserves_subpoint_motion_and_bounds() {
         let origin = CGPoint { x: 0.0, y: 50.0 };
-        let p = next_point(origin, 0.25, -0.5, 2.0, bounds()).unwrap();
+        let p = next_point(origin, 0.25, -0.5, 2.0, &displays()).unwrap();
         assert_eq!((p.x, p.y), (0.5, 49.0));
-        let p = next_point(origin, 500.0, -500.0, 1.0, bounds()).unwrap();
+        let p = next_point(origin, 500.0, -500.0, 1.0, &displays()).unwrap();
         assert_eq!((p.x, p.y), (99.0, 20.0));
     }
     #[test]
     fn invalid_inputs_never_reach_ffi() {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(next_point(CGPoint::default(), value, 0.0, 1.0, bounds()).is_err());
+            assert!(next_point(CGPoint::default(), value, 0.0, 1.0, &displays()).is_err());
         }
-        assert!(next_point(CGPoint::default(), f64::MAX, 0.0, 2.0, bounds()).is_err());
+        assert!(next_point(CGPoint::default(), f64::MAX, 0.0, 2.0, &displays()).is_err());
         assert!(Bounds::from_rect(CGRect::default()).is_err());
+    }
+
+    #[test]
+    fn relative_movement_crosses_adjacent_screens_without_clamping_to_main() {
+        let screens = vec![
+            Display {
+                id: 1,
+                bounds: Bounds {
+                    left: -100.0,
+                    top: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+            },
+            Display {
+                id: 2,
+                bounds: Bounds {
+                    left: 0.0,
+                    top: 0.0,
+                    width: 200.0,
+                    height: 100.0,
+                },
+            },
+        ];
+        let point = next_point(CGPoint { x: -1.5, y: 20.0 }, 3.0, 0.0, 1.0, &screens).unwrap();
+        assert_eq!((point.x, point.y), (1.5, 20.0));
+        let back = next_point(point, -100.0, 0.0, 1.0, &screens).unwrap();
+        assert_eq!((back.x, back.y), (-98.5, 20.0));
+    }
+
+    #[test]
+    fn desktop_gaps_clamp_to_real_screen_and_absolute_targets_reject_gaps() {
+        let screens = vec![
+            Display {
+                id: 1,
+                bounds: Bounds {
+                    left: -100.0,
+                    top: -100.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+            },
+            Display {
+                id: 2,
+                bounds: Bounds {
+                    left: 100.0,
+                    top: 50.0,
+                    width: 200.0,
+                    height: 100.0,
+                },
+            },
+        ];
+        let gap = CGPoint { x: 80.0, y: 40.0 };
+        assert!(!contains_point(&screens, gap));
+        let projected = clamp_to_displays(&screens, gap).unwrap();
+        assert_eq!((projected.x, projected.y), (100.0, 50.0));
+        assert!(contains_point(&screens, projected));
+        assert!(contains_point(
+            &screens,
+            CGPoint {
+                x: 299.75,
+                y: 149.75
+            }
+        ));
+        assert!(!contains_point(&screens, CGPoint { x: 300.0, y: 150.0 }));
+        assert!(!contains_point(
+            &screens,
+            CGPoint {
+                x: f64::NAN,
+                y: 0.0
+            }
+        ));
+        assert!(display_contains_point(&screens, 2, projected));
+        assert!(!display_contains_point(&screens, 1, projected));
+        assert!(!display_contains_point(&screens, 0, projected));
+        assert!(!display_contains_point(&screens, 3, projected));
+        assert!(clamp_to_displays(&[], gap).is_err());
+    }
+
+    #[test]
+    fn display_snapshots_reject_duplicates_overflow_and_invalid_extents() {
+        let display = displays()[0];
+        assert!(validate_displays(vec![]).is_err());
+        assert!(validate_displays(vec![display; 33]).is_err());
+        assert!(validate_displays(vec![display, display]).is_err());
+        assert!(validate_displays(vec![Display { id: 0, ..display }]).is_err());
+        for bad in [
+            Bounds {
+                left: f64::MAX,
+                width: f64::MAX,
+                ..bounds()
+            },
+            Bounds {
+                left: f64::MAX,
+                ..bounds()
+            },
+            Bounds {
+                width: 0.0,
+                ..bounds()
+            },
+            Bounds {
+                height: f64::NAN,
+                ..bounds()
+            },
+        ] {
+            assert!(
+                validate_displays(vec![Display {
+                    bounds: bad,
+                    ..display
+                }])
+                .is_err()
+            );
+        }
+        let sorted = validate_displays(vec![Display { id: 3, ..display }, display]).unwrap();
+        assert_eq!(sorted.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
+    fn topology_identity_geometry_and_generation_all_invalidate_an_arm() {
+        let snapshot = DisplaySnapshot {
+            generation: 7,
+            displays: displays(),
+        };
+        let mut changed = snapshot.clone();
+        changed.generation += 2; // Change away and back must still invalidate.
+        assert_ne!(snapshot, changed);
+        changed = snapshot.clone();
+        changed.displays[0].id = 2;
+        assert_ne!(snapshot, changed);
+        changed = snapshot.clone();
+        changed.displays[0].bounds.left += 100.0;
+        assert_ne!(snapshot, changed);
+        changed = snapshot.clone();
+        changed.displays.clear(); // Sleep/removal changes the awake set.
+        assert_ne!(snapshot, changed);
     }
 
     #[test]

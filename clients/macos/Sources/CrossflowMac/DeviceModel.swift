@@ -32,7 +32,8 @@ final class DeviceModel {
     var devices: [SavedDevice] = []
     var selectedID: String?
     var deviceName = "这台 Mac"
-    var includeKeyboard = false
+    // Choosing a mode never starts input; receive() remains an explicit action.
+    var includeKeyboard = true
     var code = ""
     var confirmation: Confirmation?
     var approved = false
@@ -241,7 +242,7 @@ final class DeviceModel {
                 guard receiverState != .startupRejected else { throw DeviceModelError.invalid }
                 if status.state == .startupRejected {
                     guard startupRejectionEligible else { throw DeviceModelError.invalid }
-                    let permission = status.error == "accessibility permission required" ? "辅助功能" : "输入监控"
+                    let permission = status.error == "accessibility permission required" ? "设备控制和数据访问（旧版系统称辅助功能）" : "输入监控"
                     startupRejectionMessage = "尚未开始接收。请在系统设置 → 隐私与安全性 → \(permission) 中允许 Crossflow，然后完全退出并重新打开 App。"
                 } else if status.listenEndpoint != nil || status.state == .error || status.state == .stopped {
                     startupRejectionEligible = false

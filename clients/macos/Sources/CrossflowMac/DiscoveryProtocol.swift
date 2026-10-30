@@ -31,6 +31,7 @@ enum DiscoveryError: LocalizedError, Sendable {
 
 enum DiscoveryProtocol {
     static let maxOutputBytes = 262_144
+    static let wireVersion: UInt16 = 3
 
     static func parse(_ data: Data) throws -> DiscoveryResult {
         guard data.count <= maxOutputBytes, String(data: data, encoding: .utf8) != nil else {
@@ -60,7 +61,8 @@ enum DiscoveryProtocol {
                           addresses.insert(try endpointKey(address)).inserted else { throw DiscoveryError.invalidResult }
                 }
                 return NearbyDevice(id: candidate.id, name: candidate.name, platform: candidate.platform,
-                                    protocolVersion: candidate.protocolVersion, compatible: candidate.compatible,
+                                    protocolVersion: candidate.protocolVersion,
+                                    compatible: candidate.compatible && candidate.protocolVersion == wireVersion,
                                     addresses: candidate.addresses)
             }
             return DiscoveryResult(devices: devices, capacityLimited: root.capacityLimited)
