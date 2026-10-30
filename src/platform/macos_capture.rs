@@ -14,7 +14,7 @@
 use crate::input::Button;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 pub const ORIGIN_MARKER: i64 = 0x4352_464c;
@@ -85,6 +85,7 @@ pub enum StopReason {
     UnsupportedInput,
     CallbackPanicked,
     SetupFailed,
+    FocusRace,
 }
 fn reason(value: u8) -> Option<StopReason> {
     Some(match value {
@@ -98,6 +99,7 @@ fn reason(value: u8) -> Option<StopReason> {
         8 => StopReason::UnsupportedInput,
         9 => StopReason::CallbackPanicked,
         10 => StopReason::SetupFailed,
+        11 => StopReason::FocusRace,
         _ => return None,
     })
 }
@@ -142,6 +144,7 @@ impl<T: Copy> Ring<T> {
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Shared {
+    routing: AtomicBool,
     queue: Ring<CapturedEvent>,
     stop: AtomicU8,
     remote_until: AtomicU64,
@@ -155,6 +158,7 @@ struct Shared {
 impl Shared {
     fn new() -> Self {
         Self {
+            routing: AtomicBool::new(false),
             queue: Ring::new(),
             stop: AtomicU8::new(0),
             remote_until: AtomicU64::new(0),
@@ -192,6 +196,12 @@ impl Shared {
             self.remote_until.store(0, Ordering::SeqCst);
             return true;
         }
+        // Serialize only the bounded routing decision, never wait in the tap.
+        // If a physical press is in flight the caller can retry on its next poll.
+        let Some(_routing) = self.try_route() else {
+            return false;
+        };
+        self.remote(now);
         if self.stop.load(Ordering::SeqCst) != 0 {
             return false;
         }
@@ -207,6 +217,19 @@ impl Shared {
         self.remote_until
             .store(now.saturating_add(LEASE_NS), Ordering::SeqCst);
         self.stop.load(Ordering::SeqCst) == 0
+    }
+    fn try_route(&self) -> Option<RoutingGuard<'_>> {
+        self.routing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| RoutingGuard(&self.routing))
+    }
+}
+
+struct RoutingGuard<'a>(&'a AtomicBool);
+impl Drop for RoutingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -487,7 +510,30 @@ mod native {
             if self.stop_reason().is_some() {
                 return None;
             }
-            unsafe { self.shared.queue.pop() }
+            let event = unsafe { self.shared.queue.pop() };
+            // A producer failure during the pop invalidates even older events.
+            if self.stop_reason().is_some() {
+                None
+            } else {
+                event
+            }
+        }
+        /// Place the cursor once after returning focus locally. This is an OS
+        /// cursor warp, not an injected movement event. Failure stops capture;
+        /// the integration must release remote ownership and must not replay it.
+        pub fn warp_local(&mut self, x: f64, y: f64) -> anyhow::Result<()> {
+            let result = super::super::macos::warp_local_cursor(x, y, || {
+                anyhow::ensure!(self.stop_reason().is_none(), "Mac capture is stopped");
+                anyhow::ensure!(
+                    self.shared.remote_until.load(Ordering::SeqCst) == 0,
+                    "Return focus locally before cursor placement"
+                );
+                Ok(())
+            });
+            if result.is_err() {
+                self.shared.stop(StopReason::UnsupportedInput);
+            }
+            result
         }
         /// False means focus was rejected (held local input, expired lease, stop).
         pub fn set_remote_focus(&self, remote: bool) -> bool {
@@ -578,9 +624,21 @@ mod native {
             .shared
             .physical_candidate
             .fetch_add(1, Ordering::Relaxed);
+        let shared = Arc::clone(&state.shared);
+        let Some(_routing) = shared.try_route() else {
+            // A concurrent focus handoff must not split a local press/release.
+            // Fail open for fresh input, preserving suppressed-release ownership.
+            shared.stop(StopReason::FocusRace);
+            return drain_release(state, kind, event);
+        };
         let now = state.clock.now();
         let remote = state.shared.remote(now);
         if state.shared.stop.load(Ordering::SeqCst) != 0 {
+            return drain_release(state, kind, event);
+        }
+        let point = unsafe { CGEventGetLocation(event) };
+        if !point.x.is_finite() || !point.y.is_finite() {
+            state.shared.stop(StopReason::UnsupportedInput);
             return drain_release(state, kind, event);
         }
         let flags = unsafe { CGEventGetFlags(event) };
@@ -611,7 +669,7 @@ mod native {
                 suppress = route_press(&mut state.remote_buttons[number], down, remote);
                 CaptureKind::Button { button, down }
             }
-            10 | 11 | 12 => {
+            10..=12 => {
                 let key = unsafe { CGEventGetIntegerValueField(event, 9) };
                 if !(0..128).contains(&key) {
                     if remote {
@@ -667,7 +725,6 @@ mod native {
             }
             _ => return false,
         };
-        let point = unsafe { CGEventGetLocation(event) };
         let value = CapturedEvent {
             kind: captured_kind,
             captured_at: Instant::now(),
@@ -708,7 +765,7 @@ mod native {
     /// permission it cannot intercept any event; that OS boundary is unavoidable.
     fn drain_release(state: &mut Context, kind: u32, event: Ptr) -> bool {
         match kind {
-            10 | 11 | 12 => {
+            10..=12 => {
                 let key = unsafe { CGEventGetIntegerValueField(event, 9) };
                 if !(0..128).contains(&key) {
                     return false;
@@ -991,6 +1048,29 @@ mod tests {
             reason(s.stop.load(Ordering::Relaxed)),
             Some(StopReason::SleepOrStall)
         );
+    }
+    #[test]
+    fn in_flight_local_press_cannot_race_remote_focus() {
+        let s = Shared::new();
+        let callback = s.try_route().unwrap();
+        assert!(!s.focus(true, 1));
+        assert_eq!(s.remote_until.load(Ordering::SeqCst), 0);
+        // The callback delivers this press locally before publishing its state.
+        s.held.store(1, Ordering::SeqCst);
+        drop(callback);
+        assert!(!s.focus(true, 2));
+        s.held.store(0, Ordering::SeqCst);
+        assert!(s.focus(true, 3));
+    }
+    #[test]
+    fn focus_after_capture_stall_cannot_start_a_new_lease() {
+        let s = Shared::new();
+        assert!(!s.focus(true, STALL_NS + 1));
+        assert_eq!(
+            reason(s.stop.load(Ordering::SeqCst)),
+            Some(StopReason::SleepOrStall)
+        );
+        assert_eq!(s.remote_until.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn scroll_units_and_bounds() {

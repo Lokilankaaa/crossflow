@@ -95,6 +95,7 @@ unsafe extern "C" {
     fn CGEventSourceSetLocalEventsSuppressionInterval(source: *mut c_void, seconds: f64);
     fn CGEventCreate(source: *mut c_void) -> *mut c_void;
     fn CGEventGetLocation(event: *const c_void) -> CGPoint;
+    fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
     fn CGEventCreateMouseEvent(
         source: *mut c_void,
         kind: u32,
@@ -312,6 +313,61 @@ pub fn native_displays() -> anyhow::Result<Vec<crate::session::NativeDisplay>> {
             height: display.bounds.height,
         })
         .collect())
+}
+
+/// One return-to-local cursor placement, never called from an event tap.
+/// Apple documents that this API generates no event (and therefore no new
+/// captured activity): https://developer.apple.com/documentation/coregraphics/cgwarpmousecursorposition(_:)
+pub(super) fn warp_local_cursor(
+    x: f64,
+    y: f64,
+    check: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        x.is_finite() && y.is_finite(),
+        "Invalid local cursor position"
+    );
+    check()?;
+    preflight_input_permissions().map_err(|error| anyhow::anyhow!(error.message()))?;
+    let snapshot = display_snapshot().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    finish_local_warp(
+        &snapshot,
+        CGPoint { x, y },
+        check,
+        || {
+            (
+                DISPLAY_GENERATION.load(Ordering::SeqCst),
+                DISPLAY_RECONFIGURING.load(Ordering::SeqCst),
+            )
+        },
+        |point| unsafe { CGWarpMouseCursorPosition(point) },
+    )
+}
+
+fn finish_local_warp(
+    snapshot: &DisplaySnapshot,
+    point: CGPoint,
+    check: impl FnOnce() -> anyhow::Result<()>,
+    topology: impl FnOnce() -> (u64, bool),
+    warp: impl FnOnce(CGPoint) -> i32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        contains_point(&snapshot.displays, point),
+        "Local cursor target is outside awake active displays"
+    );
+    // The permission/display queries above may block. Recheck capture stop and
+    // focus immediately before the OS call; never revive an expired capture.
+    check()?;
+    let (generation, reconfiguring) = topology();
+    anyhow::ensure!(
+        !reconfiguring && generation == snapshot.generation,
+        "Displays changed before local cursor placement"
+    );
+    anyhow::ensure!(
+        warp(point) == 0,
+        "CoreGraphics rejected local cursor placement"
+    );
+    Ok(())
 }
 
 fn contains_point(displays: &[Display], point: CGPoint) -> bool {
@@ -1044,6 +1100,84 @@ mod tests {
             id: 1,
             bounds: bounds(),
         }]
+    }
+
+    #[test]
+    fn local_warp_rejects_invalid_targets_without_calling_os() {
+        let snapshot = DisplaySnapshot {
+            generation: 7,
+            displays: displays(),
+        };
+        for point in [
+            CGPoint {
+                x: f64::NAN,
+                y: 50.0,
+            },
+            CGPoint {
+                x: 0.0,
+                y: f64::INFINITY,
+            },
+            CGPoint { x: 100.0, y: 50.0 }, // exclusive right edge
+            CGPoint { x: 0.0, y: 120.0 },  // exclusive bottom edge
+            CGPoint { x: -101.0, y: 50.0 },
+        ] {
+            assert!(
+                finish_local_warp(
+                    &snapshot,
+                    point,
+                    || Ok(()),
+                    || (7, false),
+                    |_| panic!("invalid warp reached OS")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn local_warp_rechecks_stop_and_topology_after_slow_queries() {
+        let snapshot = DisplaySnapshot {
+            generation: 7,
+            displays: displays(),
+        };
+        let point = CGPoint { x: -50.5, y: 40.25 };
+        assert!(
+            finish_local_warp(
+                &snapshot,
+                point,
+                || anyhow::bail!("capture stopped during query"),
+                || (7, false),
+                |_| panic!("stopped warp reached OS")
+            )
+            .is_err()
+        );
+        for topology in [(8, false), (7, true)] {
+            assert!(
+                finish_local_warp(
+                    &snapshot,
+                    point,
+                    || Ok(()),
+                    || topology,
+                    |_| panic!("stale warp reached OS")
+                )
+                .is_err()
+            );
+        }
+        let calls = std::cell::Cell::new(0);
+        finish_local_warp(
+            &snapshot,
+            point,
+            || Ok(()),
+            || (7, false),
+            |actual| {
+                assert_eq!((actual.x, actual.y), (-50.5, 40.25));
+                calls.set(calls.get() + 1);
+                0
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(finish_local_warp(&snapshot, point, || Ok(()), || (7, false), |_| 1000).is_err());
     }
 
     #[test]
