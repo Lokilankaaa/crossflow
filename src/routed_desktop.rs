@@ -89,7 +89,7 @@ impl RoutedInput {
         let next = if let Some(f) = &self.focus {
             self.config.advance(f, dx, dy)?
         } else {
-            let previous=self.last_local_native;
+            let previous = self.last_local_native;
             let segment = if let Some(previous) = previous {
                 self.config.local_segment(previous, native)?
             } else {
@@ -98,28 +98,34 @@ impl RoutedInput {
             self.last_local_native = Some(native);
             let candidate = match segment {
                 Some(f) => Some(f),
-                None => if let Some(p)=previous {
-                    // Only axes already clamped at the edge represent unused
-                    // motion. Native movement along the edge was applied by OS.
-                    let push_x=if p.x==native.x {dx} else {0.0};
-                    let push_y=if p.y==native.y {dy} else {0.0};
-                    self.config.local_exit(native, push_x, push_y)?
-                } else {None},
+                None => {
+                    if let Some(p) = previous {
+                        // Only axes already clamped at the edge represent unused
+                        // motion. Native movement along the edge was applied by OS.
+                        let push_x = if p.x == native.x { dx } else { 0.0 };
+                        let push_y = if p.y == native.y { dy } else { 0.0 };
+                        self.config.local_exit(native, push_x, push_y)?
+                    } else {
+                        None
+                    }
+                }
             };
             let Some(f) = candidate else {
                 return Ok(None);
             };
             f
         };
-        self.apply_focus(next,t0)
+        self.apply_focus(next, t0)
     }
-    fn apply_focus(&mut self,next:Focus,t0:u64)->anyhow::Result<Option<Point>> {
+    fn apply_focus(&mut self, next: Focus, t0: u64) -> anyhow::Result<Option<Point>> {
         let point = self.config.native_point(&next)?;
         if self.config.is_local(&next) {
             self.remote_gate.store(false, Ordering::Release);
             let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
-            if !q.is_connected() || q.control_epoch()!=self.expected_queue_epoch {
-                drop(q); self.sync(); return Ok(None);
+            if !q.is_connected() || q.control_epoch() != self.expected_queue_epoch {
+                drop(q);
+                self.sync();
+                return Ok(None);
             }
             q.pause();
             self.expected_queue_epoch = q.control_epoch();
@@ -128,8 +134,10 @@ impl RoutedInput {
             Ok(Some(point))
         } else {
             let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
-            if !q.is_connected() || q.control_epoch()!=self.expected_queue_epoch {
-                drop(q); self.sync(); return Ok(None);
+            if !q.is_connected() || q.control_epoch() != self.expected_queue_epoch {
+                drop(q);
+                self.sync();
+                return Ok(None);
             }
             if !q.is_active() && !q.arm() {
                 drop(q);
@@ -271,7 +279,7 @@ mod tests {
         }
         r.sync();
         assert!(r.enable(r.generation));
-        r.movement(Point{x:99.,y:50.},0.,0.,0).unwrap();
+        r.movement(Point { x: 99., y: 50. }, 0., 0., 0).unwrap();
         r
     }
     #[test]
@@ -308,21 +316,35 @@ mod tests {
     }
     #[test]
     fn reconnect_between_geometry_and_commit_revokes_both_transitions() {
-        for local in [false,true] {
-            let mut r=routed();
-            r.movement(Point{x:99.,y:50.},5.,0.,1).unwrap();
-            {let mut q=r.input.lock().unwrap();q.end_session();q.begin_session();}
-            let next=Focus{screen_id:if local {"w"}else{"m"}.into(),point:Point{x:if local {90.}else{110.},y:50.}};
-            assert!(r.apply_focus(next,2).unwrap().is_none());
-            assert!(!r.enabled);assert!(!r.remote_gate.load(Ordering::Acquire));assert!(!r.input.lock().unwrap().is_active());
+        for local in [false, true] {
+            let mut r = routed();
+            r.movement(Point { x: 99., y: 50. }, 5., 0., 1).unwrap();
+            {
+                let mut q = r.input.lock().unwrap();
+                q.end_session();
+                q.begin_session();
+            }
+            let next = Focus {
+                screen_id: if local { "w" } else { "m" }.into(),
+                point: Point {
+                    x: if local { 90. } else { 110. },
+                    y: 50.,
+                },
+            };
+            assert!(r.apply_focus(next, 2).unwrap().is_none());
+            assert!(!r.enabled);
+            assert!(!r.remote_gate.load(Ordering::Acquire));
+            assert!(!r.input.lock().unwrap().is_active());
         }
     }
     #[test]
     fn arriving_at_edge_does_not_repeat_whole_native_packet() {
-        let mut r=routed();r.last_local_native=Some(Point{x:95.,y:50.});
-        r.movement(Point{x:99.,y:52.},5.,2.,1).unwrap();
+        let mut r = routed();
+        r.last_local_native = Some(Point { x: 95., y: 50. });
+        r.movement(Point { x: 99., y: 52. }, 5., 2., 1).unwrap();
         assert!(!r.remote_gate.load(Ordering::Acquire));
-        r.movement(Point{x:99.,y:54.},5.,2.,2).unwrap();
-        let f=r.focus.as_ref().unwrap();assert_eq!(f.point,Point{x:105.,y:54.});
+        r.movement(Point { x: 99., y: 54. }, 5., 2., 2).unwrap();
+        let f = r.focus.as_ref().unwrap();
+        assert_eq!(f.point, Point { x: 105., y: 54. });
     }
 }
