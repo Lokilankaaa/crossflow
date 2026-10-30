@@ -783,6 +783,17 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
                     self.sink.maintain()?;
                 }
             }
+            if !self.receiver.active {
+                // Keep the idle native worker available for a later Arm or
+                // ownership handoff. clock() already checked peer liveness,
+                // the current ownership lease and any release barrier. This
+                // does not reset/arm the sink or renew input authority.
+                ensure!(
+                    !self.sink.emergency_pressed(),
+                    "local emergency stopped pair input"
+                );
+                self.sink.maintain()?;
+            }
             Ok(())
         })();
         self.finish(result)
@@ -1018,6 +1029,81 @@ mod tests {
             a.receive(Message::KeepAlive, ms * 1_000_000).unwrap();
         }
         assert!(a.receive(Message::KeepAlive, 151_000_000).is_err());
+        assert!(!a.status.connected);
+    }
+    #[test]
+    fn paused_workers_stay_idle_and_available_beyond_ten_seconds() {
+        let (mut a, mut b, ar, br) = enabled();
+        a.pause(0).unwrap();
+        pump(&mut a, &mut b, 0);
+        for now in (25..=12_000).step_by(25).map(|ms| ms * 1_000_000) {
+            let before = (ar.lock().unwrap().maintained, br.lock().unwrap().maintained);
+            a.tick(now).unwrap();
+            b.tick(now).unwrap();
+            pump(&mut a, &mut b, now);
+            assert_eq!(ar.lock().unwrap().maintained, before.0 + 1);
+            assert_eq!(br.lock().unwrap().maintained, before.1 + 1);
+            for endpoint in [&a, &b] {
+                assert!(endpoint.status.connected);
+                assert!(!endpoint.status.enabled && !endpoint.status.input_active);
+                assert!(!endpoint.receiver.active);
+                assert!(endpoint.status.owner.is_none());
+            }
+        }
+        a.enable_local(12_000_000_000).unwrap();
+        pump(&mut a, &mut b, 12_000_000_000);
+        input(&mut a, Kind::Arm, 12_000_000_000);
+        pump(&mut a, &mut b, 12_000_000_000);
+        assert!(b.status.input_active);
+    }
+    #[test]
+    fn source_idle_worker_is_maintained_until_reverse_takeover() {
+        let (mut a, mut b, ar, _) = enabled();
+        input(&mut a, Kind::Arm, 0);
+        pump(&mut a, &mut b, 0);
+        for now in (25..=12_000).step_by(25).map(|ms| ms * 1_000_000) {
+            let before = ar.lock().unwrap().maintained;
+            a.tick(now).unwrap();
+            b.tick(now).unwrap();
+            pump(&mut a, &mut b, now);
+            assert_eq!(ar.lock().unwrap().maintained, before + 1);
+            assert_eq!(a.status.owner, Some(Side::A));
+            assert!(!a.status.input_active && !a.receiver.active);
+            assert!(b.status.input_active);
+        }
+        b.request_local(12_000_000_000).unwrap();
+        pump(&mut a, &mut b, 12_000_000_000);
+        input(&mut b, Kind::Arm, 12_000_000_000);
+        pump(&mut a, &mut b, 12_000_000_000);
+        assert_eq!(a.status.owner, Some(Side::B));
+        assert!(a.status.input_active);
+        assert!(!b.status.input_active);
+    }
+    #[test]
+    fn idle_maintenance_stops_on_disconnect_liveness_or_ownership_lease_expiry() {
+        let (mut a, ar) = endpoint(Side::A);
+        a.tick(1).unwrap();
+        let maintained = ar.lock().unwrap().maintained;
+        a.disconnect();
+        assert!(a.tick(2).is_err());
+        assert_eq!(ar.lock().unwrap().maintained, maintained);
+
+        let (mut a, ar) = endpoint(Side::A);
+        a.tick(1).unwrap();
+        let maintained = ar.lock().unwrap().maintained;
+        assert!(a.tick(LEASE_TTL_NS + 1).is_err());
+        assert_eq!(ar.lock().unwrap().maintained, maintained);
+        assert!(!a.status.connected);
+
+        let (mut a, _, ar, _) = enabled();
+        for ms in [40, 80, 120] {
+            a.receive(Message::KeepAlive, ms * 1_000_000).unwrap();
+            a.tick(ms * 1_000_000).unwrap();
+        }
+        let maintained = ar.lock().unwrap().maintained;
+        // Peer is still live, but its ownership lease has expired.
+        assert!(a.tick(LEASE_TTL_NS + 1).is_err());
+        assert_eq!(ar.lock().unwrap().maintained, maintained);
         assert!(!a.status.connected);
     }
     #[test]

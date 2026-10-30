@@ -7,7 +7,7 @@ use crate::{
     pair_endpoint::{EndpointStatus, LocalSource, PairEndpoint},
     pair_layout::PairLayout,
     pair_source::SharedSource,
-    pair_wire::{Display, Hello, Message, PairPeer},
+    pair_wire::{Display, Hello, Message, PairPeer, Received},
     protocol::Kind,
     screen_runtime::RuntimeLayout,
     security::Identity,
@@ -65,6 +65,33 @@ pub enum EstablishOutcome {
 }
 
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
+// A pump can read the peer's readiness marker and its first runtime records
+// together. Keep that ordered tail intact until the local endpoint exists.
+fn accept_ready_batch(
+    records: Vec<Received>,
+    revision: u64,
+    local_ready_sent: bool,
+    received: &mut bool,
+) -> Result<Vec<Received>> {
+    ensure!(records.len() <= 64, "native readiness backlog exceeded");
+    let mut runtime = Vec::new();
+    for record in records {
+        if let Message::SessionReady { revision: peer } = &record.message {
+            ensure!(
+                *peer == revision && !*received,
+                "unexpected record before native readiness"
+            );
+            *received = true;
+        } else {
+            ensure!(
+                local_ready_sent && *received,
+                "unexpected record before native readiness"
+            );
+            runtime.push(record);
+        }
+    }
+    Ok(runtime)
+}
 fn setup_alive(stop: &AtomicBool, end: Instant) -> Result<()> {
     ensure!(!stop.load(Ordering::Acquire), "pair setup stopped");
     ensure!(Instant::now() < end, "pair setup timed out");
@@ -299,7 +326,7 @@ impl PairConnection {
         host: &mut impl Host,
         stop: &AtomicBool,
         log: &Log,
-    ) -> Result<bool> {
+    ) -> Result<Option<Vec<Received>>> {
         let end = Instant::now() + PREPARE_TIMEOUT;
         let mut sent = false;
         let mut received = self.early_peer_ready;
@@ -310,7 +337,7 @@ impl PairConnection {
                 stop.store(true, Ordering::Release);
             }
             if stop.load(Ordering::Acquire) {
-                return Ok(false);
+                return Ok(None);
             }
             ensure!(Instant::now() < end, "native pair preparation timed out");
             let state = source.status();
@@ -329,16 +356,15 @@ impl PairConnection {
                 })?;
                 sent = true;
             }
-            for record in self.peer.pump()? {
-                ensure!(
-                    matches!(record.message,Message::SessionReady{revision} if revision==self.revision)
-                        && !received,
-                    "unexpected record before native readiness"
-                );
-                received = true;
-            }
+            let records = self.peer.pump()?;
+            let runtime = accept_ready_batch(
+                records,
+                self.revision,
+                sent && !self.peer.pending(),
+                &mut received,
+            )?;
             if sent && received && !self.peer.pending() {
-                return Ok(true);
+                return Ok(Some(runtime));
             }
             thread::sleep(Duration::from_micros(500));
         }
@@ -462,7 +488,7 @@ impl PairConnection {
         stop: &AtomicBool,
         log: Log,
     ) -> Result<()> {
-        let initial = (|| -> Result<bool> {
+        let initial = (|| -> Result<Option<Vec<Received>>> {
             ensure!(
                 source.matches_runtime(self.runtime()),
                 "capture source does not match authenticated arrangement"
@@ -476,7 +502,7 @@ impl PairConnection {
             sink.release_owned()?;
             self.native_ready(source, sink, host, stop, &log)
         })();
-        if !matches!(initial, Ok(true)) {
+        if !matches!(initial, Ok(Some(_))) {
             self.peer.abort();
             source.disconnect();
             let cleanup = sink.release_owned();
@@ -487,6 +513,7 @@ impl PairConnection {
             cleanup.context("pair preparation cleanup unconfirmed")?;
             return initial.map(|_| ());
         }
+        let mut ready_records = initial?.unwrap();
         let local_side = self.local_side();
         let created = PairEndpoint::new(
             local_side,
@@ -566,7 +593,11 @@ impl PairConnection {
                 {
                     bail!("local revoke discarded pending transport input");
                 }
-                let records = self.peer.pump()?;
+                let records = if ready_records.is_empty() {
+                    self.peer.pump()?
+                } else {
+                    std::mem::take(&mut ready_records)
+                };
                 for record in records {
                     host.pulse(log.ns())?;
                     if stop.load(Ordering::Acquire) {
@@ -920,6 +951,194 @@ mod tests {
             worker: Some(worker),
         }
     }
+    #[test]
+    fn readiness_batch_preserves_tail_and_rejects_pre_ready_or_duplicate_records() {
+        let at = Instant::now();
+        let record = |sequence, message| Received {
+            sequence,
+            message,
+            received_at: at,
+        };
+        let ready = || record(10, Message::SessionReady { revision: 1 });
+        let mut received = false;
+        let tail = accept_ready_batch(
+            vec![
+                ready(),
+                record(11, Message::KeepAlive),
+                record(12, Message::Enable),
+            ],
+            1,
+            true,
+            &mut received,
+        )
+        .unwrap();
+        assert!(received);
+        assert_eq!(
+            tail.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            [11, 12]
+        );
+        assert!(tail.iter().all(|r| r.received_at == at));
+        assert_eq!(tail[0].message, Message::KeepAlive);
+        assert_eq!(tail[1].message, Message::Enable);
+        for records in [
+            vec![record(9, Message::Enable), ready()],
+            vec![ready(), ready()],
+            vec![ready(), record(11, Message::KeepAlive), ready()],
+        ] {
+            assert!(accept_ready_batch(records, 1, true, &mut false).is_err());
+        }
+        assert!(
+            accept_ready_batch(
+                vec![ready(), record(11, Message::Enable)],
+                1,
+                false,
+                &mut false
+            )
+            .is_err()
+        );
+        assert!(accept_ready_batch(vec![ready()], 2, true, &mut false).is_err());
+        assert!(accept_ready_batch(vec![ready()], 1, true, &mut true).is_err());
+        let oversized = (0..65).map(|i| record(i, Message::KeepAlive)).collect();
+        assert!(accept_ready_batch(oversized, 1, true, &mut true).is_err());
+    }
+
+    #[test]
+    #[ignore = "real encrypted localhost readiness race; mock native adapters only"]
+    fn native_readiness_retains_runtime_tail_from_same_encrypted_pump() -> Result<()> {
+        struct GatedHost {
+            pulses: usize,
+            go: Sender<()>,
+            sent: Receiver<()>,
+        }
+        impl Host for GatedHost {
+            fn pulse(&mut self, _now: u64) -> Result<()> {
+                self.pulses += 1;
+                if self.pulses == 2 {
+                    self.go.send(())?;
+                    self.sent.recv_timeout(Duration::from_secs(2))?;
+                }
+                Ok(())
+            }
+            fn poll_command(&mut self) -> Result<Option<Command>> {
+                Ok(None)
+            }
+            fn publish(&mut self, _status: &SessionStatus) -> Result<()> {
+                Ok(())
+            }
+        }
+        let fixture = fixture()?;
+        let initiator = Identity::load(&fixture.0.join("identities/windows"))?;
+        let responder = Identity::load(&fixture.0.join("identities/mac"))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let (go, receive_go) = mpsc::channel();
+        let (sent, receive_sent) = mpsc::channel();
+        let (finished, receive_finished) = mpsc::channel();
+        let server_log = LogWriter::new(&fixture.0.join("server.jsonl"), serde_json::json!({}))?;
+        let server = thread::spawn(move || -> Result<()> {
+            let EstablishOutcome::Session(mut connection) = PairConnection::establish(
+                listener.accept()?.0,
+                &responder,
+                false,
+                hello(&responder),
+                None,
+                &AtomicBool::new(false),
+                server_log.log.clone(),
+            )?
+            else {
+                bail!("unexpected inventory query")
+            };
+            // Wait until the client has transmitted Ready, then wait for its
+            // next native pulse before sending both records. This guarantees
+            // one pump sees the boundary and tail without timing-based sleeps.
+            let end = Instant::now() + Duration::from_secs(2);
+            while !connection.early_peer_ready {
+                let records = connection.peer.pump()?;
+                if !records.is_empty() {
+                    ensure!(
+                        records.len() == 1
+                            && records[0].message == Message::SessionReady { revision: 1 }
+                    );
+                    break;
+                }
+                ensure!(Instant::now() < end, "client Ready missing");
+                thread::yield_now();
+            }
+            receive_go.recv_timeout(Duration::from_secs(2))?;
+            for message in [Message::SessionReady { revision: 1 }, Message::KeepAlive] {
+                connection.peer.queue(message)?;
+                flush_setup(&mut connection.peer, &AtomicBool::new(false), end)?;
+            }
+            sent.send(())?;
+            receive_finished.recv_timeout(Duration::from_secs(2))?;
+            server_log.finish()
+        });
+        let client_log = LogWriter::new(&fixture.0.join("client.jsonl"), serde_json::json!({}))?;
+        let outcome = (|| -> Result<()> {
+            let EstablishOutcome::Session(mut connection) = PairConnection::establish(
+                TcpStream::connect(address)?,
+                &initiator,
+                true,
+                hello(&initiator),
+                Some(proposal()),
+                &AtomicBool::new(false),
+                client_log.log.clone(),
+            )?
+            else {
+                bail!("unexpected inventory query")
+            };
+            let source = SharedSource::new(connection.runtime().clone())?;
+            source.observe(
+                SourceEvent::Snapshot {
+                    buttons: vec![],
+                    keys: vec![],
+                },
+                client_log.log.ns(),
+            )?;
+            let mut sink = MockSink(Arc::new(Mutex::new(vec![])));
+            let mut host = GatedHost {
+                pulses: 0,
+                go,
+                sent: receive_sent,
+            };
+            let tail = connection
+                .native_ready(
+                    &source,
+                    &mut sink,
+                    &mut host,
+                    &AtomicBool::new(false),
+                    &client_log.log,
+                )?
+                .context("unexpected stop")?;
+            assert_eq!(host.pulses, 2);
+            assert_eq!(tail.len(), 1);
+            assert_eq!(tail[0].message, Message::KeepAlive);
+            assert!(tail[0].received_at <= Instant::now());
+            let mut endpoint = PairEndpoint::new(
+                connection.local_side(),
+                1,
+                source,
+                sink,
+                client_log.log.ns(),
+            )?;
+            for record in tail {
+                endpoint.receive(record.message, client_log.log.ns())?;
+            }
+            assert!(!endpoint.status().enabled);
+            assert!(!endpoint.status().input_active);
+            endpoint.shutdown()?;
+            Ok(())
+        })();
+        let _ = finished.send(());
+        let server_result = server.join().unwrap();
+        client_log.finish()?;
+        if outcome.is_err() || server_result.is_err() {
+            eprintln!("readiness client={outcome:?}, server={server_result:?}");
+        }
+        outcome?;
+        server_result
+    }
+
     #[test]
     #[ignore = "real encrypted localhost session; simulated physical input and mock sinks only"]
     fn full_duplex_session_waits_for_native_ready_then_routes_both_physical_sources() -> Result<()>
