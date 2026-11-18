@@ -373,8 +373,7 @@ mod native {
     use crate::permission_probe::{PermissionCheckError, PermissionProbe, ProbeConfig};
     use std::ffi::c_void;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::Arc;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
     type Ptr = *mut c_void;
@@ -410,6 +409,10 @@ mod native {
         fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
         fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
         fn CGPreflightListenEventAccess() -> bool;
+        fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayHideCursor(display: u32) -> i32;
+        fn CGDisplayShowCursor(display: u32) -> i32;
     }
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -456,8 +459,42 @@ mod native {
         unsafe { AXIsProcessTrusted() != 0 && CGPreflightListenEventAccess() }
     }
 
+    #[derive(Default)]
+    struct CursorState {
+        disassociated: bool,
+        hidden: bool,
+    }
+
+    #[derive(Default)]
+    struct CursorSuppression(Mutex<CursorState>);
+
+    impl CursorSuppression {
+        fn set_suppressed(&self, suppress: bool) {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if suppress {
+                if !state.disassociated && unsafe { CGAssociateMouseAndMouseCursorPosition(0) } == 0
+                {
+                    state.disassociated = true;
+                }
+                if !state.hidden && unsafe { CGDisplayHideCursor(CGMainDisplayID()) } == 0 {
+                    state.hidden = true;
+                }
+            } else {
+                if state.hidden {
+                    let _ = unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
+                    state.hidden = false;
+                }
+                if state.disassociated {
+                    let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
+                    state.disassociated = false;
+                }
+            }
+        }
+    }
+
     pub struct MacCapture {
         shared: Arc<Shared>,
+        cursor: Arc<CursorSuppression>,
         worker: Option<JoinHandle<()>>,
         clock: Clock,
         pub initial_held: HeldSnapshot,
@@ -470,14 +507,22 @@ mod native {
             );
             let clock = Clock::new()?;
             let shared = Arc::new(Shared::new());
+            let cursor = Arc::new(CursorSuppression::default());
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let state = Arc::clone(&shared);
+            let worker_cursor = Arc::clone(&cursor);
             let worker = thread::Builder::new()
                 .name("crossflow-mac-input".into())
                 .spawn(move || {
                     let result = catch_unwind(AssertUnwindSafe(|| {
-                        run(Arc::clone(&state), clock, ready_tx)
+                        run(
+                            Arc::clone(&state),
+                            Arc::clone(&worker_cursor),
+                            clock,
+                            ready_tx,
+                        )
                     }));
+                    worker_cursor.set_suppressed(false);
                     if result.is_err() {
                         state.stop(StopReason::CallbackPanicked);
                     }
@@ -485,12 +530,14 @@ mod native {
             match ready_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Ok(initial_held)) => Ok(Self {
                     shared,
+                    cursor,
                     worker: Some(worker),
                     clock,
                     initial_held,
                 }),
                 result => {
                     shared.stop(StopReason::SetupFailed);
+                    cursor.set_suppressed(false);
                     // Do not block the caller forever on a stalled OS permission RPC.
                     if worker.is_finished() {
                         let _ = worker.join();
@@ -537,7 +584,9 @@ mod native {
         }
         /// False means focus was rejected (held local input, expired lease, stop).
         pub fn set_remote_focus(&self, remote: bool) -> bool {
-            self.shared.focus(remote, self.clock.now())
+            let accepted = self.shared.focus(remote, self.clock.now());
+            self.cursor.set_suppressed(remote && accepted);
+            accepted
         }
         pub fn stop_reason(&self) -> Option<StopReason> {
             self.shared.remote(self.clock.now());
@@ -556,6 +605,7 @@ mod native {
         }
         pub fn stop(&self) {
             self.shared.stop(StopReason::Requested);
+            self.cursor.set_suppressed(false);
         }
     }
     impl Drop for MacCapture {
@@ -672,8 +722,8 @@ mod native {
             10..=12 => {
                 let key = unsafe { CGEventGetIntegerValueField(event, 9) };
                 if !(0..128).contains(&key) {
-                    if remote {
-                        state.shared.stop(StopReason::UnsupportedInput);
+                    if !remote && (kind == 10 || kind == 12) {
+                        state.shared.activity.fetch_add(1, Ordering::Release);
                     }
                     return false;
                 }
@@ -687,24 +737,18 @@ mod native {
                     state.shared.stop(StopReason::EmergencyShortcut);
                     return false;
                 }
+                let Some(usage) = hid_usage(key as u16) else {
+                    if !remote && (kind == 10 || kind == 12) {
+                        state.shared.activity.fetch_add(1, Ordering::Release);
+                    }
+                    return false;
+                };
                 if kind == 10 && unsafe { CGEventGetIntegerValueField(event, 8) } != 0 {
                     return state.remote_keys[index];
                 }
                 update_held(&state.shared, &mut state.keys[index], down);
                 suppress = route_press(&mut state.remote_keys[index], down, remote);
-                match hid_usage(key as u16) {
-                    Some(usage) => CaptureKind::Key { usage, down },
-                    None => {
-                        if remote {
-                            state.shared.stop(StopReason::UnsupportedInput);
-                        }
-                        state.remote_keys[index] = false;
-                        suppress = false;
-                        CaptureKind::UnsupportedKey {
-                            keycode: key as u16,
-                        }
-                    }
-                }
+                CaptureKind::Key { usage, down }
             }
             22 => {
                 // Fixed-point line deltas retain trackpad/sub-notch precision;
@@ -828,6 +872,7 @@ mod native {
     }
     fn run(
         shared: Arc<Shared>,
+        cursor: Arc<CursorSuppression>,
         clock: Clock,
         ready: mpsc::SyncSender<Result<HeldSnapshot, String>>,
     ) {
@@ -911,12 +956,13 @@ mod native {
         // loop has not dispatched callbacks yet; this thread owns the arrays.
         let mut snapshot = HeldSnapshot::default();
         for key in 0..128 {
+            let Some(usage) = hid_usage(key as u16) else {
+                continue;
+            };
             state.keys[key] = unsafe { CGEventSourceKeyState(1, key as u16) };
             if state.keys[key] {
                 shared.held.fetch_add(1, Ordering::SeqCst);
-                if let Some(usage) = hid_usage(key as u16) {
-                    snapshot.keys.push(usage);
-                }
+                snapshot.keys.push(usage);
             }
         }
         for number in 0..5 {
@@ -948,7 +994,11 @@ mod native {
         }
         loop {
             let now = clock.now();
-            shared.remote(now); // Detect sleep/scheduler stalls even with no input.
+            if !shared.remote(now) {
+                // Restore local cursor visibility and association promptly if
+                // focus lease expires or capture stops while the session thread stalls.
+                cursor.set_suppressed(false);
+            }
             if state
                 .permission
                 .as_ref()
@@ -958,6 +1008,7 @@ mod native {
             }
             if shared.stop.load(Ordering::SeqCst) != 0 {
                 // Stop read-only checks; retain only release ownership cleanup.
+                cursor.set_suppressed(false);
                 state.permission.take();
                 if !state.remote_keys.iter().any(|v| *v) && !state.remote_buttons.iter().any(|v| *v)
                 {
@@ -981,6 +1032,7 @@ mod native {
             }
         }
         drop(tap); // Invalidate before freeing callback context.
+        cursor.set_suppressed(false);
     }
 }
 #[cfg(target_os = "macos")]

@@ -115,6 +115,17 @@ impl RuntimeLayout {
         self.screen(&focus.screen_id)
             .is_ok_and(|s| s.device_id == self.local_device_id)
     }
+    pub fn contains_local_native_point(&self, display_id: u32, point: Point) -> bool {
+        point.x.is_finite()
+            && point.y.is_finite()
+            && self.bindings.iter().any(|binding| {
+                binding.native_id == display_id.to_string()
+                    && self
+                        .screen(&binding.screen_id)
+                        .is_ok_and(|screen| screen.device_id == self.local_device_id)
+                    && binding.native.contains(point)
+            })
+    }
     pub fn local_focus(&self, native: Point) -> Option<Focus> {
         self.bindings.iter().find_map(|b| {
             let s = self.screen(&b.screen_id).ok()?;

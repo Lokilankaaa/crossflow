@@ -96,6 +96,7 @@ unsafe extern "C" {
     fn CGEventCreate(source: *mut c_void) -> *mut c_void;
     fn CGEventGetLocation(event: *const c_void) -> CGPoint;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     fn CGEventCreateMouseEvent(
         source: *mut c_void,
         kind: u32,
@@ -347,7 +348,13 @@ pub(super) fn warp_local_cursor(
                 DISPLAY_RECONFIGURING.load(Ordering::SeqCst),
             )
         },
-        |point| unsafe { CGWarpMouseCursorPosition(point) },
+        |point| unsafe {
+            let code = CGWarpMouseCursorPosition(point);
+            if code == 0 {
+                let _ = CGAssociateMouseAndMouseCursorPosition(1);
+            }
+            code
+        },
     )
 }
 
@@ -658,12 +665,80 @@ pub fn preflight_input_permissions() -> Result<(), MissingInputPermission> {
     Ok(())
 }
 
+const HW_GUARD_POLL_NS: u64 = 5_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardFailure {
+    Emergency,
+    Topology,
+}
+
+fn poll_cadence_guard(
+    last_poll_ns: &AtomicU64,
+    emergency_latched: &AtomicBool,
+    topology_latched: &AtomicBool,
+    elapsed_ns: u64,
+    interval_ns: u64,
+    mut emergency_fn: impl FnMut() -> bool,
+    mut topology_ok_fn: impl FnMut() -> bool,
+) -> Result<(), GuardFailure> {
+    if emergency_latched.load(Ordering::Acquire) {
+        return Err(GuardFailure::Emergency);
+    }
+    if topology_latched.load(Ordering::Acquire) {
+        return Err(GuardFailure::Topology);
+    }
+    let last = last_poll_ns.load(Ordering::Acquire);
+    if elapsed_ns.saturating_sub(last) >= interval_ns {
+        if emergency_fn() {
+            emergency_latched.store(true, Ordering::Release);
+            return Err(GuardFailure::Emergency);
+        }
+        if !topology_ok_fn() {
+            topology_latched.store(true, Ordering::Release);
+            return Err(GuardFailure::Topology);
+        }
+        last_poll_ns.store(elapsed_ns, Ordering::Release);
+    }
+    Ok(())
+}
+
+struct HwGuardCache {
+    origin: std::time::Instant,
+    last_poll_ns: AtomicU64,
+    emergency_latched: AtomicBool,
+    topology_latched: AtomicBool,
+}
+
+impl HwGuardCache {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            last_poll_ns: AtomicU64::new(0),
+            emergency_latched: AtomicBool::new(false),
+            topology_latched: AtomicBool::new(false),
+        }
+    }
+
+    fn reset_at_now(&mut self) {
+        self.origin = std::time::Instant::now();
+        self.last_poll_ns.store(0, Ordering::Release);
+        self.emergency_latched.store(false, Ordering::Release);
+        self.topology_latched.store(false, Ordering::Release);
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
 pub struct MacMouseSink {
     source: OwnedCf,
     gain: f64,
     snapshot: DisplaySnapshot,
     input_failed: bool,
     permission_probe: Option<PermissionProbe>,
+    hw_guards: HwGuardCache,
     position: CGPoint,
     owned_buttons: BTreeSet<Button>,
     owned_keys: BTreeSet<u16>,
@@ -691,6 +766,7 @@ impl MacMouseSink {
             },
             input_failed: true,
             permission_probe: None,
+            hw_guards: HwGuardCache::new(),
             position: CGPoint::default(),
             owned_buttons: BTreeSet::new(),
             owned_keys: BTreeSet::new(),
@@ -707,6 +783,13 @@ impl MacMouseSink {
         // Only an explicit arm/reset may establish a fresh permission epoch.
         self.permission_probe = None;
         self.release_owned()?;
+        if emergency_pressed() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Local Escape requested an emergency stop",
+            )
+            .into());
+        }
         preflight_input_permissions().map_err(|permission| failure(permission.message()))?;
         let permission_probe = PermissionProbe::start_after_success(
             || preflight_input_permissions().map_err(|_| PermissionCheckError::Denied),
@@ -724,6 +807,7 @@ impl MacMouseSink {
                 "Local cursor is not on an awake active display; remote input stopped",
             ));
         }
+        self.hw_guards.reset_at_now();
         self.snapshot = snapshot;
         self.position = position;
         permission_probe
@@ -757,7 +841,7 @@ impl MacMouseSink {
         if self.input_failed {
             return Err(failure("Input adapter requires a fresh arm after failure"));
         }
-        if emergency_pressed() {
+        if self.hw_guards.emergency_latched.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Local Escape requested an emergency stop",
@@ -772,12 +856,35 @@ impl MacMouseSink {
             .ok_or_else(|| failure("Input permission monitor is not running"))?
             .check()
             .map_err(|reason| failure(reason.message()))?;
-        if display_snapshot()? != self.snapshot {
+        if self.hw_guards.topology_latched.load(Ordering::Acquire)
+            || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
+            || DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
+        {
             return Err(failure(
                 "Displays changed or slept; remote input stopped, check the layout before re-arming",
             ));
         }
-        Ok(())
+        // Escape hardware state and full display enumeration stay within a 5ms
+        // WindowServer cadence while atomic topology/permission checks run every frame.
+        match poll_cadence_guard(
+            &self.hw_guards.last_poll_ns,
+            &self.hw_guards.emergency_latched,
+            &self.hw_guards.topology_latched,
+            self.hw_guards.elapsed_ns(),
+            HW_GUARD_POLL_NS,
+            emergency_pressed,
+            || display_snapshot().is_ok_and(|snapshot| snapshot == self.snapshot),
+        ) {
+            Ok(()) => Ok(()),
+            Err(GuardFailure::Emergency) => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Local Escape requested an emergency stop",
+            )
+            .into()),
+            Err(GuardFailure::Topology) => Err(failure(
+                "Displays changed or slept; remote input stopped, check the layout before re-arming",
+            )),
+        }
     }
 
     fn post_marked(&self, event: &OwnedCf, flags: u64) {
@@ -998,14 +1105,28 @@ impl MacMouseSink {
     pub fn emergency_pressed(&self) -> bool {
         // The worker/session polls this while idle as well as during input, so
         // hotplug while a key is held also reaches its owned-input cleanup path.
-        emergency_pressed()
-            || self.input_failed
+        if self.input_failed
+            || self.hw_guards.emergency_latched.load(Ordering::Acquire)
+            || self.hw_guards.topology_latched.load(Ordering::Acquire)
             || self
                 .permission_probe
                 .as_ref()
                 .is_none_or(|probe| probe.check().is_err())
             || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
             || DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
+        {
+            return true;
+        }
+        poll_cadence_guard(
+            &self.hw_guards.last_poll_ns,
+            &self.hw_guards.emergency_latched,
+            &self.hw_guards.topology_latched,
+            self.hw_guards.elapsed_ns(),
+            HW_GUARD_POLL_NS,
+            emergency_pressed,
+            || display_snapshot().is_ok_and(|snapshot| snapshot == self.snapshot),
+        )
+        .is_err()
     }
 }
 
@@ -1433,5 +1554,156 @@ mod tests {
         assert_eq!(wheel, before);
         assert_eq!(wheel.accumulate(-119, 119).unwrap(), (0, 0));
         assert_eq!(wheel, WheelRemainder::default());
+    }
+
+    #[test]
+    fn guard_cadence_throttles_windowserver_queries_and_latches_failures() {
+        let last = AtomicU64::new(0);
+        let emergency_latched = AtomicBool::new(false);
+        let topology_latched = AtomicBool::new(false);
+        let mut emergency_calls = 0usize;
+        let mut topology_calls = 0usize;
+
+        // Within 5ms, neither closure is called.
+        for elapsed in [0, 1_000_000, HW_GUARD_POLL_NS - 1] {
+            assert_eq!(
+                poll_cadence_guard(
+                    &last,
+                    &emergency_latched,
+                    &topology_latched,
+                    elapsed,
+                    HW_GUARD_POLL_NS,
+                    || {
+                        emergency_calls += 1;
+                        false
+                    },
+                    || {
+                        topology_calls += 1;
+                        true
+                    },
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!((emergency_calls, topology_calls), (0, 0));
+
+        // At 5ms boundary, both closures run once and advance last_poll_ns.
+        assert_eq!(
+            poll_cadence_guard(
+                &last,
+                &emergency_latched,
+                &topology_latched,
+                HW_GUARD_POLL_NS,
+                HW_GUARD_POLL_NS,
+                || {
+                    emergency_calls += 1;
+                    false
+                },
+                || {
+                    topology_calls += 1;
+                    true
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!((emergency_calls, topology_calls), (1, 1));
+        assert_eq!(last.load(Ordering::Acquire), HW_GUARD_POLL_NS);
+
+        // Next 4.999ms skips again.
+        assert_eq!(
+            poll_cadence_guard(
+                &last,
+                &emergency_latched,
+                &topology_latched,
+                HW_GUARD_POLL_NS * 2 - 1,
+                HW_GUARD_POLL_NS,
+                || {
+                    emergency_calls += 1;
+                    false
+                },
+                || {
+                    topology_calls += 1;
+                    true
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!((emergency_calls, topology_calls), (1, 1));
+
+        // Emergency latches permanently without calling topology or recovering.
+        assert_eq!(
+            poll_cadence_guard(
+                &last,
+                &emergency_latched,
+                &topology_latched,
+                HW_GUARD_POLL_NS * 2,
+                HW_GUARD_POLL_NS,
+                || {
+                    emergency_calls += 1;
+                    true
+                },
+                || {
+                    topology_calls += 1;
+                    true
+                },
+            ),
+            Err(GuardFailure::Emergency)
+        );
+        assert_eq!(
+            poll_cadence_guard(
+                &last,
+                &emergency_latched,
+                &topology_latched,
+                HW_GUARD_POLL_NS * 3,
+                HW_GUARD_POLL_NS,
+                || {
+                    emergency_calls += 1;
+                    false
+                },
+                || {
+                    topology_calls += 1;
+                    true
+                },
+            ),
+            Err(GuardFailure::Emergency)
+        );
+        assert_eq!((emergency_calls, topology_calls), (2, 1));
+
+        // Topology latches permanently and never recovers even if topology returns OK.
+        let last = AtomicU64::new(0);
+        let emergency_latched = AtomicBool::new(false);
+        let topology_latched = AtomicBool::new(false);
+        let mut topo_calls = 0usize;
+        assert_eq!(
+            poll_cadence_guard(
+                &last,
+                &emergency_latched,
+                &topology_latched,
+                HW_GUARD_POLL_NS,
+                HW_GUARD_POLL_NS,
+                || false,
+                || {
+                    topo_calls += 1;
+                    false
+                },
+            ),
+            Err(GuardFailure::Topology)
+        );
+        assert_eq!(
+            poll_cadence_guard(
+                &last,
+                &emergency_latched,
+                &topology_latched,
+                HW_GUARD_POLL_NS * 2,
+                HW_GUARD_POLL_NS,
+                || false,
+                || {
+                    topo_calls += 1;
+                    true
+                },
+            ),
+            Err(GuardFailure::Topology)
+        );
+        assert_eq!(topo_calls, 1);
     }
 }

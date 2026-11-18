@@ -330,20 +330,54 @@ pub(super) fn abort_input() {
         }
     });
 }
+fn coalesce_raw_delta(prev_dx: i32, prev_dy: i32, dx: i32, dy: i32) -> Option<(i32, i32)> {
+    let next_dx = prev_dx.checked_add(dx)?;
+    let next_dy = prev_dy.checked_add(dy)?;
+    ((-20_000..=20_000).contains(&next_dx) && (-20_000..=20_000).contains(&next_dy))
+        .then_some((next_dx, next_dy))
+}
+
 impl HookState {
     fn enqueue(&mut self, event: CaptureEvent) {
         if self.stop.load(Ordering::Acquire) {
             return;
         }
-        // Capacity is allocated before hooks are installed. Overflow stops the
-        // entire source rather than losing a button/key release or growing.
-        if self.events.len() == EVENT_CAPACITY {
-            self.failed = true;
-            self.focus.store(false, Ordering::Release);
-            self.stop.store(true, Ordering::Release);
-            return;
+        let coalesced = if self.focus.load(Ordering::Acquire) {
+            match (self.events.back_mut(), &event) {
+                (
+                    Some(CaptureEvent::Delta {
+                        dx: prev_dx,
+                        dy: prev_dy,
+                        ..
+                    }),
+                    CaptureEvent::Delta { dx, dy, .. },
+                ) => {
+                    if let Some((next_dx, next_dy)) =
+                        coalesce_raw_delta(*prev_dx, *prev_dy, *dx, *dy)
+                    {
+                        *prev_dx = next_dx;
+                        *prev_dy = next_dy;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !coalesced {
+            // Capacity is allocated before hooks are installed. Overflow stops the
+            // entire source rather than losing a button/key release or growing.
+            if self.events.len() == EVENT_CAPACITY {
+                self.failed = true;
+                self.focus.store(false, Ordering::Release);
+                self.stop.store(true, Ordering::Release);
+                return;
+            }
+            self.events.push_back(event);
         }
-        self.events.push_back(event);
         if !self.wake_posted {
             if unsafe { PostMessageW(self.hwnd, WM_ROUTED_INPUT, 0, 0) } == 0 {
                 self.failed = true;
@@ -843,5 +877,56 @@ mod tests {
         focus.store(true, Ordering::Release);
         drop(hooks);
         assert!(!focus.load(Ordering::Acquire));
+    }
+    #[test]
+    fn raw_deltas_coalesce_while_remote_focus_is_active_without_displacing_controls() {
+        let focus = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut state = HookState {
+            policy: Policy::new(|_| false),
+            hwnd: null_mut(),
+            focus: focus.clone(),
+            stop: stop.clone(),
+            events: VecDeque::with_capacity(EVENT_CAPACITY),
+            wake_posted: true,
+            failed: false,
+            requested_stop: false,
+        };
+        let t1 = Instant::now();
+        state.enqueue(CaptureEvent::Delta {
+            dx: 3,
+            dy: -4,
+            captured_at: t1,
+        });
+        state.enqueue(CaptureEvent::Delta {
+            dx: 7,
+            dy: 9,
+            captured_at: Instant::now(),
+        });
+        assert_eq!(state.events.len(), 1);
+        assert!(matches!(
+            state.events.back(),
+            Some(CaptureEvent::Delta { dx: 10, dy: 5, .. })
+        ));
+        state.enqueue(CaptureEvent::Key {
+            usage: 4,
+            down: true,
+            captured_at: Instant::now(),
+            remote_at_capture: Some(true),
+        });
+        state.enqueue(CaptureEvent::Delta {
+            dx: -2,
+            dy: 1,
+            captured_at: Instant::now(),
+        });
+        assert_eq!(state.events.len(), 3);
+        // When focus is local, adjacent raw deltas remain distinct.
+        focus.store(false, Ordering::Release);
+        state.enqueue(CaptureEvent::Delta {
+            dx: 5,
+            dy: 6,
+            captured_at: Instant::now(),
+        });
+        assert_eq!(state.events.len(), 4);
     }
 }

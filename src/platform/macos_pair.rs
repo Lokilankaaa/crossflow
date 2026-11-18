@@ -225,8 +225,7 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
                 break;
             }
             let Some(mapped) = source_event(event.kind, event.native_x, event.native_y) else {
-                self.fail("unsupported captured input");
-                break;
+                continue;
             };
             if !matches!(event.kind, CaptureKind::Delta { .. })
                 && event.remote_focus != self.gate.load(Ordering::SeqCst)
@@ -592,5 +591,15 @@ mod tests {
         replaced.wire_id = 3;
         replaced.native_id = "3".into();
         assert!(validate_startup_inventory(&f.capture.source, &[replaced]).is_err());
+    }
+    #[test]
+    fn unsupported_key_events_are_ignored_without_stopping_session() {
+        let mut f = Fixture::new();
+        f.push(CaptureKind::UnsupportedKey { keycode: 63 }, false);
+        f.push(CaptureKind::UnsupportedKey { keycode: 57 }, true);
+        f.capture.poll(0).unwrap();
+        assert_eq!(f.capture.command(), None);
+        assert_eq!(f.capture.failure(), None);
+        assert!(f.capture.source.status().ready);
     }
 }

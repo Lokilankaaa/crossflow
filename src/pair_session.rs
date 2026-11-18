@@ -1,6 +1,7 @@
 //! Shared duplex runtime. OS capture/UI adapters implement Host; input authority
 //! stays in PairEndpoint and all network traffic uses one pinned Noise socket.
 use crate::{
+    arrangement::Point,
     input::Button,
     metrics::Log,
     pair_control::Side,
@@ -158,6 +159,71 @@ impl SessionDiagnostics {
         }
         result
     }
+}
+
+fn can_coalesce_motion(runtime: &RuntimeLayout, current: &Message, next: &Message) -> bool {
+    let (
+        Message::Input {
+            source: current_source,
+            owner_epoch: current_epoch,
+            layout_revision: current_revision,
+            frame: current_frame,
+        },
+        Message::Input {
+            source: next_source,
+            owner_epoch: next_epoch,
+            layout_revision: next_revision,
+            frame: next_frame,
+        },
+    ) = (current, next)
+    else {
+        return false;
+    };
+    if current_source != next_source
+        || current_epoch != next_epoch
+        || current_revision != next_revision
+    {
+        return false;
+    }
+    match (current_frame.kind, next_frame.kind) {
+        (Kind::Position, Kind::Position) => {
+            current_frame.display_id == next_frame.display_id
+                && runtime.contains_local_native_point(
+                    current_frame.display_id,
+                    Point {
+                        x: current_frame.x,
+                        y: current_frame.y,
+                    },
+                )
+        }
+        (Kind::Move, Kind::Move) => {
+            current_frame.x.is_finite()
+                && current_frame.y.is_finite()
+                && next_frame.x.is_finite()
+                && next_frame.y.is_finite()
+        }
+        _ => false,
+    }
+}
+
+fn drain_outbound<K: MouseSink>(
+    peer: &mut PairPeer,
+    endpoint: &mut PairEndpoint<SharedSource, K>,
+    diagnostics: &SessionDiagnostics,
+    log: &Log,
+) -> Result<usize> {
+    let mut drained = 0usize;
+    while !peer.pending() {
+        let Some(message) = endpoint.pop_outbound_at(log.ns())? else {
+            break;
+        };
+        let trace = InputTrace::from_message(&message);
+        peer.queue(message)?;
+        diagnostics.queued(trace, endpoint.pending_outbound());
+        drained += 1;
+        peer.flush_pending()?;
+    }
+    Ok(drained)
 }
 // A pump can read the peer's readiness marker and its first runtime records
 // together. Keep that ordered tail intact until the local endpoint exists.
@@ -651,6 +717,7 @@ impl PairConnection {
         let mut sent_routing: Option<RoutingState> = None;
         let mut authority = endpoint.status().epoch;
         let interval = Duration::from_secs_f64(1. / f64::from(self.max_hz));
+        let mut consecutive_busy_spins: u8 = 0;
         let result = (|| -> Result<()> {
             loop {
                 host.pulse(log.ns())?;
@@ -705,7 +772,9 @@ impl PairConnection {
                 } else {
                     std::mem::take(&mut ready_records)
                 };
-                for record in records {
+                let batch_was_empty = records.is_empty();
+                let mut iter = records.into_iter().peekable();
+                while let Some(record) = iter.next() {
                     host.pulse(log.ns())?;
                     if stop.load(Ordering::Acquire) {
                         return Ok(());
@@ -718,6 +787,9 @@ impl PairConnection {
                             endpoint.request_local(log.ns())?;
                         }
                     }
+                    let defer = iter.peek().is_some_and(|next| {
+                        can_coalesce_motion(&self.runtime, &record.message, &next.message)
+                    });
                     let trace = InputTrace::from_message(&record.message);
                     diagnostics.dispatch(trace, record.received_at, || {
                         if let Message::Input { frame, .. } = &record.message {
@@ -725,19 +797,22 @@ impl PairConnection {
                                 self.shared_layout().routing_state(frame)?;
                             }
                         }
-                        endpoint.receive(record.message, log.ns())
+                        endpoint.receive_coalesced(record.message, defer, log.ns())
                     })?;
                 }
                 if self.peer.pending_input() && !endpoint.lease_ready(log.ns()) {
                     bail!("remote revoke discarded pending transport input");
                 }
                 endpoint.tick(log.ns())?;
+                let mut drained =
+                    drain_outbound(&mut self.peer, &mut endpoint, &diagnostics, &log)?;
                 let state = endpoint.status();
                 if state.epoch != authority {
                     authority = state.epoch;
                     sent_routing = None;
                     last_motion = None;
                 }
+                let mut submitted = false;
                 if !self.peer.pending()
                     && endpoint.pending_outbound() == 0
                     && endpoint.lease_ready(log.ns())
@@ -752,6 +827,7 @@ impl PairConnection {
                             endpoint.send_input(frame, log.ns())?,
                             "source authority changed while submitting captured input"
                         );
+                        submitted = true;
                         if motion {
                             last_motion = Some(Instant::now());
                         }
@@ -764,16 +840,11 @@ impl PairConnection {
                             endpoint.send_input(frame, log.ns())?,
                             "source authority changed while submitting focus"
                         );
+                        submitted = true;
                         sent_routing = Some(routing);
                     }
                 }
-                if !self.peer.pending() {
-                    if let Some(message) = endpoint.pop_outbound_at(log.ns())? {
-                        let trace = InputTrace::from_message(&message);
-                        self.peer.queue(message)?;
-                        diagnostics.queued(trace, endpoint.pending_outbound());
-                    }
-                }
+                drained += drain_outbound(&mut self.peer, &mut endpoint, &diagnostics, &log)?;
                 let status = self.session_status(&endpoint, source)?;
                 if last_status.as_ref() != Some(&status)
                     || last_publish.elapsed() >= Duration::from_millis(100)
@@ -782,7 +853,18 @@ impl PairConnection {
                     last_status = Some(status);
                     last_publish = Instant::now();
                 }
-                thread::sleep(Duration::from_micros(500));
+                let did_work = !batch_was_empty || drained > 0 || submitted;
+                if did_work && consecutive_busy_spins < 8 {
+                    consecutive_busy_spins += 1;
+                    thread::yield_now();
+                } else {
+                    consecutive_busy_spins = 0;
+                    thread::sleep(Duration::from_micros(if state.owner.is_some() {
+                        150
+                    } else {
+                        500
+                    }));
+                }
             }
         })();
         // Never flush queued input during any exit, including a normal Stop.
@@ -1663,6 +1745,251 @@ mod tests {
                     )
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "real encrypted localhost batch coalescing; mock adapters only"]
+    fn encrypted_batch_coalesces_consecutive_positions_into_latest_sink_call() -> Result<()> {
+        use crate::protocol::Frame;
+        let fixture = fixture()?;
+        let initiator = Identity::load(&fixture.0.join("identities/windows"))?;
+        let responder = Identity::load(&fixture.0.join("identities/mac"))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        struct RecordingSink {
+            positions: Arc<Mutex<Vec<(f64, f64, u32)>>>,
+            armed_tx: Option<Sender<()>>,
+        }
+        impl MouseSink for RecordingSink {
+            fn reset(&mut self) -> Result<()> {
+                if let Some(tx) = self.armed_tx.take() {
+                    let _ = tx.send(());
+                }
+                Ok(())
+            }
+            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                Ok((x, y))
+            }
+            fn position(&mut self, x: f64, y: f64, id: u32) -> Result<(f64, f64)> {
+                self.positions.lock().unwrap().push((x, y, id));
+                Ok((x, y))
+            }
+            fn release_owned(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct BatchGateHost {
+            gate: Option<Receiver<()>>,
+            parked: Option<Sender<()>>,
+            armed: Arc<AtomicBool>,
+            commands: Receiver<Command>,
+        }
+        impl Host for BatchGateHost {
+            fn pulse(&mut self, _now: u64) -> Result<()> {
+                if self.armed.load(Ordering::Acquire) {
+                    if let Some(rx) = self.gate.take() {
+                        if let Some(tx) = self.parked.take() {
+                            let _ = tx.send(());
+                        }
+                        rx.recv_timeout(Duration::from_secs(2))?;
+                    }
+                }
+                Ok(())
+            }
+            fn poll_command(&mut self) -> Result<Option<Command>> {
+                Ok(self.commands.try_recv().ok())
+            }
+            fn publish(&mut self, _status: &SessionStatus) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let positions = Arc::new(Mutex::new(Vec::new()));
+        let b_positions = positions.clone();
+        let b_path = fixture.0.join("b.jsonl");
+        let b_stop = stop.clone();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (batch_tx, batch_rx) = mpsc::channel();
+        let (b_cmd_tx, b_cmd_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let writer = LogWriter::new(&b_path, serde_json::json!({"os_input":false}))?;
+            let result = (|| -> Result<()> {
+                let EstablishOutcome::Session(prepared) = PairConnection::establish(
+                    listener.accept()?.0,
+                    &responder,
+                    false,
+                    hello(&responder),
+                    None,
+                    &b_stop,
+                    writer.log.clone(),
+                )?
+                else {
+                    bail!("unexpected inventory query")
+                };
+                let source = SharedSource::new(prepared.runtime().clone())?;
+                source.observe(
+                    SourceEvent::Snapshot {
+                        buttons: vec![],
+                        keys: vec![],
+                    },
+                    writer.log.ns(),
+                )?;
+                let armed_flag = Arc::new(AtomicBool::new(false));
+                let flag_clone = armed_flag.clone();
+                let (inner_armed_tx, inner_armed_rx) = mpsc::channel();
+                thread::spawn(move || {
+                    if inner_armed_rx.recv().is_ok() {
+                        flag_clone.store(true, Ordering::Release);
+                    }
+                });
+                let mut sink = RecordingSink {
+                    positions: b_positions,
+                    armed_tx: Some(inner_armed_tx),
+                };
+                let mut host = BatchGateHost {
+                    gate: Some(batch_rx),
+                    parked: Some(parked_tx),
+                    armed: armed_flag,
+                    commands: b_cmd_rx,
+                };
+                prepared.run(&source, &mut sink, &mut host, &b_stop, writer.log.clone())
+            })();
+            writer.finish()?;
+            result
+        });
+
+        let a_log = LogWriter::new(&fixture.0.join("a.jsonl"), serde_json::json!({}))?;
+        let outcome = (|| -> Result<()> {
+            let EstablishOutcome::Session(mut connection_a) = PairConnection::establish(
+                TcpStream::connect(address)?,
+                &initiator,
+                true,
+                hello(&initiator),
+                Some(proposal()),
+                &stop,
+                a_log.log.clone(),
+            )?
+            else {
+                bail!("unexpected inventory query")
+            };
+            let source_a = SharedSource::new(connection_a.runtime().clone())?;
+            source_a.observe(
+                SourceEvent::Snapshot {
+                    buttons: vec![],
+                    keys: vec![],
+                },
+                a_log.log.ns(),
+            )?;
+            struct DummySink;
+            impl MouseSink for DummySink {
+                fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                    Ok((x, y))
+                }
+                fn release_owned(&mut self) -> Result<()> {
+                    Ok(())
+                }
+            }
+            struct DummyHost;
+            impl Host for DummyHost {
+                fn pulse(&mut self, _: u64) -> Result<()> {
+                    Ok(())
+                }
+                fn poll_command(&mut self) -> Result<Option<Command>> {
+                    Ok(None)
+                }
+                fn publish(&mut self, _: &SessionStatus) -> Result<()> {
+                    Ok(())
+                }
+            }
+            let _ = connection_a
+                .native_ready(&source_a, &mut DummySink, &mut DummyHost, &stop, &a_log.log)?
+                .context("unexpected stop")?;
+            let mut endpoint_a = PairEndpoint::new(
+                connection_a.local_side(),
+                1,
+                source_a,
+                DummySink,
+                a_log.log.ns(),
+            )?;
+            endpoint_a.enable_local(a_log.log.ns())?;
+            let end = Instant::now() + Duration::from_secs(2);
+            while !endpoint_a.lease_ready(a_log.log.ns()) {
+                ensure!(Instant::now() < end, "sender lease timed out");
+                while let Some(m) = endpoint_a.pop_outbound_at(a_log.log.ns())? {
+                    connection_a.peer.queue(m)?;
+                    connection_a.peer.flush_pending()?;
+                }
+                for r in connection_a.peer.pump()? {
+                    endpoint_a.receive(r.message, a_log.log.ns())?;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            // Send Arm and wait until B processes Arm and parks at the batch gate.
+            let mut arm = Frame::new(Kind::Arm);
+            arm.t0_ns = a_log.log.ns();
+            assert!(endpoint_a.send_input(arm, arm.t0_ns)?);
+            while let Some(m) = endpoint_a.pop_outbound_at(a_log.log.ns())? {
+                connection_a.peer.queue(m)?;
+                connection_a.peer.flush_pending()?;
+            }
+            parked_rx.recv_timeout(Duration::from_secs(2))?;
+            // Pump B's Lease messages, then flush 3 Position frames back-to-back
+            // while B's pulse is parked so they arrive in a single pump().
+            for r in connection_a.peer.pump()? {
+                endpoint_a.receive(r.message, a_log.log.ns())?;
+            }
+            for (x, y) in [(10.0, 10.0), (25.0, 35.0), (60.0, 70.0)] {
+                let mut f = Frame::new(Kind::Position);
+                f.display_id = 7;
+                f.x = x;
+                f.y = y;
+                f.t0_ns = a_log.log.ns();
+                assert!(endpoint_a.send_input(f, f.t0_ns)?);
+                let msg = endpoint_a.pop_outbound_at(a_log.log.ns())?.unwrap();
+                connection_a.peer.queue(msg)?;
+                connection_a.peer.flush_pending()?;
+            }
+            thread::sleep(Duration::from_millis(5));
+            batch_tx.send(())?;
+            let end = Instant::now() + Duration::from_secs(2);
+            while positions.lock().unwrap().is_empty() {
+                ensure!(Instant::now() < end, "coalesced position timed out");
+                for r in connection_a.peer.pump()? {
+                    endpoint_a.receive(r.message, a_log.log.ns())?;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(*positions.lock().unwrap(), vec![(60.0, 70.0, 7)]);
+            let _ = b_cmd_tx.send(Command::Stop);
+            Ok(())
+        })();
+        stop.store(true, Ordering::Release);
+        let _ = batch_tx.send(());
+        let server_res = server.join().unwrap();
+        a_log.finish()?;
+        outcome?;
+        server_res?;
+
+        let events = fs::read_to_string(fixture.0.join("b.jsonl"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let received_positions = events
+            .iter()
+            .filter(|v| v["event"] == "pair_input_received" && v["kind"] == "Position")
+            .collect::<Vec<_>>();
+        let call_positions = events
+            .iter()
+            .filter(|v| v["event"] == "pair_input_call" && v["kind"] == "Position")
+            .collect::<Vec<_>>();
+        assert_eq!(received_positions.len(), 3);
+        assert!(received_positions.iter().all(|v| v["success"] == true));
+        assert_eq!(call_positions.len(), 1);
+        assert_eq!(call_positions[0]["seq"], received_positions[2]["seq"]);
+        assert_eq!(call_positions[0]["success"], true);
         Ok(())
     }
 }

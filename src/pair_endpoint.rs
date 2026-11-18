@@ -55,6 +55,7 @@ pub struct PairEndpoint<S: LocalSource, K: MouseSink> {
     deferred_request: bool,
     discard_through: Option<u64>,
     receiver: ReceiverState,
+    coalesced_move: Option<(f64, f64)>,
     routing: Option<Frame>,
     outbound: VecDeque<Message>,
     now: u64,
@@ -101,6 +102,7 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
             deferred_request: false,
             discard_through: None,
             receiver: ReceiverState::new(LEASE_TTL_NS),
+            coalesced_move: None,
             routing: None,
             outbound: VecDeque::with_capacity(OUTBOUND_CAPACITY),
             now: now_ns,
@@ -204,6 +206,7 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
         Ok(())
     }
     fn cleanup(&mut self) -> Result<()> {
+        self.coalesced_move = None;
         self.routing = None;
         self.discard_through = Some(self.status.epoch);
         self.status.owner = None;
@@ -464,11 +467,27 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
         Ok(())
     }
     pub fn receive(&mut self, message: Message, now: u64) -> Result<()> {
+        self.receive_coalesced(message, false, now)
+    }
+
+    pub fn receive_coalesced(
+        &mut self,
+        message: Message,
+        defer_motion_sink: bool,
+        now: u64,
+    ) -> Result<()> {
         let result = (|| {
             self.clock(now)?;
             match message {
-                Message::KeepAlive => {}
+                Message::KeepAlive => {
+                    if let Some((dx, dy)) = self.coalesced_move.take() {
+                        self.sink.move_by(dx, dy)?;
+                    }
+                }
                 Message::Lease { token } => {
+                    if let Some((dx, dy)) = self.coalesced_move.take() {
+                        self.sink.move_by(dx, dy)?;
+                    }
                     ensure!(
                         token > self.last_peer_token,
                         "duplicate or stale peer lease"
@@ -590,7 +609,13 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
                     owner_epoch,
                     layout_revision,
                     frame,
-                } => self.input(source, owner_epoch, layout_revision, frame)?,
+                } => self.input(
+                    source,
+                    owner_epoch,
+                    layout_revision,
+                    frame,
+                    defer_motion_sink,
+                )?,
                 Message::Hello(_)
                 | Message::Layout { .. }
                 | Message::LayoutAccepted { .. }
@@ -606,7 +631,14 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
         })();
         self.finish(result)
     }
-    fn input(&mut self, source: Side, epoch: u64, revision: u64, frame: Frame) -> Result<()> {
+    fn input(
+        &mut self,
+        source: Side,
+        epoch: u64,
+        revision: u64,
+        frame: Frame,
+        defer_motion_sink: bool,
+    ) -> Result<()> {
         ensure!(
             source == self.remote(),
             "input source does not match authenticated peer"
@@ -645,6 +677,9 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
         );
         let delta = self.receiver.apply(frame, self.now)?;
         if frame.kind == Kind::RoutingState {
+            if let Some((dx, dy)) = self.coalesced_move.take() {
+                self.sink.move_by(dx, dy)?;
+            }
             self.routing = Some(frame);
             // Metadata passes ownership, lease and sequence checks, but cannot
             // replace the active-input heartbeat or renew the native worker.
@@ -652,26 +687,77 @@ impl<S: LocalSource, K: MouseSink> PairEndpoint<S, K> {
         }
         match frame.kind {
             Kind::Arm => {
+                self.coalesced_move = None;
                 self.routing = None;
                 self.sink.reset()?;
             }
             Kind::Pause | Kind::Stop => {
+                self.coalesced_move = None;
                 self.routing = None;
                 self.sink.release_owned()?;
             }
             Kind::Move => {
                 let (dx, dy) = delta.ok_or_else(|| anyhow::anyhow!("missing movement delta"))?;
-                self.sink.move_by(dx, dy)?;
+                let (total_dx, total_dy) = match self.coalesced_move.take() {
+                    Some((px, py)) => {
+                        let sum_x = px + dx;
+                        let sum_y = py + dy;
+                        if sum_x.is_finite()
+                            && sum_y.is_finite()
+                            && sum_x.abs() <= 20_000.0
+                            && sum_y.abs() <= 20_000.0
+                        {
+                            (sum_x, sum_y)
+                        } else {
+                            self.sink.move_by(px, py)?;
+                            (dx, dy)
+                        }
+                    }
+                    None => (dx, dy),
+                };
+                if defer_motion_sink {
+                    self.coalesced_move = Some((total_dx, total_dy));
+                    self.status.input_active = self.receiver.active;
+                    self.last_input = Some(self.now);
+                    return Ok(());
+                }
+                self.sink.move_by(total_dx, total_dy)?;
             }
             Kind::Position => {
+                if let Some((dx, dy)) = self.coalesced_move.take() {
+                    self.sink.move_by(dx, dy)?;
+                }
+                if defer_motion_sink {
+                    self.status.input_active = self.receiver.active;
+                    self.last_input = Some(self.now);
+                    return Ok(());
+                }
                 self.sink.position(frame.x, frame.y, frame.display_id)?;
             }
-            Kind::Key => self.sink.key(frame.code, frame.down)?,
-            Kind::Button => self
-                .sink
-                .button(button_from_code(frame.code)?, frame.down)?,
-            Kind::Scroll => self.sink.scroll(frame.wheel_x, frame.wheel_y)?,
-            Kind::Heartbeat => {}
+            Kind::Key => {
+                if let Some((dx, dy)) = self.coalesced_move.take() {
+                    self.sink.move_by(dx, dy)?;
+                }
+                self.sink.key(frame.code, frame.down)?;
+            }
+            Kind::Button => {
+                if let Some((dx, dy)) = self.coalesced_move.take() {
+                    self.sink.move_by(dx, dy)?;
+                }
+                self.sink
+                    .button(button_from_code(frame.code)?, frame.down)?;
+            }
+            Kind::Scroll => {
+                if let Some((dx, dy)) = self.coalesced_move.take() {
+                    self.sink.move_by(dx, dy)?;
+                }
+                self.sink.scroll(frame.wheel_x, frame.wheel_y)?;
+            }
+            Kind::Heartbeat => {
+                if let Some((dx, dy)) = self.coalesced_move.take() {
+                    self.sink.move_by(dx, dy)?;
+                }
+            }
             _ => unreachable!(),
         }
         self.status.input_active = self.receiver.active;
@@ -1317,5 +1403,169 @@ mod tests {
                 .unwrap()
                 .ends_with(":release")
         );
+    }
+
+    #[test]
+    fn consecutive_positions_and_moves_coalesce_between_discrete_barriers() {
+        use crate::input::Button;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct TraceSink(Rc<RefCell<Vec<String>>>);
+        impl MouseSink for TraceSink {
+            fn reset(&mut self) -> Result<()> {
+                self.0.borrow_mut().push("reset".into());
+                Ok(())
+            }
+            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                self.0.borrow_mut().push(format!("move:{x}:{y}"));
+                Ok((x, y))
+            }
+            fn position(&mut self, x: f64, y: f64, id: u32) -> Result<(f64, f64)> {
+                self.0.borrow_mut().push(format!("pos:{x}:{y}:{id}"));
+                Ok((x, y))
+            }
+            fn button(&mut self, button: Button, down: bool) -> Result<()> {
+                self.0.borrow_mut().push(format!("btn:{button:?}:{down}"));
+                Ok(())
+            }
+            fn release_owned(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct NoopSource;
+        impl LocalSource for NoopSource {
+            fn revoke(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn grant(&mut self, _: u64, _: u64) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // First exercise Position coalescing around discrete Button barriers.
+        let sink_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut b =
+            PairEndpoint::new(Side::B, 7, NoopSource, TraceSink(sink_calls.clone()), 0).unwrap();
+        b.receive(
+            Message::Revoke {
+                barrier_epoch: 1,
+                reason: RevokeReason::Enable,
+            },
+            0,
+        )
+        .unwrap();
+        b.receive(
+            Message::Grant {
+                source: Side::A,
+                owner_epoch: 1,
+                layout_revision: 7,
+            },
+            0,
+        )
+        .unwrap();
+        b.receive(Message::Lease { token: 1 }, 0).unwrap();
+
+        let msg = |seq: u64, kind: Kind, x: f64, y: f64, down: bool| {
+            let mut f = Frame::new(kind);
+            f.seq = seq;
+            f.lease = 1;
+            f.t0_ns = 0;
+            f.t1_ns = 1;
+            f.x = x;
+            f.y = y;
+            f.display_id = if kind == Kind::Position { 7 } else { 0 };
+            f.code = 0;
+            f.down = down;
+            Message::Input {
+                source: Side::A,
+                owner_epoch: 1,
+                layout_revision: 7,
+                frame: f,
+            }
+        };
+        let batch = [
+            (msg(1, Kind::Arm, 0., 0., false), false),
+            (msg(2, Kind::Position, 10., 10., false), true),
+            (msg(3, Kind::Position, 20., 20., false), true),
+            (msg(4, Kind::Position, 30., 30., false), false),
+            (msg(5, Kind::Button, 0., 0., true), false),
+            (msg(6, Kind::Position, 40., 40., false), true),
+            (msg(7, Kind::Position, 50., 50., false), false),
+            (msg(8, Kind::Button, 0., 0., false), false),
+        ];
+        for (m, defer) in batch {
+            b.receive_coalesced(m, defer, 1).unwrap();
+        }
+        assert_eq!(
+            *sink_calls.borrow(),
+            vec![
+                "reset",
+                "pos:30:30:7",
+                "btn:Left:true",
+                "pos:50:50:7",
+                "btn:Left:false",
+            ]
+        );
+        // Duplicate sequence inside a deferred Position run must fail closed.
+        b.receive_coalesced(msg(9, Kind::Position, 60., 60., false), true, 1)
+            .unwrap();
+        assert!(
+            b.receive_coalesced(msg(9, Kind::Position, 70., 70., false), false, 1)
+                .is_err()
+        );
+        assert!(!b.status().connected);
+
+        // Next verify Move deltas accumulate accurately and fail closed on invalid seq.
+        let move_calls = Rc::new(RefCell::new(Vec::new()));
+        let mut b =
+            PairEndpoint::new(Side::B, 7, NoopSource, TraceSink(move_calls.clone()), 0).unwrap();
+        b.receive(
+            Message::Revoke {
+                barrier_epoch: 1,
+                reason: RevokeReason::Enable,
+            },
+            0,
+        )
+        .unwrap();
+        b.receive(
+            Message::Grant {
+                source: Side::A,
+                owner_epoch: 1,
+                layout_revision: 7,
+            },
+            0,
+        )
+        .unwrap();
+        b.receive(Message::Lease { token: 1 }, 0).unwrap();
+        let mk = |seq: u64, kind: Kind, x: f64, y: f64| {
+            let mut f = Frame::new(kind);
+            f.seq = seq;
+            f.lease = 1;
+            f.t0_ns = 0;
+            f.t1_ns = 1;
+            f.x = x;
+            f.y = y;
+            Message::Input {
+                source: Side::A,
+                owner_epoch: 1,
+                layout_revision: 7,
+                frame: f,
+            }
+        };
+        b.receive_coalesced(mk(1, Kind::Arm, 0., 0.), false, 1)
+            .unwrap();
+        b.receive_coalesced(mk(2, Kind::Move, 3., 4.), true, 1)
+            .unwrap();
+        b.receive_coalesced(mk(3, Kind::Move, 10., 12.), false, 1)
+            .unwrap();
+        assert_eq!(*move_calls.borrow(), vec!["reset", "move:10:12"]);
+        b.receive_coalesced(mk(4, Kind::Move, 11., 13.), true, 1)
+            .unwrap();
+        assert!(
+            b.receive_coalesced(mk(4, Kind::Move, 12., 14.), false, 1)
+                .is_err()
+        );
+        assert!(!b.status().connected);
     }
 }
