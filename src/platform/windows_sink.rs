@@ -24,8 +24,9 @@ use windows_sys::Win32::{
             WTSQuerySessionInformationW,
         },
         StationsAndDesktops::{
-            CloseDesktop, DESKTOP_READOBJECTS, GetThreadDesktop, GetUserObjectInformationW, HDESK,
-            OpenInputDesktop, UOI_IO, UOI_NAME,
+            CloseDesktop, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS,
+            GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenInputDesktop, SetThreadDesktop,
+            UOI_IO, UOI_NAME,
         },
         Threading::GetCurrentThreadId,
     },
@@ -348,6 +349,113 @@ impl Platform for Native {
     }
 }
 
+/// Elevated `LocalSystem` platform backend used exclusively inside `CrossflowInputService`'s
+/// interactive session worker (`crossflow.exe service-worker`). Dynamically follows the active
+/// Windows input desktop (`WinSta0\Default` <-> `WinSta0\Winlogon`) via `OpenInputDesktop` +
+/// `SetThreadDesktop` so remote mouse and keyboard control work across UAC prompts, elevated
+/// Administrator applications, and the Windows lock screen.
+struct NativeService {
+    attached: std::sync::Mutex<Option<(String, isize)>>,
+}
+unsafe impl Send for NativeService {}
+
+impl NativeService {
+    fn new() -> Self {
+        Self {
+            attached: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn sync_input_desktop(&self) -> Result<()> {
+        const RIGHTS: u32 = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP | 0x01FF;
+        let mut hdesk: HDESK = null_mut();
+        for _ in 0..3 {
+            hdesk = unsafe { OpenInputDesktop(0, 0, RIGHTS) };
+            if !hdesk.is_null() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        ensure!(
+            !hdesk.is_null(),
+            "OpenInputDesktop failed in service worker"
+        );
+        let name = match desktop_name(hdesk) {
+            Ok(n) => n,
+            Err(e) => {
+                unsafe { CloseDesktop(hdesk) };
+                return Err(e);
+            }
+        };
+        let allowed =
+            name.eq_ignore_ascii_case("Default") || name.eq_ignore_ascii_case("Winlogon");
+        if !allowed {
+            unsafe { CloseDesktop(hdesk) };
+            bail!("unsupported interactive desktop for service input");
+        }
+        let mut guard = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+        let same = guard
+            .as_ref()
+            .is_some_and(|(cur, _)| cur.eq_ignore_ascii_case(&name));
+        if same {
+            unsafe { CloseDesktop(hdesk) };
+            return Ok(());
+        }
+        let ok = unsafe { SetThreadDesktop(hdesk) };
+        if ok == 0 {
+            unsafe { CloseDesktop(hdesk) };
+            bail!("SetThreadDesktop failed while switching to {name}");
+        }
+        if let Some((_, old_raw)) = guard.replace((name, hdesk as isize))
+            && old_raw != 0
+        {
+            unsafe { CloseDesktop(old_raw as HDESK) };
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeService {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.attached.lock()
+            && let Some((_, raw)) = guard.take()
+            && raw != 0
+        {
+            unsafe { CloseDesktop(raw as HDESK) };
+        }
+    }
+}
+
+impl Platform for NativeService {
+    fn ready(&self) -> Result<()> {
+        self.sync_input_desktop()
+    }
+    fn displays(&self) -> Result<Vec<NativeDisplay>> {
+        let _ = self.sync_input_desktop();
+        receiver_displays()
+    }
+    fn cursor(&self) -> Result<(f64, f64)> {
+        let _ = self.sync_input_desktop();
+        super::cursor_position().map_err(anyhow::Error::msg)
+    }
+    fn held(&self, vk: u16) -> bool {
+        unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
+    }
+    fn key_vk(&self, scan: u16) -> u16 {
+        unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
+    }
+    fn post(&mut self, input: INPUT) -> Result<()> {
+        let _ = self.sync_input_desktop();
+        crate::power::wake_display_throttled();
+        let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
+        ensure!(
+            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
+            "Windows service input insertion failed"
+        );
+        Ok(())
+    }
+}
+
 pub struct WindowsMouseSink {
     platform: Box<dyn Platform>,
     emergency: Arc<AtomicBool>,
@@ -368,6 +476,27 @@ impl WindowsMouseSink {
         );
         let mut sink = Self {
             platform: Box::new(Native),
+            emergency,
+            gain,
+            displays: Vec::new(),
+            position: (0.0, 0.0),
+            failed: true,
+            keys: BTreeSet::new(),
+            buttons: BTreeSet::new(),
+        };
+        sink.reset()?;
+        Ok(sink)
+    }
+
+    /// Elevated `LocalSystem` service sink supporting `WinSta0\Default`, UAC
+    /// Secure Desktop (`WinSta0\Winlogon`), elevated Admin windows, and Lock Screen.
+    pub fn new_service(gain: f64, emergency: Arc<AtomicBool>) -> Result<Self> {
+        ensure!(
+            gain.is_finite() && gain > 0.0,
+            "mouse gain must be finite and positive"
+        );
+        let mut sink = Self {
+            platform: Box::new(NativeService::new()),
             emergency,
             gain,
             displays: Vec::new(),

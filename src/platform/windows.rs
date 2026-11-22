@@ -5,6 +5,8 @@
 
 #[path = "windows_routed.rs"]
 mod routed;
+#[path = "windows_service.rs"]
+pub mod service;
 #[path = "windows_sink.rs"]
 mod sink;
 pub use routed::{

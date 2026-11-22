@@ -97,6 +97,21 @@ enum Command {
         #[arg(long)]
         gain: f64,
     },
+    /// Private Windows LocalSystem service entry point invoked by SCM.
+    #[command(hide = true)]
+    WindowsService,
+    /// Private interactive-session LocalSystem input worker spawned by WindowsService.
+    #[command(hide = true)]
+    ServiceWorker {
+        #[arg(long)]
+        session: u32,
+    },
+    /// Install and start CrossflowInputService (Administrator UAC required).
+    InstallService,
+    /// Stop and uninstall CrossflowInputService (Administrator UAC required).
+    UninstallService,
+    /// Print JSON status of CrossflowInputService.
+    ServiceStatus,
     /// Create paired static identities. Share only the mac bundle with the Mac.
     Pair {
         #[arg(long, default_value = ".pairing")]
@@ -547,6 +562,56 @@ fn main() -> Result<()> {
             crossflow::injection_worker::run_native(gain)?;
             #[cfg(not(any(target_os = "macos", windows)))]
             anyhow::bail!("native input worker requires Windows or macOS");
+        }
+        Command::WindowsService => {
+            std::panic::set_hook(Box::new(|_| {}));
+            #[cfg(windows)]
+            crossflow::platform::windows::service::run_windows_service()?;
+            #[cfg(not(windows))]
+            anyhow::bail!("Windows service mode is only supported on Windows");
+        }
+        Command::ServiceWorker { session } => {
+            std::panic::set_hook(Box::new(|_| {}));
+            #[cfg(windows)]
+            crossflow::platform::windows::service::run_service_worker(session)?;
+            #[cfg(not(windows))]
+            {
+                let _ = session;
+                anyhow::bail!("Windows service worker is only supported on Windows");
+            }
+        }
+        Command::InstallService => {
+            #[cfg(windows)]
+            {
+                crossflow::platform::windows::service::install_service()?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&crossflow::platform::windows::service::query_status())?
+                );
+            }
+            #[cfg(not(windows))]
+            anyhow::bail!("Windows service installation is only supported on Windows");
+        }
+        Command::UninstallService => {
+            #[cfg(windows)]
+            {
+                crossflow::platform::windows::service::uninstall_service()?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&crossflow::platform::windows::service::query_status())?
+                );
+            }
+            #[cfg(not(windows))]
+            anyhow::bail!("Windows service uninstallation is only supported on Windows");
+        }
+        Command::ServiceStatus => {
+            #[cfg(windows)]
+            println!(
+                "{}",
+                serde_json::to_string(&crossflow::platform::windows::service::query_status())?
+            );
+            #[cfg(not(windows))]
+            println!("{{\"installed\":false,\"running\":false,\"pipe_ready\":false}}");
         }
         Command::Pair { out } => {
             println!(

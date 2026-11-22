@@ -419,7 +419,8 @@ fn dispatch_request(
 /// One in-flight RPC; terminal errors cannot create a replacement worker or
 /// replay an action. Construct once per receiver process, outside the input loop.
 pub struct WorkerProxy {
-    child: Child,
+    child: Option<Child>,
+    service_backed: bool,
     requests: Option<SyncSender<[u8; FRAME_LEN]>>,
     responses: Receiver<Message>,
     io_failed: Arc<AtomicBool>,
@@ -432,6 +433,50 @@ pub struct WorkerProxy {
     displays: Vec<crate::session::NativeDisplay>,
 }
 impl WorkerProxy {
+    fn from_streams<R, W>(
+        input: R,
+        output: W,
+        child: Option<Child>,
+        service_backed: bool,
+        ready_timeout: Duration,
+    ) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let io_failed = Arc::new(AtomicBool::new(false));
+        let responses = reader(input, io_failed.clone());
+        let (requests, _) = writer(output, io_failed.clone());
+        let mut proxy = Self {
+            child,
+            service_backed,
+            requests: Some(requests),
+            responses,
+            io_failed,
+            terminal: false,
+            seq: 0,
+            epoch: 0,
+            last_heartbeat: Instant::now(),
+            latest_timing: None,
+            failure_log: None,
+            displays: Vec::new(),
+        };
+        let ready = proxy.responses.recv_timeout(ready_timeout);
+        if !matches!(
+            ready,
+            Ok(Message {
+                op: Op::Ready,
+                seq: 0,
+                epoch: 0,
+                ..
+            })
+        ) {
+            proxy.fail();
+            bail!("input worker did not become ready");
+        }
+        Ok(proxy)
+    }
+
     pub fn spawn(command: &mut Command) -> Result<Self> {
         command
             .stdin(Stdio::piped())
@@ -450,45 +495,23 @@ impl WorkerProxy {
             command.creation_flags(0x08000000); // CREATE_NO_WINDOW, no visible helper console.
         }
         let mut child = command.spawn().context("start input worker")?;
-        let io_failed = Arc::new(AtomicBool::new(false));
-        let responses = reader(
-            child.stdout.take().context("worker stdout missing")?,
-            io_failed.clone(),
-        );
-        let (requests, _) = writer(
-            child.stdin.take().context("worker stdin missing")?,
-            io_failed.clone(),
-        );
-        let mut proxy = Self {
-            child,
-            requests: Some(requests),
-            responses,
-            io_failed,
-            terminal: false,
-            seq: 0,
-            epoch: 0,
-            last_heartbeat: Instant::now(),
-            latest_timing: None,
-            failure_log: None,
-            displays: Vec::new(),
-        };
-        let ready = proxy.responses.recv_timeout(Duration::from_secs(3));
-        if !matches!(
-            ready,
-            Ok(Message {
-                op: Op::Ready,
-                seq: 0,
-                epoch: 0,
-                ..
-            })
-        ) {
-            proxy.fail();
-            bail!("input worker did not become ready");
-        }
-        Ok(proxy)
+        let stdout = child.stdout.take().context("worker stdout missing")?;
+        let stdin = child.stdin.take().context("worker stdin missing")?;
+        Self::from_streams(stdout, stdin, Some(child), false, Duration::from_secs(3))
     }
+
+    #[cfg(windows)]
+    pub fn try_connect_windows_service() -> Result<Self> {
+        let (reader, writer) = crate::platform::windows::service::connect_service_pipe()?;
+        Self::from_streams(reader, writer, None, true, Duration::from_millis(800))
+    }
+
+    pub fn is_service_backed(&self) -> bool {
+        self.service_backed
+    }
+
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().map_or(0, Child::id)
     }
 
     /// Optional bounded log records the first terminal RPC failure separately
@@ -509,9 +532,12 @@ impl WorkerProxy {
     pub fn shutdown(&mut self) -> Result<()> {
         self.rpc(Message::new(Op::Shutdown))?;
         self.fail();
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
         let until = Instant::now() + Duration::from_millis(500);
         loop {
-            if let Some(status) = self.child.try_wait()? {
+            if let Some(status) = child.try_wait()? {
                 ensure!(status.success(), "input worker exited with cleanup failure");
                 return Ok(());
             }
@@ -540,7 +566,9 @@ impl WorkerProxy {
                 !self.io_failed.load(Ordering::Acquire),
                 "input worker pipe failed"
             );
-            ensure!(self.child.try_wait()?.is_none(), "input worker exited");
+            if let Some(child) = self.child.as_mut() {
+                ensure!(child.try_wait()?.is_none(), "input worker exited");
+            }
             self.seq = self
                 .seq
                 .checked_add(1)
@@ -675,9 +703,12 @@ impl Drop for WorkerProxy {
             eprintln!("Input worker shutdown acknowledgement unavailable; cleanup unconfirmed.");
         }
         self.requests.take();
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         let until = Instant::now() + Duration::from_millis(500);
         loop {
-            match self.child.try_wait() {
+            match child.try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(2)),
                 _ => break,
@@ -685,9 +716,9 @@ impl Drop for WorkerProxy {
         }
         // Do not pretend a forced worker kill released anything. No restart.
         eprintln!("Input worker did not exit; terminating it with input release unconfirmed.");
-        let _ = self.child.kill();
+        let _ = child.kill();
         // Child::wait could block if termination failed; leave reaping to the OS
         // when this one-shot experimental receiver process itself exits.
-        let _ = self.child.try_wait();
+        let _ = child.try_wait();
     }
 }

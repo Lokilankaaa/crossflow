@@ -61,6 +61,10 @@ internal sealed class MainWindow : Window
     private readonly ToggleSwitch clipboardToggle = new();
     private readonly ToggleSwitch inputStateToggle = new();
     private readonly ToggleSwitch screenLockToggle = new();
+    private readonly TextBlock serviceStateBadge = new();
+    private readonly Button installServiceButton = new();
+    private readonly Button uninstallServiceButton = new();
+    private bool serviceBusy;
     private bool updatingClipboardUi;
     private bool updatingInputStateUi;
     private bool updatingScreenLockUi;
@@ -402,6 +406,47 @@ internal sealed class MainWindow : Window
             await peerMesh.SetScreenLockAsync(screenLockToggle.IsOn);
         };
         sidebar.Children.Add(screenLockToggle);
+
+        sidebar.Children.Add(Divider());
+
+        // Optional Windows LocalSystem Service Mode (UAC / Admin windows / Lock Screen)
+        var svcHeader = new Grid { Margin = new Thickness(2, 2, 0, 0) };
+        svcHeader.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        svcHeader.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        svcHeader.Children.Add(new TextBlock
+        {
+            Text = "系统服务模式",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = theme.Brush("text_secondary"),
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        serviceStateBadge.Text = "未安装";
+        serviceStateBadge.FontSize = 11;
+        serviceStateBadge.Foreground = theme.Brush("text_secondary");
+        serviceStateBadge.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(serviceStateBadge, 1);
+        svcHeader.Children.Add(serviceStateBadge);
+        sidebar.Children.Add(svcHeader);
+
+        sidebar.Children.Add(new TextBlock
+        {
+            Text = "启用后可远程操作 UAC 弹窗、管理员窗口和锁屏界面",
+            FontSize = 11,
+            Foreground = theme.Brush("text_secondary"),
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(2, 0, 2, 2)
+        });
+
+        StyleCompactButton(installServiceButton, "安装并启用服务");
+        StyleCompactButton(uninstallServiceButton, "卸载");
+        uninstallServiceButton.Visibility = Visibility.Collapsed;
+        installServiceButton.Click += async (_, _) => await RunElevatedServiceCommandAsync("install-service");
+        uninstallServiceButton.Click += async (_, _) => await RunElevatedServiceCommandAsync("uninstall-service");
+        var svcButtonsRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        svcButtonsRow.Children.Add(installServiceButton);
+        svcButtonsRow.Children.Add(uninstallServiceButton);
+        sidebar.Children.Add(svcButtonsRow);
 
         sidebar.Children.Add(Divider());
 
@@ -1015,6 +1060,62 @@ internal sealed class MainWindow : Window
         }
     }
 
+    private async Task RunElevatedServiceCommandAsync(string subcommand)
+    {
+        if (serviceBusy || closing) return;
+        string executable = System.IO.Path.Combine(AppContext.BaseDirectory, "crossflow.exe");
+        if (!File.Exists(executable))
+        {
+            ShowNotice("缺少 crossflow.exe，无法操作 Windows 系统服务。", isError: true);
+            return;
+        }
+        serviceBusy = true;
+        installServiceButton.IsEnabled = false;
+        uninstallServiceButton.IsEnabled = false;
+        ClearNotice();
+        try
+        {
+            var psi = new ProcessStartInfo(executable, subcommand)
+            {
+                WorkingDirectory = AppContext.BaseDirectory,
+                UseShellExecute = true,
+                Verb = "runas",
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            using var proc = Process.Start(psi);
+            if (proc is null)
+            {
+                ShowNotice("无法启动管理员授权进程。", isError: true);
+                return;
+            }
+            await proc.WaitForExitAsync();
+            if (proc.ExitCode == 0)
+            {
+                ShowNotice(subcommand == "install-service"
+                    ? "系统服务模式已启用，现在其他设备可直接操作 UAC 弹窗、管理员窗口和锁屏界面。"
+                    : "系统服务模式已卸载，已切回普通便携模式。", isError: false);
+            }
+            else
+            {
+                ShowNotice($"服务操作失败（退出码 {proc.ExitCode}），请确认已允许管理员权限。", isError: true);
+            }
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            ShowNotice("已取消管理员授权。", isError: false);
+        }
+        catch (Exception ex)
+        {
+            ShowNotice($"服务操作异常：{ex.Message}", isError: true);
+        }
+        finally
+        {
+            serviceBusy = false;
+            installServiceButton.IsEnabled = !closing;
+            uninstallServiceButton.IsEnabled = !closing;
+        }
+    }
+
     private async Task OnPrimaryActionClickAsync()
     {
         if (closing) return;
@@ -1122,6 +1223,16 @@ internal sealed class MainWindow : Window
             screenLockToggle.IsOn = snap.ScreenLocked;
             updatingScreenLockUi = false;
         }
+        serviceStateBadge.Text = snap.ServiceModeActive
+            ? "运行中"
+            : snap.ServiceModeInstalled ? "已安装" : "未安装";
+        serviceStateBadge.Foreground = snap.ServiceModeActive
+            ? new SolidColorBrush(global::Windows.UI.Color.FromArgb(255, 22, 163, 74))
+            : theme.Brush("text_secondary");
+        installServiceButton.Content = snap.ServiceModeInstalled ? "更新 / 重启服务" : "安装并启用服务";
+        installServiceButton.IsEnabled = !serviceBusy && !closing;
+        uninstallServiceButton.Visibility = snap.ServiceModeInstalled ? Visibility.Visible : Visibility.Collapsed;
+        uninstallServiceButton.IsEnabled = !serviceBusy && !closing;
         RenderHotkeyButtons(snap.Hotkeys);
         string hkToggle = snap.Hotkeys.ToggleSharing ?? "未设置";
         string hkJump = snap.Hotkeys.QuickJumpNext ?? "未设置";

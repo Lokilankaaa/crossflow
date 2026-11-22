@@ -97,6 +97,8 @@ internal sealed record PeerMeshSnapshot(
     bool ClipboardSync,
     bool InputStateSync,
     bool ScreenLocked,
+    bool ServiceModeInstalled,
+    bool ServiceModeActive,
     HotkeyConfigInfo Hotkeys,
     string SelectedChannel,
     string? DirectPeer,
@@ -120,7 +122,7 @@ internal sealed record PeerMeshSnapshot(
     long Generation)
 {
     internal static PeerMeshSnapshot Initial => new(
-        "idle", null, null, "open", false, true, true, true, false, HotkeyConfigInfo.Defaults, "auto", null, null, [], [], [],
+        "idle", null, null, "open", false, false, true, true, false, false, false, HotkeyConfigInfo.Defaults, "auto", null, null, [], [], [],
         false, null, null, null, null, null, null,
         [], [], null, null, null, false, 0);
 }
@@ -356,6 +358,8 @@ internal sealed class PeerMeshController
                             parsed.ClipboardSync,
                             parsed.InputStateSync,
                             parsed.ScreenLocked,
+                            parsed.ServiceModeInstalled,
+                            parsed.ServiceModeActive,
                             parsed.Hotkeys ?? HotkeyConfigInfo.Defaults,
                             parsed.SelectedChannel ?? "auto",
                             parsed.DirectPeer,
@@ -424,10 +428,12 @@ internal sealed class PeerMeshController
         [JsonPropertyName("local_name")] public string? LocalName { get; set; }
         [JsonPropertyName("auth_mode")] public string? AuthMode { get; set; }
         [JsonPropertyName("passphrase_configured")] public bool PassphraseConfigured { get; set; }
-        [JsonPropertyName("smart_keymap")] public bool SmartKeymap { get; set; } = true;
+        [JsonPropertyName("smart_keymap")] public bool SmartKeymap { get; set; }
         [JsonPropertyName("clipboard_sync")] public bool ClipboardSync { get; set; } = true;
         [JsonPropertyName("input_state_sync")] public bool InputStateSync { get; set; } = true;
         [JsonPropertyName("screen_locked")] public bool ScreenLocked { get; set; }
+        [JsonPropertyName("service_mode_installed")] public bool ServiceModeInstalled { get; set; }
+        [JsonPropertyName("service_mode_active")] public bool ServiceModeActive { get; set; }
         [JsonPropertyName("hotkeys")] public HotkeyConfigInfo? Hotkeys { get; set; }
         [JsonPropertyName("selected_channel")] public string? SelectedChannel { get; set; }
         [JsonPropertyName("direct_peer")] public string? DirectPeer { get; set; }

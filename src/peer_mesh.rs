@@ -169,6 +169,8 @@ struct PeerUiStatus {
     clipboard_sync: bool,
     input_state_sync: bool,
     screen_locked: bool,
+    service_mode_installed: bool,
+    service_mode_active: bool,
     hotkeys: HotkeyConfig,
     selected_channel: String,
     direct_peer: Option<String>,
@@ -776,10 +778,34 @@ fn emit_status(stdout: &Mutex<std::io::Stdout>, status: &PeerUiStatus) {
 }
 
 
+fn query_windows_service_flags() -> (bool, bool, bool) {
+    #[cfg(windows)]
+    {
+        let st = crate::platform::windows::service::query_status();
+        (st.installed, st.running, st.pipe_ready)
+    }
+    #[cfg(not(windows))]
+    {
+        (false, false, false)
+    }
+}
+
 fn prepare_worker(inventory: &[Display], log: Log) -> Result<WorkerProxy> {
-    let mut command = process::Command::new(std::env::current_exe()?);
-    command.args(["input-worker", "--gain", "1"]);
-    let mut sink = WorkerProxy::spawn(&mut command)?;
+    #[cfg(windows)]
+    let mut sink = match WorkerProxy::try_connect_windows_service() {
+        Ok(s) => s,
+        Err(_) => {
+            let mut command = process::Command::new(std::env::current_exe()?);
+            command.args(["input-worker", "--gain", "1"]);
+            WorkerProxy::spawn(&mut command)?
+        }
+    };
+    #[cfg(not(windows))]
+    let mut sink = {
+        let mut command = process::Command::new(std::env::current_exe()?);
+        command.args(["input-worker", "--gain", "1"]);
+        WorkerProxy::spawn(&mut command)?
+    };
     sink.attach_failure_log(log);
     sink.set_displays(
         inventory
@@ -829,16 +855,19 @@ struct ActiveMeshPeer {
 
 struct MeshNativeIo {
     source: SharedSource,
-    capture: Box<dyn Capture + Send>,
+    capture: Option<Box<dyn Capture + Send>>,
     sink: WorkerProxy,
     last_activity: u64,
     last_sink_maintain: Instant,
+    last_capture_retry: Instant,
     enabled_attempted: bool,
 }
 
 impl MeshNativeIo {
     fn shutdown(mut self) {
-        let _ = self.capture.stop();
+        if let Some(mut cap) = self.capture.take() {
+            let _ = cap.stop();
+        }
         let _ = self.sink.shutdown();
     }
 }
@@ -1000,6 +1029,8 @@ pub fn run(
                     clipboard_sync: config.clipboard_sync,
                     input_state_sync: config.input_state_sync,
                     screen_locked: false,
+                    service_mode_installed: false,
+                    service_mode_active: false,
                     hotkeys: config.hotkeys.clone(),
                     selected_channel: config.channel.clone(),
                     direct_peer: config.direct_peer.clone(),
@@ -1073,26 +1104,38 @@ pub fn run(
                 clipboard_sync_flag.clone(),
             );
             let channel_cache = Arc::new(Mutex::new(local_channels.clone()));
+            let service_flags_cache = Arc::new(Mutex::new(query_windows_service_flags()));
             let channel_watch_stop = Arc::new(AtomicBool::new(false));
             {
                 let cache = channel_cache.clone();
+                let svc_cache = service_flags_cache.clone();
                 let watch_stop = channel_watch_stop.clone();
                 let _ = thread::Builder::new()
                     .name("crossflow-channel-watch".into())
                     .spawn(move || {
-                        let mut last = Instant::now();
+                        let mut last_ch = Instant::now();
+                        let mut last_svc = Instant::now() - Duration::from_secs(2);
                         while !watch_stop.load(Ordering::Acquire) {
-                            if last.elapsed() >= Duration::from_secs(4) {
-                                last = Instant::now();
+                            if last_ch.elapsed() >= Duration::from_secs(4) {
+                                last_ch = Instant::now();
                                 let refreshed = enumerate_local_channels();
                                 if let Ok(mut slot) = cache.lock() {
                                     *slot = refreshed;
+                                }
+                            }
+                            if last_svc.elapsed() >= Duration::from_millis(1200) {
+                                last_svc = Instant::now();
+                                let flags = query_windows_service_flags();
+                                if let Ok(mut slot) = svc_cache.lock() {
+                                    *slot = flags;
                                 }
                             }
                             thread::sleep(Duration::from_millis(200));
                         }
                     });
             }
+            let mut service_mode_flags = query_windows_service_flags();
+            let mut last_service_check = Instant::now();
 
             let mut discovery = DiscoveryHandle::start(DiscoveryConfig {
                 local_device_id: Some(local_discovery_id.clone()),
@@ -1139,6 +1182,28 @@ pub fn run(
                     last_channel_refresh = Instant::now();
                     if let Ok(cached) = channel_cache.try_lock() {
                         local_channels = cached.clone();
+                    }
+                }
+                if last_service_check.elapsed() >= Duration::from_millis(800) {
+                    last_service_check = Instant::now();
+                    if let Ok(cached) = service_flags_cache.try_lock() {
+                        service_mode_flags = *cached;
+                    }
+                    // Hot-upgrade portable worker onto LocalSystem service pipe as soon as
+                    // CrossflowInputService becomes available (zero restart required!).
+                    if service_mode_flags.2
+                        && inbound_owner.is_none()
+                        && let Some(ref mut io) = native_io
+                        && !io.sink.is_service_backed()
+                        && let Ok(new_sink) = prepare_worker(&local_displays, log.clone())
+                    {
+                        if new_sink.is_service_backed() {
+                            let mut old = std::mem::replace(&mut io.sink, new_sink);
+                            let _ = old.shutdown();
+                        } else {
+                            let mut unused = new_sink;
+                            let _ = unused.shutdown();
+                        }
                     }
                 }
                 if active_peers.is_empty() && last_display_refresh.elapsed() >= Duration::from_secs(2)
@@ -1721,8 +1786,9 @@ pub fn run(
                                                 if let Some(ref mut io) = native_io
                                                     && let Ok(Some(pt)) =
                                                         io.source.force_return_local_with_clock(|| log.ns())
+                                                    && let Some(ref mut cap) = io.capture
                                                 {
-                                                    let _ = io.capture.warp_local(pt);
+                                                    let _ = cap.warp_local(pt);
                                                 }
                                                 active_outbound_target = None;
                                             }
@@ -1784,8 +1850,9 @@ pub fn run(
                         if let Some(ref mut io) = native_io
                             && let Ok(Some(pt)) =
                                 io.source.force_return_local_with_clock(|| log.ns())
+                            && let Some(ref mut cap) = io.capture
                         {
-                            let _ = io.capture.warp_local(pt);
+                            let _ = cap.warp_local(pt);
                         }
                     }
                     if inbound_owner.as_deref() == Some(dead.as_str()) {
@@ -1824,10 +1891,25 @@ pub fn run(
                                         let last_activity = source.activity_counter();
                                         native_io = Some(MeshNativeIo {
                                             source,
-                                            capture,
+                                            capture: Some(capture),
                                             sink,
                                             last_activity,
                                             last_sink_maintain: Instant::now(),
+                                            last_capture_retry: Instant::now(),
+                                            enabled_attempted: false,
+                                        });
+                                    }
+                                    Err(_) if sink.is_service_backed() => {
+                                        // Lock screen / secure desktop: keep elevated service sink
+                                        // alive so remote peers can still control and unlock!
+                                        let last_activity = source.activity_counter();
+                                        native_io = Some(MeshNativeIo {
+                                            source,
+                                            capture: None,
+                                            sink,
+                                            last_activity,
+                                            last_sink_maintain: Instant::now(),
+                                            last_capture_retry: Instant::now(),
                                             enabled_attempted: false,
                                         });
                                     }
@@ -1849,26 +1931,64 @@ pub fn run(
                 // 7. Poll native capture, process custom hotkeys / QuickJump, route 1-hop frames!
                 let mut restart_native: Option<&'static str> = None;
                 if let Some(ref mut io) = native_io {
-                    if let Err(err) = io.capture.poll(log.ns()) {
-                        log.write(
-                            "mesh_native_restart",
-                            serde_json::json!({"reason": "capture_poll_err", "detail": format!("{err:#}")}),
-                        );
-                        restart_native = Some("capture_poll_err");
-                    } else if let Some(failure) = io.source.status().failure {
-                        log.write(
-                            "mesh_native_restart",
-                            serde_json::json!({"reason": "source_failure", "detail": format!("{failure:?}")}),
-                        );
-                        restart_native = Some("source_failure");
-                    } else if let Some(failure) = io.capture.failure() {
-                        log.write(
-                            "mesh_native_restart",
-                            serde_json::json!({"reason": "capture_failure", "detail": failure}),
-                        );
-                        restart_native = Some("capture_failure");
-                    } else {
-                        if let Some(sc) = io.capture.command() {
+                    // Retry starting capture if we are currently in receive-only service mode (e.g. after unlock)
+                    if io.capture.is_none()
+                        && io.last_capture_retry.elapsed() >= Duration::from_millis(1200)
+                    {
+                        io.last_capture_retry = Instant::now();
+                        let rt = io.source.runtime();
+                        if let Ok(fresh_source) = SharedSource::new(rt) {
+                            fresh_source.set_edge_locked(screen_locked);
+                            if let Ok(cap) = (platform.capture)(fresh_source.clone(), log.clone()) {
+                                io.last_activity = fresh_source.activity_counter();
+                                io.source = fresh_source;
+                                io.capture = Some(cap);
+                                io.enabled_attempted = false;
+                            }
+                        }
+                    }
+
+                    let mut capture_failed = false;
+                    if let Some(ref mut cap) = io.capture {
+                        if let Err(err) = cap.poll(log.ns()) {
+                            log.write(
+                                "mesh_native_restart",
+                                serde_json::json!({"reason": "capture_poll_err", "detail": format!("{err:#}")}),
+                            );
+                            capture_failed = true;
+                        } else if let Some(failure) = io.source.status().failure {
+                            log.write(
+                                "mesh_native_restart",
+                                serde_json::json!({"reason": "source_failure", "detail": format!("{failure:?}")}),
+                            );
+                            capture_failed = true;
+                        } else if let Some(failure) = cap.failure() {
+                            log.write(
+                                "mesh_native_restart",
+                                serde_json::json!({"reason": "capture_failure", "detail": failure}),
+                            );
+                            capture_failed = true;
+                        }
+                    }
+
+                    if capture_failed {
+                        if io.sink.is_service_backed() {
+                            // Keep LocalSystem service sink alive across lock-screen transitions!
+                            if let Some(mut old_cap) = io.capture.take() {
+                                let _ = old_cap.stop();
+                            }
+                            if let Some(prev) = active_outbound_target.take()
+                                && let Some(p) = active_peers.get_mut(&prev)
+                            {
+                                let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                                let _ = p.conn.flush();
+                            }
+                            io.last_capture_retry = Instant::now();
+                        } else {
+                            restart_native = Some("capture_failed");
+                        }
+                    } else if let Some(ref mut cap) = io.capture {
+                        if let Some(sc) = cap.command() {
                             match sc {
                                 Shortcut::Stop => {
                                     user_paused = true;
@@ -1968,7 +2088,7 @@ pub fn run(
                                 if let Ok(Some(local_pt)) =
                                     io.source.quick_jump_to_device_with_clock(&target, || log.ns())
                                 {
-                                    let _ = io.capture.warp_local(local_pt);
+                                    let _ = cap.warp_local(local_pt);
                                 }
                             }
                         }
@@ -2042,17 +2162,19 @@ pub fn run(
                                 let _ = peer.conn.flush();
                             }
                         }
+                    }
 
-                        // Keep input-worker heartbeat healthy
-                        if io.last_sink_maintain.elapsed() >= Duration::from_millis(15) {
-                            io.last_sink_maintain = Instant::now();
-                            if let Err(err) = io.sink.maintain() {
-                                log.write(
-                                    "mesh_native_restart",
-                                    serde_json::json!({"reason": "sink_maintain_err", "detail": format!("{err:#}")}),
-                                );
-                                restart_native = Some("sink_maintain_err");
-                            }
+                    // Keep input-worker heartbeat healthy (even when capture is paused on lock screen!)
+                    if restart_native.is_none()
+                        && io.last_sink_maintain.elapsed() >= Duration::from_millis(15)
+                    {
+                        io.last_sink_maintain = Instant::now();
+                        if let Err(err) = io.sink.maintain() {
+                            log.write(
+                                "mesh_native_restart",
+                                serde_json::json!({"reason": "sink_maintain_err", "detail": format!("{err:#}")}),
+                            );
+                            restart_native = Some("sink_maintain_err");
                         }
                     }
                 }
@@ -2167,8 +2289,13 @@ pub fn run(
                     });
                 }
 
+                let service_mode_installed = service_mode_flags.0;
+                let service_mode_active = native_io
+                    .as_ref()
+                    .map(|io| io.sink.is_service_backed())
+                    .unwrap_or(service_mode_flags.1 && service_mode_flags.2);
                 let sig = format!(
-                    "{state_str}|{:?}|{:?}|{screen_locked}|{}|{}|{}|{:?}",
+                    "{state_str}|{:?}|{:?}|{screen_locked}|{service_mode_installed}|{service_mode_active}|{}|{}|{}|{:?}",
                     focus_dev,
                     focus_scr,
                     peers_list.len(),
@@ -2209,6 +2336,8 @@ pub fn run(
                             clipboard_sync: config.clipboard_sync,
                             input_state_sync: config.input_state_sync,
                             screen_locked,
+                            service_mode_installed,
+                            service_mode_active,
                             hotkeys: config.hotkeys.clone(),
                             selected_channel: config.channel.clone(),
                             direct_peer: config.direct_peer.clone(),
@@ -2276,6 +2405,8 @@ pub fn run(
             clipboard_sync: config.clipboard_sync,
             input_state_sync: config.input_state_sync,
             screen_locked,
+            service_mode_installed: false,
+            service_mode_active: false,
             hotkeys: config.hotkeys,
             selected_channel: config.channel,
             direct_peer: config.direct_peer,
