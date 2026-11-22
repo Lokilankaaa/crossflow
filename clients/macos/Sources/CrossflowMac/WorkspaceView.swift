@@ -43,12 +43,15 @@ private final class HotkeyKeyMonitor {
     static let shared = HotkeyKeyMonitor()
     private var monitor: Any?
 
-    func start(onEvent: @escaping @MainActor (NSEvent) -> Bool) {
+    func start(onEvent: @escaping @MainActor (UInt16, NSEvent.ModifierFlags) -> Bool) {
         stop()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            MainActor.assumeIsolated {
-                onEvent(event) ? nil : event
+            let code = event.keyCode
+            let flags = event.modifierFlags
+            let consumed = MainActor.assumeIsolated {
+                onEvent(code, flags)
             }
+            return consumed ? nil : event
         }
     }
 
@@ -473,8 +476,8 @@ struct WorkspaceView: View {
         }
         recordingHotkeyField = field
         peer.setHotkeySuspended(true)
-        HotkeyKeyMonitor.shared.start { event in
-            handleRecordedKeyEvent(event, field: field)
+        HotkeyKeyMonitor.shared.start { keyCode, modifierFlags in
+            handleRecordedKeyEvent(keyCode: keyCode, modifierFlags: modifierFlags, field: field)
         }
     }
 
@@ -486,10 +489,9 @@ struct WorkspaceView: View {
         HotkeyKeyMonitor.shared.stop()
     }
 
-    private func handleRecordedKeyEvent(_ event: NSEvent, field: String) -> Bool {
-        let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
+    private func handleRecordedKeyEvent(keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags, field: String) -> Bool {
+        let flags = modifierFlags.intersection([.control, .option, .shift, .command])
         let hasMod = !flags.isEmpty
-        let keyCode = event.keyCode
 
         if !hasMod && keyCode == 53 {
             cancelHotkeyRecording()
