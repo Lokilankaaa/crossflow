@@ -99,10 +99,10 @@ struct WorkspaceView: View {
     private var statusColor: Color {
         if isAuthMismatch { return .orange }
         switch peer.state {
-        case "sharing": Color(red: 22/255, green: 163/255, blue: 74/255)
-        case "paused", "searching", "starting": Theme.accent
-        case "error", "startup_rejected": .red
-        default: Theme.secondary
+        case "sharing": return Color(red: 22/255, green: 163/255, blue: 74/255)
+        case "paused", "searching", "starting": return Theme.accent
+        case "error", "startup_rejected": return .red
+        default: return Theme.secondary
         }
     }
 
