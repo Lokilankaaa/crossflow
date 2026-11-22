@@ -41,6 +41,17 @@ internal sealed record PeerSharedLayout(
     [property: JsonPropertyName("receiver_device_id")] string ReceiverDeviceId,
     [property: JsonPropertyName("screens")] IReadOnlyList<PeerSharedScreen> Screens);
 
+internal sealed record TransferStatusInfo(
+    [property: JsonPropertyName("direction")] string Direction,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("bytes_done")] ulong BytesDone,
+    [property: JsonPropertyName("bytes_total")] ulong BytesTotal,
+    [property: JsonPropertyName("files_done")] int FilesDone,
+    [property: JsonPropertyName("files_total")] int FilesTotal,
+    [property: JsonPropertyName("saved_dir")] string? SavedDir,
+    [property: JsonPropertyName("error")] string? Error);
+
 internal sealed record PeerMeshSnapshot(
     string State,
     string? LocalDeviceId,
@@ -63,6 +74,7 @@ internal sealed record PeerMeshSnapshot(
     IReadOnlyList<PeerDisplayInfo> LocalDisplays,
     IReadOnlyList<DiscoveredPeerInfo> DiscoveredPeers,
     PeerSharedLayout? SharedLayout,
+    TransferStatusInfo? Transfer,
     string? Error,
     bool ProcessRunning,
     long Generation)
@@ -70,7 +82,7 @@ internal sealed record PeerMeshSnapshot(
     internal static PeerMeshSnapshot Initial => new(
         "idle", null, null, "open", false, true, true, "auto", null, null, [],
         false, null, null, null, null, null, null,
-        [], [], null, null, false, 0);
+        [], [], null, null, null, false, 0);
 }
 
 /// Manages one packaged `crossflow.exe peer` symmetric P2P LAN mesh process.
@@ -200,6 +212,10 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_keymap", enabled });
     internal Task SetClipboardAsync(bool enabled) =>
         SendCommandAsync(new { op = "set_clipboard", enabled });
+    internal Task SendFilesAsync(IReadOnlyList<string> paths) =>
+        SendCommandAsync(new { op = "send_files", paths });
+    internal Task CancelTransferAsync() =>
+        SendCommandAsync(new { op = "cancel_transfer" });
 
     private async Task SendCommandAsync(object payload)
     {
@@ -296,6 +312,7 @@ internal sealed class PeerMeshController
                             parsed.LocalDisplays ?? [],
                             parsed.DiscoveredPeers ?? [],
                             parsed.SharedLayout,
+                            parsed.Transfer,
                             parsed.Error,
                             ProcessRunning: parsed.State is not ("stopped" or "error"),
                             run.Generation);
@@ -362,6 +379,7 @@ internal sealed class PeerMeshController
         [JsonPropertyName("local_displays")] public List<PeerDisplayInfo>? LocalDisplays { get; set; }
         [JsonPropertyName("discovered_peers")] public List<DiscoveredPeerInfo>? DiscoveredPeers { get; set; }
         [JsonPropertyName("shared_layout")] public PeerSharedLayout? SharedLayout { get; set; }
+        [JsonPropertyName("transfer")] public TransferStatusInfo? Transfer { get; set; }
         [JsonPropertyName("error")] public string? Error { get; set; }
     }
 }

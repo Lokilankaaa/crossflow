@@ -4,6 +4,7 @@
 //! on macOS, with zero external crate dependencies.
 
 use snow::resolvers::{CryptoResolver, DefaultResolver};
+use std::path::PathBuf;
 
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
@@ -12,6 +13,7 @@ pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 pub enum ClipboardItem {
     Text(String),
     Png(Vec<u8>),
+    Files(Vec<PathBuf>),
 }
 
 impl ClipboardItem {
@@ -19,6 +21,7 @@ impl ClipboardItem {
         match self {
             Self::Text(_) => "text",
             Self::Png(_) => "png",
+            Self::Files(_) => "files",
         }
     }
 
@@ -26,15 +29,23 @@ impl ClipboardItem {
         match self {
             Self::Text(s) => s.as_bytes(),
             Self::Png(b) => b.as_slice(),
+            Self::Files(_) => &[],
         }
     }
 
     pub fn hash_hex(&self) -> String {
-        let tag = match self {
-            Self::Text(_) => b'T',
-            Self::Png(_) => b'P',
-        };
-        blake2s_hex(tag, self.bytes())
+        match self {
+            Self::Text(s) => blake2s_hex(b'T', s.as_bytes()),
+            Self::Png(b) => blake2s_hex(b'P', b.as_slice()),
+            Self::Files(paths) => {
+                let joined = paths
+                    .iter()
+                    .map(|p| p.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                blake2s_hex(b'F', joined.as_bytes())
+            }
+        }
     }
 }
 
@@ -255,7 +266,8 @@ fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
 #[cfg(windows)]
 mod windows_clip {
     use super::*;
-    use std::ffi::c_void;
+    use std::ffi::{OsString, c_void};
+    use std::os::windows::ffi::OsStringExt;
     use std::ptr::null_mut;
     use std::sync::OnceLock;
     use std::thread;
@@ -263,7 +275,13 @@ mod windows_clip {
 
     const CF_DIB: u32 = 8;
     const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
     const GMEM_MOVEABLE: u32 = 0x0002;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn DragQueryFileW(hdrop: *mut c_void, i_file: u32, lpsz_file: *mut u16, cch: u32) -> u32;
+    }
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -339,7 +357,34 @@ mod windows_clip {
 
     pub fn read() -> Option<ClipboardItem> {
         let _guard = ClipboardGuard::open()?;
-        // Prefer UTF-16 text first
+        // Check copied files/folders (CF_HDROP) before plain text
+        if unsafe { IsClipboardFormatAvailable(CF_HDROP) } != 0 {
+            let handle = unsafe { GetClipboardData(CF_HDROP) };
+            if !handle.is_null() {
+                let count = unsafe { DragQueryFileW(handle, 0xFFFF_FFFF, null_mut(), 0) };
+                if count > 0 && count <= 256 {
+                    let mut paths = Vec::with_capacity(count as usize);
+                    for i in 0..count {
+                        let len = unsafe { DragQueryFileW(handle, i, null_mut(), 0) };
+                        if len > 0 && len <= 4096 {
+                            let mut buf = vec![0u16; (len + 1) as usize];
+                            let copied =
+                                unsafe { DragQueryFileW(handle, i, buf.as_mut_ptr(), len + 1) };
+                            if copied > 0 {
+                                let p = PathBuf::from(OsString::from_wide(&buf[..copied as usize]));
+                                if p.exists() {
+                                    paths.push(p);
+                                }
+                            }
+                        }
+                    }
+                    if !paths.is_empty() {
+                        return Some(ClipboardItem::Files(paths));
+                    }
+                }
+            }
+        }
+        // Prefer UTF-16 text next
         if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } != 0 {
             let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
             if let Some(bytes) = copy_handle_bytes(handle, MAX_TEXT_BYTES * 2 + 4) {
@@ -419,6 +464,27 @@ mod windows_clip {
                 let fmt = png_format();
                 fmt != 0 && set_global_bytes(fmt, png)
             }
+            ClipboardItem::Files(paths) => {
+                if paths.is_empty() {
+                    return false;
+                }
+                // DROPFILES (20 bytes): pFiles=20, pt=(0,0), fNC=0, fWide=1
+                let mut buf = Vec::with_capacity(20 + paths.len() * 128);
+                buf.extend_from_slice(&20u32.to_le_bytes());
+                buf.extend_from_slice(&0i32.to_le_bytes());
+                buf.extend_from_slice(&0i32.to_le_bytes());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                for p in paths {
+                    let s = p.to_string_lossy();
+                    for w in s.encode_utf16() {
+                        buf.extend_from_slice(&w.to_le_bytes());
+                    }
+                    buf.extend_from_slice(&0u16.to_le_bytes());
+                }
+                buf.extend_from_slice(&0u16.to_le_bytes());
+                set_global_bytes(CF_HDROP, &buf)
+            }
         }
     }
 }
@@ -491,6 +557,21 @@ mod macos_clip {
             std::mem::transmute(objc_msgSend as *const ());
         f(obj, sel, bytes, len)
     }
+    unsafe fn msg1_usize_id(obj: Id, sel: Sel, idx: usize) -> Id {
+        let f: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel, idx)
+    }
+    unsafe fn msg1_id_bool(obj: Id, sel: Sel, a1: Id) -> bool {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> bool =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel, a1)
+    }
+    unsafe fn msg1_id_void(obj: Id, sel: Sel, a1: Id) {
+        let f: unsafe extern "C" fn(Id, Sel, Id) =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel, a1)
+    }
     unsafe fn msg2_id_bool(obj: Id, sel: Sel, a1: Id, a2: Id) -> bool {
         let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> bool =
             std::mem::transmute(objc_msgSend as *const ());
@@ -527,6 +608,50 @@ mod macos_clip {
             let pb = general_pasteboard();
             if pb.is_null() {
                 return None;
+            }
+            // Check Finder copied file URLs BEFORE plain text (Finder puts filenames as text too!)
+            let items = msg0_id(pb, sel_registerName(c"pasteboardItems".as_ptr()));
+            if !items.is_null() {
+                let count = msg0_usize(items, sel_registerName(c"count".as_ptr()));
+                if count > 0 && count <= 256 {
+                    let file_url_type = nsstring(c"public.file-url");
+                    let str_sel = sel_registerName(c"stringForType:".as_ptr());
+                    let obj_at_sel = sel_registerName(c"objectAtIndex:".as_ptr());
+                    let nsurl_cls = objc_getClass(c"NSURL".as_ptr());
+                    let url_with_str_sel = sel_registerName(c"URLWithString:".as_ptr());
+                    let path_sel = sel_registerName(c"path".as_ptr());
+                    let utf8_sel = sel_registerName(c"UTF8String".as_ptr());
+                    let mut paths = Vec::new();
+                    for i in 0..count {
+                        let item = msg1_usize_id(items, obj_at_sel, i);
+                        if item.is_null() {
+                            continue;
+                        }
+                        let url_str = msg1_id(item, str_sel, file_url_type);
+                        if url_str.is_null() {
+                            continue;
+                        }
+                        let url = msg1_id(nsurl_cls, url_with_str_sel, url_str);
+                        if url.is_null() {
+                            continue;
+                        }
+                        let path_ns = msg0_id(url, path_sel);
+                        if path_ns.is_null() {
+                            continue;
+                        }
+                        let ptr = msg0_ptr(path_ns, utf8_sel) as *const c_char;
+                        if !ptr.is_null() {
+                            let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+                            let p = PathBuf::from(s);
+                            if p.exists() {
+                                paths.push(p);
+                            }
+                        }
+                    }
+                    if !paths.is_empty() {
+                        return Some(ClipboardItem::Files(paths));
+                    }
+                }
             }
             // Prefer plain UTF-8 text
             let text_type = nsstring(c"public.utf8-plain-text");
@@ -594,6 +719,30 @@ mod macos_clip {
                     let ty = nsstring(c"public.png");
                     let sel = sel_registerName(c"setData:forType:".as_ptr());
                     msg2_id_bool(pb, sel, data, ty)
+                }
+                ClipboardItem::Files(paths) => {
+                    if paths.is_empty() {
+                        return false;
+                    }
+                    let arr_cls = objc_getClass(c"NSMutableArray".as_ptr());
+                    let arr = msg0_id(arr_cls, sel_registerName(c"array".as_ptr()));
+                    if arr.is_null() {
+                        return false;
+                    }
+                    let url_cls = objc_getClass(c"NSURL".as_ptr());
+                    let file_url_sel = sel_registerName(c"fileURLWithPath:".as_ptr());
+                    let add_sel = sel_registerName(c"addObject:".as_ptr());
+                    for p in paths {
+                        let Ok(cstr) = std::ffi::CString::new(p.to_string_lossy().as_ref()) else {
+                            continue;
+                        };
+                        let ns_path = nsstring(&cstr);
+                        let url = msg1_id(url_cls, file_url_sel, ns_path);
+                        if !url.is_null() {
+                            msg1_id_void(arr, add_sel, url);
+                        }
+                    }
+                    msg1_id_bool(pb, sel_registerName(c"writeObjects:".as_ptr()), arr)
                 }
             }
         }

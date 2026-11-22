@@ -89,6 +89,27 @@ struct PeerSharedLayoutWire: Sendable, Equatable, Codable {
     }
 }
 
+struct TransferStatusInfo: Sendable, Equatable, Decodable {
+    let direction: String
+    let state: String
+    let name: String
+    let bytesDone: UInt64
+    let bytesTotal: UInt64
+    let filesDone: Int
+    let filesTotal: Int
+    let savedDir: String?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case direction, state, name, error
+        case bytesDone = "bytes_done"
+        case bytesTotal = "bytes_total"
+        case filesDone = "files_done"
+        case filesTotal = "files_total"
+        case savedDir = "saved_dir"
+    }
+}
+
 struct PeerStatusWire: Sendable, Equatable, Decodable {
     let protocolVersion: Int
     let state: String
@@ -112,6 +133,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let localDisplays: [PeerDisplayInfo]
     let discoveredPeers: [DiscoveredPeerInfo]
     let sharedLayout: PeerSharedLayoutWire?
+    let transfer: TransferStatusInfo?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -137,6 +159,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case localDisplays = "local_displays"
         case discoveredPeers = "discovered_peers"
         case sharedLayout = "shared_layout"
+        case transfer
         case error
     }
 }
@@ -170,6 +193,11 @@ private struct SetKeymapCommandWire: Encodable {
 private struct SetClipboardCommandWire: Encodable {
     let op = "set_clipboard"
     let enabled: Bool
+}
+
+private struct SendFilesCommandWire: Encodable {
+    let op = "send_files"
+    let paths: [String]
 }
 
 private final class PeerProcessRunner: @unchecked Sendable {
@@ -330,6 +358,7 @@ final class PeerMeshModel {
     var localDisplays: [PeerDisplayInfo] = []
     var discoveredPeers: [DiscoveredPeerInfo] = []
     var sharedLayout: SharedLayout?
+    var transfer: TransferStatusInfo?
     var error: String?
 
     @ObservationIgnored private let runner = PeerProcessRunner()
@@ -451,6 +480,7 @@ final class PeerMeshModel {
         localDisplays = s.localDisplays
         discoveredPeers = s.discoveredPeers
         sharedLayout = s.sharedLayout?.toSharedLayout
+        transfer = s.transfer
         error = s.error
     }
 
@@ -496,6 +526,18 @@ final class PeerMeshModel {
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }
+    }
+
+    func sendFiles(_ paths: [String]) {
+        guard !paths.isEmpty else { return }
+        let cmd = SendFilesCommandWire(paths: paths)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func cancelTransfer() {
+        runner.send(Data("{\"op\":\"cancel_transfer\"}".utf8))
     }
 
     func applyLayout(_ layout: SharedLayout) {

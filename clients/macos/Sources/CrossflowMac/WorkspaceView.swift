@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 private final class RemoteCursorHider {
@@ -461,6 +462,10 @@ struct WorkspaceView: View {
                 waitingCanvas
             }
 
+            if let xfer = peer.transfer {
+                transferBar(xfer)
+            }
+
             HStack {
                 let connText: String = {
                     guard let name = peer.peerName else { return "正在自动发现附近设备…" }
@@ -469,7 +474,7 @@ struct WorkspaceView: View {
                 }()
                 Text(connText)
                 Spacer()
-                Text("对等架构 · Windows ↔ Mac 双向跨屏")
+                Text("支持复制文件或拖入窗口跨屏直传")
             }
             .font(.system(size: 12))
             .foregroundStyle(Theme.secondary)
@@ -477,6 +482,97 @@ struct WorkspaceView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.background)
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard peer.peerDeviceID != nil else { return false }
+            handleFileDrop(providers)
+            return true
+        }
+    }
+
+    private func handleFileDrop(_ providers: [NSItemProvider]) {
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var collected: [String] = []
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    lock.withLock { collected.append(url.path) }
+                } else if let url = item as? URL {
+                    lock.withLock { collected.append(url.path) }
+                }
+            }
+        }
+        group.notify(queue: .main) {
+            let paths = lock.withLock { collected }
+            if !paths.isEmpty {
+                peer.sendFiles(paths)
+            }
+        }
+    }
+
+    private func transferBar(_ xfer: TransferStatusInfo) -> some View {
+        let pct = xfer.bytesTotal > 0 ? min(1.0, Double(xfer.bytesDone) / Double(xfer.bytesTotal)) : (xfer.state == "completed" ? 1.0 : 0.0)
+        return HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(transferTitle(xfer))
+                    .font(.system(size: 12, weight: .semibold))
+                if xfer.state == "active" {
+                    ProgressView(value: pct)
+                        .progressViewStyle(.linear)
+                }
+                Text(transferSubtitle(xfer, pct: pct))
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.secondary)
+            }
+            Spacer()
+            if xfer.state == "active" {
+                Button("取消") { peer.cancelTransfer() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            } else if xfer.state == "completed", let dir = xfer.savedDir {
+                Button("打开文件夹") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border, lineWidth: 1))
+    }
+
+    private func transferTitle(_ xfer: TransferStatusInfo) -> String {
+        switch xfer.state {
+        case "active": return (xfer.direction == "sending" ? "正在发送：" : "正在接收：") + xfer.name
+        case "completed": return xfer.direction == "sending" ? "已发送：\(xfer.name)" : "已接收：\(xfer.name)（可直接粘贴）"
+        case "cancelled": return "已取消传输：\(xfer.name)"
+        default: return "传输失败：\(xfer.name)"
+        }
+    }
+
+    private func transferSubtitle(_ xfer: TransferStatusInfo, pct: Double) -> String {
+        switch xfer.state {
+        case "active":
+            return "\(formatBytes(xfer.bytesDone)) / \(formatBytes(xfer.bytesTotal)) · \(Int(pct * 100))%（\(xfer.filesDone)/\(xfer.filesTotal)）"
+        case "completed":
+            if let dir = xfer.savedDir { return "已保存至 \(dir)" }
+            return "\(formatBytes(xfer.bytesTotal)) · 校验通过"
+        case "cancelled":
+            return "临时文件已清理"
+        default:
+            return xfer.error ?? "请重试"
+        }
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
+        if bytes >= 1024 * 1024 * 1024 { return String(format: "%.2f GB", Double(bytes) / 1_073_741_824.0) }
+        if bytes >= 1024 * 1024 { return String(format: "%.1f MB", Double(bytes) / 1_048_576.0) }
+        if bytes >= 1024 { return String(format: "%.1f KB", Double(bytes) / 1024.0) }
+        return "\(bytes) B"
     }
 
     private func commitLayout(_ candidate: SharedLayout, recordUndo: Bool) {

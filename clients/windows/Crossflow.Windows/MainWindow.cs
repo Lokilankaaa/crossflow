@@ -1,10 +1,13 @@
+using System.Diagnostics;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
+using Windows.Storage;
 using Windows.System;
 
 namespace Crossflow.Windows;
@@ -51,6 +54,12 @@ internal sealed class MainWindow : Window
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
     private readonly InfoBar notice = new() { IsOpen = false, IsClosable = true };
+    private readonly Border transferBar = new() { Visibility = Visibility.Collapsed };
+    private readonly TextBlock transferTitle = new() { FontSize = 12, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold };
+    private readonly TextBlock transferDetail = new() { FontSize = 11 };
+    private readonly ProgressBar transferProgress = new() { Minimum = 0, Maximum = 100, Height = 4 };
+    private readonly Button transferActionButton = new();
+    private string? transferSavedDir;
     private readonly Canvas canvas = new();
     private readonly TextBlock footerStatus = new();
 
@@ -339,6 +348,33 @@ internal sealed class MainWindow : Window
         workspace.RowDefinitions.Add(new() { Height = GridLength.Auto });
         workspace.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
         workspace.RowDefinitions.Add(new() { Height = GridLength.Auto });
+        workspace.RowDefinitions.Add(new() { Height = GridLength.Auto });
+
+        // Drag & drop files anywhere onto workspace to send directly to peer!
+        workspace.AllowDrop = true;
+        workspace.DragOver += (_, e) =>
+        {
+            if (currentSnap.PeerDeviceId is not null && e.DataView.Contains(StandardDataFormats.StorageItems))
+            {
+                e.AcceptedOperation = DataPackageOperation.Copy;
+                e.DragUIOverride.Caption = $"发送到 {currentSnap.PeerName ?? "对方设备"}";
+            }
+            else
+            {
+                e.AcceptedOperation = DataPackageOperation.None;
+            }
+        };
+        workspace.Drop += async (_, e) =>
+        {
+            if (currentSnap.PeerDeviceId is null || !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+            try
+            {
+                var items = await e.DataView.GetStorageItemsAsync();
+                var paths = items.Select(i => i.Path).Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
+                if (paths.Count > 0) await peerMesh.SendFilesAsync(paths);
+            }
+            catch { }
+        };
 
         var header = new Grid { Margin = new Thickness(0, 0, 0, 14) };
         header.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
@@ -377,11 +413,43 @@ internal sealed class MainWindow : Window
         Grid.SetRow(board, 2);
         workspace.Children.Add(board);
 
+        // Compact File Transfer Bar (only visible during/right after transfer)
+        var xferGrid = new Grid { ColumnSpacing = 12 };
+        xferGrid.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        xferGrid.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        var xferInfo = new StackPanel { Spacing = 4 };
+        transferTitle.Foreground = theme.Brush("text");
+        transferDetail.Foreground = theme.Brush("text_secondary");
+        xferInfo.Children.Add(transferTitle);
+        xferInfo.Children.Add(transferProgress);
+        xferInfo.Children.Add(transferDetail);
+        xferGrid.Children.Add(xferInfo);
+        StyleCompactButton(transferActionButton, "取消");
+        transferActionButton.VerticalAlignment = VerticalAlignment.Center;
+        transferActionButton.Click += async (_, _) =>
+        {
+            if (currentSnap.Transfer?.State == "active")
+                await peerMesh.CancelTransferAsync();
+            else if (!string.IsNullOrEmpty(transferSavedDir))
+                try { Process.Start(new ProcessStartInfo("explorer.exe", $"\"{transferSavedDir}\"") { UseShellExecute = true }); } catch { }
+        };
+        Grid.SetColumn(transferActionButton, 1);
+        xferGrid.Children.Add(transferActionButton);
+        transferBar.Child = xferGrid;
+        transferBar.Background = theme.Brush("surface");
+        transferBar.BorderBrush = theme.Brush("border");
+        transferBar.BorderThickness = new Thickness(1);
+        transferBar.CornerRadius = new CornerRadius(10);
+        transferBar.Padding = new Thickness(14, 10, 14, 10);
+        transferBar.Margin = new Thickness(0, 10, 0, 0);
+        Grid.SetRow(transferBar, 3);
+        workspace.Children.Add(transferBar);
+
         footerStatus.FontSize = 12;
         footerStatus.Foreground = theme.Brush("text_secondary");
         footerStatus.Margin = new Thickness(2, 12, 0, 0);
-        footerStatus.Text = "快捷键：Ctrl + Alt + 空格 暂停/恢复 · Ctrl + Alt + Esc 紧急暂停";
-        Grid.SetRow(footerStatus, 3);
+        footerStatus.Text = "快捷键：Ctrl + Alt + 空格 暂停/恢复 · Ctrl + Alt + Esc 紧急暂停 · 支持复制文件或拖入窗口跨屏直传";
+        Grid.SetRow(footerStatus, 4);
         workspace.Children.Add(footerStatus);
 
         Grid.SetColumn(workspace, 1);
@@ -585,9 +653,59 @@ internal sealed class MainWindow : Window
         }
 
         RenderDiscoveredPeers(snap);
+        UpdateTransferBar(snap.Transfer);
         SyncCanvasFromSnapshot(snap);
         UpdateControls();
     }
+
+    private void UpdateTransferBar(TransferStatusInfo? xfer)
+    {
+        if (xfer is null)
+        {
+            transferBar.Visibility = Visibility.Collapsed;
+            return;
+        }
+        transferBar.Visibility = Visibility.Visible;
+        transferSavedDir = xfer.SavedDir;
+        string dirLabel = xfer.Direction == "sending" ? "正在发送" : "正在接收";
+        double pct = xfer.BytesTotal > 0 ? Math.Min(100.0, xfer.BytesDone * 100.0 / xfer.BytesTotal) : (xfer.State == "completed" ? 100.0 : 0.0);
+        transferProgress.Value = pct;
+        transferProgress.Visibility = xfer.State == "active" ? Visibility.Visible : Visibility.Collapsed;
+
+        switch (xfer.State)
+        {
+            case "active":
+                transferTitle.Text = $"{dirLabel}：{xfer.Name}";
+                transferDetail.Text = $"{FormatBytes(xfer.BytesDone)} / {FormatBytes(xfer.BytesTotal)} · {pct:0}%（{xfer.FilesDone}/{xfer.FilesTotal}）";
+                transferActionButton.Content = "取消";
+                transferActionButton.Visibility = Visibility.Visible;
+                break;
+            case "completed":
+                transferTitle.Text = xfer.Direction == "sending" ? $"已发送：{xfer.Name}" : $"已接收：{xfer.Name}（可直接粘贴）";
+                transferDetail.Text = xfer.SavedDir is not null ? $"已保存至 {xfer.SavedDir}" : $"{FormatBytes(xfer.BytesTotal)} · 校验通过";
+                transferActionButton.Content = "打开文件夹";
+                transferActionButton.Visibility = xfer.SavedDir is not null ? Visibility.Visible : Visibility.Collapsed;
+                break;
+            case "cancelled":
+                transferTitle.Text = $"已取消传输：{xfer.Name}";
+                transferDetail.Text = "临时文件已清理";
+                transferActionButton.Visibility = Visibility.Collapsed;
+                break;
+            default:
+                transferTitle.Text = $"传输失败：{xfer.Name}";
+                transferDetail.Text = xfer.Error ?? "请重试";
+                transferActionButton.Visibility = Visibility.Collapsed;
+                break;
+        }
+    }
+
+    private static string FormatBytes(ulong bytes) => bytes switch
+    {
+        >= 1024UL * 1024 * 1024 => $"{bytes / (1024.0 * 1024 * 1024):0.##} GB",
+        >= 1024UL * 1024 => $"{bytes / (1024.0 * 1024):0.#} MB",
+        >= 1024UL => $"{bytes / 1024.0:0.#} KB",
+        _ => $"{bytes} B"
+    };
 
     private void SyncChannelSelector(PeerMeshSnapshot snap)
     {

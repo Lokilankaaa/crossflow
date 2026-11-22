@@ -139,6 +139,7 @@ struct PeerUiStatus {
     local_displays: Vec<Display>,
     discovered_peers: Vec<DiscoveredPeerInfo>,
     shared_layout: Option<SharedLayout>,
+    transfer: Option<crate::aux_channel::TransferStatus>,
     error: Option<String>,
 }
 
@@ -165,6 +166,10 @@ enum UiCommand {
     SetClipboard {
         enabled: bool,
     },
+    SendFiles {
+        paths: Vec<String>,
+    },
+    CancelTransfer,
 }
 
 fn app_data_root() -> Result<PathBuf> {
@@ -605,6 +610,7 @@ struct PeerHost<'a> {
     config: &'a mut PeerConfig,
     smart_keymap_flag: &'a Arc<AtomicBool>,
     clipboard_sync_flag: &'a Arc<AtomicBool>,
+    aux: Option<&'a crate::aux_channel::AuxSession>,
     reconfigure_requested: &'a mut bool,
     network_channels: Vec<NetworkChannelInfo>,
     active_channel_label: Option<String>,
@@ -714,6 +720,17 @@ impl PeerHost<'_> {
                     self.clipboard_sync_flag.store(enabled, Ordering::Relaxed);
                     save_config(self.config);
                 }
+                Ok(UiCommand::SendFiles { paths }) => {
+                    if let Some(aux) = self.aux {
+                        let list: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+                        aux.send_files(list);
+                    }
+                }
+                Ok(UiCommand::CancelTransfer) => {
+                    if let Some(aux) = self.aux {
+                        aux.cancel_transfer();
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.global_stop.store(true, Ordering::Release);
@@ -798,9 +815,11 @@ impl Host for PeerHost<'_> {
             self.pending = Some(Command::Enable { epoch: self.epoch });
         }
         let discovered = self.discovered_list();
+        let transfer = self.aux.and_then(|a| a.current_transfer());
         let state_changed = self.last_emitted_enabled != Some(status.endpoint.enabled)
             || self.last_emitted_focus_screen != status.focus_screen_id
-            || self.last_emitted_peer_count != discovered.len();
+            || self.last_emitted_peer_count != discovered.len()
+            || transfer.as_ref().is_some_and(|t| t.state == "active");
         if state_changed
             || self.last_emit.elapsed() >= Duration::from_millis(250)
             || self.pending.is_some()
@@ -839,6 +858,7 @@ impl Host for PeerHost<'_> {
                     local_displays: self.local_displays.clone(),
                     discovered_peers: discovered,
                     shared_layout: Some(status.shared_layout.clone()),
+                    transfer,
                     error: None,
                 },
             );
@@ -904,6 +924,7 @@ pub fn run(
                     local_displays: vec![],
                     discovered_peers: vec![],
                     shared_layout: None,
+                    transfer: None,
                     error: Some(permission.message().to_string()),
                 },
             );
@@ -1041,6 +1062,7 @@ pub fn run(
                             clipboard_sync_flag.store(enabled, Ordering::Relaxed);
                             save_config(&config);
                         }
+                        Ok(UiCommand::SendFiles { .. } | UiCommand::CancelTransfer) => {}
                         Err(TryRecvError::Empty) => break,
                     }
                 }
@@ -1090,6 +1112,7 @@ pub fn run(
                                 })
                                 .collect(),
                             shared_layout: None,
+                            transfer: None,
                             error: last_error.clone(),
                         },
                     );
@@ -1268,7 +1291,7 @@ pub fn run(
                     }
                 };
 
-                let _aux_session = peer_sock.map(|sock| {
+                let aux_session = peer_sock.map(|sock| {
                     crate::aux_channel::AuxSession::spawn(
                         aux_listener.clone(),
                         sock,
@@ -1297,6 +1320,7 @@ pub fn run(
                         config: &mut config,
                         smart_keymap_flag: &smart_keymap_flag,
                         clipboard_sync_flag: &clipboard_sync_flag,
+                        aux: aux_session.as_ref(),
                         reconfigure_requested: &mut reconfigure_requested,
                         network_channels: channel_infos(&local_channels),
                         active_channel_label,
@@ -1399,6 +1423,7 @@ pub fn run(
             local_displays: vec![],
             discovered_peers: vec![],
             shared_layout: None,
+            transfer: None,
             error: result.as_ref().err().map(|e| format!("{e:#}")),
         },
     );
