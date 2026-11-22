@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -6,6 +7,17 @@ namespace Crossflow.Windows;
 
 internal static class Program
 {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string lpWindowName);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    private static Mutex? singleInstanceMutex;
+
     [STAThread]
     private static void Main(string[] args)
     {
@@ -21,6 +33,17 @@ internal static class Program
         if (args.Length == 2 && args[0] == "--session-fixture") { SessionSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--session-self-test") { SessionSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--self-test") { SelfTest.Run(args[1]); return; }
+        singleInstanceMutex = new Mutex(true, @"Local\Crossflow.Windows.SingleInstance", out bool createdNew);
+        if (!createdNew)
+        {
+            var existing = FindWindow(null, "Crossflow");
+            if (existing != IntPtr.Zero)
+            {
+                ShowWindow(existing, 9); // SW_RESTORE
+                SetForegroundWindow(existing);
+            }
+            return;
+        }
         StartupDiagnostics.Write("startup-enter");
         AppDomain.CurrentDomain.UnhandledException += (_, failure) => StartupDiagnostics.Write("domain-unhandled", failure.ExceptionObject as Exception);
         try

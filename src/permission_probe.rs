@@ -82,8 +82,8 @@ pub struct ProbeConfig {
 impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_millis(25),
-            max_success_age: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(250),
+            max_success_age: Duration::from_millis(2000),
         }
     }
 }
@@ -92,7 +92,7 @@ impl ProbeConfig {
         if self.poll_interval.is_zero()
             || self.max_success_age.is_zero()
             || self.poll_interval > self.max_success_age
-            || self.max_success_age > Duration::from_millis(100)
+            || self.max_success_age > Duration::from_secs(10)
         {
             return Err(ProbeFailure::InvalidConfig);
         }
@@ -359,11 +359,11 @@ mod tests {
                 ..Default::default()
             },
             ProbeConfig {
-                max_success_age: Duration::from_millis(101),
+                max_success_age: Duration::from_millis(10_001),
                 ..Default::default()
             },
             ProbeConfig {
-                max_success_age: Duration::from_millis(20),
+                max_success_age: Duration::from_millis(200),
                 ..Default::default()
             },
         ] {
@@ -437,7 +437,7 @@ mod tests {
         )
         .unwrap();
         entry.recv_timeout(Duration::from_secs(2)).unwrap();
-        time.store(101, Ordering::Release);
+        time.store(2001, Ordering::Release);
         assert_eq!(probe.check(), Err(ProbeFailure::Stale));
         let shared = probe.state.clone();
         let started = Instant::now();

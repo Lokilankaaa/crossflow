@@ -19,8 +19,8 @@ use std::time::Instant;
 
 pub const ORIGIN_MARKER: i64 = 0x4352_464c;
 const CAPACITY: usize = 512;
-const LEASE_NS: u64 = 100_000_000;
-const STALL_NS: u64 = 250_000_000;
+const LEASE_NS: u64 = 400_000_000;
+const STALL_NS: u64 = 1_500_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CaptureKind {
@@ -86,6 +86,23 @@ pub enum StopReason {
     CallbackPanicked,
     SetupFailed,
     FocusRace,
+}
+impl StopReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "native capture stopped (requested)",
+            Self::EmergencyShortcut => "local emergency shortcut",
+            Self::QueueOverflow => "native capture stopped (queue overflow)",
+            Self::TapDisabled => "native capture stopped (event tap disabled by macOS)",
+            Self::PermissionsLost => "native capture stopped (permissions lost or probe stale)",
+            Self::SleepOrStall => "native capture stopped (run loop stall or sleep)",
+            Self::FocusLeaseExpired => "native capture stopped (focus lease expired)",
+            Self::UnsupportedInput => "native capture stopped (unsupported input)",
+            Self::CallbackPanicked => "native capture stopped (callback panicked)",
+            Self::SetupFailed => "native capture stopped (setup failed)",
+            Self::FocusRace => "native capture stopped (focus handoff race)",
+        }
+    }
 }
 fn reason(value: u8) -> Option<StopReason> {
     Some(match value {
@@ -972,7 +989,11 @@ mod native {
                 snapshot.buttons.push(button(number).unwrap());
             }
         }
-        shared.remote(clock.now());
+        // Refresh loop_tick after sampling 128 keys so startup latency is never
+        // misclassified as a run-loop stall.
+        let ready_now = clock.now();
+        shared.loop_tick.store(ready_now, Ordering::Release);
+        shared.remote(ready_now);
         if state
             .permission
             .as_ref()

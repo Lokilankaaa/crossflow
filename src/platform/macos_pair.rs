@@ -172,7 +172,7 @@ impl<T: NativeTap> MacPairCapture<T> {
             if reason == StopReason::EmergencyShortcut {
                 self.halt("local emergency shortcut", None);
             } else {
-                self.fail("native capture stopped");
+                self.fail(reason.label());
             }
         } else if self.source.status().failure.is_some() {
             self.fail("reverse capture/source failed");

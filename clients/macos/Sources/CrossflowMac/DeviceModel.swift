@@ -31,11 +31,12 @@ final class DeviceModel {
     enum Operation { case invitation, receiver }
     var devices: [SavedDevice] = []
     var selectedID: String?
-    var deviceName = "这台 Mac"
+    var deviceName = Host.current().localizedName ?? "这台 Mac"
     var code = ""
     var confirmation: Confirmation?
     var approved = false
     var message = "选择已配对电脑，或添加新电脑。"
+    var lastError: String?
     var listMessage = ""
     var loading = false
     var operation: Operation?
@@ -44,6 +45,7 @@ final class DeviceModel {
     var cleanupUnconfirmed = false
     var stopping = false
     var stopPending = false
+    var userPaused = false
     @ObservationIgnored private let process = NativeProcessClient()
     @ObservationIgnored private let listing = NativeProcessClient()
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -149,6 +151,8 @@ final class DeviceModel {
 
     func receive() {
         guard canStart, let selected, let executable = executable("crossflow") else { return }
+        userPaused = false
+        lastError = nil
         do {
             let logs = try logDirectoryOverride ?? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                    appropriateFor: nil, create: true)
@@ -163,6 +167,26 @@ final class DeviceModel {
             let current = generation
             task = Task { await run(executable, arguments: arguments, timeout: 3620, generation: current) }
         } catch { message = "无法创建本地运行记录，请检查磁盘空间。" }
+    }
+
+    func ensureListeningIfReady() {
+        guard !userPaused, canStart, selected != nil, !loading,
+              receiverState != .startupRejected, lastError == nil else { return }
+        receive()
+    }
+
+    func resetErrorAndRetry() {
+        guard operation == nil, !stopPending, !shuttingDown else { return }
+        cleanupUnconfirmed = false
+        lastError = nil
+        userPaused = false
+        receiverState = nil
+        receive()
+    }
+
+    func pauseListening() {
+        userPaused = true
+        stop()
     }
 
     private func beginOperation(_ value: Operation) {
@@ -205,7 +229,11 @@ final class DeviceModel {
                     // confirmed ordinary exit, rather than a signal or kill.
                     message = startupRejectionMessage
                 } else {
-                    message = "接收未正常完成，请检查系统权限或运行记录。"
+                    if let lastError, !lastError.isEmpty {
+                        message = "接收中断：\(lastError)"
+                    } else {
+                        message = "接收未正常完成，请检查系统权限或运行记录。"
+                    }
                     cleanupUnconfirmed = true
                 }
             } else if exit == 0, let savedID, !invalidEvent {
@@ -280,7 +308,10 @@ final class DeviceModel {
                     else { message = "共享已开启 · 等待光标位置。" }
                 case .stopping: message = "正在停止并释放输入…"
                 case .stopped: message = "接收已停止。"
-                case .error: message = "接收出现错误，请检查系统权限或运行记录。"
+                case .error:
+                    let detail = status.error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    lastError = detail.isEmpty ? "接收出现错误" : detail
+                    message = detail.isEmpty ? "接收出现错误，请重试或检查系统权限。" : "接收中断：\(detail)"
                 case .startupRejected: message = "输入权限未开启，正在确认接收进程退出…"
                 }
             }
