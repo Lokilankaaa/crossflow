@@ -460,9 +460,16 @@ fn with_policy(f: impl FnOnce(&mut HookState) -> Decision) -> bool {
 }
 
 unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
     if code >= 0 && lparam != 0 {
         let input = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        if input.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) == 0 {
+        let is_media_vk = matches!(input.vkCode, 0xAD..=0xB1 | 0xB3);
+        // OEM laptop Fn-key daemons and Windows HID Input Service (`hidserv`) often
+        // deliver Fn + Volume/Mute/Media keys with LLKHF_INJECTED set. Accept media
+        // keys unless they carry Crossflow's own INPUT_ORIGIN_TAG.
+        let accept = (input.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) == 0)
+            || (is_media_vk && input.dwExtraInfo != INPUT_ORIGIN_TAG);
+        if accept {
             let suppress = with_policy(|state| {
                 let remote =
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);

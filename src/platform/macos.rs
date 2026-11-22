@@ -551,6 +551,82 @@ fn mac_media_keytype(usage: u16) -> Option<i32> {
 }
 
 fn post_mac_media_key(key_type: i32, down: bool) {
+    // Primary (macOS 11+ / Apple Silicon Sequoia): build an NX_SYSDEFINED (type 14,
+    // subtype 8) NSEvent, extract its CGEvent, tag ORIGIN_MARKER so macos_capture
+    // never loops it back, and post via CGEventPost(HID_EVENT_TAP).
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {}
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+        fn objc_msgSend();
+    }
+
+    let state_byte: isize = if down { 0x0A } else { 0x0B };
+    let data1: isize = ((key_type as isize) << 16) | (state_byte << 8);
+    let flags: usize = (state_byte as usize) << 8;
+
+    let posted_via_cgevent = unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let ok = (|| -> bool {
+            let cls = objc_getClass(c"NSEvent".as_ptr());
+            if cls.is_null() {
+                return false;
+            }
+            type MakeOther = extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                usize,
+                CGPoint,
+                usize,
+                f64,
+                isize,
+                *mut c_void,
+                i16,
+                isize,
+                isize,
+            ) -> *mut c_void;
+            let make_other: MakeOther = std::mem::transmute(objc_msgSend as *const ());
+            let sel_make = sel_registerName(
+                c"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:".as_ptr(),
+            );
+            let ns_ev = make_other(
+                cls,
+                sel_make,
+                14, // NSEventTypeSystemDefined
+                CGPoint { x: 0.0, y: 0.0 },
+                flags,
+                0.0,
+                0,
+                std::ptr::null_mut(),
+                8, // NX_SUBTYPE_AUX_CONTROL_BUTTONS
+                data1,
+                -1,
+            );
+            if ns_ev.is_null() {
+                return false;
+            }
+            let get_cg: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let cg = get_cg(ns_ev, sel_registerName(c"CGEvent".as_ptr()));
+            if cg.is_null() {
+                return false;
+            }
+            CGEventSetIntegerValueField(cg, EVENT_SOURCE_USER_DATA, ORIGIN_MARKER);
+            CGEventPost(HID_EVENT_TAP, cg);
+            true
+        })();
+        objc_autoreleasePoolPop(pool);
+        ok
+    };
+    if posted_via_cgevent {
+        return;
+    }
+
+    // Fallback: legacy IOHIDPostEvent
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct IoGPoint {
@@ -608,13 +684,12 @@ fn post_mac_media_key(key_type: i32, down: bool) {
         if IOServiceOpen(svc, mach_task_self_, K_IOHID_PARAM_CONNECT_TYPE, &mut conn) == 0
             && conn != 0
         {
-            let state_byte = if down { 0x0A } else { 0x0B };
             let mut data = NxEventData {
                 reserved: 0,
                 sub_type: NX_SUBTYPE_AUX_CONTROL_BUTTONS,
                 l: [0; 11],
             };
-            data.l[0] = (key_type << 16) | (state_byte << 8);
+            data.l[0] = data1 as i32;
             let _ = IOHIDPostEvent(
                 conn,
                 NX_SYSDEFINED,
