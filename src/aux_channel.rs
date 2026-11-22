@@ -743,11 +743,149 @@ fn recv_file_batch(
     outcome
 }
 
+enum AuxOutbound {
+    Files(Vec<PathBuf>),
+    Clipboard { item: ClipboardItem, hash: String },
+}
+
+#[derive(Default)]
+struct SharedClipEcho {
+    last_token: u64,
+    pending_empty_token: Option<(u64, u8)>,
+    last_sent_hash: Option<String>,
+    last_remote_hash: Option<String>,
+}
+
+/// Shared multi-peer auxiliary hub on port `main_port + 1`:
+/// - Accepts inbound aux connections from arbitrary mesh peers concurrently and
+///   dispatches each Noise-verified `(TcpStream, SecureChannel)` by `remote_id`.
+/// - Centralizes local OS clipboard polling into ONE single reader (avoiding Win32
+///   `OpenClipboard` contention across N peers) with mesh-wide BLAKE2s echo suppression.
+#[derive(Clone)]
+pub struct AuxMeshHub {
+    pending_inbound: Arc<Mutex<HashMap<String, (TcpStream, SecureChannel)>>>,
+    clip_echo: Arc<Mutex<SharedClipEcho>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl AuxMeshHub {
+    pub fn start(
+        listener: Option<Arc<TcpListener>>,
+        local_device_id: String,
+        passphrase: Option<String>,
+    ) -> Self {
+        let pending_inbound: Arc<Mutex<HashMap<String, (TcpStream, SecureChannel)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let clip_echo = Arc::new(Mutex::new(SharedClipEcho {
+            last_token: clipboard::change_token(),
+            pending_empty_token: None,
+            last_sent_hash: None,
+            last_remote_hash: None,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Some(listener) = listener {
+            let inbound = pending_inbound.clone();
+            let stop_flag = stop.clone();
+            let _ = thread::Builder::new()
+                .name("crossflow-aux-acceptor".into())
+                .spawn(move || {
+                    while !stop_flag.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((mut stream, _addr)) => {
+                                let dev = local_device_id.clone();
+                                let pass = passphrase.clone();
+                                let inbound_map = inbound.clone();
+                                let _ = thread::Builder::new()
+                                    .name("crossflow-aux-handshake".into())
+                                    .spawn(move || {
+                                        let _ = stream.set_nonblocking(false);
+                                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                                        if let Ok((ch, remote_id)) = security::handshake_lan_psk(
+                                            &mut stream,
+                                            &dev,
+                                            pass.as_deref(),
+                                            false,
+                                        ) && let Ok(mut guard) = inbound_map.lock()
+                                        {
+                                            guard.insert(remote_id, (stream, ch));
+                                        }
+                                    });
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+        }
+        Self {
+            pending_inbound,
+            clip_echo,
+            stop,
+        }
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
+    fn take_inbound(&self, remote_id: &str) -> Option<(TcpStream, SecureChannel)> {
+        self.pending_inbound.lock().ok()?.remove(remote_id)
+    }
+
+    /// Poll local OS clipboard once for the entire N-peer mesh.
+    /// Returns `Some((item, hash))` when new non-echo clipboard content is ready to broadcast.
+    pub fn poll_local_clipboard(&self) -> Option<(ClipboardItem, String)> {
+        let mut st = self.clip_echo.lock().ok()?;
+        let token = clipboard::change_token();
+        let should_read = if token != st.last_token {
+            st.pending_empty_token = Some((token, 0));
+            st.last_token = token;
+            true
+        } else if let Some((tok, retries)) = st.pending_empty_token {
+            if tok == token && retries < 3 {
+                st.pending_empty_token = Some((tok, retries + 1));
+                true
+            } else {
+                st.pending_empty_token = None;
+                false
+            }
+        } else {
+            false
+        };
+        if !should_read {
+            return None;
+        }
+        let item = clipboard::read()?;
+        st.pending_empty_token = None;
+        let hash = item.hash_hex();
+        let is_echo = st.last_remote_hash.as_deref() == Some(hash.as_str())
+            || st.last_sent_hash.as_deref() == Some(hash.as_str());
+        if is_echo {
+            return None;
+        }
+        st.last_sent_hash = Some(hash.clone());
+        st.last_remote_hash = None;
+        Some((item, hash))
+    }
+
+    fn record_remote_clipboard_write(&self, hash: String) {
+        if let Ok(mut st) = self.clip_echo.lock() {
+            st.last_remote_hash = Some(hash);
+            st.last_sent_hash = None;
+            st.last_token = clipboard::change_token();
+            st.pending_empty_token = None;
+        }
+    }
+}
+
 pub struct AuxSession {
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     push_state_now: Arc<AtomicBool>,
-    send_tx: Sender<Vec<PathBuf>>,
+    send_tx: Sender<AuxOutbound>,
     transfer_slot: Arc<Mutex<Option<(TransferStatus, Instant)>>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -780,6 +918,61 @@ impl AuxSession {
             .spawn(move || {
                 let _ = run_aux(
                     aux_listener,
+                    None,
+                    peer_main_addr,
+                    initiator,
+                    &local_device_id,
+                    &expected_remote_id,
+                    passphrase.as_deref(),
+                    &clipboard_enabled,
+                    &input_state_sync_enabled,
+                    &local_has_focus,
+                    &worker_push,
+                    send_rx,
+                    &worker_cancel,
+                    &worker_slot,
+                    &worker_stop,
+                );
+            })
+            .ok();
+        Self {
+            stop,
+            cancel,
+            push_state_now,
+            send_tx,
+            transfer_slot,
+            worker,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_mesh_peer(
+        hub: AuxMeshHub,
+        peer_main_addr: SocketAddr,
+        initiator: bool,
+        local_device_id: String,
+        expected_remote_id: String,
+        passphrase: Option<String>,
+        clipboard_enabled: Arc<AtomicBool>,
+        input_state_sync_enabled: Arc<AtomicBool>,
+        local_has_focus: Arc<AtomicBool>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let push_state_now = Arc::new(AtomicBool::new(false));
+        let transfer_slot = Arc::new(Mutex::new(None));
+        let (send_tx, send_rx) = mpsc::channel();
+
+        let worker_stop = stop.clone();
+        let worker_cancel = cancel.clone();
+        let worker_push = push_state_now.clone();
+        let worker_slot = transfer_slot.clone();
+        let worker = thread::Builder::new()
+            .name("crossflow-mesh-aux".into())
+            .spawn(move || {
+                let _ = run_aux(
+                    None,
+                    Some(hub),
                     peer_main_addr,
                     initiator,
                     &local_device_id,
@@ -812,8 +1005,12 @@ impl AuxSession {
 
     pub fn send_files(&self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
-            let _ = self.send_tx.send(paths);
+            let _ = self.send_tx.send(AuxOutbound::Files(paths));
         }
+    }
+
+    pub fn push_clipboard(&self, item: ClipboardItem, hash: String) {
+        let _ = self.send_tx.send(AuxOutbound::Clipboard { item, hash });
     }
 
     pub fn cancel_transfer(&self) {
@@ -844,6 +1041,7 @@ impl Drop for AuxSession {
 #[allow(clippy::too_many_arguments)]
 fn run_aux(
     aux_listener: Option<Arc<TcpListener>>,
+    mesh_hub: Option<AuxMeshHub>,
     peer_main_addr: SocketAddr,
     initiator: bool,
     local_device_id: &str,
@@ -853,61 +1051,79 @@ fn run_aux(
     input_state_sync_enabled: &AtomicBool,
     local_has_focus: &AtomicBool,
     push_state_now: &AtomicBool,
-    send_rx: Receiver<Vec<PathBuf>>,
+    send_rx: Receiver<AuxOutbound>,
     cancel: &AtomicBool,
     transfer_slot: &Mutex<Option<(TransferStatus, Instant)>>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let mut stream = if initiator {
-        let target = SocketAddr::new(
-            peer_main_addr.ip(),
-            peer_main_addr.port().saturating_add(1),
-        );
-        let mut connected = None;
-        for _ in 0..8 {
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if let Ok(s) = TcpStream::connect_timeout(&target, Duration::from_millis(350)) {
-                connected = Some(s);
-                break;
-            }
-            thread::sleep(Duration::from_millis(150));
-        }
-        let Some(s) = connected else {
-            return Ok(());
-        };
-        s
-    } else {
-        let Some(listener) = aux_listener else {
-            return Ok(());
-        };
-        let deadline = Instant::now() + Duration::from_secs(3);
+    let (mut stream, mut ch) = if let Some(ref hub) = mesh_hub
+        && !initiator
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut accepted = None;
         while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-            match listener.accept() {
-                Ok((s, addr)) if addr.ip() == peer_main_addr.ip() => {
-                    accepted = Some(s);
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(30));
-                }
-                Err(_) => return Ok(()),
+            if let Some(pair) = hub.take_inbound(expected_remote_id) {
+                accepted = Some(pair);
+                break;
             }
+            thread::sleep(Duration::from_millis(25));
         }
-        let Some(s) = accepted else {
+        let Some(pair) = accepted else {
             return Ok(());
         };
-        s
+        pair
+    } else {
+        let mut stream = if initiator {
+            let target = SocketAddr::new(
+                peer_main_addr.ip(),
+                peer_main_addr.port().saturating_add(1),
+            );
+            let mut connected = None;
+            for _ in 0..10 {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if let Ok(s) = TcpStream::connect_timeout(&target, Duration::from_millis(350)) {
+                    connected = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            let Some(s) = connected else {
+                return Ok(());
+            };
+            s
+        } else {
+            let Some(listener) = aux_listener else {
+                return Ok(());
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut accepted = None;
+            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((s, addr)) if addr.ip() == peer_main_addr.ip() => {
+                        accepted = Some(s);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(30));
+                    }
+                    Err(_) => return Ok(()),
+                }
+            }
+            let Some(s) = accepted else {
+                return Ok(());
+            };
+            s
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let (ch, remote_id) =
+            security::handshake_lan_psk(&mut stream, local_device_id, passphrase, initiator)?;
+        ensure!(remote_id == expected_remote_id, "aux peer identity mismatch");
+        (stream, ch)
     };
-
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let (mut ch, remote_id) =
-        security::handshake_lan_psk(&mut stream, local_device_id, passphrase, initiator)?;
-    ensure!(remote_id == expected_remote_id, "aux peer identity mismatch");
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -925,9 +1141,9 @@ fn run_aux(
     let mut last_ping = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
-        // 1. Explicit drag-and-drop / send_files requests from UI
+        // 1. Explicit drag-and-drop / send_files / mesh-broadcast clipboard requests
         match send_rx.try_recv() {
-            Ok(paths) => {
+            Ok(AuxOutbound::Files(paths)) => {
                 let batch_id = next_batch_id;
                 next_batch_id += 1;
                 send_file_batch(
@@ -941,12 +1157,36 @@ fn run_aux(
                 )?;
                 last_ping = Instant::now();
             }
+            Ok(AuxOutbound::Clipboard { item, hash }) => {
+                match item {
+                    ClipboardItem::Text(_) | ClipboardItem::Png(_) => {
+                        send_clipboard_item(&mut stream, &mut ch, &item, &hash)?;
+                    }
+                    ClipboardItem::Files(paths) => {
+                        let batch_id = next_batch_id;
+                        next_batch_id += 1;
+                        send_file_batch(
+                            &mut stream,
+                            &mut ch,
+                            batch_id,
+                            &paths,
+                            cancel,
+                            stop,
+                            transfer_slot,
+                        )?;
+                    }
+                }
+                last_sent_hash = Some(hash);
+                last_remote_hash = None;
+                last_ping = Instant::now();
+            }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => break,
         }
 
-        // 2. Poll local clipboard changes (text, PNG screenshots, OR copied files/folders!)
-        if last_poll.elapsed() >= CLIP_POLL_INTERVAL {
+        // 2. Poll local clipboard changes in standalone (non-mesh) mode;
+        //    in mesh mode, AuxMeshHub polls once centrally and fans out via AuxOutbound::Clipboard.
+        if mesh_hub.is_none() && last_poll.elapsed() >= CLIP_POLL_INTERVAL {
             last_poll = Instant::now();
             if clipboard_enabled.load(Ordering::Relaxed) {
                 let token = clipboard::change_token();
@@ -1065,10 +1305,13 @@ fn run_aux(
                 Ok(AuxHeader::Clipboard { format, hash, len }) => {
                     let item = recv_clipboard_item(&mut stream, &mut ch, &format, &hash, len)?;
                     if clipboard_enabled.load(Ordering::Relaxed) {
-                        last_remote_hash = Some(hash);
+                        last_remote_hash = Some(hash.clone());
                         last_sent_hash = None;
                         if clipboard::write(&item) {
                             last_token = clipboard::change_token();
+                            if let Some(ref hub) = mesh_hub {
+                                hub.record_remote_clipboard_write(hash);
+                            }
                         }
                     }
                 }
@@ -1092,10 +1335,14 @@ fn run_aux(
                     )? && !saved_paths.is_empty()
                     {
                         let clip_item = ClipboardItem::Files(saved_paths);
-                        last_remote_hash = Some(clip_item.hash_hex());
+                        let hash = clip_item.hash_hex();
+                        last_remote_hash = Some(hash.clone());
                         last_sent_hash = None;
                         if clipboard::write(&clip_item) {
                             last_token = clipboard::change_token();
+                            if let Some(ref hub) = mesh_hub {
+                                hub.record_remote_clipboard_write(hash);
+                            }
                         }
                     }
                 }

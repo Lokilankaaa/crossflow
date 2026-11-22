@@ -1618,6 +1618,14 @@ internal sealed class MainWindow : Window
 
     private void ClearNotice() => notice.IsOpen = false;
 
+    private global::Windows.UI.Color DeviceColor(int index) => (index % 4) switch
+    {
+        0 => theme.Brush("accent").Color,                                   // Local: Cobalt Blue
+        1 => theme.Brush("device_secondary").Color,                         // Peer 1: Emerald Teal
+        2 => global::Windows.UI.Color.FromArgb(255, 124, 58, 237),          // Peer 2: Indigo Violet
+        _ => global::Windows.UI.Color.FromArgb(255, 217, 119, 6),           // Peer 3: Warm Amber
+    };
+
     private void RefreshScreenList()
     {
         screenListPanel.Children.Clear();
@@ -1630,7 +1638,7 @@ internal sealed class MainWindow : Window
         int groupIndex = 0;
         foreach (var group in layout.Screens.GroupBy(s => s.DeviceId))
         {
-            var color = theme.Brush(groupIndex++ % 2 == 0 ? "accent" : "device_secondary");
+            var color = new SolidColorBrush(DeviceColor(groupIndex++));
             var heading = Text($"{DeviceName(group.Key)} · {group.Count()} 屏", "caption");
             heading.Foreground = color;
             heading.Margin = new Thickness(4, 6, 0, 2);
@@ -1781,7 +1789,7 @@ internal sealed class MainWindow : Window
             label.Children.Add(resLabel);
 
             bool isFocused = focusId == screen.Id;
-            var color = theme.Brush(deviceIds.IndexOf(screen.DeviceId) % 2 == 0 ? "accent" : "device_secondary").Color;
+            var color = DeviceColor(deviceIds.IndexOf(screen.DeviceId));
             var tint = new SolidColorBrush(global::Windows.UI.Color.FromArgb(isFocused ? (byte)46 : (byte)22, color.R, color.G, color.B));
             var button = new ContentControl
             {

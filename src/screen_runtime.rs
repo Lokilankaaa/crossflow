@@ -52,6 +52,7 @@ pub struct Focus {
 impl RuntimeLayout {
     pub fn validate(&self) -> Result<()> {
         self.layout.validate()?;
+        let mesh_mode = self.remote_device_id == "*";
         ensure!(
             !self.local_device_id.is_empty()
                 && !self.remote_device_id.is_empty()
@@ -73,12 +74,14 @@ impl RuntimeLayout {
                 "invalid or duplicate native screen binding"
             );
             let screen = self.screen(&b.screen_id)?;
-            ensure!(
-                screen.device_id == self.local_device_id
-                    || screen.device_id == self.remote_device_id,
-                "layout contains an unpaired third device"
-            );
-            if screen.device_id == self.remote_device_id {
+            if !mesh_mode {
+                ensure!(
+                    screen.device_id == self.local_device_id
+                        || screen.device_id == self.remote_device_id,
+                    "layout contains an unpaired third device"
+                );
+            }
+            if screen.device_id != self.local_device_id {
                 ensure!(
                     b.native_id.parse::<u32>().is_ok_and(|id| id != 0),
                     "remote native display ID must be a nonzero integer"
@@ -89,9 +92,19 @@ impl RuntimeLayout {
                 "native monitor bound twice"
             );
         }
-        for device in [&self.local_device_id, &self.remote_device_id] {
+        ensure!(
+            self.layout
+                .screens()
+                .iter()
+                .any(|s| s.device_id == self.local_device_id),
+            "local device must have a screen"
+        );
+        if !mesh_mode {
             ensure!(
-                self.layout.screens().iter().any(|s| &s.device_id == device),
+                self.layout
+                    .screens()
+                    .iter()
+                    .any(|s| s.device_id == self.remote_device_id),
                 "each device must have a screen"
             );
         }

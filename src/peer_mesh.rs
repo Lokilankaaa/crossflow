@@ -14,22 +14,28 @@
 //!   bidirectional sharing once connected unless the user explicitly paused.
 
 use crate::{
+    aux_channel::{AuxMeshHub, AuxSession},
     discovery::{self, Advertisement, Candidate, DiscoveryConfig, DiscoveryHandle},
     hotkeys::{HotkeyAction, HotkeyConfig, SharedHotkeyEngine},
     injection_worker::WorkerProxy,
+    mesh_runtime::{
+        HandshakedMeshPeer, MeshControl, MeshLayoutBook, MeshPacket, MeshPeerConn,
+        PEER_KEEPALIVE_INTERVAL, PEER_SILENCE_TIMEOUT, establish_mesh_peer,
+        is_passphrase_mismatch_error, preferred_initiator,
+    },
     metrics::{Log, LogWriter},
     pair_native::{Capture, Platform, Shortcut},
-    pair_session::{Command, Host, PairConnection, SessionStatus},
     pair_source::SharedSource,
-    pair_wire::{Display, Hello},
-    session::NativeDisplay,
+    pair_wire::Display,
+    protocol::{Frame, Kind, button_from_code},
+    session::{MouseSink, NativeDisplay},
     session_metadata::SharedLayout,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -493,29 +499,10 @@ fn load_or_create_device_id() -> Result<String> {
     Ok(id)
 }
 
-fn layout_preset_path(remote_device_id: &str) -> Result<PathBuf> {
-    let dir = app_data_root()?.join("peer-layouts");
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{remote_device_id}.json")))
-}
-
-fn load_saved_layout(remote_device_id: &str) -> Option<SharedLayout> {
-    let path = layout_preset_path(remote_device_id).ok()?;
-    let bytes = fs::read(path).ok()?;
-    let layout: SharedLayout = serde_json::from_slice(&bytes).ok()?;
-    layout.validate().ok()?;
-    Some(layout)
-}
-
-fn save_layout(remote_device_id: &str, layout: &SharedLayout) {
-    if layout.validate().is_err() {
-        return;
-    }
-    if let Ok(path) = layout_preset_path(remote_device_id)
-        && let Ok(bytes) = serde_json::to_vec_pretty(layout)
-    {
-        let _ = fs::write(path, bytes);
-    }
+fn mesh_layout_path() -> Result<PathBuf> {
+    let root = app_data_root()?;
+    fs::create_dir_all(&root)?;
+    Ok(root.join("mesh-layout.json"))
 }
 
 fn default_friendly_name() -> String {
@@ -788,14 +775,6 @@ fn emit_status(stdout: &Mutex<std::io::Stdout>, status: &PeerUiStatus) {
     }
 }
 
-fn hello(device_id: &str, platform: &Platform) -> Result<Hello> {
-    let hello = Hello {
-        device_id: device_id.to_string(),
-        inventory: (platform.inventory)()?,
-    };
-    crate::pair_wire::validate_inventory(&hello.inventory)?;
-    Ok(hello)
-}
 
 fn prepare_worker(inventory: &[Display], log: Log) -> Result<WorkerProxy> {
     let mut command = process::Command::new(std::env::current_exe()?);
@@ -824,486 +803,148 @@ impl Drop for ActiveHotkeyGuard {
     }
 }
 
-struct PeerHost<'a> {
-    capture: &'a mut dyn Capture,
-    source: &'a SharedSource,
-    hotkey_engine: &'a SharedHotkeyEngine,
-    rx: &'a Receiver<UiCommand>,
-    stdout: &'a Mutex<std::io::Stdout>,
-    discovery: &'a DiscoveryHandle,
-    session_stop: &'a AtomicBool,
-    global_stop: &'a AtomicBool,
-    deadline: Instant,
-    local_device_id: &'a str,
-    local_name: &'a str,
-    local_displays: Vec<Display>,
-    config: &'a mut PeerConfig,
-    smart_keymap_flag: &'a Arc<AtomicBool>,
-    clipboard_sync_flag: &'a Arc<AtomicBool>,
-    input_state_sync_flag: &'a Arc<AtomicBool>,
-    local_has_focus: &'a Arc<AtomicBool>,
-    aux: Option<&'a crate::aux_channel::AuxSession>,
-    reconfigure_requested: &'a mut bool,
-    network_channels: Vec<NetworkChannelInfo>,
-    active_channel_label: Option<String>,
-    listen_endpoint: Option<String>,
-    peer_device_id: String,
-    peer_name: String,
-    peer_platform: String,
-    peer_address: String,
-    user_paused: &'a mut bool,
-    screen_locked: &'a mut bool,
-    pending_layout_push: &'a mut Option<(String, SharedLayout)>,
-    pending_quick_jump: Option<(String, Instant)>,
+enum HandshakeMsg {
+    Ready {
+        dial_key: Option<String>,
+        peer: HandshakedMeshPeer,
+    },
+    Failed {
+        dial_key: Option<String>,
+        is_auth_mismatch: bool,
+        message: String,
+    },
+}
+
+struct ActiveMeshPeer {
+    device_id: String,
+    name: String,
+    platform: String,
+    peer_addr: SocketAddr,
     initiator: bool,
-    status_seen: bool,
-    auto_enable_sent: bool,
-    sharing: bool,
-    epoch: u64,
-    pending: Option<Command>,
-    last_emit: Instant,
-    last_emitted_enabled: Option<bool>,
-    last_emitted_focus_screen: Option<String>,
-    last_emitted_peer_count: usize,
-    last_emitted_locked: Option<bool>,
-    last_emitted_hotkeys: Option<HotkeyConfig>,
-    last_emitted_manual_peers: Option<Vec<ManualPeer>>,
-    last_emitted_peer_channels: Option<HashMap<String, String>>,
+    active_channel_label: Option<String>,
+    displays: Vec<Display>,
+    conn: MeshPeerConn,
+    aux: AuxSession,
 }
 
-impl PeerHost<'_> {
-    fn discovered_list(&self) -> Vec<DiscoveredPeerInfo> {
-        let Some(snap) = self.discovery.try_snapshot() else {
-            return Vec::new();
-        };
-        snap.candidates
-            .into_iter()
-            .filter(|c| c.compatible)
-            .map(|c| DiscoveredPeerInfo {
-                connected: ids_match(&self.peer_device_id, &c.device_id),
-                id: c.device_id,
-                name: c.friendly_name,
-                platform: c.platform,
-            })
-            .collect()
-    }
+struct MeshNativeIo {
+    source: SharedSource,
+    capture: Box<dyn Capture + Send>,
+    sink: WorkerProxy,
+    last_activity: u64,
+    last_sink_maintain: Instant,
+    enabled_attempted: bool,
+}
 
-    fn peers_list(&self, discovered: &[DiscoveredPeerInfo], focus_device_id: Option<&str>) -> Vec<PeerInfo> {
-        let mut list = Vec::with_capacity(discovered.len() + 1);
-        list.push(PeerInfo {
-            id: self.peer_device_id.clone(),
-            name: self.peer_name.clone(),
-            platform: self.peer_platform.clone(),
-            connected: true,
-            focused: focus_device_id == Some(self.peer_device_id.as_str()),
-            slot: Some(1),
-            address: Some(self.peer_address.clone()),
-            active_channel_label: self.active_channel_label.clone(),
-            preferred_channel: peer_channel_override(&self.config.peer_channels, &self.peer_device_id),
-        });
-        for d in discovered {
-            if ids_match(&self.peer_device_id, &d.id) {
-                continue;
-            }
-            list.push(PeerInfo {
-                id: d.id.clone(),
-                name: d.name.clone(),
-                platform: d.platform.clone(),
-                connected: false,
-                focused: false,
-                slot: None,
-                address: None,
-                active_channel_label: None,
-                preferred_channel: peer_channel_override(&self.config.peer_channels, &d.id),
-            });
-        }
-        list
+impl MeshNativeIo {
+    fn shutdown(mut self) {
+        let _ = self.capture.stop();
+        let _ = self.sink.shutdown();
     }
+}
 
-    fn drain_ui_commands(&mut self) {
-        loop {
-            match self.rx.try_recv() {
-                Ok(UiCommand::Stop) => {
-                    self.global_stop.store(true, Ordering::Release);
-                    self.session_stop.store(true, Ordering::Release);
-                    self.pending = Some(Command::Stop);
-                    break;
-                }
-                Ok(UiCommand::Pause) => {
-                    *self.user_paused = true;
-                    self.pending = Some(Command::Pause);
-                }
-                Ok(UiCommand::Resume) => {
-                    *self.user_paused = false;
-                    if self.status_seen {
-                        self.pending = Some(Command::Enable { epoch: self.epoch });
-                    }
-                }
-                Ok(UiCommand::ApplyLayout { layout }) => {
-                    if layout.validate().is_ok() {
-                        save_layout(&self.peer_device_id, &layout);
-                        *self.pending_layout_push = Some((self.peer_device_id.clone(), layout));
-                        self.session_stop.store(true, Ordering::Release);
-                        self.pending = Some(Command::Stop);
-                        break;
-                    }
-                }
-                Ok(UiCommand::SetChannel {
-                    channel,
-                    direct_peer,
-                }) => {
-                    let clean = channel.trim();
-                    self.config.channel = if clean.is_empty() {
-                        default_channel()
-                    } else {
-                        clean.to_string()
-                    };
-                    self.config.direct_peer = direct_peer
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToString::to_string);
-                    if let Some(legacy) = self.config.direct_peer.clone() {
-                        let ch = self.config.channel.clone();
-                        let _ = add_manual_peer(self.config, &legacy, None, &ch);
-                    }
-                    save_config(self.config);
-                    *self.reconfigure_requested = true;
-                    self.session_stop.store(true, Ordering::Release);
-                    self.pending = Some(Command::Stop);
-                    break;
-                }
-                Ok(UiCommand::SetPeerChannel { device_id, channel }) => {
-                    set_peer_channel(self.config, &device_id, &channel);
-                    save_config(self.config);
-                    if ids_match(&self.peer_device_id, &device_id) {
-                        *self.reconfigure_requested = true;
-                        self.session_stop.store(true, Ordering::Release);
-                        self.pending = Some(Command::Stop);
-                        break;
-                    }
-                }
-                Ok(UiCommand::AddManualPeer {
-                    address,
-                    label,
-                    channel,
-                }) => {
-                    if add_manual_peer(self.config, &address, label, &channel) {
-                        save_config(self.config);
-                    }
-                }
-                Ok(UiCommand::RemoveManualPeer { address }) => {
-                    if remove_manual_peer(self.config, &address) {
-                        self.config.direct_peer = None;
-                        save_config(self.config);
-                    }
-                }
-                Ok(UiCommand::SetPassphrase { passphrase }) => {
-                    self.config.passphrase = passphrase
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToString::to_string);
-                    save_config(self.config);
-                    *self.reconfigure_requested = true;
-                    self.session_stop.store(true, Ordering::Release);
-                    self.pending = Some(Command::Stop);
-                    break;
-                }
-                Ok(UiCommand::SetKeymap { enabled }) => {
-                    self.config.smart_keymap = enabled;
-                    self.smart_keymap_flag.store(enabled, Ordering::Relaxed);
-                    save_config(self.config);
-                }
-                Ok(UiCommand::SetClipboard { enabled }) => {
-                    self.config.clipboard_sync = enabled;
-                    self.clipboard_sync_flag.store(enabled, Ordering::Relaxed);
-                    save_config(self.config);
-                }
-                Ok(UiCommand::SetInputStateSync { enabled }) => {
-                    self.config.input_state_sync = enabled;
-                    self.input_state_sync_flag.store(enabled, Ordering::Relaxed);
-                    save_config(self.config);
-                }
-                Ok(UiCommand::SetHotkeys { hotkeys }) => {
-                    self.config.hotkeys = hotkeys.normalized();
-                    self.hotkey_engine.update_config(&self.config.hotkeys);
-                    save_config(self.config);
-                }
-                Ok(UiCommand::SetHotkeySuspended { suspended }) => {
-                    self.hotkey_engine.set_suspended(suspended);
-                }
-                Ok(UiCommand::SetScreenLock { locked }) => {
-                    *self.screen_locked = locked;
-                    self.source.set_edge_locked(locked);
-                }
-                Ok(UiCommand::QuickJump { target_device_id }) => {
-                    let target = self.resolve_quick_jump_target(target_device_id.as_deref());
-                    self.queue_quick_jump(target);
-                }
-                Ok(UiCommand::SendFiles {
-                    target_device_id,
-                    paths,
-                }) => {
-                    let matches_target = target_device_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .is_none_or(|t| ids_match(&self.peer_device_id, t));
-                    if matches_target && let Some(aux) = self.aux {
-                        let list: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-                        aux.send_files(list);
-                    }
-                }
-                Ok(UiCommand::CancelTransfer) => {
-                    if let Some(aux) = self.aux {
-                        aux.cancel_transfer();
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.global_stop.store(true, Ordering::Release);
-                    self.session_stop.store(true, Ordering::Release);
-                    self.pending = Some(Command::Stop);
-                    break;
-                }
-            }
+fn apply_inbound_frame(sink: &mut WorkerProxy, frame: &Frame) -> Result<()> {
+    match frame.kind {
+        Kind::Position => {
+            let _ = sink.position(frame.x, frame.y, frame.display_id)?;
         }
+        Kind::Move => {
+            let _ = sink.move_by(frame.x, frame.y)?;
+        }
+        Kind::Button => {
+            let button = button_from_code(frame.code)?;
+            sink.button(button, frame.down)?;
+        }
+        Kind::Key => {
+            sink.key(frame.code, frame.down)?;
+        }
+        Kind::Scroll => {
+            sink.scroll(frame.wheel_x, frame.wheel_y)?;
+        }
+        _ => {}
     }
+    Ok(())
+}
 
-    fn resolve_quick_jump_target(&self, target: Option<&str>) -> String {
-        match target.map(str::trim).filter(|s| !s.is_empty()) {
-            None => {
-                // Cycle between local and peer
-                if self.source.status().remote_focus {
-                    self.local_device_id.to_string()
-                } else {
-                    self.peer_device_id.clone()
-                }
-            }
-            Some("local") => self.local_device_id.to_string(),
-            Some(id) if id == self.local_device_id => self.local_device_id.to_string(),
-            Some(_) => self.peer_device_id.clone(),
+fn remote_display_map(peers: &BTreeMap<String, ActiveMeshPeer>) -> BTreeMap<String, Vec<Display>> {
+    peers
+        .iter()
+        .map(|(id, p)| (id.clone(), p.displays.clone()))
+        .collect()
+}
+
+fn broadcast_layout_sync(
+    peers: &mut BTreeMap<String, ActiveMeshPeer>,
+    exclude_id: Option<&str>,
+    revision: u64,
+    screens: &[crate::session_metadata::SharedScreen],
+) {
+    let ctrl = MeshControl::LayoutSync {
+        revision,
+        screens: screens.to_vec(),
+    };
+    for (id, peer) in peers.iter_mut() {
+        if exclude_id == Some(id.as_str()) {
+            continue;
         }
+        let _ = peer.conn.queue_control(&ctrl);
+        let _ = peer.conn.flush();
     }
+}
 
-    fn queue_quick_jump(&mut self, target_device_id: String) {
-        if !self.sharing {
-            return;
-        }
-        self.pending_quick_jump = Some((target_device_id, Instant::now()));
-        if !self.source.status().enabled {
-            // Request local control authority from pair_session so QuickJump can proceed.
-            self.source.signal_activity();
-        }
+fn resolve_mesh_quick_jump_target(
+    target: Option<&str>,
+    local_device_id: &str,
+    active_outbound_target: Option<&str>,
+    peers: &BTreeMap<String, ActiveMeshPeer>,
+) -> Option<String> {
+    if peers.is_empty() {
+        return None;
     }
-
-    fn process_hotkeys_and_quick_jump(&mut self, now_ns: u64) -> Result<()> {
-        for action in self.hotkey_engine.drain_actions() {
-            match action {
-                HotkeyAction::EmergencyStop => {
-                    *self.user_paused = true;
-                    self.pending_quick_jump = None;
-                    self.pending = Some(Command::Pause);
-                }
-                HotkeyAction::ToggleSharing => {
-                    if self.sharing {
-                        *self.user_paused = true;
-                        self.pending_quick_jump = None;
-                        self.pending = Some(Command::Pause);
-                    } else {
-                        *self.user_paused = false;
-                        if self.status_seen {
-                            self.pending = Some(Command::Enable { epoch: self.epoch });
+    match target.map(str::trim).filter(|s| !s.is_empty()) {
+        None => {
+            // Cycle: Local -> Peer #1 -> Peer #2 -> ... -> Local
+            let peer_ids: Vec<&String> = peers.keys().collect();
+            match active_outbound_target {
+                None => Some(peer_ids[0].clone()),
+                Some(cur) => {
+                    if let Some(pos) = peer_ids.iter().position(|id| id.as_str() == cur) {
+                        if pos + 1 < peer_ids.len() {
+                            Some(peer_ids[pos + 1].clone())
+                        } else {
+                            Some(local_device_id.to_string())
                         }
-                    }
-                }
-                HotkeyAction::ToggleLockScreen => {
-                    *self.screen_locked = !*self.screen_locked;
-                    self.source.set_edge_locked(*self.screen_locked);
-                }
-                HotkeyAction::QuickJumpNext => {
-                    let target = self.resolve_quick_jump_target(None);
-                    self.queue_quick_jump(target);
-                }
-                HotkeyAction::QuickJumpHome => {
-                    self.queue_quick_jump(self.local_device_id.to_string());
-                }
-                HotkeyAction::QuickJumpDevice(idx) => {
-                    if idx == 0 {
-                        self.queue_quick_jump(self.peer_device_id.clone());
+                    } else {
+                        Some(local_device_id.to_string())
                     }
                 }
             }
         }
-
-        if let Some((target, created_at)) = self.pending_quick_jump.clone() {
-            if !self.sharing || created_at.elapsed() >= Duration::from_secs(2) {
-                self.pending_quick_jump = None;
-            } else if !self.source.status().enabled {
-                // Keep waiting briefly for local authority grant
-            } else if !self.hotkey_engine.any_modifier_held()
-                && !self.source.has_held_physical_input()
-            {
-                self.pending_quick_jump = None;
-                if let Some(local_pt) = self.source.quick_jump_to_device(&target, now_ns)? {
-                    let _ = self.capture.warp_local(local_pt);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn poll_native_shortcut(&mut self) -> Result<Option<Command>> {
-        let Some(shortcut) = self.capture.command() else {
-            return Ok(None);
-        };
-        if shortcut == Shortcut::Stop {
-            if let Some(reason) = self.capture.failure() {
-                self.session_stop.store(true, Ordering::Release);
-                anyhow::bail!(reason);
-            }
-            *self.user_paused = true;
-            return Ok(Some(Command::Pause));
-        }
-        Ok(Some(match shortcut {
-            Shortcut::Toggle if self.sharing => {
-                *self.user_paused = true;
-                Command::Pause
-            }
-            Shortcut::Toggle => {
-                *self.user_paused = false;
-                Command::Enable { epoch: self.epoch }
-            }
-            Shortcut::Stop => Command::Pause,
-        }))
+        Some("local") => Some(local_device_id.to_string()),
+        Some(id) if id == local_device_id => Some(local_device_id.to_string()),
+        Some(id) => peers
+            .keys()
+            .find(|k| ids_match(k, id))
+            .cloned()
+            .or_else(|| peers.keys().next().cloned()),
     }
 }
 
-impl Host for PeerHost<'_> {
-    fn pulse(&mut self, now_ns: u64) -> Result<()> {
-        if Instant::now() >= self.deadline {
-            self.global_stop.store(true, Ordering::Release);
-            self.session_stop.store(true, Ordering::Release);
-            return Ok(());
-        }
-        self.drain_ui_commands();
-        let result = self.capture.poll(now_ns);
-        if result.is_err() {
-            self.session_stop.store(true, Ordering::Release);
-        }
-        result?;
-        self.process_hotkeys_and_quick_jump(now_ns)?;
-        if let Some(cmd) = self.poll_native_shortcut()? {
-            self.pending = Some(cmd);
-        }
-        Ok(())
-    }
-
-    fn poll_command(&mut self) -> Result<Option<Command>> {
-        if let Some(cmd) = self.pending.take() {
-            return Ok(Some(cmd));
-        }
-        self.drain_ui_commands();
-        if let Some(cmd) = self.pending.take() {
-            return Ok(Some(cmd));
-        }
-        self.poll_native_shortcut()
-    }
-
-    fn publish(&mut self, status: &SessionStatus) -> Result<()> {
-        self.status_seen = true;
-        self.sharing = status.endpoint.enabled;
-        if self.sharing {
-            *self.user_paused = false;
-        }
-        self.epoch = status.endpoint.epoch;
-        if self.initiator
-            && !self.auto_enable_sent
-            && !*self.user_paused
-            && status.capture_ready
-            && !self.sharing
-        {
-            self.auto_enable_sent = true;
-            self.pending = Some(Command::Enable { epoch: self.epoch });
-        }
-        // Track focus ownership and immediately push Caps Lock + IME state when
-        // cursor leaves this device for the peer (ignore transient None during handoff).
-        if let Some(focus_id) = status.focus_device_id.as_deref() {
-            let now_local_focus = focus_id == self.local_device_id;
-            let prev_local_focus = self.local_has_focus.swap(now_local_focus, Ordering::AcqRel);
-            if prev_local_focus
-                && !now_local_focus
-                && let Some(aux) = self.aux
-            {
-                aux.push_input_state_now();
+fn active_transfer_snapshot(
+    peers: &BTreeMap<String, ActiveMeshPeer>,
+) -> Option<crate::aux_channel::TransferStatus> {
+    let mut fallback = None;
+    for p in peers.values() {
+        if let Some(t) = p.aux.current_transfer() {
+            if t.state == "active" {
+                return Some(t);
+            }
+            if fallback.is_none() {
+                fallback = Some(t);
             }
         }
-        let discovered = self.discovered_list();
-        let transfer = self.aux.and_then(|a| a.current_transfer());
-        let state_changed = self.last_emitted_enabled != Some(status.endpoint.enabled)
-            || self.last_emitted_focus_screen != status.focus_screen_id
-            || self.last_emitted_peer_count != discovered.len()
-            || self.last_emitted_locked != Some(*self.screen_locked)
-            || self.last_emitted_hotkeys.as_ref() != Some(&self.config.hotkeys)
-            || self.last_emitted_manual_peers.as_ref() != Some(&self.config.manual_peers)
-            || self.last_emitted_peer_channels.as_ref() != Some(&self.config.peer_channels)
-            || transfer.as_ref().is_some_and(|t| t.state == "active");
-        if state_changed
-            || self.last_emit.elapsed() >= Duration::from_millis(250)
-            || self.pending.is_some()
-        {
-            self.last_emit = Instant::now();
-            self.last_emitted_enabled = Some(status.endpoint.enabled);
-            self.last_emitted_focus_screen = status.focus_screen_id.clone();
-            self.last_emitted_peer_count = discovered.len();
-            self.last_emitted_locked = Some(*self.screen_locked);
-            self.last_emitted_hotkeys = Some(self.config.hotkeys.clone());
-            self.last_emitted_manual_peers = Some(self.config.manual_peers.clone());
-            self.last_emitted_peer_channels = Some(self.config.peer_channels.clone());
-            let peers = self.peers_list(&discovered, status.focus_device_id.as_deref());
-            let has_pass = self.config.passphrase.is_some();
-            emit_status(
-                self.stdout,
-                &PeerUiStatus {
-                    protocol: PEER_UI_PROTOCOL,
-                    state: if status.endpoint.enabled {
-                        "sharing".into()
-                    } else {
-                        "paused".into()
-                    },
-                    local_device_id: self.local_device_id.into(),
-                    local_name: self.local_name.into(),
-                    auth_mode: if has_pass { "passphrase" } else { "open" },
-                    passphrase_configured: has_pass,
-                    smart_keymap: self.config.smart_keymap,
-                    clipboard_sync: self.config.clipboard_sync,
-                    input_state_sync: self.config.input_state_sync,
-                    screen_locked: *self.screen_locked,
-                    hotkeys: self.config.hotkeys.clone(),
-                    selected_channel: self.config.channel.clone(),
-                    direct_peer: self.config.direct_peer.clone(),
-                    active_channel_label: self.active_channel_label.clone(),
-                    network_channels: self.network_channels.clone(),
-                    manual_peers: self.config.manual_peers.clone(),
-                    peers,
-                    route_enabled: status.endpoint.enabled,
-                    focus_device_id: status.focus_device_id.clone(),
-                    focus_screen_id: status.focus_screen_id.clone(),
-                    peer_device_id: Some(self.peer_device_id.clone()),
-                    peer_name: Some(self.peer_name.clone()),
-                    peer_address: Some(self.peer_address.clone()),
-                    listen_endpoint: self.listen_endpoint.clone(),
-                    local_displays: self.local_displays.clone(),
-                    discovered_peers: discovered,
-                    shared_layout: Some(status.shared_layout.clone()),
-                    transfer,
-                    error: None,
-                },
-            );
-        }
-        Ok(())
     }
+    fallback
 }
 
 pub fn run(
@@ -1335,7 +976,11 @@ pub fn run(
     let smart_keymap_flag = Arc::new(AtomicBool::new(config.smart_keymap));
     let clipboard_sync_flag = Arc::new(AtomicBool::new(config.clipboard_sync));
     let input_state_sync_flag = Arc::new(AtomicBool::new(config.input_state_sync));
+    let local_has_focus = Arc::new(AtomicBool::new(true));
     let _keep_awake = crate::power::KeepAwakeGuard::acquire();
+
+    let layout_file = mesh_layout_path()?;
+    let mut layout_book = MeshLayoutBook::load(&layout_file);
 
     #[cfg(target_os = "macos")]
     {
@@ -1386,14 +1031,13 @@ pub fn run(
     let deadline = Instant::now() + Duration::from_secs_f64(options.seconds);
     let mut user_paused = false;
     let mut screen_locked = false;
-    let mut pending_layout_push: Option<(String, SharedLayout)> = None;
+    let motion_interval = Duration::from_secs_f64(1.0 / f64::from(options.max_hz));
 
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
             let mut local_channels = enumerate_local_channels();
             let mut last_channel_refresh = Instant::now();
             if config.channel != "auto" && !local_channels.iter().any(|c| c.id == config.channel) {
-                // Selected IP disappeared (e.g. Ethernet unplugged): fall back gracefully to auto.
                 config.channel = default_channel();
             }
 
@@ -1422,6 +1066,11 @@ pub fn run(
                 l.set_nonblocking(true).ok()?;
                 Some(Arc::new(l))
             });
+            let aux_hub = AuxMeshHub::start(
+                aux_listener,
+                local_device_id.clone(),
+                config.passphrase.clone(),
+            );
 
             let mut discovery = DiscoveryHandle::start(DiscoveryConfig {
                 local_device_id: Some(local_discovery_id.clone()),
@@ -1436,40 +1085,97 @@ pub fn run(
                 compatible_protocol: u16::from(crate::protocol::WIRE_VERSION),
             })?;
 
+            let mut local_displays = (platform.inventory)().unwrap_or_default();
+            let mut last_display_refresh = Instant::now();
+            let (hs_tx, hs_rx) = mpsc::channel::<HandshakeMsg>();
+            let mut in_flight_dials: HashSet<String> = HashSet::new();
+            let mut dial_backoff: HashMap<String, Instant> = HashMap::new();
+            let mut active_peers: BTreeMap<String, ActiveMeshPeer> = BTreeMap::new();
+            let mut native_io: Option<MeshNativeIo> = None;
+
+            let mut active_outbound_target: Option<String> = None;
+            let mut inbound_owner: Option<String> = None;
+            let mut remote_focus_state: (Option<String>, Option<String>) = (None, None);
+            let mut last_broadcast_focus: (Option<String>, Option<String>) = (None, None);
+            let mut pending_quick_jump: Option<(String, Instant)> = None;
+
             let mut reconfigure_requested = false;
-            let mut last_error: Option<String> = None;
-            let mut auth_backoff_until = Instant::now();
+            let mut last_auth_error: Option<String> = None;
+            let mut last_dial_scan = Instant::now() - Duration::from_secs(2);
+            let mut last_clip_poll = Instant::now();
+            let mut last_motion_send = Instant::now() - motion_interval;
             let mut last_status_emit = Instant::now() - Duration::from_secs(1);
-            let mut last_dial_attempt = Instant::now() - Duration::from_secs(1);
-            let mut searching_since = Instant::now();
+            let mut last_status_sig = String::new();
+            let started_at = Instant::now();
 
             while !stop.load(Ordering::Acquire)
                 && !reconfigure_requested
                 && Instant::now() < deadline
             {
+                let mut did_work = false;
+                let now_ns = log.ns();
+
                 if last_channel_refresh.elapsed() >= Duration::from_secs(3) {
                     last_channel_refresh = Instant::now();
                     local_channels = enumerate_local_channels();
                 }
+                if active_peers.is_empty() && last_display_refresh.elapsed() >= Duration::from_secs(2)
+                {
+                    last_display_refresh = Instant::now();
+                    if let Ok(inv) = (platform.inventory)()
+                        && !inv.is_empty()
+                    {
+                        local_displays = inv;
+                    }
+                }
 
-                // Drain UI commands while searching
+                // 1. Drain UI commands
                 loop {
                     match rx.try_recv() {
                         Ok(UiCommand::Stop) | Err(TryRecvError::Disconnected) => {
                             stop.store(true, Ordering::Release);
                             break;
                         }
-                        Ok(UiCommand::Pause) => user_paused = true,
-                        Ok(UiCommand::Resume) => user_paused = false,
+                        Ok(UiCommand::Pause) => {
+                            user_paused = true;
+                            pending_quick_jump = None;
+                            if let Some(ref io) = native_io {
+                                io.source.pause_mesh();
+                            }
+                            if let Some(prev) = active_outbound_target.take()
+                                && let Some(p) = active_peers.get_mut(&prev)
+                            {
+                                let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                                let _ = p.conn.flush();
+                            }
+                        }
+                        Ok(UiCommand::Resume) => {
+                            user_paused = false;
+                            if let Some(ref mut io) = native_io
+                                && io.source.status().ready
+                                && io.source.enable_mesh().is_ok()
+                            {
+                                io.enabled_attempted = true;
+                            }
+                        }
                         Ok(UiCommand::ApplyLayout { layout }) => {
-                            if layout.validate().is_ok() {
-                                let target = if layout.source_device_id == local_device_id {
-                                    layout.receiver_device_id.clone()
-                                } else {
-                                    layout.source_device_id.clone()
-                                };
-                                save_layout(&target, &layout);
-                                pending_layout_push = Some((target, layout));
+                            let remotes = remote_display_map(&active_peers);
+                            if let Ok(new_rt) = layout_book.apply_user_layout(
+                                &layout.screens,
+                                &local_device_id,
+                                &local_displays,
+                                &remotes,
+                            ) {
+                                layout_book.save(&layout_file);
+                                if let Some(ref io) = native_io {
+                                    let _ = io.source.update_runtime(new_rt);
+                                }
+                                broadcast_layout_sync(
+                                    &mut active_peers,
+                                    None,
+                                    layout_book.revision(),
+                                    layout_book.active_screens(),
+                                );
                             }
                         }
                         Ok(UiCommand::SetChannel {
@@ -1498,7 +1204,23 @@ pub fn run(
                         Ok(UiCommand::SetPeerChannel { device_id, channel }) => {
                             set_peer_channel(&mut config, &device_id, &channel);
                             save_config(&config);
-                            last_dial_attempt = Instant::now() - Duration::from_secs(2);
+                            // Disconnect ONLY that specific peer so it immediately reconnects on its new channel
+                            let matching: Vec<String> = active_peers
+                                .keys()
+                                .filter(|k| ids_match(k, &device_id))
+                                .cloned()
+                                .collect();
+                            for id in matching {
+                                active_peers.remove(&id);
+                                if active_outbound_target.as_deref() == Some(id.as_str()) {
+                                    active_outbound_target = None;
+                                }
+                                if inbound_owner.as_deref() == Some(id.as_str()) {
+                                    inbound_owner = None;
+                                }
+                            }
+                            dial_backoff.retain(|k, _| !ids_match(k, &device_id));
+                            last_dial_scan = Instant::now() - Duration::from_secs(2);
                         }
                         Ok(UiCommand::AddManualPeer {
                             address,
@@ -1507,7 +1229,8 @@ pub fn run(
                         }) => {
                             if add_manual_peer(&mut config, &address, label, &channel) {
                                 save_config(&config);
-                                last_dial_attempt = Instant::now() - Duration::from_secs(2);
+                                dial_backoff.clear();
+                                last_dial_scan = Instant::now() - Duration::from_secs(2);
                             }
                         }
                         Ok(UiCommand::RemoveManualPeer { address }) => {
@@ -1523,6 +1246,7 @@ pub fn run(
                                 .filter(|s| !s.is_empty())
                                 .map(ToString::to_string);
                             save_config(&config);
+                            last_auth_error = None;
                             reconfigure_requested = true;
                             break;
                         }
@@ -1551,12 +1275,44 @@ pub fn run(
                         }
                         Ok(UiCommand::SetScreenLock { locked }) => {
                             screen_locked = locked;
+                            if let Some(ref io) = native_io {
+                                io.source.set_edge_locked(locked);
+                            }
                         }
-                        Ok(
-                            UiCommand::QuickJump { .. }
-                            | UiCommand::SendFiles { .. }
-                            | UiCommand::CancelTransfer,
-                        ) => {}
+                        Ok(UiCommand::QuickJump { target_device_id }) => {
+                            if !user_paused
+                                && let Some(target) = resolve_mesh_quick_jump_target(
+                                    target_device_id.as_deref(),
+                                    &local_device_id,
+                                    active_outbound_target.as_deref(),
+                                    &active_peers,
+                                )
+                            {
+                                pending_quick_jump = Some((target, Instant::now()));
+                            }
+                        }
+                        Ok(UiCommand::SendFiles {
+                            target_device_id,
+                            paths,
+                        }) => {
+                            let list: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+                            if !list.is_empty() {
+                                let target = target_device_id
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty());
+                                for (id, peer) in &active_peers {
+                                    if target.is_none_or(|t| ids_match(id, t)) {
+                                        peer.aux.send_files(list.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Ok(UiCommand::CancelTransfer) => {
+                            for peer in active_peers.values() {
+                                peer.aux.cancel_transfer();
+                            }
+                        }
                         Err(TryRecvError::Empty) => break,
                     }
                 }
@@ -1564,20 +1320,814 @@ pub fn run(
                     break;
                 }
 
+                // 2. Always accept inbound TCP connections on 24800 (even while already connected to N peers!)
+                loop {
+                    match listener.accept() {
+                        Ok((stream, addr)) => {
+                            let tx = hs_tx.clone();
+                            let dev_id = local_device_id.clone();
+                            let dev_name = local_name.clone();
+                            let disp = local_displays.clone();
+                            let pass = config.passphrase.clone();
+                            let rev = layout_book.revision();
+                            let screens = layout_book.active_screens().to_vec();
+                            let _ = thread::Builder::new()
+                                .name("crossflow-mesh-accept".into())
+                                .spawn(move || {
+                                    match establish_mesh_peer(
+                                        stream,
+                                        addr,
+                                        false,
+                                        &dev_id,
+                                        &dev_name,
+                                        disp,
+                                        pass.as_deref(),
+                                        rev,
+                                        screens,
+                                    ) {
+                                        Ok(peer) => {
+                                            let _ = tx.send(HandshakeMsg::Ready {
+                                                dial_key: None,
+                                                peer,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(HandshakeMsg::Failed {
+                                                dial_key: None,
+                                                is_auth_mismatch: is_passphrase_mismatch_error(&e),
+                                                message: format!("{e:#}"),
+                                            });
+                                        }
+                                    }
+                                });
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+
+                // 3. Background dial discovered peers & manual peer IPs not yet connected
                 let candidates: Vec<Candidate> = discovery
                     .try_snapshot()
                     .map(|s| s.candidates.into_iter().filter(|c| c.compatible).collect())
                     .unwrap_or_default();
 
-                if last_status_emit.elapsed() >= Duration::from_millis(250) {
+                if last_dial_scan.elapsed() >= Duration::from_millis(650) {
+                    last_dial_scan = Instant::now();
+                    let now_inst = Instant::now();
+                    let fallback_dial = started_at.elapsed() >= Duration::from_millis(1800);
+
+                    for c in &candidates {
+                        if active_peers.keys().any(|id| ids_match(id, &c.device_id))
+                            || in_flight_dials.contains(&c.device_id)
+                            || dial_backoff
+                                .get(&c.device_id)
+                                .is_some_and(|until| now_inst < *until)
+                        {
+                            continue;
+                        }
+                        if !(local_discovery_id < c.device_id || fallback_dial) {
+                            continue;
+                        }
+                        let eff_ch = effective_channel_for_peer(&config, &c.device_id);
+                        let addrs = ranked_addresses(&c.addresses, eff_ch, &local_channels);
+                        if addrs.is_empty() {
+                            continue;
+                        }
+                        let dial_key = c.device_id.clone();
+                        in_flight_dials.insert(dial_key.clone());
+                        let tx = hs_tx.clone();
+                        let dev_id = local_device_id.clone();
+                        let dev_name = local_name.clone();
+                        let disp = local_displays.clone();
+                        let pass = config.passphrase.clone();
+                        let rev = layout_book.revision();
+                        let screens = layout_book.active_screens().to_vec();
+                        let _ = thread::Builder::new()
+                            .name("crossflow-mesh-dial".into())
+                            .spawn(move || {
+                                let mut last_err = None;
+                                for addr in addrs {
+                                    match TcpStream::connect_timeout(
+                                        &addr,
+                                        Duration::from_millis(280),
+                                    ) {
+                                        Ok(stream) => {
+                                            match establish_mesh_peer(
+                                                stream,
+                                                addr,
+                                                true,
+                                                &dev_id,
+                                                &dev_name,
+                                                disp.clone(),
+                                                pass.as_deref(),
+                                                rev,
+                                                screens.clone(),
+                                            ) {
+                                                Ok(peer) => {
+                                                    let _ = tx.send(HandshakeMsg::Ready {
+                                                        dial_key: Some(dial_key),
+                                                        peer,
+                                                    });
+                                                    return;
+                                                }
+                                                Err(e) => {
+                                                    last_err = Some(e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => last_err = Some(e.into()),
+                                    }
+                                }
+                                let err = last_err
+                                    .unwrap_or_else(|| anyhow::anyhow!("peer unreachable"));
+                                let _ = tx.send(HandshakeMsg::Failed {
+                                    dial_key: Some(dial_key),
+                                    is_auth_mismatch: is_passphrase_mismatch_error(&err),
+                                    message: format!("{err:#}"),
+                                });
+                            });
+                    }
+
+                    // Manual static peer IP list
+                    for mp in &config.manual_peers {
+                        let Some(target) = parse_direct_peer(Some(&mp.address)) else {
+                            continue;
+                        };
+                        let key = format!("manual:{}", target);
+                        if active_peers.values().any(|p| p.peer_addr.ip() == target.ip())
+                            || in_flight_dials.contains(&key)
+                            || dial_backoff
+                                .get(&key)
+                                .is_some_and(|until| now_inst < *until)
+                        {
+                            continue;
+                        }
+                        in_flight_dials.insert(key.clone());
+                        let tx = hs_tx.clone();
+                        let dev_id = local_device_id.clone();
+                        let dev_name = local_name.clone();
+                        let disp = local_displays.clone();
+                        let pass = config.passphrase.clone();
+                        let rev = layout_book.revision();
+                        let screens = layout_book.active_screens().to_vec();
+                        let _ = thread::Builder::new()
+                            .name("crossflow-mesh-dial-manual".into())
+                            .spawn(move || {
+                                match TcpStream::connect_timeout(
+                                    &target,
+                                    Duration::from_millis(300),
+                                )
+                                .map_err(anyhow::Error::from)
+                                .and_then(|stream| {
+                                    establish_mesh_peer(
+                                        stream,
+                                        target,
+                                        true,
+                                        &dev_id,
+                                        &dev_name,
+                                        disp,
+                                        pass.as_deref(),
+                                        rev,
+                                        screens,
+                                    )
+                                }) {
+                                    Ok(peer) => {
+                                        let _ = tx.send(HandshakeMsg::Ready {
+                                            dial_key: Some(key),
+                                            peer,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(HandshakeMsg::Failed {
+                                            dial_key: Some(key),
+                                            is_auth_mismatch: is_passphrase_mismatch_error(&e),
+                                            message: format!("{e:#}"),
+                                        });
+                                    }
+                                }
+                            });
+                    }
+                }
+
+                // 4. Integrate newly handshaked peers
+                let mut topology_changed = false;
+                while let Ok(msg) = hs_rx.try_recv() {
+                    did_work = true;
+                    match msg {
+                        HandshakeMsg::Failed {
+                            dial_key,
+                            is_auth_mismatch,
+                            message,
+                        } => {
+                            if let Some(k) = dial_key {
+                                in_flight_dials.remove(&k);
+                                let wait = if is_auth_mismatch {
+                                    Duration::from_millis(2500)
+                                } else {
+                                    Duration::from_millis(1200)
+                                };
+                                dial_backoff.insert(k, Instant::now() + wait);
+                            }
+                            log.write("mesh_handshake_failed", serde_json::json!({"auth": is_auth_mismatch, "reason": message}));
+                            if is_auth_mismatch {
+                                last_auth_error =
+                                    Some("等待密码匹配：请确认各台设备的密码配置一致。".into());
+                            }
+                        }
+                        HandshakeMsg::Ready { dial_key, peer } => {
+                            if let Some(k) = dial_key {
+                                in_flight_dials.remove(&k);
+                                dial_backoff.remove(&k);
+                            }
+                            last_auth_error = None;
+                            let rid = peer.remote_device_id.clone();
+                            let keep_new = match active_peers.get(&rid) {
+                                None => true,
+                                Some(existing) => {
+                                    let want_init = preferred_initiator(&local_device_id, &rid);
+                                    peer.initiator == want_init && existing.initiator != want_init
+                                }
+                            };
+                            if !keep_new {
+                                continue;
+                            }
+                            let aux_initiator = preferred_initiator(&local_device_id, &rid);
+                            let aux = AuxSession::spawn_mesh_peer(
+                                aux_hub.clone(),
+                                peer.peer_addr,
+                                aux_initiator,
+                                local_device_id.clone(),
+                                rid.clone(),
+                                config.passphrase.clone(),
+                                clipboard_sync_flag.clone(),
+                                input_state_sync_flag.clone(),
+                                local_has_focus.clone(),
+                            );
+                            let active_ch =
+                                classify_active_channel(peer.peer_addr, &local_channels);
+                            let peer_rev = peer.layout_revision;
+                            let peer_screens = peer.layout_screens;
+                            active_peers.insert(
+                                rid.clone(),
+                                ActiveMeshPeer {
+                                    device_id: rid.clone(),
+                                    name: peer.name,
+                                    platform: peer.platform,
+                                    peer_addr: peer.peer_addr,
+                                    initiator: peer.initiator,
+                                    active_channel_label: active_ch,
+                                    displays: peer.displays,
+                                    conn: peer.conn,
+                                    aux,
+                                },
+                            );
+                            let remotes = remote_display_map(&active_peers);
+                            let adopted = layout_book
+                                .merge_remote_layout(
+                                    peer_rev,
+                                    &peer_screens,
+                                    &local_device_id,
+                                    &local_displays,
+                                    &remotes,
+                                )
+                                .ok()
+                                .flatten();
+                            if adopted.is_some() {
+                                layout_book.save(&layout_file);
+                                broadcast_layout_sync(
+                                    &mut active_peers,
+                                    Some(&rid),
+                                    layout_book.revision(),
+                                    layout_book.active_screens(),
+                                );
+                            }
+                            topology_changed = true;
+                        }
+                    }
+                }
+
+                // 5. Pump all connected peers (non-blocking read/write + keepalive)
+                let mut dead_peers: Vec<String> = Vec::new();
+                let peer_ids: Vec<String> = active_peers.keys().cloned().collect();
+                let mut inbound_layout_updates: Vec<(String, u64, Vec<crate::session_metadata::SharedScreen>)> = Vec::new();
+                let mut revoke_outbound_from: Vec<String> = Vec::new();
+
+                for pid in peer_ids {
+                    let Some(peer) = active_peers.get_mut(&pid) else {
+                        continue;
+                    };
+                    if peer.conn.last_tx_elapsed() >= PEER_KEEPALIVE_INTERVAL {
+                        let _ = peer.conn.queue_control(&MeshControl::KeepAlive);
+                    }
+                    if peer.conn.last_rx_elapsed() >= PEER_SILENCE_TIMEOUT {
+                        dead_peers.push(pid);
+                        continue;
+                    }
+                    match peer.conn.pump() {
+                        Ok(packets) => {
+                            if !packets.is_empty() {
+                                did_work = true;
+                            }
+                            for pkt in packets {
+                                match pkt {
+                                    MeshPacket::Input(frame) => {
+                                        if let Some(ref mut io) = native_io {
+                                            match frame.kind {
+                                                Kind::Arm => {
+                                                    if let Some(old_owner) = inbound_owner.take()
+                                                        && old_owner != pid
+                                                    {
+                                                        revoke_outbound_from.push(old_owner);
+                                                    }
+                                                    let _ = io.sink.reset();
+                                                    inbound_owner = Some(pid.clone());
+                                                }
+                                                Kind::Pause => {
+                                                    if inbound_owner.as_deref() == Some(pid.as_str())
+                                                    {
+                                                        let _ = io.sink.release_owned();
+                                                        inbound_owner = None;
+                                                    }
+                                                }
+                                                _ => {
+                                                    if inbound_owner.as_deref() == Some(pid.as_str())
+                                                    {
+                                                        if apply_inbound_frame(&mut io.sink, &frame)
+                                                            .is_err()
+                                                        {
+                                                            let _ = io.sink.release_owned();
+                                                            inbound_owner = None;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    MeshPacket::Control(ctrl) => match ctrl {
+                                        MeshControl::LayoutSync { revision, screens } => {
+                                            inbound_layout_updates
+                                                .push((pid.clone(), revision, screens));
+                                        }
+                                        MeshControl::FocusState {
+                                            focus_device_id,
+                                            focus_screen_id,
+                                        } => {
+                                            if active_outbound_target.is_none() {
+                                                remote_focus_state =
+                                                    (focus_device_id, focus_screen_id);
+                                            }
+                                        }
+                                        MeshControl::RevokeControl => {
+                                            if active_outbound_target.as_deref()
+                                                == Some(pid.as_str())
+                                            {
+                                                if let Some(ref mut io) = native_io
+                                                    && let Ok(Some(pt)) =
+                                                        io.source.force_return_local(now_ns)
+                                                {
+                                                    let _ = io.capture.warp_local(pt);
+                                                }
+                                                active_outbound_target = None;
+                                            }
+                                        }
+                                        MeshControl::KeepAlive | MeshControl::Hello { .. } => {}
+                                    },
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            dead_peers.push(pid);
+                        }
+                    }
+                }
+
+                // Notify displaced inbound owners
+                for old_id in revoke_outbound_from {
+                    if let Some(p) = active_peers.get_mut(&old_id) {
+                        let _ = p.conn.queue_control(&MeshControl::RevokeControl);
+                        let _ = p.conn.flush();
+                    }
+                }
+
+                // Merge any received LayoutSync updates
+                for (from_id, rev, screens) in inbound_layout_updates {
+                    let remotes = remote_display_map(&active_peers);
+                    if let Ok(Some(new_rt)) = layout_book.merge_remote_layout(
+                        rev,
+                        &screens,
+                        &local_device_id,
+                        &local_displays,
+                        &remotes,
+                    ) {
+                        layout_book.save(&layout_file);
+                        if let Some(ref io) = native_io {
+                            let _ = io.source.update_runtime(new_rt);
+                        }
+                        broadcast_layout_sync(
+                            &mut active_peers,
+                            Some(&from_id),
+                            layout_book.revision(),
+                            layout_book.active_screens(),
+                        );
+                    }
+                }
+
+                // Clean up disconnected peers without disrupting remaining peers!
+                for dead in dead_peers {
+                    active_peers.remove(&dead);
+                    if active_outbound_target.as_deref() == Some(dead.as_str()) {
+                        active_outbound_target = None;
+                        if let Some(ref mut io) = native_io
+                            && let Ok(Some(pt)) = io.source.force_return_local(now_ns)
+                        {
+                            let _ = io.capture.warp_local(pt);
+                        }
+                    }
+                    if inbound_owner.as_deref() == Some(dead.as_str()) {
+                        inbound_owner = None;
+                        if let Some(ref mut io) = native_io {
+                            let _ = io.sink.release_owned();
+                        }
+                    }
+                    topology_changed = true;
+                }
+
+                // 6. Start, hot-update, or stop native Capture + WorkerProxy
+                if active_peers.is_empty() {
+                    if let Some(io) = native_io.take() {
+                        io.shutdown();
+                    }
+                    active_outbound_target = None;
+                    inbound_owner = None;
+                    remote_focus_state = (None, None);
+                } else if topology_changed || native_io.is_none() {
+                    let remotes = remote_display_map(&active_peers);
+                    if let Ok(rt) =
+                        layout_book.rebuild(&local_device_id, &local_displays, &remotes)
+                    {
+                        layout_book.save(&layout_file);
+                        if let Some(ref io) = native_io {
+                            let _ = io.source.update_runtime(rt);
+                        } else if let Ok(source) = SharedSource::new(rt) {
+                            source.set_edge_locked(screen_locked);
+                            hotkey_engine.reset_modifiers();
+                            let _ = hotkey_engine.drain_actions();
+                            if let Ok(mut sink) = prepare_worker(&local_displays, log.clone()) {
+                                match (platform.capture)(source.clone(), log.clone()) {
+                                    Ok(capture) => {
+                                        let last_activity = source.activity_counter();
+                                        native_io = Some(MeshNativeIo {
+                                            source,
+                                            capture,
+                                            sink,
+                                            last_activity,
+                                            last_sink_maintain: Instant::now(),
+                                            enabled_attempted: false,
+                                        });
+                                    }
+                                    Err(_) => {
+                                        let _ = sink.shutdown();
+                                    }
+                                }
+                            }
+                        }
+                        broadcast_layout_sync(
+                            &mut active_peers,
+                            None,
+                            layout_book.revision(),
+                            layout_book.active_screens(),
+                        );
+                    }
+                }
+
+                // 7. Poll native capture, process custom hotkeys / QuickJump, route 1-hop frames!
+                let mut restart_native = false;
+                if let Some(ref mut io) = native_io {
+                    if io.capture.poll(now_ns).is_err()
+                        || io.source.status().failure.is_some()
+                        || io.capture.failure().is_some()
+                    {
+                        restart_native = true;
+                    } else {
+                        if let Some(sc) = io.capture.command() {
+                            match sc {
+                                Shortcut::Stop => {
+                                    user_paused = true;
+                                    io.source.pause_mesh();
+                                }
+                                Shortcut::Toggle => {
+                                    user_paused = !user_paused;
+                                    if user_paused {
+                                        io.source.pause_mesh();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Auto-enable once capture snapshot is ready unless user paused
+                        let st = io.source.status();
+                        if !user_paused && st.ready && !st.enabled {
+                            if io.source.enable_mesh().is_ok() {
+                                io.enabled_attempted = true;
+                            }
+                        } else if user_paused && st.enabled {
+                            io.source.pause_mesh();
+                        }
+
+                        // Drain custom hotkeys
+                        for action in hotkey_engine.drain_actions() {
+                            did_work = true;
+                            match action {
+                                HotkeyAction::EmergencyStop => {
+                                    user_paused = true;
+                                    pending_quick_jump = None;
+                                    io.source.pause_mesh();
+                                    let _ = io.sink.release_owned();
+                                    if let Some(prev) = active_outbound_target.take()
+                                        && let Some(p) = active_peers.get_mut(&prev)
+                                    {
+                                        let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                                        let _ = p.conn.flush();
+                                    }
+                                }
+                                HotkeyAction::ToggleSharing => {
+                                    user_paused = !user_paused;
+                                    pending_quick_jump = None;
+                                    if user_paused {
+                                        io.source.pause_mesh();
+                                        if let Some(prev) = active_outbound_target.take()
+                                            && let Some(p) = active_peers.get_mut(&prev)
+                                        {
+                                            let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                                            let _ = p.conn.flush();
+                                        }
+                                    } else if io.source.status().ready {
+                                        let _ = io.source.enable_mesh();
+                                    }
+                                }
+                                HotkeyAction::ToggleLockScreen => {
+                                    screen_locked = !screen_locked;
+                                    io.source.set_edge_locked(screen_locked);
+                                }
+                                HotkeyAction::QuickJumpNext => {
+                                    if !user_paused
+                                        && let Some(t) = resolve_mesh_quick_jump_target(
+                                            None,
+                                            &local_device_id,
+                                            active_outbound_target.as_deref(),
+                                            &active_peers,
+                                        )
+                                    {
+                                        pending_quick_jump = Some((t, Instant::now()));
+                                    }
+                                }
+                                HotkeyAction::QuickJumpHome => {
+                                    if !user_paused {
+                                        pending_quick_jump =
+                                            Some((local_device_id.clone(), Instant::now()));
+                                    }
+                                }
+                                HotkeyAction::QuickJumpDevice(idx) => {
+                                    if !user_paused
+                                        && let Some(id) = active_peers.keys().nth(idx).cloned()
+                                    {
+                                        pending_quick_jump = Some((id, Instant::now()));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Execute latched QuickJump once modifiers & physical keys are clear
+                        if let Some((target, created_at)) = pending_quick_jump.clone() {
+                            if user_paused || created_at.elapsed() >= Duration::from_secs(2) {
+                                pending_quick_jump = None;
+                            } else if io.source.status().enabled
+                                && !hotkey_engine.any_modifier_held()
+                                && !io.source.has_held_physical_input()
+                            {
+                                pending_quick_jump = None;
+                                if let Ok(Some(local_pt)) =
+                                    io.source.quick_jump_to_device(&target, now_ns)
+                                {
+                                    let _ = io.capture.warp_local(local_pt);
+                                }
+                            }
+                        }
+
+                        // Local physical activity revokes inbound remote injection cleanly
+                        let act = io.source.activity_counter();
+                        if act != io.last_activity {
+                            io.last_activity = act;
+                            if let Some(owner_id) = inbound_owner.take() {
+                                let _ = io.sink.release_owned();
+                                if let Some(p) = active_peers.get_mut(&owner_id) {
+                                    let _ = p.conn.queue_control(&MeshControl::RevokeControl);
+                                    let _ = p.conn.flush();
+                                }
+                            }
+                        }
+
+                        // Drain outbound frames and route directly 1-hop to target peer!
+                        let mut drained = 0usize;
+                        while drained < 32 {
+                            let allow_motion = last_motion_send.elapsed() >= motion_interval;
+                            let next = match io.source.next_mesh_frame(now_ns, allow_motion) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    restart_native = true;
+                                    break;
+                                }
+                            };
+                            let Some((target, frame)) = next else {
+                                break;
+                            };
+                            did_work = true;
+                            drained += 1;
+                            if matches!(frame.kind, Kind::Move | Kind::Position) {
+                                last_motion_send = Instant::now();
+                            }
+
+                            if active_outbound_target != target {
+                                if let Some(old_id) = active_outbound_target.take()
+                                    && let Some(old_peer) = active_peers.get_mut(&old_id)
+                                {
+                                    let _ = old_peer.conn.queue_frame(&Frame::new(Kind::Pause));
+                                    let _ = old_peer.conn.flush();
+                                }
+                                if let Some(ref new_id) = target
+                                    && let Some(new_peer) = active_peers.get(new_id)
+                                {
+                                    new_peer.aux.push_input_state_now();
+                                }
+                                active_outbound_target = target.clone();
+                            }
+
+                            if let Some(ref tid) = active_outbound_target
+                                && let Some(peer) = active_peers.get_mut(tid)
+                            {
+                                let _ = peer.conn.queue_frame(&frame);
+                                let _ = peer.conn.flush();
+                            }
+                        }
+
+                        // Keep input-worker heartbeat healthy
+                        if io.last_sink_maintain.elapsed() >= Duration::from_millis(15) {
+                            io.last_sink_maintain = Instant::now();
+                            if io.sink.maintain().is_err() {
+                                restart_native = true;
+                            }
+                        }
+                    }
+                }
+
+                if restart_native {
+                    if let Some(io) = native_io.take() {
+                        io.shutdown();
+                    }
+                    if let Some(prev) = active_outbound_target.take()
+                        && let Some(p) = active_peers.get_mut(&prev)
+                    {
+                        let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                        let _ = p.conn.flush();
+                    }
+                    inbound_owner = None;
+                    if let Ok(inv) = (platform.inventory)()
+                        && !inv.is_empty()
+                    {
+                        local_displays = inv;
+                    }
+                }
+
+                // 8. Central mesh clipboard broadcast (ONE single OS clipboard poller -> ALL peers!)
+                if !active_peers.is_empty() && last_clip_poll.elapsed() >= Duration::from_millis(160)
+                {
+                    last_clip_poll = Instant::now();
+                    if clipboard_sync_flag.load(Ordering::Relaxed)
+                        && let Some((item, hash)) = aux_hub.poll_local_clipboard()
+                    {
+                        for peer in active_peers.values() {
+                            peer.aux.push_clipboard(item.clone(), hash.clone());
+                        }
+                    }
+                }
+
+                // 9. Track local_has_focus & broadcast FocusState changes
+                let (focus_dev, focus_scr) = if let Some(ref io) = native_io
+                    && !user_paused
+                    && io.source.status().enabled
+                {
+                    if active_outbound_target.is_some() {
+                        io.source.focus_identity()
+                    } else if inbound_owner.is_some() {
+                        remote_focus_state.clone()
+                    } else {
+                        let local_f = io.source.focus_identity();
+                        if local_f.0.is_some() {
+                            local_f
+                        } else {
+                            remote_focus_state.clone()
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let is_local_focus_now = focus_dev.as_deref() == Some(local_device_id.as_str())
+                    || (active_outbound_target.is_none() && inbound_owner.is_none());
+                local_has_focus.store(is_local_focus_now, Ordering::Release);
+
+                if !active_peers.is_empty()
+                    && (focus_dev.as_deref() == Some(local_device_id.as_str())
+                        || active_outbound_target.is_some())
+                    && (focus_dev.clone(), focus_scr.clone()) != last_broadcast_focus
+                {
+                    last_broadcast_focus = (focus_dev.clone(), focus_scr.clone());
+                    let ctrl = MeshControl::FocusState {
+                        focus_device_id: focus_dev.clone(),
+                        focus_screen_id: focus_scr.clone(),
+                    };
+                    for peer in active_peers.values_mut() {
+                        let _ = peer.conn.queue_control(&ctrl);
+                        let _ = peer.conn.flush();
+                    }
+                }
+
+                // 10. Emit unified multi-device PeerUiStatus
+                let transfer = active_transfer_snapshot(&active_peers);
+                let sharing_now = !active_peers.is_empty() && !user_paused;
+                let state_str = if active_peers.is_empty() {
+                    "searching"
+                } else if user_paused {
+                    "paused"
+                } else {
+                    "sharing"
+                };
+
+                let mut peers_list: Vec<PeerInfo> = Vec::with_capacity(active_peers.len() + candidates.len());
+                for (idx, p) in active_peers.values().enumerate() {
+                    peers_list.push(PeerInfo {
+                        id: p.device_id.clone(),
+                        name: p.name.clone(),
+                        platform: p.platform.clone(),
+                        connected: true,
+                        focused: focus_dev.as_deref() == Some(p.device_id.as_str()),
+                        slot: Some(idx + 1),
+                        address: Some(p.peer_addr.to_string()),
+                        active_channel_label: p.active_channel_label.clone(),
+                        preferred_channel: peer_channel_override(&config.peer_channels, &p.device_id),
+                    });
+                }
+                for c in &candidates {
+                    if active_peers.keys().any(|id| ids_match(id, &c.device_id)) {
+                        continue;
+                    }
+                    peers_list.push(PeerInfo {
+                        id: c.device_id.clone(),
+                        name: c.friendly_name.clone(),
+                        platform: c.platform.clone(),
+                        connected: false,
+                        focused: false,
+                        slot: None,
+                        address: None,
+                        active_channel_label: None,
+                        preferred_channel: peer_channel_override(&config.peer_channels, &c.device_id),
+                    });
+                }
+
+                let sig = format!(
+                    "{state_str}|{:?}|{:?}|{screen_locked}|{}|{}|{}|{:?}",
+                    focus_dev,
+                    focus_scr,
+                    peers_list.len(),
+                    config.manual_peers.len(),
+                    layout_book.revision(),
+                    last_auth_error
+                );
+                if sig != last_status_sig
+                    || last_status_emit.elapsed() >= Duration::from_millis(250)
+                    || transfer.as_ref().is_some_and(|t| t.state == "active")
+                {
+                    last_status_sig = sig;
                     last_status_emit = Instant::now();
-                    let local_displays = (platform.inventory)().unwrap_or_default();
+                    let first_peer = active_peers.values().next();
+                    let shared_layout = first_peer.and_then(|fp| {
+                        layout_book.to_shared_layout(&local_device_id, &fp.device_id)
+                    });
+                    let discovered_compat: Vec<DiscoveredPeerInfo> = peers_list
+                        .iter()
+                        .map(|p| DiscoveredPeerInfo {
+                            id: p.id.clone(),
+                            name: p.name.clone(),
+                            platform: p.platform.clone(),
+                            connected: p.connected,
+                        })
+                        .collect();
                     let has_pass = config.passphrase.is_some();
                     emit_status(
                         &stdout,
                         &PeerUiStatus {
                             protocol: PEER_UI_PROTOCOL,
-                            state: "searching".into(),
+                            state: state_str.into(),
                             local_device_id: local_device_id.clone(),
                             local_name: local_name.clone(),
                             auth_mode: if has_pass { "passphrase" } else { "open" },
@@ -1589,343 +2139,44 @@ pub fn run(
                             hotkeys: config.hotkeys.clone(),
                             selected_channel: config.channel.clone(),
                             direct_peer: config.direct_peer.clone(),
-                            active_channel_label: None,
+                            active_channel_label: first_peer
+                                .and_then(|p| p.active_channel_label.clone()),
                             network_channels: channel_infos(&local_channels),
                             manual_peers: config.manual_peers.clone(),
-                            peers: candidates
-                                .iter()
-                                .map(|c| PeerInfo {
-                                    id: c.device_id.clone(),
-                                    name: c.friendly_name.clone(),
-                                    platform: c.platform.clone(),
-                                    connected: false,
-                                    focused: false,
-                                    slot: None,
-                                    address: None,
-                                    active_channel_label: None,
-                                    preferred_channel: peer_channel_override(
-                                        &config.peer_channels,
-                                        &c.device_id,
-                                    ),
-                                })
-                                .collect(),
-                            route_enabled: false,
-                            focus_device_id: None,
-                            focus_screen_id: None,
-                            peer_device_id: None,
-                            peer_name: None,
-                            peer_address: None,
+                            peers: peers_list,
+                            route_enabled: sharing_now,
+                            focus_device_id: focus_dev,
+                            focus_screen_id: focus_scr,
+                            peer_device_id: first_peer.map(|p| p.device_id.clone()),
+                            peer_name: first_peer.map(|p| p.name.clone()),
+                            peer_address: first_peer.map(|p| p.peer_addr.to_string()),
                             listen_endpoint: listen_endpoint.clone(),
-                            local_displays,
-                            discovered_peers: candidates
-                                .iter()
-                                .map(|c| DiscoveredPeerInfo {
-                                    id: c.device_id.clone(),
-                                    name: c.friendly_name.clone(),
-                                    platform: c.platform.clone(),
-                                    connected: false,
-                                })
-                                .collect(),
-                            shared_layout: None,
-                            transfer: None,
-                            error: last_error.clone(),
+                            local_displays: local_displays.clone(),
+                            discovered_peers: discovered_compat,
+                            shared_layout,
+                            transfer,
+                            error: if active_peers.is_empty() {
+                                last_auth_error.clone()
+                            } else {
+                                None
+                            },
                         },
                     );
                 }
 
-                // 1. Accept inbound connection (unless pushing layout)
-                let mut connected: Option<(TcpStream, bool, Option<String>, Option<String>)> = None;
-                if pending_layout_push.is_none() {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            connected = Some((stream, false, None, None));
-                        }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                // 2. Auto-dial discovered peer OR configured direct peer (e.g. ZeroTier IP)
-                let fallback_dial = searching_since.elapsed() >= Duration::from_millis(1500);
-                let in_auth_backoff = Instant::now() < auth_backoff_until;
-                let can_dial = !in_auth_backoff
-                    && (pending_layout_push.is_some()
-                        || last_dial_attempt.elapsed()
-                            >= Duration::from_millis(if fallback_dial { 1200 } else { 350 }));
-                if connected.is_none() && can_dial {
-                    last_dial_attempt = Instant::now();
-                    for candidate in &candidates {
-                        let has_push = pending_layout_push
-                            .as_ref()
-                            .is_some_and(|(id, _)| id.starts_with(&candidate.device_id));
-                        let should_dial =
-                            has_push || local_discovery_id < candidate.device_id || fallback_dial;
-                        if !should_dial {
-                            continue;
-                        }
-                        let eff_channel =
-                            effective_channel_for_peer(&config, &candidate.device_id);
-                        for addr in
-                            ranked_addresses(&candidate.addresses, eff_channel, &local_channels)
-                        {
-                            if let Ok(stream) =
-                                TcpStream::connect_timeout(&addr, Duration::from_millis(250))
-                            {
-                                connected = Some((
-                                    stream,
-                                    true,
-                                    Some(candidate.friendly_name.clone()),
-                                    Some(candidate.device_id.clone()),
-                                ));
-                                break;
-                            }
-                        }
-                        if connected.is_some() {
-                            break;
-                        }
-                    }
-
-                    // Manual peer IP list fallback (ZeroTier / cross-subnet static peers)
-                    if connected.is_none() {
-                        for mp in &config.manual_peers {
-                            if let Some(direct_addr) = parse_direct_peer(Some(&mp.address))
-                                && let Ok(stream) = TcpStream::connect_timeout(
-                                    &direct_addr,
-                                    Duration::from_millis(280),
-                                )
-                            {
-                                connected = Some((stream, true, mp.label.clone(), None));
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Fallback accept if layout push hasn't dialed yet
-                if connected.is_none() && pending_layout_push.is_some() {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            connected = Some((stream, false, None, None));
-                        }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                let Some((stream, initiator, known_name, known_discovery_id)) = connected else {
-                    thread::sleep(Duration::from_millis(25));
-                    continue;
-                };
-
-                let peer_sock = stream.peer_addr().ok();
-                let peer_address = peer_sock
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                let active_channel_label =
-                    peer_sock.and_then(|a| classify_active_channel(a, &local_channels));
-                let local_hello = hello(&local_device_id, &platform)?;
-                let preferred_layout = if initiator {
-                    if let Some((_, layout)) = pending_layout_push.take() {
-                        Some(layout)
+                if !did_work {
+                    thread::sleep(Duration::from_millis(if active_peers.is_empty() {
+                        20
                     } else {
-                        known_discovery_id
-                            .as_deref()
-                            .and_then(find_saved_layout_by_prefix)
-                    }
-                } else {
-                    None
-                };
-
-                let session_stop = Arc::new(AtomicBool::new(false));
-                let established = PairConnection::establish_peer(
-                    stream,
-                    &local_device_id,
-                    config.passphrase.as_deref(),
-                    initiator,
-                    local_hello.clone(),
-                    preferred_layout,
-                    &stop,
-                    log.clone(),
-                );
-                let mut connection = match established {
-                    Ok(conn) => {
-                        last_error = None;
-                        conn
-                    }
-                    Err(error) => {
-                        let msg = format!("{error:#}");
-                        log.write("peer_setup_failed", serde_json::json!({"reason": msg}));
-                        let is_auth_mismatch = msg.contains("passphrase")
-                            || msg.contains("Authenticate")
-                            || msg.contains("Receive LAN Noise")
-                            || msg.contains("Read handshake");
-                        if is_auth_mismatch {
-                            last_error = Some("等待密码匹配：请确认两台设备的密码配置一致。".into());
-                            auth_backoff_until = Instant::now() + Duration::from_millis(2500);
-                        } else {
-                            last_error = Some(msg);
-                            auth_backoff_until = Instant::now() + Duration::from_millis(1000);
-                        }
-                        searching_since = Instant::now();
-                        thread::sleep(Duration::from_millis(200));
-                        continue;
-                    }
-                };
-
-                let remote_id = connection.remote_device_id().to_string();
-                save_layout(&remote_id, connection.shared_layout());
-
-                let peer_name = known_name
-                    .or_else(|| {
-                        candidates
-                            .iter()
-                            .find(|c| remote_id.starts_with(&c.device_id))
-                            .map(|c| c.friendly_name.clone())
-                    })
-                    .unwrap_or_else(|| "局域网设备".into());
-
-                let known_platform = candidates
-                    .iter()
-                    .find(|c| remote_id.starts_with(&c.device_id))
-                    .map(|c| c.platform.as_str());
-                let remote_os = infer_peer_os(known_platform, connection.shared_layout(), &remote_id);
-                let different_os = remote_os != std::env::consts::OS;
-
-                connection.set_max_hz(options.max_hz)?;
-                // Preserve native Ctrl and Cmd/Win keys so macOS Ctrl shortcuts stay intact.
-                let _ = (remote_os, different_os);
-                connection.set_key_translator(crate::keymap::KeyTranslator::passthrough());
-                let source = SharedSource::new(connection.runtime().clone())?;
-                source.set_edge_locked(screen_locked);
-                hotkey_engine.reset_modifiers();
-                let _ = hotkey_engine.drain_actions();
-                let mut sink = match prepare_worker(&local_hello.inventory, log.clone()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        last_error = Some(format!("输入服务启动失败: {e:#}"));
-                        thread::sleep(Duration::from_millis(300));
-                        continue;
-                    }
-                };
-                let mut capture = match (platform.capture)(source.clone(), log.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = sink.shutdown();
-                        last_error = Some(format!("输入采集启动失败: {e:#}"));
-                        thread::sleep(Duration::from_millis(300));
-                        continue;
-                    }
-                };
-
-                let local_has_focus = Arc::new(AtomicBool::new(true));
-                let aux_session = peer_sock.map(|sock| {
-                    crate::aux_channel::AuxSession::spawn(
-                        aux_listener.clone(),
-                        sock,
-                        initiator,
-                        local_device_id.clone(),
-                        remote_id.clone(),
-                        config.passphrase.clone(),
-                        clipboard_sync_flag.clone(),
-                        input_state_sync_flag.clone(),
-                        local_has_focus.clone(),
-                    )
-                });
-
-                let run_result = connection.run(
-                    &source,
-                    &mut sink,
-                    &mut PeerHost {
-                        capture: capture.as_mut(),
-                        source: &source,
-                        hotkey_engine: &hotkey_engine,
-                        rx: &rx,
-                        stdout: &stdout,
-                        discovery: &discovery,
-                        session_stop: &session_stop,
-                        global_stop: &stop,
-                        deadline,
-                        local_device_id: &local_device_id,
-                        local_name: &local_name,
-                        local_displays: local_hello.inventory.clone(),
-                        config: &mut config,
-                        smart_keymap_flag: &smart_keymap_flag,
-                        clipboard_sync_flag: &clipboard_sync_flag,
-                        input_state_sync_flag: &input_state_sync_flag,
-                        local_has_focus: &local_has_focus,
-                        aux: aux_session.as_ref(),
-                        reconfigure_requested: &mut reconfigure_requested,
-                        network_channels: channel_infos(&local_channels),
-                        active_channel_label,
-                        listen_endpoint: listen_endpoint.clone(),
-                        peer_device_id: remote_id.clone(),
-                        peer_name: peer_name.clone(),
-                        peer_platform: remote_os.to_string(),
-                        peer_address: peer_address.clone(),
-                        user_paused: &mut user_paused,
-                        screen_locked: &mut screen_locked,
-                        pending_layout_push: &mut pending_layout_push,
-                        pending_quick_jump: None,
-                        initiator,
-                        status_seen: false,
-                        auto_enable_sent: false,
-                        sharing: false,
-                        epoch: 0,
-                        pending: None,
-                        last_emit: Instant::now() - Duration::from_secs(1),
-                        last_emitted_enabled: None,
-                        last_emitted_focus_screen: None,
-                        last_emitted_peer_count: usize::MAX,
-                        last_emitted_locked: None,
-                        last_emitted_hotkeys: None,
-                        last_emitted_manual_peers: None,
-                        last_emitted_peer_channels: None,
-                    },
-                    &session_stop,
-                    log.clone(),
-                );
-
-                let capture_cleanup = capture.stop();
-                let sink_cleanup = sink.shutdown();
-                if capture_cleanup.is_err() || sink_cleanup.is_err() {
-                    // After OS suspend / lid-close / display power transitions, the
-                    // child worker may have already exited. Log and recover automatically
-                    // rather than permanently terminating the peer service.
-                    log.write(
-                        "peer_cleanup_recovered",
-                        serde_json::json!({
-                            "capture_confirmed": capture_cleanup.is_ok(),
-                            "worker_confirmed": sink_cleanup.is_ok()
-                        }),
-                    );
-                    if capture_cleanup.is_err() {
-                        anyhow::bail!("capture cleanup unconfirmed; restart client");
-                    }
-                    searching_since = Instant::now();
-                    thread::sleep(Duration::from_millis(350));
-                    continue;
+                        1
+                    }));
                 }
-                if let Err(error) = run_result {
-                    let reason = format!("{error:#}");
-                    log.write(
-                        "peer_session_ended",
-                        serde_json::json!({"reason": reason, "cleanup_confirmed": true}),
-                    );
-                    if pending_layout_push.is_none()
-                        && !reconfigure_requested
-                        && !stop.load(Ordering::Acquire)
-                    {
-                        last_error = None;
-                    }
-                }
-                searching_since = Instant::now();
-                if reconfigure_requested {
-                    break;
-                }
-                let pause_ms = if pending_layout_push.is_some() { 40 } else { 200 };
-                thread::sleep(Duration::from_millis(pause_ms));
             }
 
+            if let Some(io) = native_io.take() {
+                io.shutdown();
+            }
+            aux_hub.stop();
             discovery.stop();
             let _ = discovery.wait_stopped(Duration::from_secs(2));
         }
@@ -1974,35 +2225,6 @@ pub fn run(
     );
     writer.finish()?;
     result
-}
-
-fn infer_peer_os(known_platform: Option<&str>, layout: &SharedLayout, remote_id: &str) -> &'static str {
-    match known_platform {
-        Some("windows") => return "windows",
-        Some("macos") => return "macos",
-        _ => {}
-    }
-    let has_win_display = layout.screens.iter().any(|s| {
-        s.device_id == remote_id
-            && (s.native_id.starts_with(r"\\.\") || s.native_id.contains("DISPLAY"))
-    });
-    if has_win_display { "windows" } else { "macos" }
-}
-
-fn find_saved_layout_by_prefix(prefix: &str) -> Option<SharedLayout> {
-    let dir = app_data_root().ok()?.join("peer-layouts");
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(stem) = name.strip_suffix(".json")
-            && stem.starts_with(prefix)
-            && stem.len() == 64
-        {
-            return load_saved_layout(stem);
-        }
-    }
-    None
 }
 
 #[cfg(test)]

@@ -722,8 +722,17 @@ struct WorkspaceView: View {
                 ForEach(Array(deviceOrder.enumerated()), id: \.element) { idx, devID in
                     let group = layout.screens.filter { $0.deviceID == devID }
                     let isLocal = devID == peer.localDeviceID
-                    let devLabel = isLocal ? "\(peer.localName) (本机)" : (peer.peerName ?? "远端设备")
-                    let color = idx % 2 == 0 ? Theme.accent : Color(red: 13/255, green: 148/255, blue: 136/255)
+                    let peerMatch = peer.peers.first { $0.id == devID }
+                    let devLabel = isLocal ? "\(peer.localName) (本机)" : (peerMatch?.name ?? peer.peerName ?? "远端设备")
+                    let color: Color = {
+                        if isLocal { return Theme.accent }
+                        switch idx % 4 {
+                        case 0: return Theme.accent
+                        case 1: return Color(red: 13/255, green: 148/255, blue: 136/255)
+                        case 2: return Color(red: 124/255, green: 58/255, blue: 237/255)
+                        default: return Color(red: 217/255, green: 119/255, blue: 6/255)
+                        }
+                    }()
                     Text("\(devLabel) · \(group.count) 屏")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(color)
@@ -812,6 +821,7 @@ struct WorkspaceView: View {
             if peer.state == "startup_rejected" {
                 permissionCard
             } else if let layout = peer.sharedLayout {
+                let nameMap = Dictionary(uniqueKeysWithValues: peer.peers.map { ($0.id, $0.name) })
                 SessionLayoutView(
                     layout: layout,
                     focusScreenID: peer.focusScreenID,
@@ -819,6 +829,7 @@ struct WorkspaceView: View {
                     sourceName: peer.peerName ?? "另一台电脑",
                     localDeviceID: peer.localDeviceID,
                     localName: peer.localName,
+                    deviceNames: nameMap,
                     editable: true,
                     onCommitLayout: { updated in
                         commitLayout(updated, recordUndo: true)

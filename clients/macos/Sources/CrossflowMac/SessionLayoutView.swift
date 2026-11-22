@@ -8,6 +8,7 @@ struct SessionLayoutView: View {
     let sourceName: String
     let localDeviceID: String?
     var localName: String = "这台 Mac"
+    var deviceNames: [String: String] = [:]
     var editable: Bool = false
     var onCommitLayout: ((SharedLayout) -> Void)? = nil
 
@@ -51,6 +52,9 @@ struct SessionLayoutView: View {
                         }
                     }
 
+                    let deviceOrder = screens.reduce(into: [String]()) { acc, s in
+                        if !acc.contains(s.deviceID) { acc.append(s.deviceID) }
+                    }
                     ForEach(screens) { screen in
                         let isDragging = draggingID == screen.id
                         let currentX = isDragging ? dragX : screen.x
@@ -59,7 +63,17 @@ struct SessionLayoutView: View {
                         let local = screen.deviceID == localDeviceID
                         let ordinal = screens.prefix(while: { $0.id != screen.id })
                             .filter { $0.deviceID == screen.deviceID }.count + 1
-                        let accentColor = local ? Theme.accent : Color(red: 13/255, green: 148/255, blue: 136/255)
+                        let devIdx = deviceOrder.firstIndex(of: screen.deviceID) ?? 0
+                        let accentColor: Color = {
+                            if local { return Theme.accent }
+                            switch devIdx % 4 {
+                            case 0: return Theme.accent
+                            case 1: return Color(red: 13/255, green: 148/255, blue: 136/255)
+                            case 2: return Color(red: 124/255, green: 58/255, blue: 237/255)
+                            default: return Color(red: 217/255, green: 119/255, blue: 6/255)
+                            }
+                        }()
+                        let displayName = local ? localName : (deviceNames[screen.deviceID] ?? sourceName)
                         let tileW = max(24, screen.width * scale)
                         let tileH = max(24, screen.height * scale)
 
@@ -74,7 +88,7 @@ struct SessionLayoutView: View {
                                     VStack(spacing: 4) {
                                         Image(systemName: local ? "laptopcomputer" : "display")
                                             .foregroundStyle(accentColor)
-                                        Text("\(local ? localName : sourceName) · 屏 \(ordinal)")
+                                        Text("\(displayName) · 屏 \(ordinal)")
                                             .font(.system(size: 13, weight: .semibold))
                                             .lineLimit(1)
                                         Text("\(Int(screen.width)) × \(Int(screen.height))")

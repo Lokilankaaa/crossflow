@@ -111,6 +111,38 @@ impl RoutedInput {
             _ => (None, None),
         }
     }
+    pub fn active_remote_device_id(&self) -> Option<String> {
+        let f = self.focus.as_ref()?;
+        let s = self.config.screen(&f.screen_id).ok()?;
+        (s.device_id != self.config.local_device_id).then(|| s.device_id.clone())
+    }
+    /// Hot-reload the 2D screen graph (e.g., when a 3rd device joins/leaves the mesh
+    /// or the user drags a screen) without restarting native input capture.
+    pub fn update_runtime(&mut self, next: RuntimeLayout) -> anyhow::Result<()> {
+        next.validate()?;
+        let still_valid_focus = self
+            .focus
+            .as_ref()
+            .and_then(|f| next.screen(&f.screen_id).ok())
+            .is_some();
+        self.config = next;
+        if !still_valid_focus && self.focus.is_some() {
+            self.remote_gate.store(false, Ordering::Release);
+            let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            q.pause();
+            self.expected_queue_epoch = q.control_epoch();
+            drop(q);
+            self.focus = None;
+        }
+        self.publish_routing();
+        Ok(())
+    }
+    /// Immediately return focus to this local device (e.g., when a remote peer
+    /// takes over its own physical mouse/keyboard and sends RevokeControl).
+    pub fn force_return_local(&mut self, t0: u64) -> anyhow::Result<Option<Point>> {
+        let local_id = self.config.local_device_id.clone();
+        self.quick_jump_to_device(&local_id, t0)
+    }
     pub fn outcome(&mut self, outcome: CaptureOutcome) {
         if matches!(outcome, CaptureOutcome::Paused(_)) {
             self.sync();
@@ -261,11 +293,19 @@ impl RoutedInput {
             self.publish_routing();
             Ok(Some(point))
         } else {
+            let prev_remote_dev = self.active_remote_device_id();
+            let next_remote_dev = self.config.screen(&next.screen_id)?.device_id.clone();
+            let switched_remote_device = prev_remote_dev
+                .as_deref()
+                .is_some_and(|prev| prev != next_remote_dev);
             let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
             if !q.is_connected() || q.control_epoch() != self.expected_queue_epoch {
                 drop(q);
                 self.sync();
                 return Ok(None);
+            }
+            if switched_remote_device {
+                q.pause();
             }
             if !q.is_active() && !q.arm() {
                 drop(q);

@@ -10,6 +10,7 @@ pub mod input_state;
 pub mod keychain;
 pub mod keychain_process;
 pub mod keymap;
+pub mod mesh_runtime;
 pub mod metrics;
 pub mod pair_app;
 pub mod pair_control;

@@ -173,6 +173,113 @@ impl SharedSource {
         }
         state.route.quick_jump_to_device(target_device_id, now_ns)
     }
+    pub fn force_return_local(&self, now_ns: u64) -> Result<Option<Point>> {
+        let mut state = self.lock();
+        state.sync();
+        if !state.route.enabled || state.failure.is_some() {
+            return Ok(None);
+        }
+        state.route.force_return_local(now_ns)
+    }
+    pub fn active_remote_device_id(&self) -> Option<String> {
+        let state = self.lock();
+        state.route.active_remote_device_id()
+    }
+    pub fn update_runtime(&self, next: RuntimeLayout) -> Result<()> {
+        let mut state = self.lock();
+        state.route.update_runtime(next)
+    }
+    pub fn enable_mesh(&self) -> Result<()> {
+        let mut state = self.lock();
+        ensure!(
+            state.sync() && state.ready && state.failure.is_none(),
+            "physical source is not ready for mesh enable"
+        );
+        if !state.route.enabled {
+            let generation = state.route.generation;
+            ensure!(
+                state.route.enable(generation),
+                "mesh source enable rejected"
+            );
+            state.emitted_epoch = None;
+        }
+        Ok(())
+    }
+    pub fn pause_mesh(&self) {
+        self.gate.store(false, Ordering::Release);
+        let mut state = self.lock();
+        state.route.pause();
+        state.failure = None;
+        state.emitted_epoch = None;
+    }
+    /// Atomically pop the next frame together with its target remote device ID
+    /// (if any) for 1-hop N-device Mesh routing.
+    pub fn next_mesh_frame(
+        &self,
+        now_ns: u64,
+        allow_motion: bool,
+    ) -> Result<Option<(Option<String>, Frame)>> {
+        let mut state = self.lock();
+        state.sync();
+        if state.failure.is_some() {
+            anyhow::bail!("physical source has an unacknowledged failure");
+        }
+        if state.last_poll_ns.is_some_and(|last| now_ns < last) {
+            state.fail(SourceFailure::ClockRegressed);
+            anyhow::bail!("physical source poll clock regressed");
+        }
+        state.last_poll_ns = Some(now_ns);
+        let target = state.route.active_remote_device_id();
+        let queue_arc = state.route.input.clone();
+        let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
+        if !queue.is_connected() {
+            return Ok(None);
+        }
+        if let Err(reason) = queue.validate_pending(now_ns) {
+            drop(queue);
+            state.fail(SourceFailure::QueuePaused(reason));
+            anyhow::bail!("physical source pending input expired");
+        }
+        let epoch = queue.control_epoch();
+        if state.emitted_epoch != Some(epoch) {
+            let mut frame = Frame::new(if queue.is_active() {
+                Kind::Arm
+            } else {
+                Kind::Pause
+            });
+            frame.t0_ns = now_ns;
+            frame.t1_ns = now_ns;
+            state.emitted_epoch = Some(epoch);
+            return Ok(Some((target, frame)));
+        }
+        if !allow_motion
+            && matches!(
+                queue.front_action(),
+                Some(InputAction::Move { .. } | InputAction::Position { .. })
+            )
+        {
+            return Ok(None);
+        }
+        let input = match queue.pop(now_ns) {
+            Ok(value) => value,
+            Err(reason) => {
+                drop(queue);
+                state.fail(SourceFailure::QueuePaused(reason));
+                anyhow::bail!("physical source queued input expired");
+            }
+        };
+        drop(queue);
+        match input {
+            Some(input) => match Frame::from_input(input, now_ns) {
+                Ok(frame) => Ok(Some((target, frame))),
+                Err(error) => {
+                    state.fail(SourceFailure::InvalidCapture);
+                    Err(error)
+                }
+            },
+            None => Ok(None),
+        }
+    }
     pub fn runtime(&self) -> RuntimeLayout {
         self.lock().route.config.clone()
     }
