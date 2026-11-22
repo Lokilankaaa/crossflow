@@ -17,10 +17,12 @@ internal static class Program
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     private static Mutex? singleInstanceMutex;
+    internal static bool StartMinimized { get; private set; }
 
     [STAThread]
     private static void Main(string[] args)
     {
+        StartMinimized = args.Any(a => string.Equals(a, "--minimized", StringComparison.OrdinalIgnoreCase));
         if (args.Length == 2 && args[0] == "--oneclick-fixture") { OneClickSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--oneclick-self-test") { OneClickSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--runtime-layout-self-test") { RuntimeLayoutSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
@@ -84,8 +86,16 @@ public sealed partial class CrossflowApplication : Application
             StartupDiagnostics.Write("main-window-failed", failure);
             window = new Window { Title = "Crossflow", Content = new TextBlock { Text = "界面未能加载。启动原因已写入：\n" + StartupDiagnostics.LogPath, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(32) } };
         }
-        window.Activate();
-        StartupDiagnostics.Write("window-activated");
+        if (Program.StartMinimized && window is MainWindow main)
+        {
+            main.StartInTray();
+            StartupDiagnostics.Write("window-started-in-tray");
+        }
+        else
+        {
+            window.Activate();
+            StartupDiagnostics.Write("window-activated");
+        }
     }
 }
 

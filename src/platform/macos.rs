@@ -521,6 +521,98 @@ fn mac_keycode(usage: u16) -> Option<u16> {
     })
 }
 
+fn mac_media_keytype(usage: u16) -> Option<i32> {
+    Some(match usage {
+        crate::keymap::HID_VOLUME_UP => 0,        // NX_KEYTYPE_SOUND_UP
+        crate::keymap::HID_VOLUME_DOWN => 1,      // NX_KEYTYPE_SOUND_DOWN
+        crate::keymap::HID_MUTE => 7,             // NX_KEYTYPE_MUTE
+        crate::keymap::HID_MEDIA_PLAY_PAUSE => 16, // NX_KEYTYPE_PLAY
+        crate::keymap::HID_MEDIA_NEXT => 17,      // NX_KEYTYPE_NEXT
+        crate::keymap::HID_MEDIA_PREV => 18,      // NX_KEYTYPE_PREVIOUS
+        _ => return None,
+    })
+}
+
+fn post_mac_media_key(key_type: i32, down: bool) {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct IoGPoint {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    struct NxEventData {
+        reserved: i16,
+        sub_type: i16,
+        l: [i32; 11],
+    }
+    const _: () = assert!(std::mem::size_of::<NxEventData>() == 48);
+    const NX_SYSDEFINED: u32 = 14;
+    const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i16 = 8;
+    const K_NX_EVENT_DATA_VERSION: u32 = 2;
+    const K_IOHID_PARAM_CONNECT_TYPE: u32 = 1;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const std::ffi::c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+        fn IOServiceOpen(
+            service: u32,
+            owning_task: u32,
+            connect_type: u32,
+            connect: *mut u32,
+        ) -> i32;
+        fn IOServiceClose(connect: u32) -> i32;
+        fn IOObjectRelease(object: u32) -> i32;
+        fn IOHIDPostEvent(
+            handle: u32,
+            event_type: u32,
+            location: IoGPoint,
+            event_data: *const NxEventData,
+            event_data_version: u32,
+            event_flags: u32,
+            options: u32,
+        ) -> i32;
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+    }
+
+    unsafe {
+        let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+        if matching.is_null() {
+            return;
+        }
+        let svc = IOServiceGetMatchingService(0, matching);
+        if svc == 0 {
+            return;
+        }
+        let mut conn: u32 = 0;
+        if IOServiceOpen(svc, mach_task_self_, K_IOHID_PARAM_CONNECT_TYPE, &mut conn) == 0
+            && conn != 0
+        {
+            let state_byte = if down { 0x0A } else { 0x0B };
+            let mut data = NxEventData {
+                reserved: 0,
+                sub_type: NX_SUBTYPE_AUX_CONTROL_BUTTONS,
+                l: [0; 11],
+            };
+            data.l[0] = (key_type << 16) | (state_byte << 8);
+            let _ = IOHIDPostEvent(
+                conn,
+                NX_SYSDEFINED,
+                IoGPoint { x: 0, y: 0 },
+                &data,
+                K_NX_EVENT_DATA_VERSION,
+                0,
+                0,
+            );
+            IOServiceClose(conn);
+        }
+        IOObjectRelease(svc);
+    }
+}
+
 fn modifier_flags(keys: &BTreeSet<u16>) -> u64 {
     let mut flags = 0;
     for (left, right, mask) in [
@@ -1090,6 +1182,17 @@ impl MacMouseSink {
     /// Control remains Control; GUI maps to Command. Remapping is a core policy.
     pub fn key(&mut self, usage: u16, down: bool) -> Result<(), AdapterError> {
         if !down && !self.owned_keys.contains(&usage) {
+            return Ok(());
+        }
+        if let Some(nx_key) = mac_media_keytype(usage) {
+            if down {
+                self.check_input_ready()?;
+                self.owned_keys.insert(usage);
+            }
+            post_mac_media_key(nx_key, down);
+            if !down {
+                self.owned_keys.remove(&usage);
+            }
             return Ok(());
         }
         let keycode = mac_keycode(usage)

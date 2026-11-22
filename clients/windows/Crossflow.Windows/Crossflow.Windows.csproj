@@ -13,6 +13,7 @@
     <SelfContained>true</SelfContained>
     <PublishReadyToRun>false</PublishReadyToRun>
     <EnableMsixTooling>false</EnableMsixTooling>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -26,6 +27,7 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="Assets\AppIcon.ico" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="../../design-tokens.json" Link="design-tokens.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="../../../examples/layout-four-screens.json" Link="sample-layout.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="../../../target/release/crossflow_bridge.dll" Link="crossflow_bridge.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../target/release/crossflow_bridge.dll')" />

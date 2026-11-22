@@ -15,6 +15,12 @@ use std::sync::{
 };
 
 pub const HID_CAPS_LOCK: u16 = 0x39;
+pub const HID_MUTE: u16 = 0x7F;
+pub const HID_VOLUME_UP: u16 = 0x80;
+pub const HID_VOLUME_DOWN: u16 = 0x81;
+pub const HID_MEDIA_PLAY_PAUSE: u16 = 0x9B;
+pub const HID_MEDIA_NEXT: u16 = 0x9C;
+pub const HID_MEDIA_PREV: u16 = 0x9D;
 /// Canonical usage ID used by Crossflow for the Apple Fn / Globe modifier key
 /// (fits inside `input::is_keyboard_usage` without colliding with standard keys).
 pub const HID_FN_GLOBE: u16 = 0xA4;
@@ -22,6 +28,19 @@ pub const HID_LEFT_CTRL: u16 = 0xE0;
 pub const HID_LEFT_GUI: u16 = 0xE3;
 pub const HID_RIGHT_CTRL: u16 = 0xE4;
 pub const HID_RIGHT_GUI: u16 = 0xE7;
+
+#[inline]
+pub fn is_media_usage(usage: u16) -> bool {
+    matches!(
+        usage,
+        HID_MUTE
+            | HID_VOLUME_UP
+            | HID_VOLUME_DOWN
+            | HID_MEDIA_PLAY_PAUSE
+            | HID_MEDIA_NEXT
+            | HID_MEDIA_PREV
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct KeyTranslator {

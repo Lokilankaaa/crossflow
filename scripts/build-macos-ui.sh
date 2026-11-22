@@ -47,6 +47,28 @@ if [ -f "$app/Contents/MacOS/crossflow-invite" ]; then
     rm -- "$app/Contents/MacOS/crossflow-invite"
 fi
 cp "$root/clients/macos/Resources/Info.plist" "$app/Contents/Info.plist"
+if [ -f "$root/assets/AppIcon-1024.png" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+    iconset="$build_root/AppIcon.iconset"
+    rm -rf "$iconset"
+    mkdir -p "$iconset"
+    for spec in \
+        "16:icon_16x16.png" \
+        "32:icon_16x16@2x.png" \
+        "32:icon_32x32.png" \
+        "64:icon_32x32@2x.png" \
+        "128:icon_128x128.png" \
+        "256:icon_128x128@2x.png" \
+        "256:icon_256x256.png" \
+        "512:icon_256x256@2x.png" \
+        "512:icon_512x512.png" \
+        "1024:icon_512x512@2x.png"; do
+        sz="${spec%%:*}"
+        name="${spec#*:}"
+        sips -z "$sz" "$sz" "$root/assets/AppIcon-1024.png" --out "$iconset/$name" >/dev/null
+    done
+    iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+    rm -rf "$iconset"
+fi
 cp "$root/clients/design-tokens.json" "$app/Contents/Resources/design-tokens.json"
 cp "$root/examples/layout-two-devices.json" "$app/Contents/Resources/layout-two-devices.json"
 cp "$root/examples/layout-four-screens.json" "$app/Contents/Resources/layout-four-screens.json"

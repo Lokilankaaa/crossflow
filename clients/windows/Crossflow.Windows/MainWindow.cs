@@ -9,6 +9,7 @@ using Microsoft.UI.Xaml.Shapes;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.Storage;
+using Windows.Storage.Pickers;
 using Windows.System;
 using WinRT.Interop;
 
@@ -79,7 +80,7 @@ internal sealed class MainWindow : Window
     private readonly PeerMeshController peerMesh = new();
     private PeerMeshSnapshot currentSnap = PeerMeshSnapshot.Initial;
     private PeerSharedLayout? activeSharedLayout;
-    private bool coreReady, busy, closing, allowClose;
+    private bool coreReady, busy, closing, allowClose, bootstrapped;
     private string? lastShownError;
 
     private readonly LayoutEditHistory layoutHistory = new();
@@ -113,9 +114,37 @@ internal sealed class MainWindow : Window
         AppWindow.Resize(new global::Windows.Graphics.SizeInt32(
             (int)theme.Number("window", "width"),
             (int)theme.Number("window", "height")));
+        string iconFile = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+        if (File.Exists(iconFile))
+            try { AppWindow.SetIcon(iconFile); } catch { }
 
         InitCanvasEvents();
         InitWindowLifecycle();
+    }
+
+    internal void StartInTray()
+    {
+        AppWindow.Hide();
+        DispatcherQueue.TryEnqueue(async () => await BootstrapOnceAsync());
+    }
+
+    private async Task BootstrapOnceAsync()
+    {
+        if (bootstrapped) return;
+        bootstrapped = true;
+        try
+        {
+            await Task.Run(() => CoreBridge.Request(new { op = "environment" }));
+            coreReady = true;
+        }
+        catch
+        {
+            coreReady = false;
+            ShowNotice("布局内核未就绪，请重新构建客户端。", isError: true);
+        }
+
+        Draw();
+        await RestartPeerAsync();
     }
 
     private bool CanEditLayout => !closing && !busy && coreReady && activeSharedLayout is not null;
@@ -508,19 +537,7 @@ internal sealed class MainWindow : Window
                 Math.Min(work.Width, (int)(theme.Number("window", "width") * density)),
                 Math.Min(work.Height, (int)(theme.Number("window", "height") * density))));
 
-            try
-            {
-                await Task.Run(() => CoreBridge.Request(new { op = "environment" }));
-                coreReady = true;
-            }
-            catch
-            {
-                coreReady = false;
-                ShowNotice("布局内核未就绪，请重新构建客户端。", isError: true);
-            }
-
-            Draw();
-            await RestartPeerAsync();
+            await BootstrapOnceAsync();
         };
 
         AppWindow.Changed += (_, change) =>
@@ -549,7 +566,43 @@ internal sealed class MainWindow : Window
             trayIcon.ShowOrRestoreRequested += () => DispatcherQueue.TryEnqueue(ShowAndActivate);
             trayIcon.HideRequested += () => DispatcherQueue.TryEnqueue(() => AppWindow.Hide());
             trayIcon.ToggleSharingRequested += () => DispatcherQueue.TryEnqueue(async () => await OnPrimaryActionClickAsync());
+            trayIcon.ToggleClipboardRequested += enabled => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetClipboardAsync(enabled));
+            trayIcon.ToggleInputStateRequested += enabled => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetInputStateSyncAsync(enabled));
+            trayIcon.SelectChannelRequested += chId => DispatcherQueue.TryEnqueue(async () =>
+                await peerMesh.SetChannelAsync(chId, chId == "auto" ? null : directPeerBox.Text));
+            trayIcon.SendFilesDialogRequested += () => DispatcherQueue.TryEnqueue(async () => await PickAndSendFilesAsync());
+            trayIcon.OpenReceiveFolderRequested += () => DispatcherQueue.TryEnqueue(OpenReceiveFolder);
             trayIcon.ExitRequested += () => DispatcherQueue.TryEnqueue(async () => await ExitApplicationAsync());
+        }
+        catch { }
+    }
+
+    private async Task PickAndSendFilesAsync()
+    {
+        if (currentSnap.PeerDeviceId is null) return;
+        try
+        {
+            var picker = new FileOpenPicker();
+            picker.FileTypeFilter.Add("*");
+            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+            var files = await picker.PickMultipleFilesAsync();
+            if (files is null || files.Count == 0) return;
+            var paths = files.Select(f => f.Path).Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
+            if (paths.Count > 0)
+                await peerMesh.SendFilesAsync(paths);
+        }
+        catch { }
+    }
+
+    private static void OpenReceiveFolder()
+    {
+        try
+        {
+            string dir = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads", "Crossflow");
+            Directory.CreateDirectory(dir);
+            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dir}\"") { UseShellExecute = true });
         }
         catch { }
     }
@@ -698,18 +751,48 @@ internal sealed class MainWindow : Window
             updatingInputStateUi = false;
         }
 
+        bool isRemoteFocus = snap.State == "sharing"
+            && snap.FocusDeviceId is not null
+            && !string.Equals(snap.FocusDeviceId, snap.LocalDeviceId, StringComparison.Ordinal);
+        TrayVisualState trayVisual = (isAuthMismatch || snap.State is "paused" or "error" or "stopped")
+            ? TrayVisualState.Paused
+            : isRemoteFocus
+                ? TrayVisualState.ActiveRemote
+                : snap.State == "sharing"
+                    ? TrayVisualState.Connected
+                    : TrayVisualState.Searching;
+
+        string peerTag = snap.PeerName ?? "远端设备";
+        string channelSuffix = snap.ActiveChannelLabel is not null ? $" · {snap.ActiveChannelLabel}" : "";
         string trayTip = snap.State switch
         {
-            "sharing" => snap.PeerName is not null ? $"Crossflow · 已连接 {snap.PeerName}" : "Crossflow · 跨屏共享中",
-            "paused" => "Crossflow · 已暂停",
+            "sharing" => $"Crossflow · 已连接 {peerTag}{channelSuffix}",
+            "paused" => $"Crossflow · 已暂停（{peerTag}）",
             "searching" => "Crossflow · 正在发现设备",
             _ => "Crossflow"
         };
-        trayIcon?.UpdateStatus(
+        string primaryMenuStatus = snap.State switch
+        {
+            "sharing" => $"已连接：{peerTag}{channelSuffix}",
+            "paused" => $"已暂停：{peerTag}",
+            _ => $"状态：{statusTitle.Text}"
+        };
+        string? focusMenuLine = snap.State == "sharing" && snap.FocusDeviceId is not null
+            ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}"
+            : null;
+
+        trayIcon?.UpdateState(
+            trayVisual,
             trayTip,
-            $"状态：{statusTitle.Text}",
+            primaryMenuStatus,
+            focusMenuLine,
+            connected: snap.State is "sharing" or "paused",
             canToggle: snap.State is "sharing" or "paused",
-            sharing: snap.State == "sharing");
+            sharing: snap.State == "sharing",
+            clipboardSync: snap.ClipboardSync,
+            inputStateSync: snap.InputStateSync,
+            channelId: snap.SelectedChannel,
+            availableChannels: snap.NetworkChannels);
 
         // Sync network channel dropdown
         SyncChannelSelector(snap);

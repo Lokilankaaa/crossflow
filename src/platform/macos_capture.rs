@@ -460,6 +460,64 @@ mod native {
         fn CGSMainConnectionID() -> u32;
         fn CGSSetConnectionProperty(cid: u32, target_cid: u32, key: Ptr, value: Ptr) -> i32;
     }
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> Ptr;
+        fn sel_registerName(name: *const std::ffi::c_char) -> Ptr;
+        fn objc_autoreleasePoolPush() -> Ptr;
+        fn objc_autoreleasePoolPop(pool: Ptr);
+        fn objc_msgSend();
+    }
+    fn decode_sysdefined_media(event: Ptr) -> Option<(u16, bool)> {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let result = (|| -> Option<(u16, bool)> {
+                let cls = objc_getClass(c"NSEvent".as_ptr());
+                if cls.is_null() {
+                    return None;
+                }
+                let sel_from: extern "C" fn(Ptr, Ptr, Ptr) -> Ptr =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let ns_ev = sel_from(cls, sel_registerName(c"eventWithCGEvent:".as_ptr()), event);
+                if ns_ev.is_null() {
+                    return None;
+                }
+                let get_i16: extern "C" fn(Ptr, Ptr) -> i16 =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let subtype = get_i16(ns_ev, sel_registerName(c"subtype".as_ptr()));
+                if subtype != 8 {
+                    return None;
+                }
+                let get_isize: extern "C" fn(Ptr, Ptr) -> isize =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let data1 = get_isize(ns_ev, sel_registerName(c"data1".as_ptr()));
+                let key_code = (data1 >> 16) & 0xFFFF;
+                let key_flags = data1 & 0xFFFF;
+                let key_state = (key_flags & 0xFF00) >> 8;
+                let is_repeat = (key_flags & 0x01) != 0;
+                if is_repeat {
+                    return None;
+                }
+                let down = match key_state {
+                    0x0A => true,
+                    0x0B => false,
+                    _ => return None,
+                };
+                let usage = match key_code {
+                    0 => crate::keymap::HID_VOLUME_UP,
+                    1 => crate::keymap::HID_VOLUME_DOWN,
+                    7 => crate::keymap::HID_MUTE,
+                    16 => crate::keymap::HID_MEDIA_PLAY_PAUSE,
+                    17 => crate::keymap::HID_MEDIA_NEXT,
+                    18 => crate::keymap::HID_MEDIA_PREV,
+                    _ => return None,
+                };
+                Some((usage, down))
+            })();
+            objc_autoreleasePoolPop(pool);
+            result
+        }
+    }
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn AXIsProcessTrusted() -> u8;
@@ -963,6 +1021,18 @@ mod native {
                 suppress = route_press(&mut state.remote_keys[index], down, remote);
                 CaptureKind::Key { usage, down }
             }
+            14 => {
+                // NX_SYSDEFINED media keys (Volume Up/Down, Mute, Play/Pause, Next/Prev)
+                let Some((usage, down)) = decode_sysdefined_media(event) else {
+                    return false;
+                };
+                state.shared.activity.fetch_add(1, Ordering::Release);
+                if !remote {
+                    return false;
+                }
+                suppress = true;
+                CaptureKind::Key { usage, down }
+            }
             22 => {
                 // Fixed-point line deltas retain trackpad/sub-notch precision;
                 // do not label this a raw wheel/HID measurement.
@@ -1101,7 +1171,7 @@ mod native {
             wheel: WheelRemainder::default(),
             permission: None,
         });
-        let mask = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27]
+        let mask = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 14, 22, 25, 26, 27]
             .iter()
             .fold(0u64, |m, t| m | (1u64 << t));
         // Prefer kCGHIDEventTap (0) so suppressed mouse/trackpad events are swallowed

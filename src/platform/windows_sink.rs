@@ -158,7 +158,33 @@ fn scan(usage: u16) -> Option<u16> {
         .iter()
         .find_map(|&(scan, hid)| (hid == usage).then_some(scan))
 }
+fn media_vk(usage: u16) -> Option<u16> {
+    Some(match usage {
+        crate::keymap::HID_MUTE => 0xAD,             // VK_VOLUME_MUTE
+        crate::keymap::HID_VOLUME_DOWN => 0xAE,      // VK_VOLUME_DOWN
+        crate::keymap::HID_VOLUME_UP => 0xAF,        // VK_VOLUME_UP
+        crate::keymap::HID_MEDIA_NEXT => 0xB0,       // VK_MEDIA_NEXT_TRACK
+        crate::keymap::HID_MEDIA_PREV => 0xB1,       // VK_MEDIA_PREV_TRACK
+        crate::keymap::HID_MEDIA_PLAY_PAUSE => 0xB3, // VK_MEDIA_PLAY_PAUSE
+        _ => return None,
+    })
+}
+
 fn keyboard(usage: u16, down: bool) -> Result<INPUT> {
+    if let Some(vk) = media_vk(usage) {
+        return Ok(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                    time: 0,
+                    dwExtraInfo: INPUT_ORIGIN_TAG,
+                },
+            },
+        });
+    }
     let scan = scan(usage).ok_or_else(|| anyhow::anyhow!("unsupported keyboard usage"))?;
     Ok(INPUT {
         r#type: INPUT_KEYBOARD,
@@ -489,7 +515,8 @@ impl MouseSink for WindowsMouseSink {
         let input = self.finish(packet)?;
         if down {
             self.checked()?;
-            let vk = self.platform.key_vk(scan(usage).expect("validated usage"));
+            let vk = media_vk(usage)
+                .unwrap_or_else(|| self.platform.key_vk(scan(usage).expect("validated usage")));
             let valid = vk != 0 && !self.keys.contains(&usage) && !self.platform.held(vk);
             self.finish(if valid {
                 Ok(())

@@ -63,6 +63,13 @@ final class DiscoveryModel {
     }
 }
 
+private enum MenuBarVisualState: Equatable {
+    case searching
+    case connected
+    case activeRemote
+    case paused
+}
+
 @MainActor
 final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let discovery = DiscoveryModel()
@@ -71,8 +78,19 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var awaitingShutdown = false
     private var statusItem: NSStatusItem?
     private var statusMenuItem: NSMenuItem?
+    private var focusMenuItem: NSMenuItem?
     private var showHideMenuItem: NSMenuItem?
     private var toggleShareMenuItem: NSMenuItem?
+    private var clipboardMenuItem: NSMenuItem?
+    private var inputStateMenuItem: NSMenuItem?
+    private var channelParentItem: NSMenuItem?
+    private var channelSubmenu: NSMenu?
+    private var sendFilesMenuItem: NSMenuItem?
+    private var autoStartMenuItem: NSMenuItem?
+    private var lastVisualState: MenuBarVisualState?
+    private var lastChannelMenuSig: String = ""
+    private var startedMinimized: Bool = CommandLine.arguments.contains("--minimized")
+    private var didApplyInitialMinimize = false
     private weak var mainWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -96,6 +114,10 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         if mainWindow !== window {
             mainWindow = window
             window.delegate = self
+            if startedMinimized && !didApplyInitialMinimize {
+                didApplyInitialMinimize = true
+                window.orderOut(nil)
+            }
             refreshMenuBar()
         }
     }
@@ -127,21 +149,25 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func setupStatusBarItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            if let img = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Crossflow") {
-                img.isTemplate = true
-                button.image = img
-            } else {
-                button.title = "CF"
-            }
+            button.image = renderMenuBarIcon(state: .searching)
+            button.imagePosition = .imageOnly
             button.toolTip = "Crossflow"
         }
 
         let menu = NSMenu()
+        menu.autoenablesItems = false
+
         let statusEntry = NSMenuItem(title: "状态：正在发现设备", action: nil, keyEquivalent: "")
         statusEntry.isEnabled = false
         menu.addItem(statusEntry)
+
+        let focusEntry = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        focusEntry.isEnabled = false
+        focusEntry.isHidden = true
+        menu.addItem(focusEntry)
+
         menu.addItem(.separator())
 
         let showHideEntry = NSMenuItem(title: "隐藏到菜单栏", action: #selector(toggleMainWindow), keyEquivalent: "")
@@ -154,6 +180,41 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         menu.addItem(toggleShareEntry)
 
         menu.addItem(.separator())
+
+        let clipEntry = NSMenuItem(title: "剪贴板共享", action: #selector(toggleClipboardSync), keyEquivalent: "")
+        clipEntry.target = self
+        clipEntry.state = .on
+        menu.addItem(clipEntry)
+
+        let imeEntry = NSMenuItem(title: "中英文与大小写同步", action: #selector(toggleInputStateSync), keyEquivalent: "")
+        imeEntry.target = self
+        imeEntry.state = .on
+        menu.addItem(imeEntry)
+
+        let chParent = NSMenuItem(title: "网络信道", action: nil, keyEquivalent: "")
+        let chSub = NSMenu()
+        chParent.submenu = chSub
+        chParent.isHidden = true
+        menu.addItem(chParent)
+
+        menu.addItem(.separator())
+
+        let sendEntry = NSMenuItem(title: "发送文件到对端…", action: #selector(pickAndSendFiles), keyEquivalent: "")
+        sendEntry.target = self
+        sendEntry.isEnabled = false
+        menu.addItem(sendEntry)
+
+        let folderEntry = NSMenuItem(title: "打开接收文件夹", action: #selector(openReceiveFolder), keyEquivalent: "")
+        folderEntry.target = self
+        menu.addItem(folderEntry)
+
+        menu.addItem(.separator())
+
+        let autoStartEntry = NSMenuItem(title: "开机自启动", action: #selector(toggleAutoStart), keyEquivalent: "")
+        autoStartEntry.target = self
+        autoStartEntry.state = isLaunchAgentEnabled() ? .on : .off
+        menu.addItem(autoStartEntry)
+
         let quitEntry = NSMenuItem(title: "退出 Crossflow", action: #selector(quitApp), keyEquivalent: "q")
         quitEntry.target = self
         menu.addItem(quitEntry)
@@ -161,24 +222,176 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         item.menu = menu
         statusItem = item
         statusMenuItem = statusEntry
+        focusMenuItem = focusEntry
         showHideMenuItem = showHideEntry
         toggleShareMenuItem = toggleShareEntry
+        clipboardMenuItem = clipEntry
+        inputStateMenuItem = imeEntry
+        channelParentItem = chParent
+        channelSubmenu = chSub
+        sendFilesMenuItem = sendEntry
+        autoStartMenuItem = autoStartEntry
     }
 
     func refreshMenuBar() {
-        statusMenuItem?.title = "状态：\(peer.statusTitle)"
-        if let button = statusItem?.button {
-            if peer.isSharing, let name = peer.peerName {
-                button.toolTip = "Crossflow · 已连接 \(name)"
+        let isRemoteFocus = peer.isSharing
+            && peer.focusDeviceID != nil
+            && peer.focusDeviceID != peer.localDeviceID
+        let visual: MenuBarVisualState = {
+            if peer.state == "paused" || peer.state == "error" || peer.state == "stopped" || peer.state == "startup_rejected" {
+                return .paused
+            }
+            if isRemoteFocus { return .activeRemote }
+            if peer.isSharing { return .connected }
+            return .searching
+        }()
+        if visual != lastVisualState {
+            lastVisualState = visual
+            statusItem?.button?.image = renderMenuBarIcon(state: visual)
+        }
+
+        let peerTag = peer.peerName ?? "远端设备"
+        let chSuffix = peer.activeChannelLabel.map { " · \($0)" } ?? ""
+        if peer.isSharing {
+            statusMenuItem?.title = "已连接：\(peerTag)\(chSuffix)"
+            statusItem?.button?.toolTip = "Crossflow · 已连接 \(peerTag)\(chSuffix)"
+        } else if peer.state == "paused" {
+            statusMenuItem?.title = "已暂停：\(peerTag)"
+            statusItem?.button?.toolTip = "Crossflow · 已暂停"
+        } else {
+            statusMenuItem?.title = "状态：\(peer.statusTitle)"
+            statusItem?.button?.toolTip = "Crossflow · \(peer.statusTitle)"
+        }
+
+        if let focusItem = focusMenuItem {
+            if peer.isSharing, peer.focusDeviceID != nil {
+                focusItem.title = "当前焦点：\(isRemoteFocus ? peerTag : "这台 Mac")"
+                focusItem.isHidden = false
             } else {
-                button.toolTip = "Crossflow · \(peer.statusTitle)"
+                focusItem.isHidden = true
             }
         }
+
         let visible = resolvedMainWindow()?.isVisible ?? false
-        showHideMenuItem?.title = visible ? "隐藏到菜单栏" : "显示主界面"
+        showHideMenuItem?.title = visible ? "隐藏到菜单栏" : "打开主界面"
+
         if let toggleItem = toggleShareMenuItem {
             toggleItem.isHidden = !peer.isConnected
             toggleItem.title = peer.isSharing ? "暂停共享" : "恢复共享"
+        }
+
+        clipboardMenuItem?.state = peer.clipboardSync ? .on : .off
+        inputStateMenuItem?.state = peer.inputStateSync ? .on : .off
+        sendFilesMenuItem?.isEnabled = peer.isConnected
+        autoStartMenuItem?.state = isLaunchAgentEnabled() ? .on : .off
+
+        let sig = peer.selectedChannel + "|" + peer.networkChannels.map { "\($0.id):\($0.label)" }.joined(separator: ",")
+        if sig != lastChannelMenuSig, let sub = channelSubmenu, let parent = channelParentItem {
+            lastChannelMenuSig = sig
+            sub.removeAllItems()
+            for ch in peer.networkChannels {
+                let item = NSMenuItem(title: ch.label, action: #selector(selectChannel(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = ch.id
+                item.state = (ch.id == peer.selectedChannel) ? .on : .off
+                sub.addItem(item)
+            }
+            parent.isHidden = peer.networkChannels.isEmpty
+        }
+    }
+
+    private func renderMenuBarIcon(state: MenuBarVisualState) -> NSImage {
+        let size = NSSize(width: 22, height: 18)
+        let img = NSImage(size: size, flipped: false) { _ in
+            let isDarkBar = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let glyphColor: NSColor = switch state {
+            case .connected: isDarkBar ? .white : NSColor(red: 30/255, green: 41/255, blue: 59/255, alpha: 1)
+            case .activeRemote: isDarkBar
+                ? NSColor(red: 56/255, green: 189/255, blue: 248/255, alpha: 1)
+                : NSColor(red: 37/255, green: 99/255, blue: 235/255, alpha: 1)
+            case .searching, .paused:
+                isDarkBar
+                    ? NSColor(white: 1.0, alpha: 0.55)
+                    : NSColor(red: 100/255, green: 116/255, blue: 139/255, alpha: 0.85)
+            }
+
+            let leftRect = NSRect(x: 1.5, y: 2.5, width: 7.8, height: 13.0)
+            let rightRect = NSRect(x: 12.2, y: 2.5, width: 7.8, height: 13.0)
+            let leftPath = NSBezierPath(roundedRect: leftRect, xRadius: 2.2, yRadius: 2.2)
+            let rightPath = NSBezierPath(roundedRect: rightRect, xRadius: 2.2, yRadius: 2.2)
+            leftPath.lineWidth = 1.75
+            rightPath.lineWidth = 1.75
+            glyphColor.setStroke()
+            leftPath.stroke()
+            rightPath.stroke()
+
+            // Clear portal gap across inner borders for the bridging arrow
+            NSGraphicsContext.current?.cgContext.setBlendMode(.clear)
+            NSBezierPath(rect: NSRect(x: 7.2, y: 5.5, width: 7.2, height: 7.0)).fill()
+            NSGraphicsContext.current?.cgContext.setBlendMode(.normal)
+
+            // Crisp bridging arrow left -> right
+            let arrow = NSBezierPath()
+            arrow.lineWidth = 1.85
+            arrow.lineCapStyle = .round
+            arrow.lineJoinStyle = .round
+            arrow.move(to: NSPoint(x: 5.2, y: 9.0))
+            arrow.line(to: NSPoint(x: 15.6, y: 9.0))
+            arrow.move(to: NSPoint(x: 12.7, y: 11.7))
+            arrow.line(to: NSPoint(x: 15.8, y: 9.0))
+            arrow.line(to: NSPoint(x: 12.7, y: 6.3))
+            glyphColor.setStroke()
+            arrow.stroke()
+
+            if state == .connected {
+                let cutout = NSBezierPath(ovalIn: NSRect(x: 15.0, y: 0.2, width: 6.6, height: 6.6))
+                NSGraphicsContext.current?.cgContext.setBlendMode(.clear)
+                cutout.fill()
+                NSGraphicsContext.current?.cgContext.setBlendMode(.normal)
+                NSColor(red: 22/255, green: 163/255, blue: 74/255, alpha: 1).setFill()
+                NSBezierPath(ovalIn: NSRect(x: 15.9, y: 1.1, width: 4.8, height: 4.8)).fill()
+            } else if state == .paused {
+                let cutout = NSBezierPath(ovalIn: NSRect(x: 14.3, y: 0.0, width: 7.4, height: 7.4))
+                NSGraphicsContext.current?.cgContext.setBlendMode(.clear)
+                cutout.fill()
+                NSGraphicsContext.current?.cgContext.setBlendMode(.normal)
+                NSColor(red: 217/255, green: 119/255, blue: 6/255, alpha: 1).setFill()
+                NSBezierPath(ovalIn: NSRect(x: 15.1, y: 0.8, width: 5.8, height: 5.8)).fill()
+                NSColor.white.setFill()
+                NSBezierPath(rect: NSRect(x: 16.8, y: 2.3, width: 0.9, height: 2.8)).fill()
+                NSBezierPath(rect: NSRect(x: 18.3, y: 2.3, width: 0.9, height: 2.8)).fill()
+            }
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
+    private func launchAgentURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/local.crossflow.mac.plist")
+    }
+
+    private func isLaunchAgentEnabled() -> Bool {
+        FileManager.default.fileExists(atPath: launchAgentURL().path)
+    }
+
+    private func setLaunchAgentEnabled(_ enable: Bool) {
+        let url = launchAgentURL()
+        if !enable {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        guard let exe = Bundle.main.executableURL?.path else { return }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let plist: [String: Any] = [
+            "Label": "local.crossflow.mac",
+            "ProgramArguments": [exe, "--minimized"],
+            "RunAtLoad": true,
+            "KeepAlive": false
+        ]
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? data.write(to: url, options: .atomic)
         }
     }
 
@@ -210,6 +423,51 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         } else if peer.state == "paused" {
             peer.resume()
         }
+    }
+
+    @objc private func toggleClipboardSync() {
+        peer.setClipboard(!peer.clipboardSync)
+        refreshMenuBar()
+    }
+
+    @objc private func toggleInputStateSync() {
+        peer.setInputStateSync(!peer.inputStateSync)
+        refreshMenuBar()
+    }
+
+    @objc private func selectChannel(_ sender: NSMenuItem) {
+        guard let chId = sender.representedObject as? String else { return }
+        peer.setChannel(chId, directPeer: chId == "auto" ? nil : peer.directPeer)
+        refreshMenuBar()
+    }
+
+    @objc private func pickAndSendFiles() {
+        guard peer.isConnected else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "发送"
+        panel.title = "选择要发送到对端的文件或文件夹"
+        if panel.runModal() == .OK {
+            let paths = panel.urls.map { (($0 as NSURL).filePathURL ?? $0.standardizedFileURL).path }
+            if !paths.isEmpty {
+                peer.sendFiles(paths)
+            }
+        }
+    }
+
+    @objc private func openReceiveFolder() {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads/Crossflow", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
+    @objc private func toggleAutoStart() {
+        setLaunchAgentEnabled(!isLaunchAgentEnabled())
+        refreshMenuBar()
     }
 
     @objc private func quitApp() {

@@ -470,8 +470,25 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 let decision = state
                     .policy
                     .transition(input.vkCode as usize, down, remote, true);
-                // Pause/E1 and multimedia keys have no supported HID mapping.
-                if input.vkCode < 0xff && input.vkCode != 0x13 {
+                // Map multimedia virtual keys (Fn + volume/mute/play/track) directly so
+                // keyboards emitting scanCode == 0 still forward seamlessly to macOS.
+                let media_usage = match input.vkCode {
+                    0xAD => Some(crate::keymap::HID_MUTE),
+                    0xAE => Some(crate::keymap::HID_VOLUME_DOWN),
+                    0xAF => Some(crate::keymap::HID_VOLUME_UP),
+                    0xB0 => Some(crate::keymap::HID_MEDIA_NEXT),
+                    0xB1 => Some(crate::keymap::HID_MEDIA_PREV),
+                    0xB3 => Some(crate::keymap::HID_MEDIA_PLAY_PAUSE),
+                    _ => None,
+                };
+                if let Some(usage) = media_usage {
+                    state.enqueue(CaptureEvent::Key {
+                        usage,
+                        down,
+                        captured_at: Instant::now(),
+                        remote_at_capture: Some(remote),
+                    });
+                } else if input.vkCode < 0xff && input.vkCode != 0x13 {
                     let scan = if input.scanCode == 0 {
                         (unsafe { MapVirtualKeyW(input.vkCode, MAPVK_VK_TO_VSC_EX) }) as u16
                     } else if input.scanCode <= 0x7f {
