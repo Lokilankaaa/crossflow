@@ -180,6 +180,27 @@ impl SharedSource {
         }
         state.route.quick_jump_to_device(target_device_id, now())
     }
+    /// Programmatically jump cursor/keyboard focus to a specific global screen ID
+    /// (local or remote). Execute any returned local warp point AFTER this returns.
+    pub fn quick_jump_to_screen(
+        &self,
+        screen_id: &str,
+        now_ns: u64,
+    ) -> Result<Option<Point>> {
+        self.quick_jump_to_screen_with_clock(screen_id, || now_ns)
+    }
+    pub fn quick_jump_to_screen_with_clock(
+        &self,
+        screen_id: &str,
+        now: impl FnOnce() -> u64,
+    ) -> Result<Option<Point>> {
+        let mut state = self.lock();
+        state.sync();
+        if !state.route.enabled || state.failure.is_some() {
+            return Ok(None);
+        }
+        state.route.quick_jump_to_screen(screen_id, now())
+    }
     pub fn force_return_local(&self, now_ns: u64) -> Result<Option<Point>> {
         self.force_return_local_with_clock(|| now_ns)
     }

@@ -275,20 +275,54 @@ impl RoutedInput {
         };
         self.apply_focus(next, t0)
     }
+    /// Programmatically jump cursor/keyboard focus directly to a specific screen ID
+    /// (works for both local multi-monitor screens and any remote screen, bypassing edge lock).
+    /// Returns `Ok(Some(local_point))` when the target screen is on the local device so the
+    /// caller can warp the OS cursor directly to that screen's center.
+    pub fn quick_jump_to_screen(
+        &mut self,
+        screen_id: &str,
+        t0: u64,
+    ) -> anyhow::Result<Option<Point>> {
+        self.sync();
+        if !self.enabled {
+            return Ok(None);
+        }
+        let Some(screen) = self
+            .config
+            .layout
+            .screens()
+            .iter()
+            .find(|s| s.id == screen_id)
+        else {
+            return Ok(None);
+        };
+        let next = Focus {
+            screen_id: screen.id.clone(),
+            point: Point {
+                x: screen.x + screen.width * 0.5,
+                y: screen.y + screen.height * 0.5,
+            },
+        };
+        self.apply_focus(next, t0)
+    }
+
     fn apply_focus(&mut self, next: Focus, t0: u64) -> anyhow::Result<Option<Point>> {
         let point = self.config.native_point(&next)?;
         if self.config.is_local(&next) {
             self.remote_gate.store(false, Ordering::Release);
-            let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
-            if !q.is_connected() || q.control_epoch() != self.expected_queue_epoch {
+            if self.focus.is_some() {
+                let mut q = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                if !q.is_connected() || q.control_epoch() != self.expected_queue_epoch {
+                    drop(q);
+                    self.sync();
+                    return Ok(None);
+                }
+                q.pause();
+                self.expected_queue_epoch = q.control_epoch();
                 drop(q);
-                self.sync();
-                return Ok(None);
+                self.focus = None;
             }
-            q.pause();
-            self.expected_queue_epoch = q.control_epoch();
-            drop(q);
-            self.focus = None;
             self.last_local_native = Some(point);
             self.publish_routing();
             Ok(Some(point))

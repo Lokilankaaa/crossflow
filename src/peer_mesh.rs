@@ -20,8 +20,8 @@ use crate::{
     injection_worker::WorkerProxy,
     mesh_runtime::{
         HandshakedMeshPeer, MeshControl, MeshLayoutBook, MeshPacket, MeshPeerConn,
-        PEER_KEEPALIVE_INTERVAL, PEER_SILENCE_TIMEOUT, establish_mesh_peer,
-        is_passphrase_mismatch_error, preferred_initiator,
+        PEER_KEEPALIVE_INTERVAL, PEER_SILENCE_TIMEOUT, canonical_screen_id, establish_mesh_peer,
+        is_passphrase_mismatch_error, ordered_screens, preferred_initiator,
     },
     metrics::{Log, LogWriter},
     pair_native::{Capture, Platform, Shortcut},
@@ -29,7 +29,7 @@ use crate::{
     pair_wire::Display,
     protocol::{Frame, Kind, button_from_code},
     session::{MouseSink, NativeDisplay},
-    session_metadata::SharedLayout,
+    session_metadata::{SharedLayout, SharedScreen},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,15 @@ pub struct PeerInfo {
     pub preferred_channel: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NumberedScreenInfo {
+    pub number: usize,
+    pub screen_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub native_id: String,
+}
+
 #[derive(Serialize)]
 struct PeerUiStatus {
     protocol: u8,
@@ -188,6 +197,7 @@ struct PeerUiStatus {
     local_displays: Vec<Display>,
     discovered_peers: Vec<DiscoveredPeerInfo>,
     shared_layout: Option<SharedLayout>,
+    screen_numbers: Vec<NumberedScreenInfo>,
     transfer: Option<crate::aux_channel::TransferStatus>,
     error: Option<String>,
 }
@@ -244,6 +254,9 @@ enum UiCommand {
     QuickJump {
         #[serde(default)]
         target_device_id: Option<String>,
+    },
+    QuickJumpScreen {
+        screen_id: String,
     },
     SendFiles {
         #[serde(default)]
@@ -959,6 +972,59 @@ fn resolve_mesh_quick_jump_target(
     }
 }
 
+#[derive(Clone, Debug)]
+enum QuickJumpTarget {
+    Device(String),
+    Screen(String),
+}
+
+fn build_numbered_screens(
+    active_screens: &[SharedScreen],
+    local_device_id: &str,
+    local_name: &str,
+    local_displays: &[Display],
+    active_peers: &BTreeMap<String, ActiveMeshPeer>,
+) -> Vec<NumberedScreenInfo> {
+    let source_screens: Vec<SharedScreen> = if !active_screens.is_empty() {
+        ordered_screens(active_screens)
+    } else {
+        let local_only: Vec<SharedScreen> = local_displays
+            .iter()
+            .map(|d| SharedScreen {
+                id: canonical_screen_id(local_device_id, d.wire_id),
+                device_id: local_device_id.to_string(),
+                native_id: d.native_id.clone(),
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+            })
+            .collect();
+        ordered_screens(&local_only)
+    };
+    source_screens
+        .into_iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            let device_name = if s.device_id == local_device_id {
+                local_name.to_string()
+            } else {
+                active_peers
+                    .get(&s.device_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| s.device_id[..s.device_id.len().min(8)].to_string())
+            };
+            NumberedScreenInfo {
+                number: idx + 1,
+                screen_id: s.id,
+                device_id: s.device_id,
+                device_name,
+                native_id: s.native_id,
+            }
+        })
+        .collect()
+}
+
 fn active_transfer_snapshot(
     peers: &BTreeMap<String, ActiveMeshPeer>,
 ) -> Option<crate::aux_channel::TransferStatus> {
@@ -1048,6 +1114,7 @@ pub fn run(
                     local_displays: vec![],
                     discovered_peers: vec![],
                     shared_layout: None,
+                    screen_numbers: vec![],
                     transfer: None,
                     error: Some(permission.message().to_string()),
                 },
@@ -1162,7 +1229,16 @@ pub fn run(
             let mut inbound_owner: Option<String> = None;
             let mut remote_focus_state: (Option<String>, Option<String>) = (None, None);
             let mut last_broadcast_focus: (Option<String>, Option<String>) = (None, None);
-            let mut pending_quick_jump: Option<(String, Instant)> = None;
+            let mut pending_quick_jump: Option<(QuickJumpTarget, Instant)> = None;
+            let mut numbered_screens: Vec<NumberedScreenInfo> = build_numbered_screens(
+                layout_book.active_screens(),
+                &local_device_id,
+                &local_name,
+                &local_displays,
+                &active_peers,
+            );
+            hotkey_engine.set_screen_count(numbered_screens.len());
+            let mut screen_numbers_dirty = false;
 
             let mut reconfigure_requested = false;
             let mut last_auth_error: Option<String> = None;
@@ -1213,6 +1289,7 @@ pub fn run(
                         && !inv.is_empty()
                     {
                         local_displays = inv;
+                        screen_numbers_dirty = true;
                     }
                 }
 
@@ -1254,6 +1331,7 @@ pub fn run(
                                 &remotes,
                             ) {
                                 layout_book.save(&layout_file);
+                                screen_numbers_dirty = true;
                                 if let Some(ref io) = native_io {
                                     let _ = io.source.update_runtime(new_rt);
                                 }
@@ -1375,7 +1453,17 @@ pub fn run(
                                     &active_peers,
                                 )
                             {
-                                pending_quick_jump = Some((target, Instant::now()));
+                                pending_quick_jump =
+                                    Some((QuickJumpTarget::Device(target), Instant::now()));
+                            }
+                        }
+                        Ok(UiCommand::QuickJumpScreen { screen_id }) => {
+                            let clean = screen_id.trim();
+                            if !user_paused && !clean.is_empty() {
+                                pending_quick_jump = Some((
+                                    QuickJumpTarget::Screen(clean.to_string()),
+                                    Instant::now(),
+                                ));
                             }
                         }
                         Ok(UiCommand::SendFiles {
@@ -1823,6 +1911,7 @@ pub fn run(
                         &remotes,
                     ) {
                         layout_book.save(&layout_file);
+                        screen_numbers_dirty = true;
                         if let Some(ref io) = native_io {
                             let _ = io.source.update_runtime(new_rt);
                         }
@@ -1925,7 +2014,24 @@ pub fn run(
                             layout_book.revision(),
                             layout_book.active_screens(),
                         );
+                        screen_numbers_dirty = true;
                     }
+                }
+                if screen_numbers_dirty || topology_changed {
+                    screen_numbers_dirty = false;
+                    let active_slice = if active_peers.is_empty() {
+                        &[][..]
+                    } else {
+                        layout_book.active_screens()
+                    };
+                    numbered_screens = build_numbered_screens(
+                        active_slice,
+                        &local_device_id,
+                        &local_name,
+                        &local_displays,
+                        &active_peers,
+                    );
+                    hotkey_engine.set_screen_count(numbered_screens.len());
                 }
 
                 // 7. Poll native capture, process custom hotkeys / QuickJump, route 1-hop frames!
@@ -2057,20 +2163,34 @@ pub fn run(
                                             &active_peers,
                                         )
                                     {
-                                        pending_quick_jump = Some((t, Instant::now()));
+                                        pending_quick_jump =
+                                            Some((QuickJumpTarget::Device(t), Instant::now()));
                                     }
                                 }
                                 HotkeyAction::QuickJumpHome => {
                                     if !user_paused {
-                                        pending_quick_jump =
-                                            Some((local_device_id.clone(), Instant::now()));
+                                        pending_quick_jump = Some((
+                                            QuickJumpTarget::Device(local_device_id.clone()),
+                                            Instant::now(),
+                                        ));
                                     }
                                 }
                                 HotkeyAction::QuickJumpDevice(idx) => {
                                     if !user_paused
                                         && let Some(id) = active_peers.keys().nth(idx).cloned()
                                     {
-                                        pending_quick_jump = Some((id, Instant::now()));
+                                        pending_quick_jump =
+                                            Some((QuickJumpTarget::Device(id), Instant::now()));
+                                    }
+                                }
+                                HotkeyAction::QuickJumpScreen(idx) => {
+                                    if !user_paused
+                                        && let Some(info) = numbered_screens.get(idx)
+                                    {
+                                        pending_quick_jump = Some((
+                                            QuickJumpTarget::Screen(info.screen_id.clone()),
+                                            Instant::now(),
+                                        ));
                                     }
                                 }
                             }
@@ -2085,9 +2205,15 @@ pub fn run(
                                 && !io.source.has_held_physical_input()
                             {
                                 pending_quick_jump = None;
-                                if let Ok(Some(local_pt)) =
-                                    io.source.quick_jump_to_device_with_clock(&target, || log.ns())
-                                {
+                                let warp = match target {
+                                    QuickJumpTarget::Device(dev_id) => io
+                                        .source
+                                        .quick_jump_to_device_with_clock(&dev_id, || log.ns()),
+                                    QuickJumpTarget::Screen(screen_id) => io
+                                        .source
+                                        .quick_jump_to_screen_with_clock(&screen_id, || log.ns()),
+                                };
+                                if let Ok(Some(local_pt)) = warp {
                                     let _ = cap.warp_local(local_pt);
                                 }
                             }
@@ -2356,6 +2482,7 @@ pub fn run(
                             local_displays: local_displays.clone(),
                             discovered_peers: discovered_compat,
                             shared_layout,
+                            screen_numbers: numbered_screens.clone(),
                             transfer,
                             error: if active_peers.is_empty() {
                                 last_auth_error.clone()
@@ -2424,6 +2551,7 @@ pub fn run(
             local_displays: vec![],
             discovered_peers: vec![],
             shared_layout: None,
+            screen_numbers: vec![],
             transfer: None,
             error: result.as_ref().err().map(|e| format!("{e:#}")),
         },

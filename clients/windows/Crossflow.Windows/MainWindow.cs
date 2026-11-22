@@ -74,6 +74,18 @@ internal sealed class MainWindow : Window
     private readonly StackPanel hotkeysPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
     private readonly Dictionary<string, Button> hotkeyButtons = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Button> hotkeyClearButtons = new(StringComparer.Ordinal);
+    private readonly ComboBox screenPrefixCombo = new();
+    private bool updatingScreenPrefixUi;
+    private static readonly (string? Prefix, string Label)[] ScreenPrefixChoices =
+    [
+        ("Ctrl+Alt", "Ctrl+Alt + 1~9"),
+        ("Ctrl+Shift", "Ctrl+Shift + 1~9"),
+        ("Alt+Shift", "Alt+Shift + 1~9"),
+        ("Ctrl+Alt+Shift", "Ctrl+Alt+Shift + 1~9"),
+        ("Alt", "Alt + 1~9"),
+        ("Ctrl+Meta", "Ctrl+Win + 1~9"),
+        (null, "已关闭"),
+    ];
     private string? recordingHotkeyField;
     private bool hotkeysExpanded;
     private TrayIcon? trayIcon;
@@ -107,6 +119,7 @@ internal sealed class MainWindow : Window
     private readonly LayoutEditHistory layoutHistory = new();
     private LayoutDocument layout = new([]);
     private readonly Dictionary<string, string> screenNames = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> screenNumbers = new(StringComparer.Ordinal);
     private string? selectedScreenId;
     private long revision;
     private double scale = 1, offsetX, offsetY;
@@ -519,9 +532,34 @@ internal sealed class MainWindow : Window
             ("lock_screen", "锁定当前屏幕"),
             ("quick_jump_next", "QuickJump 下一台"),
             ("quick_jump_home", "QuickJump 回本机"),
-            ("quick_jump_1", "QuickJump 设备 #1"),
             ("emergency_stop", "紧急停止"),
         };
+
+        // Dedicated QuickJump Screen 1-9 modifier prefix selector
+        var prefixRow = new StackPanel { Spacing = 4, Margin = new Thickness(0, 0, 0, 2) };
+        prefixRow.Children.Add(new TextBlock
+        {
+            Text = "QuickJump 屏幕 1–9（按画布编号直达）",
+            FontSize = 11.5,
+            Foreground = theme.Brush("text")
+        });
+        screenPrefixCombo.FontSize = 11;
+        screenPrefixCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
+        foreach (var (prefix, label) in ScreenPrefixChoices)
+            screenPrefixCombo.Items.Add(new ComboBoxItem { Content = label, Tag = prefix ?? "" });
+        screenPrefixCombo.SelectedIndex = 0;
+        screenPrefixCombo.SelectionChanged += async (_, _) =>
+        {
+            if (updatingScreenPrefixUi) return;
+            if (screenPrefixCombo.SelectedItem is ComboBoxItem item && item.Tag is string tag)
+            {
+                string? nextPrefix = string.IsNullOrEmpty(tag) ? null : tag;
+                var updated = currentSnap.Hotkeys with { QuickJumpScreenPrefix = nextPrefix, QuickJump1 = null, QuickJump2 = null };
+                await peerMesh.SetHotkeysAsync(updated);
+            }
+        };
+        prefixRow.Children.Add(screenPrefixCombo);
+        hotkeysPanel.Children.Add(prefixRow);
 
         foreach (var (field, label) in rows)
         {
@@ -768,6 +806,32 @@ internal sealed class MainWindow : Window
             btn.Foreground = theme.Brush(rec ? "accent" : (val is null ? "text_secondary" : "text"));
             if (hotkeyClearButtons.TryGetValue(field, out var clearBtn))
                 clearBtn.Visibility = (!rec && val is not null) ? Visibility.Visible : Visibility.Collapsed;
+        }
+        if (!screenPrefixCombo.IsDropDownOpen)
+        {
+            string targetTag = h.QuickJumpScreenPrefix ?? "";
+            int idx = -1;
+            for (int i = 0; i < screenPrefixCombo.Items.Count; i++)
+            {
+                if (screenPrefixCombo.Items[i] is ComboBoxItem item && string.Equals(item.Tag as string, targetTag, StringComparison.OrdinalIgnoreCase))
+                {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0 && !string.IsNullOrEmpty(targetTag))
+            {
+                updatingScreenPrefixUi = true;
+                screenPrefixCombo.Items.Add(new ComboBoxItem { Content = $"{targetTag} + 1~9", Tag = targetTag });
+                idx = screenPrefixCombo.Items.Count - 1;
+                updatingScreenPrefixUi = false;
+            }
+            if (idx >= 0 && screenPrefixCombo.SelectedIndex != idx)
+            {
+                updatingScreenPrefixUi = true;
+                screenPrefixCombo.SelectedIndex = idx;
+                updatingScreenPrefixUi = false;
+            }
         }
     }
 
@@ -1235,9 +1299,9 @@ internal sealed class MainWindow : Window
         uninstallServiceButton.IsEnabled = !serviceBusy && !closing;
         RenderHotkeyButtons(snap.Hotkeys);
         string hkToggle = snap.Hotkeys.ToggleSharing ?? "未设置";
-        string hkJump = snap.Hotkeys.QuickJumpNext ?? "未设置";
+        string hkScreen = snap.Hotkeys.QuickJumpScreenPrefix is { Length: > 0 } pfx ? $"{pfx}+1~9" : "未设置";
         string hkLock = snap.Hotkeys.LockScreen ?? "未设置";
-        footerStatus.Text = $"快捷键：{hkToggle} 暂停/恢复 · {hkJump} 快速切屏（手柄直通）· {hkLock} 锁定屏幕 · 支持拖入文件跨屏直传";
+        footerStatus.Text = $"快捷键：{hkScreen} 直达对应编号屏幕（手柄直通）· {hkToggle} 暂停/恢复 · {hkLock} 锁定屏幕 · 支持拖入文件跨屏直传";
 
         bool isRemoteFocus = snap.State == "sharing"
             && snap.FocusDeviceId is not null
@@ -1631,15 +1695,17 @@ internal sealed class MainWindow : Window
         if (dragOriginal is not null) return;
 
         string? nextFocus = snap.RouteEnabled ? snap.FocusScreenId : null;
+        string numbersSig = string.Join(",", snap.ScreenNumbers.Select(n => $"{n.Number}:{n.ScreenId}"));
         if (snap.SharedLayout is { Screens.Count: > 0 } shared)
         {
-            string sig = string.Join("|", shared.Screens.Select(s => $"{s.Id}:{s.X:R},{s.Y:R},{s.Width:R},{s.Height:R}"));
+            string sig = string.Join("|", shared.Screens.Select(s => $"{s.Id}:{s.X:R},{s.Y:R},{s.Width:R},{s.Height:R}")) + "#" + numbersSig;
             if (sig != lastLayoutSignature)
             {
                 lastLayoutSignature = sig;
                 activeSharedLayout = shared;
                 layout = new LayoutDocument(shared.Screens.Select(s => new ScreenLayout(s.Id, s.DeviceId, s.X, s.Y, s.Width, s.Height)).ToList());
                 RebuildScreenNames(shared, snap);
+                RebuildScreenNumbers(snap);
                 if (!layout.Screens.Any(s => s.Id == selectedScreenId))
                     selectedScreenId = layout.Screens.FirstOrDefault()?.Id;
                 lastDrawnFocus = nextFocus;
@@ -1651,7 +1717,7 @@ internal sealed class MainWindow : Window
         else
         {
             activeSharedLayout = null;
-            string localSig = "local:" + string.Join("|", snap.LocalDisplays.Select(d => $"{d.NativeId}:{d.X:R},{d.Y:R},{d.Width:R},{d.Height:R}"));
+            string localSig = "local:" + string.Join("|", snap.LocalDisplays.Select(d => $"{d.NativeId}:{d.X:R},{d.Y:R},{d.Width:R},{d.Height:R}")) + "#" + numbersSig;
             if (localSig != lastLayoutSignature)
             {
                 lastLayoutSignature = localSig;
@@ -1660,6 +1726,7 @@ internal sealed class MainWindow : Window
                 screenNames.Clear();
                 for (int i = 0; i < snap.LocalDisplays.Count; i++)
                     screenNames[$"local-{i + 1}"] = $"本机 · 屏幕 {i + 1}";
+                RebuildScreenNumbers(snap);
                 selectedScreenId = layout.Screens.FirstOrDefault()?.Id;
                 lastDrawnFocus = null;
                 RefreshScreenList();
@@ -1690,6 +1757,30 @@ internal sealed class MainWindow : Window
                 screenNames[s.Id] = $"{dev} · 屏幕 {++idx}";
         }
     }
+
+    private void RebuildScreenNumbers(PeerMeshSnapshot snap)
+    {
+        screenNumbers.Clear();
+        if (activeSharedLayout is not null && snap.ScreenNumbers.Count > 0)
+        {
+            foreach (var info in snap.ScreenNumbers)
+                screenNumbers[info.ScreenId] = info.Number;
+        }
+        if (layout.Screens.Count == 0) return;
+        bool missingAny = layout.Screens.Any(s => !screenNumbers.ContainsKey(s.Id));
+        if (!missingAny) return;
+        double minY = layout.Screens.Min(s => s.Y);
+        var ordered = layout.Screens
+            .OrderBy(s => (long)Math.Floor((s.Y - minY) / 360.0))
+            .ThenBy(s => (long)Math.Round(s.X))
+            .ThenBy(s => (long)Math.Round(s.Y))
+            .ThenBy(s => s.Id, StringComparer.Ordinal)
+            .ToList();
+        for (int i = 0; i < ordered.Count; i++)
+            screenNumbers[ordered[i].Id] = i + 1;
+    }
+
+    private int ScreenNumber(string id) => screenNumbers.TryGetValue(id, out var n) ? n : 0;
 
     private string DeviceName(string id, PeerMeshSnapshot? snap = null)
     {
@@ -1757,25 +1848,61 @@ internal sealed class MainWindow : Window
             foreach (var screen in group)
             {
                 bool active = selectedScreenId == screen.Id || focusId == screen.Id;
-                var line = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
-                line.Children.Add(new FontIcon { Glyph = screen.Height > screen.Width ? "\uE8EA" : "\uE7F4", FontSize = 14, Foreground = color });
-                line.Children.Add(new TextBlock
+                int num = ScreenNumber(screen.Id);
+                var rowGrid = new Grid { ColumnSpacing = 8 };
+                rowGrid.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                rowGrid.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                rowGrid.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+
+                var numBadge = new Border
+                {
+                    Width = 20,
+                    Height = 20,
+                    CornerRadius = new CornerRadius(10),
+                    Background = color,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Child = new TextBlock
+                    {
+                        Text = num > 0 ? num.ToString() : "·",
+                        FontSize = 11,
+                        FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+                        Foreground = new SolidColorBrush(Microsoft.UI.Colors.White),
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                };
+                Grid.SetColumn(numBadge, 0);
+                rowGrid.Children.Add(numBadge);
+
+                var labelBlock = new TextBlock
                 {
                     Text = $"{ScreenName(screen.Id)} ({screen.Width:g}×{screen.Height:g})",
                     FontSize = 12,
                     Foreground = theme.Brush("text"),
-                    TextTrimming = TextTrimming.CharacterEllipsis
-                });
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                Grid.SetColumn(labelBlock, 1);
+                rowGrid.Children.Add(labelBlock);
+
                 var btn = new Button
                 {
-                    Content = line,
+                    Content = rowGrid,
                     HorizontalAlignment = HorizontalAlignment.Stretch,
-                    HorizontalContentAlignment = HorizontalAlignment.Left,
+                    HorizontalContentAlignment = HorizontalAlignment.Stretch,
                     BorderThickness = new Thickness(0),
                     CornerRadius = new CornerRadius(8),
-                    Padding = new Thickness(10, 7, 10, 7),
+                    Padding = new Thickness(8, 6, 8, 6),
                     Background = theme.Brush(active ? "accent_subtle" : "surface")
                 };
+                if (activeSharedLayout is not null && currentSnap.State == "sharing")
+                {
+                    ToolTipService.SetToolTip(btn, num is >= 1 and <= 9
+                        ? $"点击选中 · 双击跳转至屏幕 #{num}"
+                        : "点击选中 · 双击跳转至此屏幕");
+                    string jumpScreenId = screen.Id;
+                    btn.DoubleTapped += async (_, _) => await peerMesh.QuickJumpScreenAsync(jumpScreenId);
+                }
                 btn.Click += (_, _) =>
                 {
                     selectedScreenId = screen.Id;
@@ -1916,11 +2043,40 @@ internal sealed class MainWindow : Window
                 CornerRadius = new CornerRadius(9)
             };
             AutomationProperties.SetAutomationId(button, "screen-" + screen.Id);
+            var tileContent = new Grid();
+            tileContent.Children.Add(button);
+            int globalNum = ScreenNumber(screen.Id);
+            if (globalNum > 0)
+            {
+                double badgeSize = smallTile ? 18 : 22;
+                var badge = new Border
+                {
+                    MinWidth = badgeSize,
+                    Height = badgeSize,
+                    Padding = new Thickness(smallTile ? 4 : 6, 0, smallTile ? 4 : 6, 0),
+                    CornerRadius = new CornerRadius(badgeSize / 2),
+                    Background = new SolidColorBrush(color),
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    VerticalAlignment = VerticalAlignment.Top,
+                    Margin = new Thickness(smallTile ? 5 : 8),
+                    IsHitTestVisible = false,
+                    Child = new TextBlock
+                    {
+                        Text = globalNum.ToString(),
+                        FontSize = smallTile ? 10.5 : 12,
+                        FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+                        Foreground = new SolidColorBrush(Microsoft.UI.Colors.White),
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                };
+                tileContent.Children.Add(badge);
+            }
             var tile = new Border
             {
                 Width = screen.Width * scale,
                 Height = screen.Height * scale,
-                Child = button,
+                Child = tileContent,
                 CornerRadius = new CornerRadius(10),
                 BorderThickness = new Thickness(isFocused ? 3 : selectedScreenId == screen.Id ? 2 : 1),
                 BorderBrush = new SolidColorBrush(color)

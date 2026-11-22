@@ -18,13 +18,42 @@ pub struct HotkeyBinding {
     pub key: u16,
 }
 
+/// Modifier-only prefix used with digits `1`–`9` (e.g. `"Ctrl+Alt"` -> `Ctrl+Alt+1..9`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModifierPrefix {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
+
+impl ModifierPrefix {
+    pub fn format_prefix(self) -> String {
+        let mut parts: Vec<&'static str> = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        if self.meta {
+            parts.push("Meta");
+        }
+        parts.join("+")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyAction {
     ToggleSharing,
     ToggleLockScreen,
     QuickJumpNext,
     QuickJumpHome,
-    QuickJumpDevice(usize), // 0-based remote device index
+    QuickJumpDevice(usize), // 0-based remote device index (legacy)
+    QuickJumpScreen(usize), // 0-based global screen index (0..9 => Screen #1..#9)
     EmergencyStop,
 }
 
@@ -41,9 +70,11 @@ pub struct HotkeyConfig {
     pub quick_jump_next: Option<String>,
     #[serde(default = "default_quick_jump_home")]
     pub quick_jump_home: Option<String>,
-    #[serde(default = "default_quick_jump_1")]
+    #[serde(default = "default_quick_jump_screen_prefix")]
+    pub quick_jump_screen_prefix: Option<String>,
+    #[serde(default)]
     pub quick_jump_1: Option<String>,
-    #[serde(default = "default_quick_jump_2")]
+    #[serde(default)]
     pub quick_jump_2: Option<String>,
     #[serde(default = "default_emergency_stop")]
     pub emergency_stop: Option<String>,
@@ -61,11 +92,8 @@ fn default_quick_jump_next() -> Option<String> {
 fn default_quick_jump_home() -> Option<String> {
     Some("Ctrl+Alt+H".into())
 }
-fn default_quick_jump_1() -> Option<String> {
-    Some("Ctrl+Alt+1".into())
-}
-fn default_quick_jump_2() -> Option<String> {
-    Some("Ctrl+Alt+2".into())
+fn default_quick_jump_screen_prefix() -> Option<String> {
+    Some("Ctrl+Alt".into())
 }
 fn default_emergency_stop() -> Option<String> {
     Some("Ctrl+Alt+Shift+Esc".into())
@@ -78,8 +106,9 @@ impl Default for HotkeyConfig {
             lock_screen: default_lock_screen(),
             quick_jump_next: default_quick_jump_next(),
             quick_jump_home: default_quick_jump_home(),
-            quick_jump_1: default_quick_jump_1(),
-            quick_jump_2: default_quick_jump_2(),
+            quick_jump_screen_prefix: default_quick_jump_screen_prefix(),
+            quick_jump_1: None,
+            quick_jump_2: None,
             emergency_stop: default_emergency_stop(),
         }
     }
@@ -92,15 +121,27 @@ impl HotkeyConfig {
                 .and_then(parse_chord)
                 .map(|b| b.format_chord())
         };
+        let prefix = self
+            .quick_jump_screen_prefix
+            .as_deref()
+            .and_then(parse_modifier_prefix)
+            .map(ModifierPrefix::format_prefix);
         Self {
             toggle_sharing: norm(&self.toggle_sharing),
             lock_screen: norm(&self.lock_screen),
             quick_jump_next: norm(&self.quick_jump_next),
             quick_jump_home: norm(&self.quick_jump_home),
+            quick_jump_screen_prefix: prefix,
             quick_jump_1: norm(&self.quick_jump_1),
             quick_jump_2: norm(&self.quick_jump_2),
             emergency_stop: norm(&self.emergency_stop),
         }
+    }
+
+    pub fn compiled_screen_prefix(&self) -> Option<ModifierPrefix> {
+        self.quick_jump_screen_prefix
+            .as_deref()
+            .and_then(parse_modifier_prefix)
     }
 
     pub fn compiled(&self) -> Vec<(HotkeyBinding, HotkeyAction)> {
@@ -142,6 +183,48 @@ impl HotkeyBinding {
             parts.push(name);
         }
         parts.join("+")
+    }
+}
+
+/// Parse a modifier-only prefix such as `"Ctrl+Alt"`, `"Ctrl+Shift"`, `"Alt+Shift"`, `"Ctrl+Option"`.
+/// Requires at least one modifier and rejects non-modifier keys.
+pub fn parse_modifier_prefix(raw: &str) -> Option<ModifierPrefix> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut meta = false;
+    for token in trimmed.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+        match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" | "opt" => alt = true,
+            "shift" => shift = true,
+            "meta" | "cmd" | "command" | "win" | "super" => meta = true,
+            _ => return None,
+        }
+    }
+    if !(ctrl || alt || shift || meta) {
+        return None;
+    }
+    Some(ModifierPrefix {
+        ctrl,
+        alt,
+        shift,
+        meta,
+    })
+}
+
+/// Map top-row `1`..`9` (`0x1E..=0x26`) and Numpad `1`..`9` (`0x59..=0x61`) to 0-based `0..9`.
+fn digit_1_to_9_index(usage: u16) -> Option<usize> {
+    if (0x1E..=0x26).contains(&usage) {
+        Some((usage - 0x1E) as usize)
+    } else if (0x59..=0x61).contains(&usage) {
+        Some((usage - 0x59) as usize)
+    } else {
+        None
     }
 }
 
@@ -310,6 +393,8 @@ pub fn hid_to_key_name(usage: u16) -> Option<String> {
 #[derive(Debug)]
 struct EngineInner {
     bindings: Vec<(HotkeyBinding, HotkeyAction)>,
+    screen_prefix: Option<ModifierPrefix>,
+    screen_count: usize,
     held_mods: BTreeSet<u16>,
     pending_actions: Vec<HotkeyAction>,
     suspended: bool,
@@ -329,6 +414,8 @@ impl SharedHotkeyEngine {
     pub fn new(config: &HotkeyConfig) -> Self {
         Self(Arc::new(Mutex::new(EngineInner {
             bindings: config.compiled(),
+            screen_prefix: config.compiled_screen_prefix(),
+            screen_count: 9,
             held_mods: BTreeSet::new(),
             pending_actions: Vec::new(),
             suspended: false,
@@ -338,6 +425,15 @@ impl SharedHotkeyEngine {
     pub fn update_config(&self, config: &HotkeyConfig) {
         if let Ok(mut inner) = self.0.lock() {
             inner.bindings = config.compiled();
+            inner.screen_prefix = config.compiled_screen_prefix();
+        }
+    }
+
+    /// Update the active number of numbered screens (`0..=9`) so digits beyond
+    /// the current screen count are never intercepted from other applications.
+    pub fn set_screen_count(&self, count: usize) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.screen_count = count.min(9);
         }
     }
 
@@ -375,13 +471,25 @@ impl SharedHotkeyEngine {
         let alt = inner.held_mods.contains(&0xE2) || inner.held_mods.contains(&0xE6);
         let meta = inner.held_mods.contains(&0xE3) || inner.held_mods.contains(&0xE7);
 
-        let matched = inner.bindings.iter().find_map(|(b, act)| {
-            (b.key == usage
-                && b.ctrl == ctrl
-                && b.alt == alt
-                && b.shift == shift
-                && b.meta == meta)
-                .then_some(*act)
+        let screen_match = inner.screen_prefix.and_then(|p| {
+            let idx = digit_1_to_9_index(usage)?;
+            (idx < inner.screen_count
+                && p.ctrl == ctrl
+                && p.alt == alt
+                && p.shift == shift
+                && p.meta == meta)
+                .then_some(HotkeyAction::QuickJumpScreen(idx))
+        });
+
+        let matched = screen_match.or_else(|| {
+            inner.bindings.iter().find_map(|(b, act)| {
+                (b.key == usage
+                    && b.ctrl == ctrl
+                    && b.alt == alt
+                    && b.shift == shift
+                    && b.meta == meta)
+                    .then_some(*act)
+            })
         });
         if let Some(act) = matched {
             inner.pending_actions.push(act);
@@ -456,6 +564,7 @@ mod tests {
             "lock_screen": null,
             "quick_jump_next": "Ctrl+Alt+Tab",
             "quick_jump_home": null,
+            "quick_jump_screen_prefix": null,
             "quick_jump_1": null,
             "quick_jump_2": null,
             "emergency_stop": null
@@ -465,6 +574,7 @@ mod tests {
         assert_eq!(norm.toggle_sharing, None);
         assert_eq!(norm.lock_screen, None);
         assert_eq!(norm.quick_jump_next.as_deref(), Some("Ctrl+Alt+Tab"));
+        assert_eq!(norm.quick_jump_screen_prefix, None);
         assert_eq!(norm.emergency_stop, None);
         assert_eq!(norm.compiled().len(), 1);
     }
@@ -472,6 +582,7 @@ mod tests {
     #[test]
     fn engine_matches_configured_chords_and_ignores_bare_escape() {
         let engine = SharedHotkeyEngine::default();
+        engine.set_screen_count(4);
         // Bare Escape never triggers anything
         assert_eq!(engine.observe_key(0x29, true), None);
         assert_eq!(engine.observe_key(0x29, false), None);
@@ -490,11 +601,17 @@ mod tests {
             engine.observe_key(0x2B, true),
             Some(HotkeyAction::QuickJumpNext)
         );
-        // Ctrl+Alt+1 triggers QuickJumpDevice(0)
+        // Ctrl+Alt+1..4 triggers QuickJumpScreen(0..4), top-row and numpad!
         assert_eq!(
             engine.observe_key(0x1E, true),
-            Some(HotkeyAction::QuickJumpDevice(0))
+            Some(HotkeyAction::QuickJumpScreen(0))
         );
+        assert_eq!(
+            engine.observe_key(0x5C, true), // Numpad 4
+            Some(HotkeyAction::QuickJumpScreen(3))
+        );
+        // Ctrl+Alt+5 is ignored when only 4 screens exist (does not hijack app shortcuts!)
+        assert_eq!(engine.observe_key(0x22, true), None);
         // Release modifiers
         assert_eq!(engine.observe_key(0xE2, false), None);
         assert_eq!(engine.observe_key(0xE0, false), None);
@@ -504,7 +621,8 @@ mod tests {
             vec![
                 HotkeyAction::ToggleSharing,
                 HotkeyAction::QuickJumpNext,
-                HotkeyAction::QuickJumpDevice(0),
+                HotkeyAction::QuickJumpScreen(0),
+                HotkeyAction::QuickJumpScreen(3),
             ]
         );
     }

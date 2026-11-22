@@ -420,9 +420,36 @@ fn pos_key(device_id: &str, native_id: &str) -> String {
     format!("{device_id}:{native_id}")
 }
 
-fn canonical_screen_id(device_id: &str, wire_id: u32) -> String {
+pub fn canonical_screen_id(device_id: &str, wire_id: u32) -> String {
     let prefix = &device_id[..device_id.len().min(12)];
     format!("dev-{prefix}-d{wire_id}")
+}
+
+/// Deterministic global screen numbering order across all nodes in the mesh:
+/// groups screens into horizontal rows (360px vertical buckets relative to `min_y`)
+/// so side-by-side monitors with small vertical offsets stay left-to-right on the
+/// same row, then sorts top-to-bottom, left-to-right, and finally by canonical `id`.
+///
+/// Every device in the mesh computes the exact same `#1, #2, #3...` numbering for
+/// the same 2D layout regardless of which device is local.
+pub fn ordered_screens(screens: &[SharedScreen]) -> Vec<SharedScreen> {
+    let mut sorted = screens.to_vec();
+    let min_y = sorted
+        .iter()
+        .map(|s| s.y)
+        .filter(|y| y.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let base_y = if min_y.is_finite() { min_y } else { 0.0 };
+    sorted.sort_by(|a, b| {
+        let row_a = ((a.y - base_y) / 360.0).floor() as i64;
+        let row_b = ((b.y - base_y) / 360.0).floor() as i64;
+        row_a
+            .cmp(&row_b)
+            .then_with(|| (a.x.round() as i64).cmp(&(b.x.round() as i64)))
+            .then_with(|| (a.y.round() as i64).cmp(&(b.y.round() as i64)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sorted
 }
 
 pub struct MeshLayoutBook {
@@ -975,5 +1002,106 @@ mod tests {
             err_client.as_ref().is_some_and(is_passphrase_mismatch_error)
                 || err_server.as_ref().is_some_and(is_passphrase_mismatch_error)
         );
+    }
+
+    #[test]
+    fn ordered_screens_and_quick_jump_to_screen_cover_local_and_remote_displays() {
+        let win1 = "1".repeat(64);
+        let mac = "2".repeat(64);
+        let win2 = "3".repeat(64);
+
+        let local_displays = vec![
+            disp("DISPLAY6", 1, 0., 0., 1440., 2560.),
+            disp("DISPLAY5", 2, 1440., 120., 2560., 1440.), // slight 120px vertical offset, same row!
+        ];
+        let mut remotes = BTreeMap::new();
+        remotes.insert(mac.clone(), vec![disp("MAC-1", 10, 0., 0., 1470., 956.)]);
+        remotes.insert(win2.clone(), vec![disp("WIN2-1", 20, 0., 0., 1920., 1080.)]);
+
+        let s1 = SharedScreen {
+            id: canonical_screen_id(&win1, 1),
+            device_id: win1.clone(),
+            native_id: "DISPLAY6".into(),
+            x: 0.,
+            y: 0.,
+            width: 1440.,
+            height: 2560.,
+        };
+        let s2 = SharedScreen {
+            id: canonical_screen_id(&win1, 2),
+            device_id: win1.clone(),
+            native_id: "DISPLAY5".into(),
+            x: 1440.,
+            y: 120.,
+            width: 2560.,
+            height: 1440.,
+        };
+        let s3 = SharedScreen {
+            id: canonical_screen_id(&mac, 10),
+            device_id: mac.clone(),
+            native_id: "MAC-1".into(),
+            x: 1500.,
+            y: 1560.,
+            width: 1470.,
+            height: 956.,
+        };
+        let s4 = SharedScreen {
+            id: canonical_screen_id(&win2, 20),
+            device_id: win2.clone(),
+            native_id: "WIN2-1".into(),
+            x: 1500.,
+            y: 2516.,
+            width: 1920.,
+            height: 1080.,
+        };
+
+        // Regardless of input permutation, global numbering is identical (#1=DISPLAY6, #2=DISPLAY5, #3=Mac, #4=Win2)
+        let ordered_a = ordered_screens(&[s4.clone(), s2.clone(), s3.clone(), s1.clone()]);
+        let ordered_b = ordered_screens(&[s1.clone(), s2.clone(), s3.clone(), s4.clone()]);
+        let ids_a: Vec<&str> = ordered_a.iter().map(|s| s.id.as_str()).collect();
+        let ids_b: Vec<&str> = ordered_b.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(
+            ids_a,
+            vec![s1.id.as_str(), s2.id.as_str(), s3.id.as_str(), s4.id.as_str()]
+        );
+
+        let mut book = MeshLayoutBook::load(Path::new("nonexistent-qj-test.json"));
+        let runtime = book
+            .apply_user_layout(&ordered_a, &win1, &local_displays, &remotes)
+            .unwrap();
+        let mut routed = RoutedInput::new(runtime).unwrap();
+        {
+            let mut q = routed.input.lock().unwrap();
+            q.seed_physical_held([], []).unwrap();
+            q.begin_session();
+        }
+        routed.sync();
+        assert!(routed.enable(routed.generation));
+
+        // Jump local #1 -> local #2 (returns warp point centered on DISPLAY5, stays local)
+        let warp_local2 = routed.quick_jump_to_screen(&s2.id, 10).unwrap().unwrap();
+        assert!(!routed.remote_gate.load(Ordering::Acquire));
+        assert!((warp_local2.x - (1440. + 1280.)).abs() < 1.0);
+        assert!((warp_local2.y - (120. + 720.)).abs() < 1.0);
+
+        // Jump local #2 -> remote #3 (Mac)
+        assert!(routed.quick_jump_to_screen(&s3.id, 20).unwrap().is_none());
+        assert!(routed.remote_gate.load(Ordering::Acquire));
+        assert_eq!(routed.active_remote_device_id().as_deref(), Some(mac.as_str()));
+        assert_eq!(routed.focus_identity(), (Some(mac.clone()), Some(s3.id.clone())));
+
+        // Jump remote #3 (Mac) -> remote #4 (Win2)
+        assert!(routed.quick_jump_to_screen(&s4.id, 30).unwrap().is_none());
+        assert!(routed.remote_gate.load(Ordering::Acquire));
+        assert_eq!(routed.active_remote_device_id().as_deref(), Some(win2.as_str()));
+        assert_eq!(routed.focus_identity(), (Some(win2.clone()), Some(s4.id.clone())));
+
+        // Jump remote #4 (Win2) -> local #1 (DISPLAY6)
+        let warp_local1 = routed.quick_jump_to_screen(&s1.id, 40).unwrap().unwrap();
+        assert!(!routed.remote_gate.load(Ordering::Acquire));
+        assert_eq!(routed.active_remote_device_id(), None);
+        assert!((warp_local1.x - 720.).abs() < 1.0);
+        assert!((warp_local1.y - 1280.).abs() < 1.0);
     }
 }

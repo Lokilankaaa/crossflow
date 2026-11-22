@@ -517,7 +517,8 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
-                Text("快捷键：\(peer.hotkeys.toggleSharing ?? "未设置") 暂停/恢复 · \(peer.hotkeys.quickJumpNext ?? "未设置") 快速切屏 · \(peer.hotkeys.lockScreen ?? "未设置") 锁定屏幕")
+                let screenHint = peer.hotkeys.quickJumpScreenPrefix.map { "\($0)+1~9" } ?? "未设置"
+                Text("快捷键：\(screenHint) 直达屏幕 · \(peer.hotkeys.toggleSharing ?? "未设置") 暂停/恢复 · \(peer.hotkeys.lockScreen ?? "未设置") 锁屏")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -526,6 +527,35 @@ struct WorkspaceView: View {
         }
         .frame(maxHeight: .infinity)
         .background(Theme.surface)
+    }
+
+    private var screenNumberMap: [String: Int] {
+        var map: [String: Int] = [:]
+        for info in peer.screenNumbers {
+            map[info.screenID] = info.number
+        }
+        if let layout = peer.sharedLayout, !layout.screens.isEmpty {
+            let missing = layout.screens.contains { map[$0.id] == nil }
+            if missing {
+                let minY = layout.screens.map(\.y).min() ?? 0
+                let ordered = layout.screens.sorted { a, b in
+                    let ra = Int(floor((a.y - minY) / 360.0))
+                    let rb = Int(floor((b.y - minY) / 360.0))
+                    if ra != rb { return ra < rb }
+                    let xa = Int(a.x.rounded())
+                    let xb = Int(b.x.rounded())
+                    if xa != xb { return xa < xb }
+                    let ya = Int(a.y.rounded())
+                    let yb = Int(b.y.rounded())
+                    if ya != yb { return ya < yb }
+                    return a.id < b.id
+                }
+                for (i, s) in ordered.enumerated() {
+                    map[s.id] = i + 1
+                }
+            }
+        }
+        return map
     }
 
     private var hotkeysSection: some View {
@@ -546,11 +576,39 @@ struct WorkspaceView: View {
             .buttonStyle(.plain)
 
             if hotkeysExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("QuickJump 屏幕 1–9（按画布编号直达）")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.text)
+                    let prefixBinding = Binding<String>(
+                        get: { peer.hotkeys.quickJumpScreenPrefix ?? "" },
+                        set: { next in
+                            var updated = peer.hotkeys
+                            updated.quickJumpScreenPrefix = next.isEmpty ? nil : next
+                            updated.quickJump1 = nil
+                            updated.quickJump2 = nil
+                            peer.setHotkeys(updated)
+                        }
+                    )
+                    Picker("", selection: prefixBinding) {
+                        Text("Ctrl+Option + 1~9").tag("Ctrl+Alt")
+                        Text("Ctrl+Shift + 1~9").tag("Ctrl+Shift")
+                        Text("Option+Shift + 1~9").tag("Alt+Shift")
+                        Text("Ctrl+Option+Shift + 1~9").tag("Ctrl+Alt+Shift")
+                        Text("Option + 1~9").tag("Alt")
+                        Text("Ctrl+Cmd + 1~9").tag("Ctrl+Meta")
+                        Text("已关闭").tag("")
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity)
+                }
+                .padding(.bottom, 2)
+
                 hotkeyRow(field: "toggle_sharing", label: "暂停 / 恢复共享", value: peer.hotkeys.toggleSharing)
                 hotkeyRow(field: "lock_screen", label: "锁定当前屏幕", value: peer.hotkeys.lockScreen)
                 hotkeyRow(field: "quick_jump_next", label: "QuickJump 下一台", value: peer.hotkeys.quickJumpNext)
                 hotkeyRow(field: "quick_jump_home", label: "QuickJump 回本机", value: peer.hotkeys.quickJumpHome)
-                hotkeyRow(field: "quick_jump_1", label: "QuickJump 设备 #1", value: peer.hotkeys.quickJump1)
                 hotkeyRow(field: "emergency_stop", label: "紧急停止", value: peer.hotkeys.emergencyStop)
 
                 HStack {
@@ -739,16 +797,30 @@ struct WorkspaceView: View {
                         .padding(.top, 2)
                     ForEach(Array(group.enumerated()), id: \.element.id) { sIdx, screen in
                         let focused = peer.routeEnabled && peer.focusScreenID == screen.id
+                        let globalNum = screenNumberMap[screen.id] ?? 0
                         HStack(spacing: 8) {
-                            Image(systemName: screen.height > screen.width ? "rectangle.portrait" : (isLocal ? "laptopcomputer" : "display"))
-                                .font(.system(size: 12))
-                                .foregroundStyle(color)
+                            Text(globalNum > 0 ? "\(globalNum)" : "·")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 20, height: 20)
+                                .background(color, in: Circle())
                             Text("屏幕 \(sIdx + 1) (\(Int(screen.width))×\(Int(screen.height)))")
                                 .font(.system(size: 12))
                                 .lineLimit(1)
                             Spacer()
+                            if peer.state == "sharing" {
+                                Button {
+                                    peer.quickJumpScreen(screen.id)
+                                } label: {
+                                    Image(systemName: "arrow.up.right.square")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(color)
+                                }
+                                .buttonStyle(.plain)
+                                .help(globalNum >= 1 && globalNum <= 9 ? "QuickJump 至屏幕 #\(globalNum)" : "跳转至此屏幕")
+                            }
                         }
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 6)
                         .background(focused ? Theme.subtle : Theme.background, in: RoundedRectangle(cornerRadius: 8))
                     }
@@ -761,15 +833,17 @@ struct WorkspaceView: View {
                     .foregroundStyle(Theme.accent)
                 ForEach(Array(peer.localDisplays.enumerated()), id: \.element.id) { idx, d in
                     HStack(spacing: 8) {
-                        Image(systemName: "laptopcomputer")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Theme.accent)
+                        Text("\(idx + 1)")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 20, height: 20)
+                            .background(Theme.accent, in: Circle())
                         Text("屏幕 \(idx + 1) (\(Int(d.width))×\(Int(d.height)))")
                             .font(.system(size: 12))
                             .lineLimit(1)
                         Spacer()
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 6)
                     .background(Theme.background, in: RoundedRectangle(cornerRadius: 8))
                 }
@@ -830,6 +904,7 @@ struct WorkspaceView: View {
                     localDeviceID: peer.localDeviceID,
                     localName: peer.localName,
                     deviceNames: nameMap,
+                    screenNumbers: screenNumberMap,
                     editable: true,
                     onCommitLayout: { updated in
                         commitLayout(updated, recordUndo: true)

@@ -135,11 +135,29 @@ struct PeerInfo: Sendable, Equatable, Decodable, Identifiable {
     }
 }
 
+struct NumberedScreenInfo: Sendable, Equatable, Decodable, Identifiable {
+    let number: Int
+    let screenID: String
+    let deviceID: String
+    let deviceName: String
+    let nativeID: String
+    var id: String { screenID }
+
+    enum CodingKeys: String, CodingKey {
+        case number
+        case screenID = "screen_id"
+        case deviceID = "device_id"
+        case deviceName = "device_name"
+        case nativeID = "native_id"
+    }
+}
+
 struct HotkeyConfigInfo: Sendable, Equatable, Codable {
     var toggleSharing: String?
     var lockScreen: String?
     var quickJumpNext: String?
     var quickJumpHome: String?
+    var quickJumpScreenPrefix: String?
     var quickJump1: String?
     var quickJump2: String?
     var emergencyStop: String?
@@ -149,6 +167,7 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         case lockScreen = "lock_screen"
         case quickJumpNext = "quick_jump_next"
         case quickJumpHome = "quick_jump_home"
+        case quickJumpScreenPrefix = "quick_jump_screen_prefix"
         case quickJump1 = "quick_jump_1"
         case quickJump2 = "quick_jump_2"
         case emergencyStop = "emergency_stop"
@@ -162,6 +181,7 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         try c.encode(lockScreen, forKey: .lockScreen)
         try c.encode(quickJumpNext, forKey: .quickJumpNext)
         try c.encode(quickJumpHome, forKey: .quickJumpHome)
+        try c.encode(quickJumpScreenPrefix, forKey: .quickJumpScreenPrefix)
         try c.encode(quickJump1, forKey: .quickJump1)
         try c.encode(quickJump2, forKey: .quickJump2)
         try c.encode(emergencyStop, forKey: .emergencyStop)
@@ -172,8 +192,9 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         lockScreen: "Ctrl+Alt+L",
         quickJumpNext: "Ctrl+Alt+Tab",
         quickJumpHome: "Ctrl+Alt+H",
-        quickJump1: "Ctrl+Alt+1",
-        quickJump2: "Ctrl+Alt+2",
+        quickJumpScreenPrefix: "Ctrl+Alt",
+        quickJump1: nil,
+        quickJump2: nil,
         emergencyStop: "Ctrl+Alt+Shift+Esc"
     )
 }
@@ -206,6 +227,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let localDisplays: [PeerDisplayInfo]
     let discoveredPeers: [DiscoveredPeerInfo]
     let sharedLayout: PeerSharedLayoutWire?
+    let screenNumbers: [NumberedScreenInfo]?
     let transfer: TransferStatusInfo?
     let error: String?
 
@@ -237,6 +259,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case localDisplays = "local_displays"
         case discoveredPeers = "discovered_peers"
         case sharedLayout = "shared_layout"
+        case screenNumbers = "screen_numbers"
         case transfer
         case error
     }
@@ -324,6 +347,16 @@ private struct QuickJumpCommandWire: Encodable {
     enum CodingKeys: String, CodingKey {
         case op
         case targetDeviceID = "target_device_id"
+    }
+}
+
+private struct QuickJumpScreenCommandWire: Encodable {
+    let op = "quick_jump_screen"
+    let screenID: String
+
+    enum CodingKeys: String, CodingKey {
+        case op
+        case screenID = "screen_id"
     }
 }
 
@@ -502,6 +535,7 @@ final class PeerMeshModel {
     var localDisplays: [PeerDisplayInfo] = []
     var discoveredPeers: [DiscoveredPeerInfo] = []
     var sharedLayout: SharedLayout?
+    var screenNumbers: [NumberedScreenInfo] = []
     var transfer: TransferStatusInfo?
     var error: String?
 
@@ -632,6 +666,7 @@ final class PeerMeshModel {
         localDisplays = s.localDisplays
         discoveredPeers = s.discoveredPeers
         sharedLayout = s.sharedLayout?.toSharedLayout
+        screenNumbers = s.screenNumbers ?? []
         transfer = s.transfer
         error = s.error
         onStatusChange?()
@@ -742,6 +777,13 @@ final class PeerMeshModel {
 
     func quickJump(to targetDeviceID: String?) {
         let cmd = QuickJumpCommandWire(targetDeviceID: targetDeviceID)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func quickJumpScreen(_ screenID: String) {
+        let cmd = QuickJumpScreenCommandWire(screenID: screenID)
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

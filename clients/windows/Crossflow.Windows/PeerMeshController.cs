@@ -68,11 +68,19 @@ internal sealed record PeerInfo(
     [property: JsonPropertyName("active_channel_label")] string? ActiveChannelLabel,
     [property: JsonPropertyName("preferred_channel")] string PreferredChannel);
 
+internal sealed record NumberedScreenInfo(
+    [property: JsonPropertyName("number")] int Number,
+    [property: JsonPropertyName("screen_id")] string ScreenId,
+    [property: JsonPropertyName("device_id")] string DeviceId,
+    [property: JsonPropertyName("device_name")] string DeviceName,
+    [property: JsonPropertyName("native_id")] string NativeId);
+
 internal sealed record HotkeyConfigInfo(
     [property: JsonPropertyName("toggle_sharing")] string? ToggleSharing,
     [property: JsonPropertyName("lock_screen")] string? LockScreen,
     [property: JsonPropertyName("quick_jump_next")] string? QuickJumpNext,
     [property: JsonPropertyName("quick_jump_home")] string? QuickJumpHome,
+    [property: JsonPropertyName("quick_jump_screen_prefix")] string? QuickJumpScreenPrefix,
     [property: JsonPropertyName("quick_jump_1")] string? QuickJump1,
     [property: JsonPropertyName("quick_jump_2")] string? QuickJump2,
     [property: JsonPropertyName("emergency_stop")] string? EmergencyStop)
@@ -82,8 +90,9 @@ internal sealed record HotkeyConfigInfo(
         "Ctrl+Alt+L",
         "Ctrl+Alt+Tab",
         "Ctrl+Alt+H",
-        "Ctrl+Alt+1",
-        "Ctrl+Alt+2",
+        "Ctrl+Alt",
+        null,
+        null,
         "Ctrl+Alt+Shift+Esc");
 }
 
@@ -116,6 +125,7 @@ internal sealed record PeerMeshSnapshot(
     IReadOnlyList<PeerDisplayInfo> LocalDisplays,
     IReadOnlyList<DiscoveredPeerInfo> DiscoveredPeers,
     PeerSharedLayout? SharedLayout,
+    IReadOnlyList<NumberedScreenInfo> ScreenNumbers,
     TransferStatusInfo? Transfer,
     string? Error,
     bool ProcessRunning,
@@ -124,7 +134,7 @@ internal sealed record PeerMeshSnapshot(
     internal static PeerMeshSnapshot Initial => new(
         "idle", null, null, "open", false, false, true, true, false, false, false, HotkeyConfigInfo.Defaults, "auto", null, null, [], [], [],
         false, null, null, null, null, null, null,
-        [], [], null, null, null, false, 0);
+        [], [], null, [], null, null, false, 0);
 }
 
 /// Manages one packaged `crossflow.exe peer` symmetric P2P LAN mesh process.
@@ -270,6 +280,8 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_screen_lock", locked });
     internal Task QuickJumpAsync(string? targetDeviceId) =>
         SendCommandAsync(new { op = "quick_jump", target_device_id = targetDeviceId });
+    internal Task QuickJumpScreenAsync(string screenId) =>
+        SendCommandAsync(new { op = "quick_jump_screen", screen_id = screenId });
     internal Task SendFilesAsync(IReadOnlyList<string> paths, string? targetDeviceId = null) =>
         SendCommandAsync(new { op = "send_files", target_device_id = targetDeviceId, paths });
     internal Task CancelTransferAsync() =>
@@ -377,6 +389,7 @@ internal sealed class PeerMeshController
                             parsed.LocalDisplays ?? [],
                             parsed.DiscoveredPeers ?? [],
                             parsed.SharedLayout,
+                            parsed.ScreenNumbers ?? [],
                             parsed.Transfer,
                             parsed.Error,
                             ProcessRunning: parsed.State is not ("stopped" or "error"),
@@ -451,6 +464,7 @@ internal sealed class PeerMeshController
         [JsonPropertyName("local_displays")] public List<PeerDisplayInfo>? LocalDisplays { get; set; }
         [JsonPropertyName("discovered_peers")] public List<DiscoveredPeerInfo>? DiscoveredPeers { get; set; }
         [JsonPropertyName("shared_layout")] public PeerSharedLayout? SharedLayout { get; set; }
+        [JsonPropertyName("screen_numbers")] public List<NumberedScreenInfo>? ScreenNumbers { get; set; }
         [JsonPropertyName("transfer")] public TransferStatusInfo? Transfer { get; set; }
         [JsonPropertyName("error")] public string? Error { get; set; }
     }

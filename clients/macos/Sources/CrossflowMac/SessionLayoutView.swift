@@ -9,6 +9,7 @@ struct SessionLayoutView: View {
     let localDeviceID: String?
     var localName: String = "这台 Mac"
     var deviceNames: [String: String] = [:]
+    var screenNumbers: [String: Int] = [:]
     var editable: Bool = false
     var onCommitLayout: ((SharedLayout) -> Void)? = nil
 
@@ -74,6 +75,7 @@ struct SessionLayoutView: View {
                             }
                         }()
                         let displayName = local ? localName : (deviceNames[screen.deviceID] ?? sourceName)
+                        let globalNum = screenNumbers[screen.id] ?? 0
                         let tileW = max(24, screen.width * scale)
                         let tileH = max(24, screen.height * scale)
 
@@ -83,6 +85,17 @@ struct SessionLayoutView: View {
                                 RoundedRectangle(cornerRadius: 9)
                                     .stroke(accentColor, lineWidth: focused ? 3 : isDragging ? 2 : 1.2)
                             )
+                            .overlay(alignment: .topLeading) {
+                                if globalNum > 0 {
+                                    Text("\(globalNum)")
+                                        .font(.system(size: tileH <= 96 ? 10.5 : 12, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, tileH <= 96 ? 5 : 6)
+                                        .frame(minWidth: tileH <= 96 ? 18 : 22, minHeight: tileH <= 96 ? 18 : 22)
+                                        .background(accentColor, in: Capsule())
+                                        .padding(tileH <= 96 ? 5 : 7)
+                                }
+                            }
                             .overlay {
                                 ViewThatFits {
                                     VStack(spacing: 4) {
