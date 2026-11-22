@@ -489,23 +489,35 @@ struct WorkspaceView: View {
         }
     }
 
+    private final class DroppedPathsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var paths: [String] = []
+
+        func append(_ path: String) {
+            lock.withLock { paths.append(path) }
+        }
+
+        func snapshot() -> [String] {
+            lock.withLock { paths }
+        }
+    }
+
     private func handleFileDrop(_ providers: [NSItemProvider]) {
         let group = DispatchGroup()
-        let lock = NSLock()
-        var collected: [String] = []
+        let box = DroppedPathsBox()
         for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             group.enter()
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 defer { group.leave() }
                 if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    lock.withLock { collected.append(url.path) }
+                    box.append(url.path)
                 } else if let url = item as? URL {
-                    lock.withLock { collected.append(url.path) }
+                    box.append(url.path)
                 }
             }
         }
         group.notify(queue: .main) {
-            let paths = lock.withLock { collected }
+            let paths = box.snapshot()
             if !paths.isEmpty {
                 peer.sendFiles(paths)
             }
