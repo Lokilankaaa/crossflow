@@ -166,20 +166,33 @@ impl SharedSource {
         target_device_id: &str,
         now_ns: u64,
     ) -> Result<Option<Point>> {
+        self.quick_jump_to_device_with_clock(target_device_id, || now_ns)
+    }
+    pub fn quick_jump_to_device_with_clock(
+        &self,
+        target_device_id: &str,
+        now: impl FnOnce() -> u64,
+    ) -> Result<Option<Point>> {
         let mut state = self.lock();
         state.sync();
         if !state.route.enabled || state.failure.is_some() {
             return Ok(None);
         }
-        state.route.quick_jump_to_device(target_device_id, now_ns)
+        state.route.quick_jump_to_device(target_device_id, now())
     }
     pub fn force_return_local(&self, now_ns: u64) -> Result<Option<Point>> {
+        self.force_return_local_with_clock(|| now_ns)
+    }
+    pub fn force_return_local_with_clock(
+        &self,
+        now: impl FnOnce() -> u64,
+    ) -> Result<Option<Point>> {
         let mut state = self.lock();
         state.sync();
         if !state.route.enabled || state.failure.is_some() {
             return Ok(None);
         }
-        state.route.force_return_local(now_ns)
+        state.route.force_return_local(now())
     }
     pub fn active_remote_device_id(&self) -> Option<String> {
         let state = self.lock();
@@ -219,26 +232,39 @@ impl SharedSource {
         now_ns: u64,
         allow_motion: bool,
     ) -> Result<Option<(Option<String>, Frame)>> {
+        self.next_mesh_frame_with_clock(|| now_ns, allow_motion)
+    }
+
+    /// Like `next_mesh_frame`, but samples the monotonic clock AFTER acquiring
+    /// both `state` and `queue` locks so a concurrent capture thread can never
+    /// enqueue a newer capture timestamp ahead of our poll timestamp.
+    pub fn next_mesh_frame_with_clock(
+        &self,
+        now: impl FnOnce() -> u64,
+        allow_motion: bool,
+    ) -> Result<Option<(Option<String>, Frame)>> {
         let mut state = self.lock();
         state.sync();
         if state.failure.is_some() {
             anyhow::bail!("physical source has an unacknowledged failure");
         }
-        if state.last_poll_ns.is_some_and(|last| now_ns < last) {
-            state.fail(SourceFailure::ClockRegressed);
-            anyhow::bail!("physical source poll clock regressed");
-        }
-        state.last_poll_ns = Some(now_ns);
         let target = state.route.active_remote_device_id();
         let queue_arc = state.route.input.clone();
         let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
         if !queue.is_connected() {
             return Ok(None);
         }
+        let now_ns = now();
+        if state.last_poll_ns.is_some_and(|last| now_ns < last) {
+            drop(queue);
+            state.fail(SourceFailure::ClockRegressed);
+            anyhow::bail!("physical source poll clock regressed");
+        }
+        state.last_poll_ns = Some(now_ns);
         if let Err(reason) = queue.validate_pending(now_ns) {
             drop(queue);
             state.fail(SourceFailure::QueuePaused(reason));
-            anyhow::bail!("physical source pending input expired");
+            anyhow::bail!("physical source pending input expired: {reason:?}");
         }
         let epoch = queue.control_epoch();
         if state.emitted_epoch != Some(epoch) {
@@ -265,7 +291,7 @@ impl SharedSource {
             Err(reason) => {
                 drop(queue);
                 state.fail(SourceFailure::QueuePaused(reason));
-                anyhow::bail!("physical source queued input expired");
+                anyhow::bail!("physical source queued input expired: {reason:?}");
             }
         };
         drop(queue);
@@ -956,5 +982,132 @@ mod tests {
                 .kind,
             Kind::Pause
         );
+    }
+
+    #[test]
+    fn next_mesh_frame_with_clock_routes_across_three_devices_without_clock_regression() {
+        let layout = Layout::new(vec![
+            Screen {
+                id: "win1:1".into(),
+                device_id: "win1".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            Screen {
+                id: "mac:1".into(),
+                device_id: "mac".into(),
+                x: 100.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            Screen {
+                id: "win2:1".into(),
+                device_id: "win2".into(),
+                x: 200.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+        ])
+        .unwrap();
+        let rt = RuntimeLayout {
+            layout,
+            local_device_id: "win1".into(),
+            remote_device_id: "*".into(),
+            bindings: vec![
+                Binding {
+                    screen_id: "win1:1".into(),
+                    native_id: "1".into(),
+                    native: NativeRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+                Binding {
+                    screen_id: "mac:1".into(),
+                    native_id: "1".into(),
+                    native: NativeRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+                Binding {
+                    screen_id: "win2:1".into(),
+                    native_id: "1".into(),
+                    native: NativeRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+            ],
+        };
+        let source = SharedSource::new(rt).unwrap();
+        source
+            .observe(
+                SourceEvent::Snapshot {
+                    buttons: vec![],
+                    keys: vec![],
+                },
+                100,
+            )
+            .unwrap();
+        source.enable_mesh().unwrap();
+
+        // Cross from win1 -> mac -> win2 with monotonic capture timestamps
+        let _ = source
+            .observe(
+                SourceEvent::Movement {
+                    native: Point { x: 99.0, y: 50.0 },
+                    dx: 1.0,
+                    dy: 0.0,
+                },
+                1_000,
+            )
+            .unwrap();
+        let _ = source
+            .observe(
+                SourceEvent::Movement {
+                    native: Point { x: 99.0, y: 50.0 },
+                    dx: 10.0,
+                    dy: 0.0,
+                },
+                2_000,
+            )
+            .unwrap();
+        let _ = source
+            .observe(
+                SourceEvent::Movement {
+                    native: Point { x: 99.0, y: 50.0 },
+                    dx: 120.0,
+                    dy: 0.0,
+                },
+                5_000,
+            )
+            .unwrap();
+        // Sampling under lock produces a fresh timestamp >= last_capture_ns (5_000)
+        // and delivers Arm + Position directly for win2 without ClockRegressed.
+        let (target1, frame1) = source
+            .next_mesh_frame_with_clock(|| 6_000, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target1.as_deref(), Some("win2"));
+        assert_eq!(frame1.kind, Kind::Arm);
+
+        let (target2, frame2) = source
+            .next_mesh_frame_with_clock(|| 7_000, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target2.as_deref(), Some("win2"));
+        assert_eq!(frame2.kind, Kind::Position);
+        assert!(source.status().failure.is_none());
     }
 }

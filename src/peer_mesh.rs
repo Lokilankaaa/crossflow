@@ -1070,7 +1070,29 @@ pub fn run(
                 aux_listener,
                 local_device_id.clone(),
                 config.passphrase.clone(),
+                clipboard_sync_flag.clone(),
             );
+            let channel_cache = Arc::new(Mutex::new(local_channels.clone()));
+            let channel_watch_stop = Arc::new(AtomicBool::new(false));
+            {
+                let cache = channel_cache.clone();
+                let watch_stop = channel_watch_stop.clone();
+                let _ = thread::Builder::new()
+                    .name("crossflow-channel-watch".into())
+                    .spawn(move || {
+                        let mut last = Instant::now();
+                        while !watch_stop.load(Ordering::Acquire) {
+                            if last.elapsed() >= Duration::from_secs(4) {
+                                last = Instant::now();
+                                let refreshed = enumerate_local_channels();
+                                if let Ok(mut slot) = cache.lock() {
+                                    *slot = refreshed;
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                    });
+            }
 
             let mut discovery = DiscoveryHandle::start(DiscoveryConfig {
                 local_device_id: Some(local_discovery_id.clone()),
@@ -1102,7 +1124,6 @@ pub fn run(
             let mut reconfigure_requested = false;
             let mut last_auth_error: Option<String> = None;
             let mut last_dial_scan = Instant::now() - Duration::from_secs(2);
-            let mut last_clip_poll = Instant::now();
             let mut last_motion_send = Instant::now() - motion_interval;
             let mut last_status_emit = Instant::now() - Duration::from_secs(1);
             let mut last_status_sig = String::new();
@@ -1113,11 +1134,12 @@ pub fn run(
                 && Instant::now() < deadline
             {
                 let mut did_work = false;
-                let now_ns = log.ns();
 
                 if last_channel_refresh.elapsed() >= Duration::from_secs(3) {
                     last_channel_refresh = Instant::now();
-                    local_channels = enumerate_local_channels();
+                    if let Ok(cached) = channel_cache.try_lock() {
+                        local_channels = cached.clone();
+                    }
                 }
                 if active_peers.is_empty() && last_display_refresh.elapsed() >= Duration::from_secs(2)
                 {
@@ -1608,7 +1630,7 @@ pub fn run(
                 }
 
                 // 5. Pump all connected peers (non-blocking read/write + keepalive)
-                let mut dead_peers: Vec<String> = Vec::new();
+                let mut dead_peers: Vec<(String, &'static str)> = Vec::new();
                 let peer_ids: Vec<String> = active_peers.keys().cloned().collect();
                 let mut inbound_layout_updates: Vec<(String, u64, Vec<crate::session_metadata::SharedScreen>)> = Vec::new();
                 let mut revoke_outbound_from: Vec<String> = Vec::new();
@@ -1621,7 +1643,7 @@ pub fn run(
                         let _ = peer.conn.queue_control(&MeshControl::KeepAlive);
                     }
                     if peer.conn.last_rx_elapsed() >= PEER_SILENCE_TIMEOUT {
-                        dead_peers.push(pid);
+                        dead_peers.push((pid, "silence_timeout"));
                         continue;
                     }
                     match peer.conn.pump() {
@@ -1653,9 +1675,16 @@ pub fn run(
                                                 _ => {
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
                                                     {
-                                                        if apply_inbound_frame(&mut io.sink, &frame)
-                                                            .is_err()
+                                                        if let Err(err) =
+                                                            apply_inbound_frame(&mut io.sink, &frame)
                                                         {
+                                                            log.write(
+                                                                "mesh_inbound_frame_err",
+                                                                serde_json::json!({
+                                                                    "kind": format!("{:?}", frame.kind),
+                                                                    "reason": format!("{err:#}"),
+                                                                }),
+                                                            );
                                                             let _ = io.sink.release_owned();
                                                             inbound_owner = None;
                                                         }
@@ -1679,12 +1708,19 @@ pub fn run(
                                             }
                                         }
                                         MeshControl::RevokeControl => {
+                                            log.write(
+                                                "mesh_revoke_control",
+                                                serde_json::json!({
+                                                    "direction": "rx",
+                                                    "peer": &pid[..pid.len().min(8)],
+                                                }),
+                                            );
                                             if active_outbound_target.as_deref()
                                                 == Some(pid.as_str())
                                             {
                                                 if let Some(ref mut io) = native_io
                                                     && let Ok(Some(pt)) =
-                                                        io.source.force_return_local(now_ns)
+                                                        io.source.force_return_local_with_clock(|| log.ns())
                                                 {
                                                     let _ = io.capture.warp_local(pt);
                                                 }
@@ -1697,7 +1733,7 @@ pub fn run(
                             }
                         }
                         Err(_) => {
-                            dead_peers.push(pid);
+                            dead_peers.push((pid, "pump_error"));
                         }
                     }
                 }
@@ -1734,12 +1770,20 @@ pub fn run(
                 }
 
                 // Clean up disconnected peers without disrupting remaining peers!
-                for dead in dead_peers {
+                for (dead, reason) in dead_peers {
+                    log.write(
+                        "mesh_peer_dropped",
+                        serde_json::json!({
+                            "peer": &dead[..dead.len().min(8)],
+                            "reason": reason,
+                        }),
+                    );
                     active_peers.remove(&dead);
                     if active_outbound_target.as_deref() == Some(dead.as_str()) {
                         active_outbound_target = None;
                         if let Some(ref mut io) = native_io
-                            && let Ok(Some(pt)) = io.source.force_return_local(now_ns)
+                            && let Ok(Some(pt)) =
+                                io.source.force_return_local_with_clock(|| log.ns())
                         {
                             let _ = io.capture.warp_local(pt);
                         }
@@ -1752,6 +1796,7 @@ pub fn run(
                     }
                     topology_changed = true;
                 }
+                aux_hub.set_has_peers(!active_peers.is_empty());
 
                 // 6. Start, hot-update, or stop native Capture + WorkerProxy
                 if active_peers.is_empty() {
@@ -1802,13 +1847,26 @@ pub fn run(
                 }
 
                 // 7. Poll native capture, process custom hotkeys / QuickJump, route 1-hop frames!
-                let mut restart_native = false;
+                let mut restart_native: Option<&'static str> = None;
                 if let Some(ref mut io) = native_io {
-                    if io.capture.poll(now_ns).is_err()
-                        || io.source.status().failure.is_some()
-                        || io.capture.failure().is_some()
-                    {
-                        restart_native = true;
+                    if let Err(err) = io.capture.poll(log.ns()) {
+                        log.write(
+                            "mesh_native_restart",
+                            serde_json::json!({"reason": "capture_poll_err", "detail": format!("{err:#}")}),
+                        );
+                        restart_native = Some("capture_poll_err");
+                    } else if let Some(failure) = io.source.status().failure {
+                        log.write(
+                            "mesh_native_restart",
+                            serde_json::json!({"reason": "source_failure", "detail": format!("{failure:?}")}),
+                        );
+                        restart_native = Some("source_failure");
+                    } else if let Some(failure) = io.capture.failure() {
+                        log.write(
+                            "mesh_native_restart",
+                            serde_json::json!({"reason": "capture_failure", "detail": failure}),
+                        );
+                        restart_native = Some("capture_failure");
                     } else {
                         if let Some(sc) = io.capture.command() {
                             match sc {
@@ -1908,7 +1966,7 @@ pub fn run(
                             {
                                 pending_quick_jump = None;
                                 if let Ok(Some(local_pt)) =
-                                    io.source.quick_jump_to_device(&target, now_ns)
+                                    io.source.quick_jump_to_device_with_clock(&target, || log.ns())
                                 {
                                     let _ = io.capture.warp_local(local_pt);
                                 }
@@ -1920,6 +1978,13 @@ pub fn run(
                         if act != io.last_activity {
                             io.last_activity = act;
                             if let Some(owner_id) = inbound_owner.take() {
+                                log.write(
+                                    "mesh_revoke_control",
+                                    serde_json::json!({
+                                        "direction": "tx",
+                                        "peer": &owner_id[..owner_id.len().min(8)],
+                                    }),
+                                );
                                 let _ = io.sink.release_owned();
                                 if let Some(p) = active_peers.get_mut(&owner_id) {
                                     let _ = p.conn.queue_control(&MeshControl::RevokeControl);
@@ -1932,10 +1997,17 @@ pub fn run(
                         let mut drained = 0usize;
                         while drained < 32 {
                             let allow_motion = last_motion_send.elapsed() >= motion_interval;
-                            let next = match io.source.next_mesh_frame(now_ns, allow_motion) {
+                            let next = match io
+                                .source
+                                .next_mesh_frame_with_clock(|| log.ns(), allow_motion)
+                            {
                                 Ok(v) => v,
-                                Err(_) => {
-                                    restart_native = true;
+                                Err(err) => {
+                                    log.write(
+                                        "mesh_native_restart",
+                                        serde_json::json!({"reason": "next_frame_err", "detail": format!("{err:#}")}),
+                                    );
+                                    restart_native = Some("next_frame_err");
                                     break;
                                 }
                             };
@@ -1974,14 +2046,18 @@ pub fn run(
                         // Keep input-worker heartbeat healthy
                         if io.last_sink_maintain.elapsed() >= Duration::from_millis(15) {
                             io.last_sink_maintain = Instant::now();
-                            if io.sink.maintain().is_err() {
-                                restart_native = true;
+                            if let Err(err) = io.sink.maintain() {
+                                log.write(
+                                    "mesh_native_restart",
+                                    serde_json::json!({"reason": "sink_maintain_err", "detail": format!("{err:#}")}),
+                                );
+                                restart_native = Some("sink_maintain_err");
                             }
                         }
                     }
                 }
 
-                if restart_native {
+                if restart_native.is_some() {
                     if let Some(io) = native_io.take() {
                         io.shutdown();
                     }
@@ -1999,13 +2075,10 @@ pub fn run(
                     }
                 }
 
-                // 8. Central mesh clipboard broadcast (ONE single OS clipboard poller -> ALL peers!)
-                if !active_peers.is_empty() && last_clip_poll.elapsed() >= Duration::from_millis(160)
-                {
-                    last_clip_poll = Instant::now();
-                    if clipboard_sync_flag.load(Ordering::Relaxed)
-                        && let Some((item, hash)) = aux_hub.poll_local_clipboard()
-                    {
+                // 8. Central mesh clipboard broadcast (non-blocking drain from background poller)
+                if !active_peers.is_empty() {
+                    while let Some((item, hash)) = aux_hub.take_local_clipboard() {
+                        did_work = true;
                         for peer in active_peers.values() {
                             peer.aux.push_clipboard(item.clone(), hash.clone());
                         }
@@ -2176,6 +2249,7 @@ pub fn run(
             if let Some(io) = native_io.take() {
                 io.shutdown();
             }
+            channel_watch_stop.store(true, Ordering::Release);
             aux_hub.stop();
             discovery.stop();
             let _ = discovery.wait_stopped(Duration::from_secs(2));

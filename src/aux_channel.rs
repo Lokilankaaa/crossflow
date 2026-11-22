@@ -765,6 +765,8 @@ struct SharedClipEcho {
 pub struct AuxMeshHub {
     pending_inbound: Arc<Mutex<HashMap<String, (TcpStream, SecureChannel)>>>,
     clip_echo: Arc<Mutex<SharedClipEcho>>,
+    pending_local_clips: Arc<Mutex<std::collections::VecDeque<(ClipboardItem, String)>>>,
+    has_peers: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
@@ -773,6 +775,7 @@ impl AuxMeshHub {
         listener: Option<Arc<TcpListener>>,
         local_device_id: String,
         passphrase: Option<String>,
+        clipboard_enabled: Arc<AtomicBool>,
     ) -> Self {
         let pending_inbound: Arc<Mutex<HashMap<String, (TcpStream, SecureChannel)>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -782,6 +785,9 @@ impl AuxMeshHub {
             last_sent_hash: None,
             last_remote_hash: None,
         }));
+        let pending_local_clips =
+            Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(4)));
+        let has_peers = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         if let Some(listener) = listener {
             let inbound = pending_inbound.clone();
@@ -820,11 +826,47 @@ impl AuxMeshHub {
                     }
                 });
         }
+        // Poll the local OS clipboard on a dedicated background thread so image
+        // decoding / OpenClipboard / NSPasteboard never stalls the 1000Hz input loop.
+        {
+            let echo = clip_echo.clone();
+            let queue = pending_local_clips.clone();
+            let clip_flag = clipboard_enabled;
+            let peers_flag = has_peers.clone();
+            let stop_flag = stop.clone();
+            let _ = thread::Builder::new()
+                .name("crossflow-mesh-clipboard".into())
+                .spawn(move || {
+                    let mut last_poll = Instant::now();
+                    while !stop_flag.load(Ordering::Acquire) {
+                        if last_poll.elapsed() >= CLIP_POLL_INTERVAL {
+                            last_poll = Instant::now();
+                            if peers_flag.load(Ordering::Acquire)
+                                && clip_flag.load(Ordering::Relaxed)
+                                && let Some(entry) = poll_local_clipboard_inner(&echo)
+                                && let Ok(mut q) = queue.lock()
+                            {
+                                while q.len() >= 4 {
+                                    q.pop_front();
+                                }
+                                q.push_back(entry);
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                });
+        }
         Self {
             pending_inbound,
             clip_echo,
+            pending_local_clips,
+            has_peers,
             stop,
         }
+    }
+
+    pub fn set_has_peers(&self, active: bool) {
+        self.has_peers.store(active, Ordering::Release);
     }
 
     pub fn stop(&self) {
@@ -835,40 +877,14 @@ impl AuxMeshHub {
         self.pending_inbound.lock().ok()?.remove(remote_id)
     }
 
-    /// Poll local OS clipboard once for the entire N-peer mesh.
-    /// Returns `Some((item, hash))` when new non-echo clipboard content is ready to broadcast.
+    /// Non-blocking drain of local clipboard items discovered by the background poller.
+    pub fn take_local_clipboard(&self) -> Option<(ClipboardItem, String)> {
+        self.pending_local_clips.lock().ok()?.pop_front()
+    }
+
+    /// Synchronous single-poll helper (kept for direct tests).
     pub fn poll_local_clipboard(&self) -> Option<(ClipboardItem, String)> {
-        let mut st = self.clip_echo.lock().ok()?;
-        let token = clipboard::change_token();
-        let should_read = if token != st.last_token {
-            st.pending_empty_token = Some((token, 0));
-            st.last_token = token;
-            true
-        } else if let Some((tok, retries)) = st.pending_empty_token {
-            if tok == token && retries < 3 {
-                st.pending_empty_token = Some((tok, retries + 1));
-                true
-            } else {
-                st.pending_empty_token = None;
-                false
-            }
-        } else {
-            false
-        };
-        if !should_read {
-            return None;
-        }
-        let item = clipboard::read()?;
-        st.pending_empty_token = None;
-        let hash = item.hash_hex();
-        let is_echo = st.last_remote_hash.as_deref() == Some(hash.as_str())
-            || st.last_sent_hash.as_deref() == Some(hash.as_str());
-        if is_echo {
-            return None;
-        }
-        st.last_sent_hash = Some(hash.clone());
-        st.last_remote_hash = None;
-        Some((item, hash))
+        poll_local_clipboard_inner(&self.clip_echo)
     }
 
     fn record_remote_clipboard_write(&self, hash: String) {
@@ -879,6 +895,42 @@ impl AuxMeshHub {
             st.pending_empty_token = None;
         }
     }
+}
+
+fn poll_local_clipboard_inner(
+    clip_echo: &Mutex<SharedClipEcho>,
+) -> Option<(ClipboardItem, String)> {
+    let mut st = clip_echo.lock().ok()?;
+    let token = clipboard::change_token();
+    let should_read = if token != st.last_token {
+        st.pending_empty_token = Some((token, 0));
+        st.last_token = token;
+        true
+    } else if let Some((tok, retries)) = st.pending_empty_token {
+        if tok == token && retries < 3 {
+            st.pending_empty_token = Some((tok, retries + 1));
+            true
+        } else {
+            st.pending_empty_token = None;
+            false
+        }
+    } else {
+        false
+    };
+    if !should_read {
+        return None;
+    }
+    let item = clipboard::read()?;
+    st.pending_empty_token = None;
+    let hash = item.hash_hex();
+    let is_echo = st.last_remote_hash.as_deref() == Some(hash.as_str())
+        || st.last_sent_hash.as_deref() == Some(hash.as_str());
+    if is_echo {
+        return None;
+    }
+    st.last_sent_hash = Some(hash.clone());
+    st.last_remote_hash = None;
+    Some((item, hash))
 }
 
 pub struct AuxSession {
