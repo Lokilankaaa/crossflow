@@ -117,6 +117,7 @@ internal sealed class MainWindow : Window
 
         statusDetail.FontSize = 12;
         statusDetail.Foreground = theme.Brush("text_secondary");
+        statusDetail.MinHeight = 36;
         statusDetail.Text = "正在初始化局域网自动发现…";
 
         var statusCardContent = new StackPanel { Spacing = 8 };
@@ -426,7 +427,11 @@ internal sealed class MainWindow : Window
     {
         currentSnap = snap;
 
-        statusTitle.Text = snap.State switch
+        bool isAuthMismatch = snap.Error is not null
+            && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)
+                || snap.Error.StartsWith("连接验证失败", StringComparison.Ordinal));
+
+        statusTitle.Text = isAuthMismatch ? "等待密码匹配" : snap.State switch
         {
             "sharing" => "跨屏共享中",
             "paused" => "已连接 · 已暂停",
@@ -437,7 +442,9 @@ internal sealed class MainWindow : Window
             _ => "等待中"
         };
 
-        statusDot.Fill = snap.State switch
+        statusDot.Fill = isAuthMismatch
+            ? new SolidColorBrush(global::Windows.UI.Color.FromArgb(255, 217, 119, 6))
+            : snap.State switch
         {
             "sharing" => new SolidColorBrush(global::Windows.UI.Color.FromArgb(255, 22, 163, 74)),
             "paused" or "searching" or "starting" => theme.Brush("accent"),
@@ -486,12 +493,17 @@ internal sealed class MainWindow : Window
             primaryAction.Visibility = Visibility.Collapsed;
         }
 
-        if (snap.Error is not null && snap.Error != lastShownError)
+        // Keep peer-mesh status/auth mismatch inside the sidebar Status Card so
+        // the main canvas never jumps vertically when one peer toggles passphrase mode.
+        bool isExpectedPeerWarning = snap.Error is not null
+            && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)
+                || snap.Error.StartsWith("连接验证失败", StringComparison.Ordinal));
+        if (snap.Error is not null && !isExpectedPeerWarning && snap.Error != lastShownError)
         {
             lastShownError = snap.Error;
             ShowNotice(snap.Error, isError: true);
         }
-        else if (snap.Error is null && lastShownError is not null)
+        else if ((snap.Error is null || isExpectedPeerWarning) && lastShownError is not null)
         {
             lastShownError = null;
             ClearNotice();

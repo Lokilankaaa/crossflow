@@ -91,7 +91,13 @@ struct WorkspaceView: View {
         RemoteCursorHider.shared.setHidden(remoteFocused)
     }
 
+    private var isAuthMismatch: Bool {
+        guard let err = peer.error else { return false }
+        return err.hasPrefix("等待密码匹配") || err.hasPrefix("连接验证失败")
+    }
+
     private var statusColor: Color {
+        if isAuthMismatch { return .orange }
         switch peer.state {
         case "sharing": Color(red: 22/255, green: 163/255, blue: 74/255)
         case "paused", "searching", "starting": Theme.accent
@@ -123,12 +129,13 @@ struct WorkspaceView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 8) {
                         Circle().fill(statusColor).frame(width: 9, height: 9)
-                        Text(peer.statusTitle).font(.system(size: 14, weight: .semibold))
+                        Text(isAuthMismatch ? "等待密码匹配" : peer.statusTitle).font(.system(size: 14, weight: .semibold))
                     }
                     Text(peer.statusDetail)
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .frame(minHeight: 34, alignment: .topLeading)
 
                     if peer.state == "sharing" {
                         Button("暂停共享") { peer.pause() }

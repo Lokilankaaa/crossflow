@@ -561,6 +561,7 @@ pub fn run(
     let mut user_paused = false;
     let mut pending_layout_push: Option<(String, SharedLayout)> = None;
     let mut last_error: Option<String> = None;
+    let mut auth_backoff_until = Instant::now();
     let mut last_status_emit = Instant::now() - Duration::from_secs(1);
     let mut last_dial_attempt = Instant::now() - Duration::from_secs(1);
     let mut searching_since = Instant::now();
@@ -648,8 +649,11 @@ pub fn run(
             // 2. Otherwise auto-dial discovered LAN peer if we win tie-break, have a layout push,
             //    or have waited >1.5s without an inbound connection (handles asymmetric firewalls).
             let fallback_dial = searching_since.elapsed() >= Duration::from_millis(1500);
-            let can_dial = pending_layout_push.is_some()
-                || last_dial_attempt.elapsed() >= Duration::from_millis(if fallback_dial { 900 } else { 350 });
+            let in_auth_backoff = Instant::now() < auth_backoff_until;
+            let can_dial = !in_auth_backoff
+                && (pending_layout_push.is_some()
+                    || last_dial_attempt.elapsed()
+                        >= Duration::from_millis(if fallback_dial { 1200 } else { 350 }));
             if connected.is_none() && can_dial {
                 last_dial_attempt = Instant::now();
                 for candidate in &candidates {
@@ -729,12 +733,19 @@ pub fn run(
                 Err(error) => {
                     let msg = format!("{error:#}");
                     log.write("peer_setup_failed", serde_json::json!({"reason": msg}));
-                    last_error = Some(if msg.contains("passphrase") || msg.contains("Authenticate") {
-                        "连接验证失败：请确认两台设备的共享密码一致。".into()
+                    let is_auth_mismatch = msg.contains("passphrase")
+                        || msg.contains("Authenticate")
+                        || msg.contains("Receive LAN Noise")
+                        || msg.contains("Read handshake");
+                    if is_auth_mismatch {
+                        last_error = Some("等待密码匹配：请确认两台设备的共享密码设置一致。".into());
+                        auth_backoff_until = Instant::now() + Duration::from_millis(2500);
                     } else {
-                        msg
-                    });
-                    thread::sleep(Duration::from_millis(250));
+                        last_error = Some(msg);
+                        auth_backoff_until = Instant::now() + Duration::from_millis(1000);
+                    }
+                    searching_since = Instant::now();
+                    thread::sleep(Duration::from_millis(200));
                     continue;
                 }
             };
