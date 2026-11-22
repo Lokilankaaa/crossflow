@@ -11,9 +11,9 @@ struct SessionLayoutView: View {
     var editable: Bool = false
     var onCommitLayout: ((SharedLayout) -> Void)? = nil
 
-    @State private var draggingID: String?
-    @State private var dragX: Double = 0
-    @State private var dragY: Double = 0
+    @ViewState private var draggingID: String?
+    @ViewState private var dragX: Double = 0
+    @ViewState private var dragY: Double = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
