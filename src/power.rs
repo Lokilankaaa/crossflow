@@ -99,10 +99,10 @@ mod macos_impl {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFStringCreateWithCString(
-            alloc: *const c_void,
+            alloc: *mut c_void,
             c_str: *const c_char,
             encoding: u32,
-        ) -> *const c_void;
+        ) -> *mut c_void;
         fn CFRelease(cf: *const c_void);
     }
 
@@ -131,12 +131,12 @@ mod macos_impl {
     pub fn acquire_system_keepalive() -> Option<u32> {
         unsafe {
             let kind = CFStringCreateWithCString(
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 c"PreventUserIdleSystemSleep".as_ptr(),
                 K_CF_STRING_ENCODING_UTF8,
             );
             let reason = CFStringCreateWithCString(
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 c"Crossflow LAN peer keepalive".as_ptr(),
                 K_CF_STRING_ENCODING_UTF8,
             );
@@ -169,7 +169,7 @@ mod macos_impl {
                 return;
             }
             let reason = CFStringCreateWithCString(
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 c"Crossflow remote input wake".as_ptr(),
                 K_CF_STRING_ENCODING_UTF8,
             );

@@ -591,22 +591,34 @@ internal sealed class MainWindow : Window
 
     private void SyncChannelSelector(PeerMeshSnapshot snap)
     {
-        string sig = snap.SelectedChannel + "|" + string.Join(",", snap.NetworkChannels.Select(c => $"{c.Id}:{c.Label}"));
-        if (sig == lastChannelListSig) return;
-        lastChannelListSig = sig;
+        if (channelCombo.IsDropDownOpen) return;
+
+        string itemsSig = string.Join(",", snap.NetworkChannels.Select(c => $"{c.Id}:{c.Label}"));
         updatingChannelUi = true;
         try
         {
-            channelCombo.Items.Clear();
-            ComboBoxItem? match = null;
-            foreach (var ch in snap.NetworkChannels)
+            if (itemsSig != lastChannelListSig)
             {
-                var item = new ComboBoxItem { Content = ch.Label, Tag = ch.Id };
-                channelCombo.Items.Add(item);
-                if (ch.Id == snap.SelectedChannel) match = item;
+                lastChannelListSig = itemsSig;
+                channelCombo.Items.Clear();
+                foreach (var ch in snap.NetworkChannels)
+                {
+                    channelCombo.Items.Add(new ComboBoxItem { Content = ch.Label, Tag = ch.Id });
+                }
             }
-            if (match is not null) channelCombo.SelectedItem = match;
-            else if (channelCombo.Items.Count > 0) channelCombo.SelectedIndex = 0;
+
+            int desiredIndex = -1;
+            for (int i = 0; i < channelCombo.Items.Count; i++)
+            {
+                if (channelCombo.Items[i] is ComboBoxItem { Tag: string id } && id == snap.SelectedChannel)
+                {
+                    desiredIndex = i;
+                    break;
+                }
+            }
+            if (desiredIndex < 0 && channelCombo.Items.Count > 0) desiredIndex = 0;
+            if (desiredIndex >= 0 && channelCombo.SelectedIndex != desiredIndex)
+                channelCombo.SelectedIndex = desiredIndex;
 
             bool showDirect = snap.SelectedChannel != "auto";
             directPeerPanel.Visibility = showDirect ? Visibility.Visible : Visibility.Collapsed;
