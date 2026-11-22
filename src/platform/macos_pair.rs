@@ -176,10 +176,16 @@ impl<T: NativeTap> MacPairCapture<T> {
             }
         } else if self.source.status().failure.is_some() {
             self.fail("reverse capture/source failed");
-        } else if self.display_epoch.is_none()
-            || self.display_epoch != macos::capture_display_epoch()
-        {
-            self.fail("Mac display configuration changed");
+        } else if self.display_epoch != macos::capture_display_epoch() {
+            if let Some(next_epoch) = macos::capture_display_epoch()
+                && macos::native_displays()
+                    .ok()
+                    .is_some_and(|actual| validate_startup_inventory(&self.source, &actual).is_ok())
+            {
+                self.display_epoch = Some(next_epoch);
+            } else {
+                self.fail("Mac display configuration changed");
+            }
         }
         self.stopped
     }

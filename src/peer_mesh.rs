@@ -81,10 +81,16 @@ struct PeerConfig {
     direct_peer: Option<String>,
     #[serde(default)]
     passphrase: Option<String>,
+    #[serde(default = "default_true")]
+    smart_keymap: bool,
 }
 
 fn default_channel() -> String {
     "auto".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for PeerConfig {
@@ -93,6 +99,7 @@ impl Default for PeerConfig {
             channel: default_channel(),
             direct_peer: None,
             passphrase: None,
+            smart_keymap: true,
         }
     }
 }
@@ -113,6 +120,7 @@ struct PeerUiStatus {
     local_name: String,
     auth_mode: &'static str,
     passphrase_configured: bool,
+    smart_keymap: bool,
     selected_channel: String,
     direct_peer: Option<String>,
     active_channel_label: Option<String>,
@@ -146,6 +154,9 @@ enum UiCommand {
     },
     SetPassphrase {
         passphrase: Option<String>,
+    },
+    SetKeymap {
+        enabled: bool,
     },
 }
 
@@ -585,6 +596,7 @@ struct PeerHost<'a> {
     local_name: &'a str,
     local_displays: Vec<Display>,
     config: &'a mut PeerConfig,
+    smart_keymap_flag: &'a Arc<AtomicBool>,
     reconfigure_requested: &'a mut bool,
     network_channels: Vec<NetworkChannelInfo>,
     active_channel_label: Option<String>,
@@ -683,6 +695,11 @@ impl PeerHost<'_> {
                     self.session_stop.store(true, Ordering::Release);
                     self.pending = Some(Command::Stop);
                     break;
+                }
+                Ok(UiCommand::SetKeymap { enabled }) => {
+                    self.config.smart_keymap = enabled;
+                    self.smart_keymap_flag.store(enabled, Ordering::Relaxed);
+                    save_config(self.config);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -793,6 +810,7 @@ impl Host for PeerHost<'_> {
                     local_name: self.local_name.into(),
                     auth_mode: if has_pass { "passphrase" } else { "open" },
                     passphrase_configured: has_pass,
+                    smart_keymap: self.config.smart_keymap,
                     selected_channel: self.config.channel.clone(),
                     direct_peer: self.config.direct_peer.clone(),
                     active_channel_label: self.active_channel_label.clone(),
@@ -838,6 +856,8 @@ pub fn run(
         .map(ToString::to_string)
         .unwrap_or_else(default_friendly_name);
     let mut config = load_config(options.passphrase);
+    let smart_keymap_flag = Arc::new(AtomicBool::new(config.smart_keymap));
+    let _keep_awake = crate::power::KeepAwakeGuard::acquire();
 
     #[cfg(target_os = "macos")]
     {
@@ -853,6 +873,7 @@ pub fn run(
                     local_name,
                     auth_mode: if has_pass { "passphrase" } else { "open" },
                     passphrase_configured: has_pass,
+                    smart_keymap: config.smart_keymap,
                     selected_channel: config.channel.clone(),
                     direct_peer: config.direct_peer.clone(),
                     active_channel_label: None,
@@ -985,6 +1006,11 @@ pub fn run(
                             reconfigure_requested = true;
                             break;
                         }
+                        Ok(UiCommand::SetKeymap { enabled }) => {
+                            config.smart_keymap = enabled;
+                            smart_keymap_flag.store(enabled, Ordering::Relaxed);
+                            save_config(&config);
+                        }
                         Err(TryRecvError::Empty) => break,
                     }
                 }
@@ -1010,6 +1036,7 @@ pub fn run(
                             local_name: local_name.clone(),
                             auth_mode: if has_pass { "passphrase" } else { "open" },
                             passphrase_configured: has_pass,
+                            smart_keymap: config.smart_keymap,
                             selected_channel: config.channel.clone(),
                             direct_peer: config.direct_peer.clone(),
                             active_channel_label: None,
@@ -1180,7 +1207,18 @@ pub fn run(
                     })
                     .unwrap_or_else(|| "局域网设备".into());
 
+                let known_platform = candidates
+                    .iter()
+                    .find(|c| remote_id.starts_with(&c.device_id))
+                    .map(|c| c.platform.as_str());
+                let remote_os = infer_peer_os(known_platform, connection.shared_layout(), &remote_id);
+                let different_os = remote_os != std::env::consts::OS;
+
                 connection.set_max_hz(options.max_hz)?;
+                connection.set_key_translator(crate::keymap::KeyTranslator::new(
+                    smart_keymap_flag.clone(),
+                    different_os,
+                ));
                 let source = SharedSource::new(connection.runtime().clone())?;
                 let mut sink = match prepare_worker(&local_hello.inventory, log.clone()) {
                     Ok(s) => s,
@@ -1215,6 +1253,7 @@ pub fn run(
                         local_name: &local_name,
                         local_displays: local_hello.inventory.clone(),
                         config: &mut config,
+                        smart_keymap_flag: &smart_keymap_flag,
                         reconfigure_requested: &mut reconfigure_requested,
                         network_channels: channel_infos(&local_channels),
                         active_channel_label,
@@ -1242,14 +1281,22 @@ pub fn run(
                 let capture_cleanup = capture.stop();
                 let sink_cleanup = sink.shutdown();
                 if capture_cleanup.is_err() || sink_cleanup.is_err() {
+                    // After OS suspend / lid-close / display power transitions, the
+                    // child worker may have already exited. Log and recover automatically
+                    // rather than permanently terminating the peer service.
                     log.write(
-                        "peer_cleanup_failed",
+                        "peer_cleanup_recovered",
                         serde_json::json!({
                             "capture_confirmed": capture_cleanup.is_ok(),
                             "worker_confirmed": sink_cleanup.is_ok()
                         }),
                     );
-                    anyhow::bail!("cleanup unconfirmed; restart client");
+                    if capture_cleanup.is_err() {
+                        anyhow::bail!("capture cleanup unconfirmed; restart client");
+                    }
+                    searching_since = Instant::now();
+                    thread::sleep(Duration::from_millis(350));
+                    continue;
                 }
                 if let Err(error) = run_result {
                     let reason = format!("{error:#}");
@@ -1293,6 +1340,7 @@ pub fn run(
             local_name,
             auth_mode: if has_pass { "passphrase" } else { "open" },
             passphrase_configured: has_pass,
+            smart_keymap: config.smart_keymap,
             selected_channel: config.channel,
             direct_peer: config.direct_peer,
             active_channel_label: None,
@@ -1312,6 +1360,19 @@ pub fn run(
     );
     writer.finish()?;
     result
+}
+
+fn infer_peer_os(known_platform: Option<&str>, layout: &SharedLayout, remote_id: &str) -> &'static str {
+    match known_platform {
+        Some("windows") => return "windows",
+        Some("macos") => return "macos",
+        _ => {}
+    }
+    let has_win_display = layout.screens.iter().any(|s| {
+        s.device_id == remote_id
+            && (s.native_id.starts_with(r"\\.\") || s.native_id.contains("DISPLAY"))
+    });
+    if has_win_display { "windows" } else { "macos" }
 }
 
 fn find_saved_layout_by_prefix(prefix: &str) -> Option<SharedLayout> {

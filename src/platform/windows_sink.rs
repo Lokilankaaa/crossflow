@@ -310,6 +310,7 @@ impl Platform for Native {
         unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
+        crate::power::wake_display_throttled();
         let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
         // One event per call avoids ambiguous partial batches. Even a successful
         // insertion does not establish foreground-app acceptance or visibility.

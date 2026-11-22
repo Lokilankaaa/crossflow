@@ -45,6 +45,9 @@ internal sealed class MainWindow : Window
     private readonly Button savePasswordButton = new();
     private readonly Button cancelPasswordButton = new();
 
+    private readonly ToggleSwitch smartKeymapToggle = new();
+    private bool updatingKeymapUi;
+
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
     private readonly InfoBar notice = new() { IsOpen = false, IsClosable = true };
@@ -273,6 +276,22 @@ internal sealed class MainWindow : Window
         passwordEditorPanel.Children.Add(passwordBox);
         passwordEditorPanel.Children.Add(editActions);
         sidebar.Children.Add(passwordEditorPanel);
+
+        sidebar.Children.Add(Divider());
+
+        // Cross-OS smart keymap toggle (Ctrl <-> Cmd)
+        sidebar.Children.Add(SectionLabel("键盘转换"));
+        smartKeymapToggle.Header = null;
+        smartKeymapToggle.IsOn = true;
+        smartKeymapToggle.OnContent = "自动转换 Ctrl ↔ Cmd";
+        smartKeymapToggle.OffContent = "原始键位直通";
+        smartKeymapToggle.FontSize = 12;
+        smartKeymapToggle.Toggled += async (_, _) =>
+        {
+            if (updatingKeymapUi) return;
+            await peerMesh.SetKeymapAsync(smartKeymapToggle.IsOn);
+        };
+        sidebar.Children.Add(smartKeymapToggle);
 
         sidebar.Children.Add(Divider());
 
@@ -543,6 +562,13 @@ internal sealed class MainWindow : Window
         passwordStateBadge.Foreground = theme.Brush(snap.PassphraseConfigured ? "accent" : "text_secondary");
         editPasswordButton.Content = snap.PassphraseConfigured ? "修改" : "配置密码";
         clearPasswordButton.Visibility = snap.PassphraseConfigured ? Visibility.Visible : Visibility.Collapsed;
+
+        if (smartKeymapToggle.IsOn != snap.SmartKeymap)
+        {
+            updatingKeymapUi = true;
+            smartKeymapToggle.IsOn = snap.SmartKeymap;
+            updatingKeymapUi = false;
+        }
 
         // Sync network channel dropdown
         SyncChannelSelector(snap);

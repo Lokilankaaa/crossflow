@@ -57,6 +57,7 @@ pub struct PairConnection {
     revision: u64,
     early_peer_ready: bool,
     max_hz: u32,
+    keymap: crate::keymap::KeyTranslator,
 }
 pub type Prepared = PairConnection;
 // Only one setup result exists per connection; this is never a buffered message.
@@ -453,6 +454,7 @@ impl PairConnection {
                     revision,
                     early_peer_ready,
                     max_hz: 1000,
+                    keymap: crate::keymap::KeyTranslator::passthrough(),
                 }));
             }
             thread::sleep(Duration::from_micros(500));
@@ -579,6 +581,7 @@ impl PairConnection {
                     revision,
                     early_peer_ready,
                     max_hz: 1000,
+                    keymap: crate::keymap::KeyTranslator::passthrough(),
                 });
             }
             thread::sleep(Duration::from_micros(500));
@@ -603,6 +606,9 @@ impl PairConnection {
         ensure!((60..=8000).contains(&hz), "max-hz must be 60..8000");
         self.max_hz = hz;
         Ok(())
+    }
+    pub fn set_key_translator(&mut self, translator: crate::keymap::KeyTranslator) {
+        self.keymap = translator;
     }
 
     fn native_ready(
@@ -937,6 +943,7 @@ impl PairConnection {
                     authority = state.epoch;
                     sent_routing = None;
                     last_motion = None;
+                    self.keymap.reset();
                 }
                 let mut submitted = false;
                 if !self.peer.pending()
@@ -944,10 +951,13 @@ impl PairConnection {
                     && endpoint.lease_ready(log.ns())
                 {
                     let allow_motion = last_motion.is_none_or(|at| at.elapsed() >= interval);
-                    if let Some(frame) = source.next_frame_rate_limited(log.ns(), allow_motion)? {
+                    if let Some(mut frame) = source.next_frame_rate_limited(log.ns(), allow_motion)? {
                         let motion = matches!(frame.kind, Kind::Move | Kind::Position);
                         if matches!(frame.kind, Kind::Arm | Kind::Pause | Kind::Stop) {
                             sent_routing = None;
+                            self.keymap.reset();
+                        } else if frame.kind == Kind::Key {
+                            frame.code = self.keymap.translate(frame.code, frame.down);
                         }
                         ensure!(
                             endpoint.send_input(frame, log.ns())?,

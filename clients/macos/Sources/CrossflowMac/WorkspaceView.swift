@@ -306,6 +306,25 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
+                // Cross-OS smart keymap toggle (Ctrl <-> Cmd — 1:1 with Windows)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("键盘转换")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.secondary)
+                    let keymapBinding = Binding<Bool>(
+                        get: { peer.smartKeymap },
+                        set: { peer.setKeymap($0) }
+                    )
+                    Toggle(isOn: keymapBinding) {
+                        Text(peer.smartKeymap ? "自动转换 Ctrl ↔ Cmd" : "原始键位直通")
+                            .font(.system(size: 12))
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+
+                Divider().overlay(Theme.border).padding(.vertical, 2)
+
                 // Screens subsection (aligned 1:1 with Windows sidebar!)
                 Text("屏幕")
                     .font(.system(size: 12, weight: .semibold))

@@ -20,7 +20,7 @@ pub const PAIR_VERSION: u16 = 1;
 pub const MAX_PLAINTEXT: usize = 32 * 1024;
 const MAGIC: &[u8; 4] = b"CFP1";
 const HEADER: usize = 16;
-const SEND_STALL: Duration = Duration::from_millis(30);
+const SEND_STALL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

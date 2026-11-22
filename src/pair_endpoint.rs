@@ -12,10 +12,10 @@ use crate::{
 use anyhow::{Result, bail, ensure};
 use std::collections::VecDeque;
 
-pub const LEASE_PERIOD_NS: u64 = 25_000_000;
-pub const LEASE_TTL_NS: u64 = 150_000_000;
-pub const KEEPALIVE_PERIOD_NS: u64 = 40_000_000;
-pub const BARRIER_TIMEOUT_NS: u64 = 500_000_000;
+pub const LEASE_PERIOD_NS: u64 = 50_000_000;
+pub const LEASE_TTL_NS: u64 = 1_500_000_000;
+pub const KEEPALIVE_PERIOD_NS: u64 = 80_000_000;
+pub const BARRIER_TIMEOUT_NS: u64 = 2_000_000_000;
 pub const OUTBOUND_CAPACITY: usize = 256;
 
 /// Return only after local suppression is undone and old queued capture is
@@ -1114,7 +1114,7 @@ mod tests {
         for ms in [40, 80, 120] {
             a.receive(Message::KeepAlive, ms * 1_000_000).unwrap();
         }
-        assert!(a.receive(Message::KeepAlive, 151_000_000).is_err());
+        assert!(a.receive(Message::KeepAlive, LEASE_TTL_NS + 1_000_000).is_err());
         assert!(!a.status.connected);
     }
     #[test]
@@ -1202,7 +1202,7 @@ mod tests {
             b.tick(ms * 1_000_000).unwrap();
         }
         let maintained = br.lock().unwrap().maintained;
-        assert!(b.receive(Message::Lease { token: 5 }, 151_000_000).is_err());
+        assert!(b.receive(Message::Lease { token: 5 }, LEASE_TTL_NS + 1_000_000).is_err());
         assert_eq!(br.lock().unwrap().maintained, maintained);
         assert!(!b.status.connected);
     }
@@ -1210,10 +1210,10 @@ mod tests {
     fn release_barrier_expires_even_with_peer_keepalives() {
         let (mut a, _) = endpoint(Side::A);
         a.enable_local(0).unwrap();
-        for ms in (40..=480).step_by(40) {
+        for ms in (80..=(BARRIER_TIMEOUT_NS / 1_000_000 - 40)).step_by(80) {
             a.receive(Message::KeepAlive, ms * 1_000_000).unwrap();
         }
-        assert!(a.tick(501_000_000).is_err());
+        assert!(a.tick(BARRIER_TIMEOUT_NS + 1_000_000).is_err());
         assert!(
             !a.outbound
                 .iter()
@@ -1353,7 +1353,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(br.lock().unwrap().maintained, count);
-        assert!(b.tick(151_000_000).is_err());
+        assert!(b.tick(LEASE_TTL_NS + 1_000_000).is_err());
         assert!(!b.status.connected);
     }
     #[test]

@@ -47,6 +47,7 @@ internal sealed record PeerMeshSnapshot(
     string? LocalName,
     string AuthMode,
     bool PassphraseConfigured,
+    bool SmartKeymap,
     string SelectedChannel,
     string? DirectPeer,
     string? ActiveChannelLabel,
@@ -66,7 +67,7 @@ internal sealed record PeerMeshSnapshot(
     long Generation)
 {
     internal static PeerMeshSnapshot Initial => new(
-        "idle", null, null, "open", false, "auto", null, null, [],
+        "idle", null, null, "open", false, true, "auto", null, null, [],
         false, null, null, null, null, null, null,
         [], [], null, null, false, 0);
 }
@@ -194,6 +195,8 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_channel", channel, direct_peer = string.IsNullOrWhiteSpace(directPeer) ? null : directPeer.Trim() });
     internal Task SetPassphraseAsync(string? passphrase) =>
         SendCommandAsync(new { op = "set_passphrase", passphrase = string.IsNullOrWhiteSpace(passphrase) ? null : passphrase.Trim() });
+    internal Task SetKeymapAsync(bool enabled) =>
+        SendCommandAsync(new { op = "set_keymap", enabled });
 
     private async Task SendCommandAsync(object payload)
     {
@@ -274,6 +277,7 @@ internal sealed class PeerMeshController
                             parsed.LocalName,
                             parsed.AuthMode ?? "open",
                             parsed.PassphraseConfigured,
+                            parsed.SmartKeymap,
                             parsed.SelectedChannel ?? "auto",
                             parsed.DirectPeer,
                             parsed.ActiveChannelLabel,
@@ -338,6 +342,7 @@ internal sealed class PeerMeshController
         [JsonPropertyName("local_name")] public string? LocalName { get; set; }
         [JsonPropertyName("auth_mode")] public string? AuthMode { get; set; }
         [JsonPropertyName("passphrase_configured")] public bool PassphraseConfigured { get; set; }
+        [JsonPropertyName("smart_keymap")] public bool SmartKeymap { get; set; } = true;
         [JsonPropertyName("selected_channel")] public string? SelectedChannel { get; set; }
         [JsonPropertyName("direct_peer")] public string? DirectPeer { get; set; }
         [JsonPropertyName("active_channel_label")] public string? ActiveChannelLabel { get; set; }

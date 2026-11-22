@@ -96,6 +96,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let localName: String
     let authMode: String
     let passphraseConfigured: Bool
+    let smartKeymap: Bool
     let selectedChannel: String
     let directPeer: String?
     let activeChannelLabel: String?
@@ -119,6 +120,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case localName = "local_name"
         case authMode = "auth_mode"
         case passphraseConfigured = "passphrase_configured"
+        case smartKeymap = "smart_keymap"
         case selectedChannel = "selected_channel"
         case directPeer = "direct_peer"
         case activeChannelLabel = "active_channel_label"
@@ -156,6 +158,11 @@ private struct SetChannelCommandWire: Encodable {
 private struct SetPassphraseCommandWire: Encodable {
     let op = "set_passphrase"
     let passphrase: String?
+}
+
+private struct SetKeymapCommandWire: Encodable {
+    let op = "set_keymap"
+    let enabled: Bool
 }
 
 private final class PeerProcessRunner: @unchecked Sendable {
@@ -300,6 +307,7 @@ final class PeerMeshModel {
     var localName: String = Host.current().localizedName ?? "这台 Mac"
     var authMode: String = "open"
     var passphraseConfigured: Bool = false
+    var smartKeymap: Bool = true
     var selectedChannel: String = "auto"
     var directPeer: String = ""
     var activeChannelLabel: String?
@@ -416,6 +424,7 @@ final class PeerMeshModel {
         localName = s.localName
         authMode = s.authMode
         passphraseConfigured = s.passphraseConfigured
+        smartKeymap = s.smartKeymap
         selectedChannel = s.selectedChannel
         if !syncedDirectPeerOnce {
             syncedDirectPeerOnce = true
@@ -459,6 +468,14 @@ final class PeerMeshModel {
     func setPassphrase(_ secret: String?) {
         let trimmed = secret?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cmd = SetPassphraseCommandWire(passphrase: (trimmed?.isEmpty == false) ? trimmed : nil)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setKeymap(_ enabled: Bool) {
+        smartKeymap = enabled
+        let cmd = SetKeymapCommandWire(enabled: enabled)
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

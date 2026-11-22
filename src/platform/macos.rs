@@ -286,9 +286,8 @@ fn display_snapshot() -> Result<DisplaySnapshot, AdapterError> {
         if id == 0 || unsafe { CGDisplayIsActive(id) == 0 } {
             return Err(failure("Active display set changed during enumeration"));
         }
-        if unsafe { CGDisplayIsAsleep(id) != 0 } {
-            continue;
-        }
+        // Keep asleep displays in the snapshot so display sleep does not drop
+        // the layout or kill the remote wake-to-unlock session.
         displays.push(Display {
             id,
             bounds: Bounds::from_rect(unsafe { CGDisplayBounds(id) })?,
@@ -858,11 +857,22 @@ impl MacMouseSink {
             .map_err(|reason| failure(reason.message()))?;
         if self.hw_guards.topology_latched.load(Ordering::Acquire)
             || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
-            || DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
         {
             return Err(failure(
-                "Displays changed or slept; remote input stopped, check the layout before re-arming",
+                "Displays changed; remote input stopped, check the layout before re-arming",
             ));
+        }
+        if DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation {
+            match display_snapshot() {
+                Ok(current) if current.displays == self.snapshot.displays => {
+                    // Display slept/woke without changing geometry: keep session alive.
+                }
+                _ => {
+                    return Err(failure(
+                        "Displays changed; remote input stopped, check the layout before re-arming",
+                    ));
+                }
+            }
         }
         // Escape hardware state and full display enumeration stay within a 5ms
         // WindowServer cadence while atomic topology/permission checks run every frame.
@@ -873,7 +883,7 @@ impl MacMouseSink {
             self.hw_guards.elapsed_ns(),
             HW_GUARD_POLL_NS,
             emergency_pressed,
-            || display_snapshot().is_ok_and(|snapshot| snapshot == self.snapshot),
+            || display_snapshot().is_ok_and(|snapshot| snapshot.displays == self.snapshot.displays),
         ) {
             Ok(()) => Ok(()),
             Err(GuardFailure::Emergency) => Err(io::Error::new(
@@ -888,6 +898,7 @@ impl MacMouseSink {
     }
 
     fn post_marked(&self, event: &OwnedCf, flags: u64) {
+        crate::power::wake_display_throttled();
         // SAFETY: event owns a non-null live CGEvent. Posting returns void;
         // successful return establishes neither OS acceptance nor visibility.
         unsafe {
@@ -1113,7 +1124,11 @@ impl MacMouseSink {
                 .as_ref()
                 .is_none_or(|probe| probe.check().is_err())
             || DISPLAY_RECONFIGURING.load(Ordering::SeqCst)
-            || DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
+        {
+            return true;
+        }
+        if DISPLAY_GENERATION.load(Ordering::SeqCst) != self.snapshot.generation
+            && !display_snapshot().is_ok_and(|snapshot| snapshot.displays == self.snapshot.displays)
         {
             return true;
         }
@@ -1124,7 +1139,7 @@ impl MacMouseSink {
             self.hw_guards.elapsed_ns(),
             HW_GUARD_POLL_NS,
             emergency_pressed,
-            || display_snapshot().is_ok_and(|snapshot| snapshot == self.snapshot),
+            || display_snapshot().is_ok_and(|snapshot| snapshot.displays == self.snapshot.displays),
         )
         .is_err()
     }
