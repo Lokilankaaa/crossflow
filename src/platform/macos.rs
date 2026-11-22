@@ -1450,17 +1450,26 @@ impl MacMouseSink {
         } else {
             crate::input_state::read_caps_lock()
         };
-        unsafe {
-            CGEventSetIntegerValueField(
-                event.as_ptr(),
-                KEYBOARD_AUTOREPEAT,
-                if is_repeat { 1 } else { 0 },
-            );
-        }
         let has_shift = projected.contains(&0xE1) || projected.contains(&0xE5);
         let has_option = projected.contains(&0xE2) || projected.contains(&0xE6);
         let has_ctrl = projected.contains(&0xE0) || projected.contains(&0xE4);
         let has_cmd = projected.contains(&0xE3) || projected.contains(&0xE7);
+        // On macOS, default `ApplePressAndHoldEnabled = true` intercepts repeated
+        // letter keydowns (`a`..`z`) whenever `KEYBOARD_AUTOREPEAT == 1`, either
+        // opening the accent picker or swallowing repeats completely. Reporting
+        // repeated plain/Shifted letters with `KEYBOARD_AUTOREPEAT = 0` lets all
+        // 26 letters repeat cleanly while keeping native autorepeat=1 for Backspace,
+        // Delete, arrows, punctuation, and Cmd/Ctrl/Option combos.
+        let is_plain_or_shifted_letter =
+            (0x04..=0x1D).contains(&usage) && !has_ctrl && !has_cmd && !has_option;
+        let autorepeat_flag = if is_repeat && !is_plain_or_shifted_letter {
+            1
+        } else {
+            0
+        };
+        unsafe {
+            CGEventSetIntegerValueField(event.as_ptr(), KEYBOARD_AUTOREPEAT, autorepeat_flag);
+        }
         if !is_flags_key
             && is_printable_hid_usage(usage)
             && (has_shift || has_option || caps_active)
@@ -1471,7 +1480,7 @@ impl MacMouseSink {
             if let Some(len) = translate_mac_unicode_into(
                 keycode,
                 down,
-                is_repeat,
+                autorepeat_flag != 0,
                 has_shift,
                 has_option,
                 caps_active,
