@@ -450,6 +450,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_null_clears_hotkey_binding_instead_of_restoring_default() {
+        let json = r#"{
+            "toggle_sharing": null,
+            "lock_screen": null,
+            "quick_jump_next": "Ctrl+Alt+Tab",
+            "quick_jump_home": null,
+            "quick_jump_1": null,
+            "quick_jump_2": null,
+            "emergency_stop": null
+        }"#;
+        let cfg: HotkeyConfig = serde_json::from_str(json).unwrap();
+        let norm = cfg.normalized();
+        assert_eq!(norm.toggle_sharing, None);
+        assert_eq!(norm.lock_screen, None);
+        assert_eq!(norm.quick_jump_next.as_deref(), Some("Ctrl+Alt+Tab"));
+        assert_eq!(norm.emergency_stop, None);
+        assert_eq!(norm.compiled().len(), 1);
+    }
+
+    #[test]
     fn engine_matches_configured_chords_and_ignores_bare_escape() {
         let engine = SharedHotkeyEngine::default();
         // Bare Escape never triggers anything

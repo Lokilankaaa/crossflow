@@ -915,6 +915,7 @@ fn run_aux(
     let receive_dir = default_receive_dir()?;
     let mut next_batch_id: u64 = 1;
     let mut last_token = clipboard::change_token();
+    let mut pending_empty_token: Option<(u64, u8)> = None;
     let mut last_sent_hash: Option<String> = None;
     let mut last_remote_hash: Option<String> = None;
     let mut last_poll = Instant::now();
@@ -949,9 +950,24 @@ fn run_aux(
             last_poll = Instant::now();
             if clipboard_enabled.load(Ordering::Relaxed) {
                 let token = clipboard::change_token();
-                if token != last_token {
+                let should_read = if token != last_token {
+                    pending_empty_token = Some((token, 0));
                     last_token = token;
+                    true
+                } else if let Some((tok, retries)) = pending_empty_token {
+                    if tok == token && retries < 3 {
+                        pending_empty_token = Some((tok, retries + 1));
+                        true
+                    } else {
+                        pending_empty_token = None;
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_read {
                     if let Some(item) = clipboard::read() {
+                        pending_empty_token = None;
                         let hash = item.hash_hex();
                         let is_echo = last_remote_hash.as_deref() == Some(hash.as_str())
                             || last_sent_hash.as_deref() == Some(hash.as_str());

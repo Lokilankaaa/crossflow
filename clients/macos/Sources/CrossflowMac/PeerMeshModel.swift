@@ -129,6 +129,19 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         case emergencyStop = "emergency_stop"
     }
 
+    // Explicitly encode nil as JSON `null` (default Codable omits nil keys, which
+    // causes Rust serde's `#[serde(default = "...")]` to restore the default chord).
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(toggleSharing, forKey: .toggleSharing)
+        try c.encode(lockScreen, forKey: .lockScreen)
+        try c.encode(quickJumpNext, forKey: .quickJumpNext)
+        try c.encode(quickJumpHome, forKey: .quickJumpHome)
+        try c.encode(quickJump1, forKey: .quickJump1)
+        try c.encode(quickJump2, forKey: .quickJump2)
+        try c.encode(emergencyStop, forKey: .emergencyStop)
+    }
+
     static let defaults = HotkeyConfigInfo(
         toggleSharing: "Ctrl+Alt+S",
         lockScreen: "Ctrl+Alt+L",

@@ -447,7 +447,7 @@ struct WorkspaceView: View {
 
     private func hotkeyRow(field: String, label: String, value: String?) -> some View {
         let isRecording = recordingHotkeyField == field
-        return HStack(spacing: 6) {
+        return HStack(spacing: 4) {
             Text(label)
                 .font(.system(size: 11.5))
                 .foregroundStyle(Theme.text)
@@ -459,14 +459,40 @@ struct WorkspaceView: View {
                 Text(isRecording ? "请按组合键…" : (value ?? "未设置"))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(isRecording ? Theme.accent : (value == nil ? Theme.secondary : Theme.text))
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 7)
                     .padding(.vertical, 3)
-                    .frame(minWidth: 82)
+                    .frame(minWidth: 74)
                     .background(Theme.background, in: RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(isRecording ? Theme.accent : Theme.border, lineWidth: 1))
             }
             .buttonStyle(.plain)
+            if value != nil && !isRecording {
+                Button {
+                    clearHotkey(field)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.secondary.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+                .help("清空该快捷键")
+            }
         }
+    }
+
+    private func clearHotkey(_ field: String) {
+        cancelHotkeyRecording()
+        var updated = peer.hotkeys
+        switch field {
+        case "toggle_sharing": updated.toggleSharing = nil
+        case "lock_screen": updated.lockScreen = nil
+        case "quick_jump_next": updated.quickJumpNext = nil
+        case "quick_jump_home": updated.quickJumpHome = nil
+        case "quick_jump_1": updated.quickJump1 = nil
+        case "emergency_stop": updated.emergencyStop = nil
+        default: break
+        }
+        peer.setHotkeys(updated)
     }
 
     private func toggleHotkeyRecording(_ field: String) {

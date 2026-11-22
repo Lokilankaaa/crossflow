@@ -62,6 +62,7 @@ internal sealed class MainWindow : Window
     private readonly Button hotkeysHeaderButton = new();
     private readonly StackPanel hotkeysPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
     private readonly Dictionary<string, Button> hotkeyButtons = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Button> hotkeyClearButtons = new(StringComparer.Ordinal);
     private string? recordingHotkeyField;
     private bool hotkeysExpanded;
     private TrayIcon? trayIcon;
@@ -452,8 +453,9 @@ internal sealed class MainWindow : Window
 
         foreach (var (field, label) in rows)
         {
-            var row = new Grid { ColumnSpacing = 6 };
+            var row = new Grid { ColumnSpacing = 4 };
             row.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
             row.Children.Add(new TextBlock
             {
@@ -466,8 +468,8 @@ internal sealed class MainWindow : Window
             {
                 Content = "—",
                 FontSize = 11,
-                Padding = new Thickness(8, 3, 8, 3),
-                MinWidth = 86,
+                Padding = new Thickness(7, 3, 7, 3),
+                MinWidth = 76,
                 Background = theme.Brush("background"),
                 Foreground = theme.Brush("text"),
                 BorderBrush = theme.Brush("border"),
@@ -479,6 +481,24 @@ internal sealed class MainWindow : Window
             Grid.SetColumn(btn, 1);
             row.Children.Add(btn);
             hotkeyButtons[field] = btn;
+
+            var clearBtn = new Button
+            {
+                Content = "×",
+                FontSize = 11,
+                Padding = new Thickness(5, 2, 5, 2),
+                MinWidth = 22,
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                Foreground = theme.Brush("text_secondary"),
+                BorderThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(6)
+            };
+            ToolTipService.SetToolTip(clearBtn, "清空该快捷键");
+            clearBtn.Click += async (_, _) => await ClearHotkeyAsync(captured);
+            Grid.SetColumn(clearBtn, 2);
+            row.Children.Add(clearBtn);
+            hotkeyClearButtons[field] = clearBtn;
+
             hotkeysPanel.Children.Add(row);
         }
 
@@ -637,6 +657,24 @@ internal sealed class MainWindow : Window
         };
     }
 
+    private async Task ClearHotkeyAsync(string field)
+    {
+        CancelHotkeyRecording();
+        var h = currentSnap.Hotkeys;
+        var updated = field switch
+        {
+            "toggle_sharing" => h with { ToggleSharing = null },
+            "lock_screen" => h with { LockScreen = null },
+            "quick_jump_next" => h with { QuickJumpNext = null },
+            "quick_jump_home" => h with { QuickJumpHome = null },
+            "quick_jump_1" => h with { QuickJump1 = null },
+            "emergency_stop" => h with { EmergencyStop = null },
+            _ => h
+        };
+        RenderHotkeyButtons(updated);
+        await peerMesh.SetHotkeysAsync(updated);
+    }
+
     private void RenderHotkeyButtons(HotkeyConfigInfo h)
     {
         string? GetVal(string f) => f switch
@@ -652,9 +690,12 @@ internal sealed class MainWindow : Window
         foreach (var (field, btn) in hotkeyButtons)
         {
             bool rec = recordingHotkeyField == field;
-            btn.Content = rec ? "请按组合键…" : (GetVal(field) ?? "未设置");
+            string? val = GetVal(field);
+            btn.Content = rec ? "请按组合键…" : (val ?? "未设置");
             btn.BorderBrush = theme.Brush(rec ? "accent" : "border");
-            btn.Foreground = theme.Brush(rec ? "accent" : (GetVal(field) is null ? "text_secondary" : "text"));
+            btn.Foreground = theme.Brush(rec ? "accent" : (val is null ? "text_secondary" : "text"));
+            if (hotkeyClearButtons.TryGetValue(field, out var clearBtn))
+                clearBtn.Visibility = (!rec && val is not null) ? Visibility.Visible : Visibility.Collapsed;
         }
     }
 
