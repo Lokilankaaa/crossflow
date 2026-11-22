@@ -430,6 +430,8 @@ mod native {
         fn CGMainDisplayID() -> u32;
         fn CGDisplayHideCursor(display: u32) -> i32;
         fn CGDisplayShowCursor(display: u32) -> i32;
+        fn CGSMainConnectionID() -> u32;
+        fn CGSSetConnectionProperty(cid: u32, target_cid: u32, key: Ptr, value: Ptr) -> i32;
     }
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -438,6 +440,8 @@ mod native {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         static kCFRunLoopDefaultMode: Ptr;
+        static kCFBooleanTrue: Ptr;
+        fn CFStringCreateWithCString(alloc: Ptr, c_str: *const std::ffi::c_char, encoding: u32) -> Ptr;
         fn CFMachPortCreateRunLoopSource(allocator: Ptr, port: Ptr, order: isize) -> Ptr;
         fn CFMachPortInvalidate(port: Ptr);
         fn CFRunLoopGetCurrent() -> Ptr;
@@ -478,6 +482,7 @@ mod native {
 
     #[derive(Default)]
     struct CursorState {
+        bg_enabled: bool,
         disassociated: bool,
         hidden: bool,
     }
@@ -486,9 +491,34 @@ mod native {
     struct CursorSuppression(Mutex<CursorState>);
 
     impl CursorSuppression {
+        fn ensure_background_cursor(state: &mut CursorState) {
+            if state.bg_enabled {
+                return;
+            }
+            // macOS silently ignores CGDisplayHideCursor from background helper
+            // processes unless SetsCursorInBackground is enabled on the CGS connection.
+            const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+            let key = unsafe {
+                CFStringCreateWithCString(
+                    std::ptr::null_mut(),
+                    c"SetsCursorInBackground".as_ptr(),
+                    K_CF_STRING_ENCODING_UTF8,
+                )
+            };
+            if !key.is_null() {
+                unsafe {
+                    let cid = CGSMainConnectionID();
+                    let _ = CGSSetConnectionProperty(cid, cid, key, kCFBooleanTrue);
+                    CFRelease(key);
+                }
+                state.bg_enabled = true;
+            }
+        }
+
         fn set_suppressed(&self, suppress: bool) {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if suppress {
+                Self::ensure_background_cursor(&mut state);
                 if !state.disassociated && unsafe { CGAssociateMouseAndMouseCursorPosition(0) } == 0
                 {
                     state.disassociated = true;
@@ -601,8 +631,21 @@ mod native {
         }
         /// False means focus was rejected (held local input, expired lease, stop).
         pub fn set_remote_focus(&self, remote: bool) -> bool {
-            let accepted = self.shared.focus(remote, self.clock.now());
-            self.cursor.set_suppressed(remote && accepted);
+            let mut accepted = self.shared.focus(remote, self.clock.now());
+            if remote && !accepted && self.shared.stop.load(Ordering::SeqCst) == 0 {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                    accepted = self.shared.focus(true, self.clock.now());
+                    if accepted || self.shared.stop.load(Ordering::SeqCst) != 0 {
+                        break;
+                    }
+                }
+            }
+            if !remote {
+                self.cursor.set_suppressed(false);
+            } else if accepted {
+                self.cursor.set_suppressed(true);
+            }
             accepted
         }
         pub fn stop_reason(&self) -> Option<StopReason> {
@@ -702,7 +745,17 @@ mod native {
             .physical_candidate
             .fetch_add(1, Ordering::Relaxed);
         let shared = Arc::clone(&state.shared);
-        let Some(_routing) = shared.try_route() else {
+        let mut guard = shared.try_route();
+        if guard.is_none() {
+            for _ in 0..64 {
+                std::hint::spin_loop();
+                guard = shared.try_route();
+                if guard.is_some() {
+                    break;
+                }
+            }
+        }
+        let Some(_routing) = guard else {
             // A concurrent focus handoff must not split a local press/release.
             // Fail open for fresh input, preserving suppressed-release ownership.
             shared.stop(StopReason::FocusRace);

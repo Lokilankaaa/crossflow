@@ -185,11 +185,12 @@ impl<T: NativeTap> MacPairCapture<T> {
     }
 
     fn update_focus(&mut self) -> bool {
-        if !self
-            .native
-            .set_remote_focus(self.gate.load(Ordering::SeqCst))
-        {
-            self.fail("capture focus handoff rejected");
+        let want_remote = self.gate.load(Ordering::SeqCst);
+        if !self.native.set_remote_focus(want_remote) {
+            // Transient rejection (e.g. EventTap callback in flight or local key
+            // still held) is retried on the next poll; only fail if the native
+            // tap itself has latched a terminal StopReason.
+            return !self.check_stop();
         }
         !self.stopped
     }
