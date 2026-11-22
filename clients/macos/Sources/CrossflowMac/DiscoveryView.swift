@@ -116,7 +116,7 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             window.delegate = self
             if startedMinimized && !didApplyInitialMinimize {
                 didApplyInitialMinimize = true
-                window.orderOut(nil)
+                hideMainWindow(window)
             }
             refreshMenuBar()
         }
@@ -126,9 +126,14 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         if awaitingShutdown {
             return true
         }
-        sender.orderOut(nil)
-        refreshMenuBar()
+        hideMainWindow(sender)
         return false
+    }
+
+    private func hideMainWindow(_ window: NSWindow) {
+        window.orderOut(nil)
+        NSApp.setActivationPolicy(.accessory)
+        refreshMenuBar()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -401,17 +406,21 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     func showMainWindow() {
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         if let win = resolvedMainWindow() {
             win.makeKeyAndOrderFront(nil)
+            DispatchQueue.main.async { [weak win] in
+                NSApp.activate(ignoringOtherApps: true)
+                win?.makeKeyAndOrderFront(nil)
+            }
         }
         refreshMenuBar()
     }
 
     @objc private func toggleMainWindow() {
         if let win = resolvedMainWindow(), win.isVisible {
-            win.orderOut(nil)
-            refreshMenuBar()
+            hideMainWindow(win)
         } else {
             showMainWindow()
         }
