@@ -357,7 +357,7 @@ mod platform {
         fn CFArrayGetCount(array: *const c_void) -> isize;
         fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
         fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
-        fn CFStringCreateWithCString(alloc: *const c_void, c_str: *const c_char, encoding: u32) -> *mut c_void;
+        fn CFStringCreateWithCString(alloc: *mut c_void, c_str: *const c_char, encoding: u32) -> *mut c_void;
         fn CFStringGetLength(string: *const c_void) -> isize;
         fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
         fn CFStringGetCString(
@@ -473,7 +473,7 @@ mod platform {
     }
 
     unsafe fn cf_str(s: &std::ffi::CStr) -> *mut c_void {
-        CFStringCreateWithCString(null(), s.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+        CFStringCreateWithCString(std::ptr::null_mut(), s.as_ptr(), K_CF_STRING_ENCODING_UTF8)
     }
 
     unsafe fn dict_string(dict: *const c_void, key: &std::ffi::CStr) -> Option<String> {

@@ -1,197 +1,84 @@
 # Crossflow
 
-跨设备键鼠共享系统。各端使用同一个 **Rust 核心**，平台适配层负责系统输入接口；客户端使用统一设计语言。当前为阶段 0：默认 Windows → Mac 鼠标移动，另有显式开启的实验键盘、按钮和滚轮模式，不是完整 KVM 产品。
+跨平台（Windows 11 ↔ macOS）低延迟、端到端加密的对等（P2P）键鼠、剪贴板与文件跨屏共享工具。
 
-## 当前可以做什么
+核心协议、网络发现、Noise 加密、多屏路由、剪贴板与文件传输全部采用 **纯 Rust** 实现，双端客户端分别使用原生 **WinUI 3（Windows）** 与 **SwiftUI / AppKit（macOS）**，遵循统一的「静白（Quiet White）」视觉设计。
 
-- Windows Raw Input 采集相对鼠标移动；全局快捷键明确开启和停止共享。
-- 同一套 Rust 协议、身份认证、加密传输、控制会话、日志代码运行于 Windows 和 macOS。
-- Mac 使用 CoreGraphics 注入光标移动，并记录接收和注入调用耗时。
-- 显式离线配对、双方固定公钥认证、每次连接建立新的加密会话。
-- 有界移动合并、短期接收许可、断线停止、重新连接后保持暂停。
-- 不操作系统光标的加密回环测试、采集日志和统计摘要。
+---
 
-默认仍只发送鼠标移动。实验模式加入按钮、滚轮与物理键身份；剪贴板尚未实现。Windows 本地输入不会被抑制，Mac 仍限主显示器和线性鼠标增益。不能据此宣称完成双向控制、游戏保护、多屏穿越或 ShareMouse 替代。
+## 核心特性
 
-**当前协议为 v2，两端必须同时更新和重新构建。** 旧版 v1 会被明确拒绝，已有配对身份可保留；不能混用旧 Mac 程序与新 Windows 程序。
+- **对称 P2P 自动发现与自动连接**
+  - 基于 mDNS（`_crossflow._tcp.local.`）局域网自动发现，双端开箱即连，无主/从机之分。
+  - **多网络信道优选与指定**：自动识别并排序 `有线直连 > 有线局域网 > Wi-Fi > ZeroTier 虚拟局域网`（自动过滤代理 TUN 与无效链路本地地址），支持指定网卡信道与对端直连 IP。
+  - **Noise_NNpsk0 端到端加密**：默认局域网免密自动加密连接，可选配置共享密码隔离分组（持久化于本地配置）。
+- **低延迟双向键鼠与多屏布局**
+  - 最高 1000Hz 跨屏光标与平滑滚轮，支持任意多显示器可视化拖拽排列，实时双向同步布局。
+  - macOS 端采用 `kCGHIDEventTap` 抑制与零延迟 0s-suppression 光标回归，双向穿越丝滑不卡边界。
+  - 完整键位共享：原样保留 `Ctrl` / `Cmd(Win)` 快捷键（不破坏 macOS `Ctrl` 组合键与 Mission Control / Spaces 切屏），支持 **Caps Lock、Fn/Globe、小键盘、F1–F20** 以及 **双向音量 / 静音 / 播放暂停 / 切歌多媒体键**。
+- **熄屏防断连与远程唤醒解锁**
+  - macOS IOKit / Windows `SetThreadExecutionState` 阻止系统空闲休眠但允许熄屏节能；远端鼠标移入时自动唤醒屏幕并支持直接输入锁屏密码解锁。
+- **中英文与大小写双向同步**
+  - 鼠标跨出本机或焦点端切换输入状态时，通过独立加密辅助通道实时同步 Windows（IMM32 / HKL + Caps Lock）与 macOS（`cfprefsd` HIToolbox / Carbon TIS + IOKit `IOHIDModifierLockState`）。
+- **加密剪贴板共享 & 流式文件/文件夹传输**
+  - 独立 `Noise_NNpsk0` 加密辅助通道（默认端口 `24801`），与键鼠主通道（`24800`）完全解耦，传大文件不影响鼠标丝滑度。
+  - 支持文本（最高 4 MiB）、截图/PNG 图片（最高 16 MiB，含 Windows `CF_DIB` 自动转 PNG）及 BLAKE2s 回声防环。
+  - 支持 **`Ctrl+C` / `Cmd+C` 复制文件或文件夹跨屏自动直传** 以及 **拖入窗口 / 托盘菜单选文件发送**；32 KiB 加密分块 + 每文件 BLAKE2s 校验 + `.part` 原子落盘到 `Downloads/Crossflow`，完成后自动回填对端剪贴板即可直接粘贴，并附实时进度条、取消与打开目录按钮。
+- **原生系统托盘 / 菜单栏常驻**
+  - 自定义应用图标（`AppIcon.ico` / `AppIcon.icns`）与 4 态实时状态托盘图标（已连接、正在控制远端、搜索中、已暂停）。
+  - 托盘快捷菜单支持一键暂停/恢复、剪贴板与中英文/大小写开关、网络信道切换、发送文件、打开接收目录、开机自启动（`--minimized` 静默进托盘）。
 
-## 构建
+---
 
-需要 Rust 工具链。Windows 的本项目便携工具位于 `.tools/`，不会进入 Git，也不修改系统 PATH：
+## 目录结构
 
-```powershell
-./scripts/cargo-local.ps1 build --release
-./scripts/cargo-local.ps1 test
+```text
+.
+├── src/                        # Rust 共享核心（peer_mesh, pair_*, aux_channel, clipboard, input_state, power, platform/）
+├── crates/crossflow-bridge/    # C ABI 桥接库（供 WinUI 3 / SwiftUI 调用布局校验与跨屏计算）
+├── clients/
+│   ├── design-tokens.json      # 双端共享静白设计令牌
+│   ├── windows/Crossflow.Windows/  # Windows WinUI 3 原生客户端
+│   └── macos/                  # macOS SwiftUI / AppKit 原生客户端（LSUIElement 菜单栏应用）
+├── assets/                     # 应用图标母版（AppIcon-1024.png）
+├── scripts/                    # 双端构建与验证脚本
+└── docs/                       # 架构与协议文档
 ```
 
-在已有标准 Rust 工具链的 Windows、Mac 或 Linux 上使用：
+---
+
+## 构建与测试
+
+### Windows
+
+需要 Rust 工具链与 .NET 10 SDK（项目根目录 `.tools/` 下的便携工具会自动被 `scripts/cargo-local.ps1` 识别）：
+
+```powershell
+# 运行 Rust 单元测试
+.\scripts\cargo-local.ps1 test --lib
+
+# 构建 Release 内核、桥接库与 WinUI 3 客户端
+.\scripts\build-windows-ui.ps1 -Configuration Release
+```
+
+产物位于：`clients\windows\Crossflow.Windows\bin\x64\Release\net10.0-windows10.0.19041.0\win-x64\Crossflow.Windows.exe`
+
+### macOS
+
+需要 Rust 工具链与 Xcode Command Line Tools：
 
 ```sh
-cargo build --release --locked
-cargo test --locked
+# 运行 Rust 单元测试
+cargo test --lib
+
+# 构建 Release 内核与桥接库
+cargo build --release --bin crossflow -p crossflow -p crossflow-bridge
+
+# 打包原生 Crossflow.app（含自动生成 AppIcon.icns）
+CROSSFLOW_MACOS_APP_PATH="$PWD/dist/cross-screen/Crossflow.app" \
+CROSSFLOW_CORE_EXECUTABLE="$PWD/target/release/crossflow" \
+CROSSFLOW_BRIDGE_LIBRARY="$PWD/target/release/libcrossflow_bridge.dylib" \
+sh ./scripts/build-macos-ui.sh
 ```
 
-Mac 需要 Xcode Command Line Tools 提供系统框架链接能力。Windows GNU 便携工具只用于本机开发，不是产品分发依赖；生成的 Windows 程序可单独测试。`Cargo.lock` 固定依赖版本。
-
-## 首次配对（阶段 0 开发诊断）
-
-Windows 内核现有应用管理的已配对设备存储：`crossflow peers` 只返回公开设备信息；原生“设备”页可点选已保存设备连接，无需再次传入目标 IP 或身份目录，仍须通过固定公钥认证且连接后保持暂停。开始、暂停、停止均在正常页面可见，底层使用 `desktop-send --peer <设备ID> --log <日志>`。隐藏的 `peer-import --identity <已有诊断目录> --name <名称> --endpoint <地址:端口>` 仅供开发迁移已有可信身份，使用当前用户 DPAPI 保存到 `LOCALAPPDATA/Crossflow/peers`，保留源文件且不覆盖既有设备。这尚不是首次安装的配对码流程；撤销管理仍待实现。Windows 本机 DrySink 的实际界面连接、开始、暂停、停止已验证，不能替代跨机配对或 Mac 输入验收。
-
-已配对设备连接现在先尝试保存地址，失败后后台浏览局域网，并轮换候选地址。所有地址仍使用同一已保存身份进行 Noise 认证，发现名称和随机发现 ID 不授予输入权限；重连后保持暂停。自动候选仅限私有 IPv4、IPv4 link-local、IPv6 ULA 和带作用域的 IPv6 link-local，去重后最多 64 个；公网、回环及 IPv4-mapped 广播候选不会自动尝试。明确保存的诊断地址仍按原配置使用。成功地址仅在当前进程记忆，不修改配对记录；下次启动仍可从旧地址失败后重新发现。
-
-真实 mDNS/TCP 测试已在同一 Windows 主机的两张网卡间完成：错误身份拒绝、发现正确接收器、IP 和端口同时变化、发送端不重启、重连暂停且无移动重放；另验证沉默握手可停止。见 `docs/peer-route-recovery-validation-20261029.json`。这不代表 Windows/Mac 跨机发现或可见光标性能已通过。浏览后台本身若终止，目前记录错误并继续尝试保存/历史认证地址，需要重新启动连接才能重建浏览；不宣称覆盖所有网卡故障。有限连接/握手预算为 250/500ms，慢于预算会重试。
-
-正式客户端的目标流程是“自动发现局域网设备 → 点选 → 双方确认配对码 → 记住设备”，由应用保管身份密钥，不向普通用户索取 IP 或身份文件。Windows 原生“设备”页已接入真实发现；以下文件交换仅为折叠的开发诊断入口，正式配对码与应用密钥保管尚未完成。
-
-正式接入的必要验收条件（2026-10-29 用户确认）：
-
-- 两端全新安装即可在局域网发现并点选设备，正常流程不要求填写 IP、端口或选择身份文件。
-- 首次连接由两端确认匹配码；取消、错码、过期或超限均不能建立信任。发现名称及广播内容本身不能授权输入。
-- 配对成功后由客户端安全保存凭据；重启、休眠唤醒和地址变化后自动重新寻找并认证原设备，无需重新交换文件。连接恢复与开始转发输入是独立状态。
-- 提供解除配对；解除后必须重新确认才能连接。配对码不广播、不写日志、不用作长期共享密码。
-- Windows 与 Mac 都完成上述实机流程才算验收通过。当前短码实验、已保存诊断身份的连接，以及本机发现结果均不能单独代表此流程已完成。
-
-共享内核已加入真实 mDNS/DNS-SD 发布与浏览，可用 `crossflow discover --seconds 5` 做限时浏览诊断；接收端增加 `--discoverable --device-name '公开设备名称'` 可发布实际监听地址和端口。Windows 设备页在打开及刷新时扫描，本机真实接收器出现、退出后刷新消失均已验证。输出中的设备均未认证，不会建立输入会话；空列表也不证明跨机发现已通过。Mac 原生列表、跨机发现和配对码仍待集成验证。发现服务使用 `_crossflow._tcp.local.`，限制候选数量，保留 IPv6 接口作用域，不广播配对码或身份密钥。
-
-短码认证的独立依赖试验位于 `experiments/pairing-spake2/`。固定 BoringSSL 源码版本与校验值在 `source-lock.json`；验证下载后，以 `cmake -S experiments/pairing-spake2 -B <项目外构建目录> -DBORINGSSL_SOURCE_DIR=<已校验源码目录>` 配置，再构建 `spake2_test`。其 `rust-pairing/` 独立工作区已验证 Rust 接口、真实 localhost TCP/Noise XX 绑定、同码确认，以及错码、绑定变化、篡改、中间人和总时限拒绝；记录见该目录的 `result-windows.json`。后续邀请模块已加入随机八位码、120 秒期限、每码三次及进程级每分钟五次/单一在途限制，取消和换码会使旧请求失效；实际 TCP 验证见 `result-invitation-windows.json`。这些模块未链接到产品，不是完整配对流程或安全审计；双端界面、实际配对监听服务、双方完成确认、持久化信任提交及 Mac 原生构建仍待完成。
-
-```powershell
-./target/release/crossflow.exe pair --out .pairing
-```
-
-只会输出公钥及配对标识。通过可信的本地方式把 `.pairing/mac/` 交给 Mac，Windows 保留 `.pairing/windows/`。每个目录内的 `identity.json` 包含该设备私钥，不能提交 Git、发到公开聊天或放在公共下载地址。Mac 设置目录权限 `700`、文件权限 `600`。已存在的配对目录不会被覆盖。重新配对时双方都替换为新的一对身份，原身份不再被对方接受。
-
-阶段 0 采用 `Noise_KK_25519_ChaChaPoly_BLAKE2s` 固定公钥认证与加密，运行于 `TCP_NODELAY` 连接；使用 `snow` 的纯 Rust 算法实现，不自创加密协议。配对包交换是最小实验流程，正式的双端确认界面属于后续产品工作。
-
-## 先做不注入的连接检查
-
-Mac 终端运行，`MAC_LAN_IP` 替换为 Mac 的实际局域网地址：
-
-```sh
-./target/release/crossflow environment
-./target/release/crossflow receive --bind MAC_LAN_IP:24800 --identity .pairing/mac --log runs/mac-dry-01.jsonl --seconds 60
-```
-
-Windows 运行人工合成输入测试，此模式不会采集实际鼠标：
-
-```powershell
-./target/release/crossflow.exe send --host MAC_LAN_IP:24800 --identity .pairing/windows --log runs/windows-dry-01.jsonl --seconds 5 --synthetic
-```
-
-接收端默认只累加数据，**没有 `--inject` 就不向系统注入输入**。本机完整回环检查可以运行 `./scripts/smoke-loopback.ps1`。
-
-## Windows 鼠标控制 Mac
-
-### 可重复启动入口
-
-构建并配对后，可用启动脚本自动生成本轮独立日志。先启动 Mac，再启动 Windows；相对路径均以项目根目录为准。
-
-```sh
-sh scripts/start-mac.sh --bind MAC_LAN_IP:24800 --identity .pairing/mac --seconds 180 --inject
-```
-
-```powershell
-./scripts/start-windows.ps1 -MacHost MAC_LAN_IP -Identity .pairing/windows -Seconds 180
-```
-
-接收端脚本默认 **DrySink、不移动光标**，只有 `--inject` 才启用实际控制。Windows 默认采集真实鼠标，但仍需在控制窗口点击开始或按 Ctrl+Alt+空格。进行合成链路测试时，Mac 去掉 `--inject`，Windows 显式加 `-DryRunSynthetic`；不要混用合成发送与实际注入。
-
-已有实验身份位于其他目录时，用 `-Identity` / `--identity` 指向该目录，脚本不会重新配对或覆盖身份。以下底层命令仍可用于手工指定日志。
-
-Mac 本地终端先确认命令所属应用具备“辅助功能”和“输入监控”权限。程序只检查权限，不会自动授予；失败时按提示在系统设置中授权后重新启动。
-
-```sh
-./target/release/crossflow receive --bind MAC_LAN_IP:24800 --identity .pairing/mac --log runs/mac-input-01.jsonl --seconds 60 --inject --gain 1
-```
-
-Windows 运行：
-
-```powershell
-./target/release/crossflow.exe send --host MAC_LAN_IP:24800 --identity .pairing/windows --log runs/windows-input-01.jsonl --seconds 60 --max-hz 1000
-```
-
-- 发送端打开原生控制窗口，显示连接与共享状态。连接成功后仍是暂停状态，点击“开始共享”按钮或按 **Ctrl+Alt+空格** 开启；再次点击或按键可暂停。
-- Windows 点击“停止并退出”、关闭控制窗口或按 **Ctrl+Alt+Esc** 结束发送；Mac 按住 **Escape** 结束接收。两个命令默认最多运行 60 秒，Ctrl+C 也可退出。
-- 若 Windows 快捷键已被其他程序占用，控制窗口会标明该快捷键不可用，仍可用按钮开始、暂停和停止；其他系统注册错误仍会明确报错退出。
-- 重新连接必须再次手动开启，避免无意抢回控制。显示器变化、休眠、权限或注入错误会终止接收运行。
-- 开启时 Mac 光标需位于主显示器；每次开启从当前位置建立基线。
-- 上述默认模式不发送点击：Mac 光标移动时，Windows 本地鼠标仍可移动和点击，测试时注意自己正在操作哪一台设备。
-
-### 实验键盘、点击、拖动与滚轮
-
-仅在有人在场时开启系统注入。先以不带 `--inject` 的 Mac DrySink 验证完整输入；Windows 脚本增加 `-ExperimentalInputs`，仍需手动开始。实际控制需要 Mac 同时指定 `--inject --inject-actions`。两个开关默认关闭，现有快捷入口仍只共享移动。
-
-```powershell
-./scripts/start-windows.ps1 -MacHost MAC_LAN_IP -Identity .pairing/windows -Seconds 180 -ExperimentalInputs
-```
-
-```sh
-sh scripts/start-mac.sh --bind MAC_LAN_IP:24800 --identity .pairing/mac --seconds 180 --inject --inject-actions
-```
-
-Windows 本地键盘和点击仍会作用于本地应用，当前不是无缝焦点接管。Mac 支持 ANSI 物理字母／数字／标点、基础导航、F1–F12 和左右修饰键；目标输入法与键盘布局决定字符。Ctrl 保持 Ctrl，GUI 键映射 Command；自定义 Ctrl/Cmd 映射、长按重复、Caps Lock、数字键盘、国际键、Fn/媒体键和双击次数尚不支持。接收端遇到不支持的键会停止并清理当前会话，不能假定所有 Windows 可采集按键都能在 Mac 使用。
-
-按钮／键盘／滚轮不会跨越相邻移动被合并。暂停、Stop、EOF、过期输入、紧急停止及普通错误会尝试释放本会话持有的键与按钮；释放失败终止接收器并报告。`--inject-actions` 现使用独立输入进程：主接收进程单独死亡或不再推进时，由输入进程自己的租约触发清理。Windows 模拟进程已验证此机制；Mac 原生构建及真实释放尚未验收。输入进程本身被杀、整个进程树被杀、系统崩溃或原生调用永久卡住时仍不能保证释放。默认仅移动路径不启用该进程，实验动作路径增加的 IPC 耗时和流畅度仍需测试。滚轮暂用 120 原始单位换一行，水平符号、自然滚动、拖动与修饰键行为都待实机核验。
-
-独立进程的纯模拟检查（不调用系统输入适配器）：先执行 `cargo build --example worker_fixture --locked`，再执行 `cargo test --test injection_worker_process --locked -- --ignored --test-threads=1`。Windows 可通过 `scripts/cargo-local.ps1 -CargoArgs @(...)` 使用本仓库工具链。正常测试核对清理 ACK 和实际进程退出；强杀测试只杀它自己创建的假主进程。
-
-连接恢复的补充检查：`cargo test --test network_stall --locked -- --ignored --test-threads=1 --nocapture`。真实加密发送/接收器经回环字节中继经历五轮各两秒停顿，仅记录 fake 输入；检查释放、暂停重连、物理持有状态和旧输入不重放，并将原始日志及报告保留在 `runs/network-stall-*`。此工具不修改系统网络，不模拟 TCP 之前的丢包/抖动，不能替代阶段 0 的 T14 实网验收。
-
-Mac 原生复验可运行 `sh scripts/validate-mac-core.sh`；依赖已缓存时可加 `--offline`。脚本检查原生架构、拒绝 Rosetta，显式使用匹配的 Darwin target，依次检查格式、测试、Clippy、release 构建、fake worker、加密网络、Unix 停止信号及五轮字节流停顿，并读取显示/权限预检。它不调用实际捕获/注入入口或打开界面。逐步输出、构建版本与 Git 状态保存在 `runs/mac-core-validation-*`，任何一步失败即停止；`status.txt` 仅在全部步骤成功后写入 `passed`。部分测试会清理各自的临时目录，因此脚本保留的是逐步命令输出，不保证保留每个测试的全部内部原始日志。该脚本目前只通过语法与非 Mac 拒绝执行检查，尚待 Mac 原生运行；通过后仍需单独验证 Escape、真实按键释放和本地/ShareMouse/Crossflow 可见效果。
-
-该复验使用显式 target，验证产物位于 `target/<Darwin target>/release/crossflow`。后续现场运行时，将脚本末尾显示的绝对路径传给 `start-mac.sh --binary PATH`，以免误用旧的 `target/release/crossflow`；默认启动路径仍兼容原有入口。
-
-终端停止接入同一个退出流程：Windows 的 Ctrl+C / Ctrl+Break，以及 macOS 的 SIGINT / SIGTERM / SIGHUP 请求停止采集和网络循环，接收器清理拥有的输入后结束日志。信号回调只提交停止请求，实际释放在正常线程完成。已经进入系统适配器的调用不能中途抢占；连接／握手、域名解析与日志刷新也可能延后退出，不能承诺固定的毫秒级退出时间。关闭 Windows 控制台只提供有界的尽力清理窗口；任务管理器强制终止、SIGKILL、崩溃和关机不属于此保证。
-
-`--max-hz` 是发送上限，**不是实际输入频率或流畅度保证**。原型不插入平滑缓冲；积压超过设定界限会停止该会话，保留错误证据。
-
-## 记录和评估
-
-```powershell
-./target/release/crossflow.exe capture --log runs/local-capture-01.jsonl --seconds 10
-./target/release/crossflow.exe summarize runs/windows-input-01.jsonl
-./target/release/crossflow.exe summarize runs/mac-input-01.jsonl
-```
-
-日志文件名每轮必须不同，已有日志不会被覆盖。日志不含键盘字符、剪贴板或私钥。每份日志的 metadata 记录 Git 提交、工作区是否有修改、编译器和构建时间；源代码归档缺少 Git 信息时明确标为 unknown，不继承上级目录的仓库版本。
-
-连接诊断分别记录 TCP 建立/接收、握手开始、本端握手完成及进入传输。每次尝试有本端编号和套接字地址；两端应通过反向匹配的地址关联，不能假定各自编号相同。`handshake_completed` 的 `local_only` 表示本端完成，不证明对端已收到响应。错误会保留具体读写阶段和底层原因；两端时钟未同步，跨机时间不能直接相减。
-
-`sent` 是历史事件名，实际表示已加密并排入本地待写缓冲区；新增 `completion:queued_local` 明确这一边界。发送会话结束时的 `transport_summary` 区分排队与完整写入 socket 的数量，并保留未写完尾帧的序号和字节数。完整 socket 写入仍不是接收端确认。停止时直接丢弃待写尾帧，不为计数一致而继续发送旧输入；旧日志没有这一汇总时不能反推实际写入数。
-
-摘要给出本机各段耗时的 P50、P95、P99 和最大值、样本量、错误与日志完整性。完整输入间隔与筛选后的短间隔分别报告；超过 50 ms 的间隔可能是空闲或停顿，不能仅凭日志判断，也不能自动删除后声称流畅。文件结尾损坏、时间倒退、缺少字段和日志写盘失败需保留为证据缺陷。软件时间戳不能替代外部录像里的可见光标更新。
-
-在同一 Mac 显示器上分别对比本地鼠标、ShareMouse、Crossflow；保持 DPI、显示模式、网络和任务一致。按照 V0.2 计划每组预热 2 分钟、至少 5 轮，每轮 60 秒。没有可靠物理触发时间和录像误差分析时，不报告精确端到端延迟；两机单调时钟不能直接相减。
-
-## 项目结构与状态
-
-### 屏幕布局开发工具
-
-`ui/index.html` 是离线交互草稿。正式界面以轻量、美观、响应快为目标，采用 macOS SwiftUI 与 Windows WinUI 3，共享设计资源并调用同一 Rust 内核。两端源码均已汇入主分支，见 [Windows 构建说明](clients/windows/README.md)与 [Mac 构建说明](clients/macos/README.md)。Mac 已通过原生构建及十项真实桥接自检，仍待原生窗口视觉验证和会话控制接入。HTML 草稿不作为正式客户端技术选型。
-
-Windows 原生客户端构建：
-
-```powershell
-./scripts/build-windows-ui.ps1 -BootstrapSdk
-```
-
-该脚本在项目目录内准备 .NET SDK，构建并打包 Rust 核心与 WinUI 3 应用，不安装全局开发工具。客户端通过 C ABI 复用布局校验和穿越计算，通过私有控制管道管理随包核心的连接、开始、暂停和停止。打开界面不自动连接或共享。A「静白」主题与四屏样例已加入，一台设备可拥有多个屏幕。示例需明确加载，不代表发现或连接的设备；导出布局尚不会应用到正在运行的会话。
-
-原生构建、8 项 C# → Rust 布局自检和 21 项假子进程会话测试通过；真实窗口启动、四屏示例载入、独立屏幕选择、连接页控件与空闲关闭已检查。实际拖动、文件对话框、闲置资源占用和界面发起的 Mac 端到端共享仍需实机验收。当前自包含构建约 172.83 MiB（含运行库），不是已验收的轻量发行包。
-
-Rust 核心可验证同一份布局，并计算一次边缘穿越：
-
-```powershell
-./target/debug/crossflow.exe layout-check examples/layout-two-devices.json
-./target/debug/crossflow.exe layout-trace examples/layout-two-devices.json --from windows-main --start-x 1910 --start-y 500 --end-x 1930 --end-y 500
-```
-
-示例数据不代表实机配置。布局计算已独立实现，自动发现显示器、跨屏切换控制权以及正式桌面客户端封装尚未接入。键盘、点击和滚轮使用独立显式开启的实验输入模式，尚未与布局编辑器连接。
-
-- `src/`：共享核心和 CLI；`src/platform/`：平台输入适配。
-- `docs/architecture.md`：统一核心、客户端一致性与平台边界。
-- `docs/phase0-status.md`：实际验证记录和仍需完成的项目。
-- `docs/reference/`：V0.2 需求和验收计划原文。
-- `CONTRIBUTING.md`：分支、审查、测试和多人协作约定。
-
-阶段 0 尚未完成。尤其是 Mac 实机光标效果、ShareMouse 对照与高刷新率验证，必须在目标机器上取得证据。
+> **macOS 权限说明**：首次运行需在「系统设置 → 隐私与安全性」中为 `Crossflow.app` 授予 **辅助功能** 与 **输入监控** 权限，并使用固定开发证书签名以保持权限连续性。
