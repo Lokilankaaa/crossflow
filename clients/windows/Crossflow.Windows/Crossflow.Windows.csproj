@@ -30,9 +30,5 @@
     <Content Include="../../../examples/layout-four-screens.json" Link="sample-layout.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="../../../target/release/crossflow_bridge.dll" Link="crossflow_bridge.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../target/release/crossflow_bridge.dll')" />
     <Content Include="../../../target/release/crossflow.exe" Link="crossflow.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../target/release/crossflow.exe')" />
-    <Content Include="../../../.tools/pairing-package/crossflow-enroll.exe" Link="crossflow-enroll.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../.tools/pairing-package/crossflow-enroll.exe')" />
-    <Content Include="../../../.tools/pairing-package/libc++.dll" Link="libc++.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../.tools/pairing-package/libc++.dll')" />
-    <Content Include="../../../.tools/pairing-package/libunwind.dll" Link="libunwind.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../.tools/pairing-package/libunwind.dll')" />
-    <Content Include="../../../.tools/pairing-package/libwinpthread-1.dll" Link="libwinpthread-1.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../../.tools/pairing-package/libwinpthread-1.dll')" />
   </ItemGroup>
 </Project>

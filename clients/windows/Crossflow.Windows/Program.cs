@@ -24,8 +24,6 @@ internal static class Program
         if (args.Length == 2 && args[0] == "--oneclick-fixture") { OneClickSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--oneclick-self-test") { OneClickSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--runtime-layout-self-test") { RuntimeLayoutSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
-        if (args.Length == 2 && args[0] == "--pairing-fixture") { PairingSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
-        if (args.Length == 2 && args[0] == "--pairing-self-test") { PairingSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--peer-fixture") { PeerSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--peer-self-test") { PeerSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--discovery-fixture") { DiscoverySelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }

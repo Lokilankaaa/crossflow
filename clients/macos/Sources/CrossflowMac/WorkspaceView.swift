@@ -43,6 +43,8 @@ struct WorkspaceView: View {
     @ViewState private var showDetails = false
     @ViewState private var layoutNotice: String?
     @ViewState private var undoStack: [SharedLayout] = []
+    @ViewState private var editingPassword = false
+    @ViewState private var passwordInput = ""
 
     var body: some View {
         HStack(spacing: 0) {
@@ -108,7 +110,7 @@ struct WorkspaceView: View {
 
     private var sidebar: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 // Brand
                 HStack(spacing: 10) {
                     Image(systemName: "rectangle.2.swap")
@@ -125,8 +127,8 @@ struct WorkspaceView: View {
                 }
                 .padding(.bottom, 4)
 
-                // Unified Status Card (symmetric with Windows)
-                VStack(alignment: .leading, spacing: 10) {
+                // Unified Status Card (1:1 with Windows)
+                VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
                         Circle().fill(statusColor).frame(width: 9, height: 9)
                         Text(isAuthMismatch ? "等待密码匹配" : peer.statusTitle).font(.system(size: 14, weight: .semibold))
@@ -157,14 +159,14 @@ struct WorkspaceView: View {
                 .background(Theme.background, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
 
-                // LAN Devices section
-                Text("局域网设备")
+                // Nearby Devices section
+                Text("附近设备")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.secondary)
-                    .padding(.top, 4)
+                    .padding(.top, 2)
 
                 if peer.discoveredPeers.isEmpty && peer.peerName == nil {
-                    Text("在另一台电脑打开 Crossflow 即可自动发现并连接。")
+                    Text("另一台电脑打开 Crossflow 后自动连接。")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.secondary)
                 } else {
@@ -180,7 +182,14 @@ struct WorkspaceView: View {
                                     Text(dev.name)
                                         .font(.system(size: 13, weight: dev.connected ? .semibold : .regular))
                                         .lineLimit(1)
-                                    Text(dev.connected && peer.peerAddress != nil ? peer.peerAddress! : (dev.platform == "macos" ? "macOS · 局域网" : "Windows · 局域网"))
+                                    let sub: String = {
+                                        if dev.connected, let addr = peer.peerAddress {
+                                            if let ch = peer.activeChannelLabel { return "\(ch) · \(addr)" }
+                                            return addr
+                                        }
+                                        return dev.platform == "macos" ? "macOS" : "Windows"
+                                    }()
+                                    Text(sub)
                                         .font(.system(size: 11))
                                         .foregroundStyle(Theme.secondary)
                                         .lineLimit(1)
@@ -200,42 +209,109 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
-                // Security Mode (optional shared passphrase)
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("连接安全")
+                // Network Channel selector (1:1 with Windows)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("网络信道")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Theme.secondary)
 
-                    Toggle(isOn: $peer.usePassphrase) {
-                        Text(peer.usePassphrase ? "仅限共享密码连接" : "局域网自动连接（免密码）")
-                            .font(.system(size: 12))
-                    }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .onChange(of: peer.usePassphrase) { _, enabled in
-                        if !enabled && peer.authMode == "passphrase" {
-                            peer.passphrase = ""
-                            peer.start(secret: "")
+                    let channelBinding = Binding<String>(
+                        get: { peer.selectedChannel },
+                        set: { next in
+                            peer.setChannel(next, directPeer: next == "auto" ? nil : peer.directPeer)
                         }
-                    }
-
-                    if peer.usePassphrase {
-                        SecureField("输入两台设备一致的密码", text: $peer.passphrase)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 12))
-                        Button("应用密码并重连") {
-                            let trimmed = peer.passphrase.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if trimmed.isEmpty {
-                                layoutNotice = "请输入共享密码，或关闭开关恢复免密码自动连接。"
-                            } else {
-                                layoutNotice = nil
-                                peer.start(secret: trimmed)
+                    )
+                    Picker("", selection: channelBinding) {
+                        if peer.networkChannels.isEmpty {
+                            Text("自动选择最优").tag("auto")
+                        } else {
+                            ForEach(peer.networkChannels) { ch in
+                                Text(ch.label).tag(ch.id)
                             }
                         }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+
+                    if peer.selectedChannel != "auto" {
+                        TextField("对方 IP（可选，如 192.168.194.10）", text: $peer.directPeer)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12))
+                        Button("指定连接") {
+                            peer.setChannel(peer.selectedChannel, directPeer: peer.directPeer)
+                        }
                         .buttonStyle(.bordered)
+                        .controlSize(.small)
                         .frame(maxWidth: .infinity)
                     }
                 }
+
+                Divider().overlay(Theme.border).padding(.vertical, 2)
+
+                // Minimal Password Configuration (已配置 / 未配置 — 1:1 with Windows)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("连接密码")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Theme.secondary)
+                        Spacer()
+                        Text(peer.passphraseConfigured ? "已配置" : "未配置")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(peer.passphraseConfigured ? Theme.accent : Theme.secondary)
+                    }
+
+                    if editingPassword {
+                        SecureField("输入共享密码", text: $passwordInput)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12))
+                        HStack(spacing: 6) {
+                            Button("保存") {
+                                let trimmed = passwordInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if trimmed.isEmpty {
+                                    layoutNotice = "密码不能为空。"
+                                } else {
+                                    layoutNotice = nil
+                                    passwordInput = ""
+                                    editingPassword = false
+                                    peer.setPassphrase(trimmed)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            Button("取消") {
+                                passwordInput = ""
+                                editingPassword = false
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    } else {
+                        HStack(spacing: 6) {
+                            Button(peer.passphraseConfigured ? "修改" : "配置密码") {
+                                passwordInput = ""
+                                editingPassword = true
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            if peer.passphraseConfigured {
+                                Button("清除") {
+                                    peer.setPassphrase(nil)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                }
+
+                Divider().overlay(Theme.border).padding(.vertical, 2)
+
+                // Screens subsection (aligned 1:1 with Windows sidebar!)
+                Text("屏幕")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.secondary)
+
+                sidebarScreenList
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
@@ -248,6 +324,66 @@ struct WorkspaceView: View {
         }
         .frame(maxHeight: .infinity)
         .background(Theme.surface)
+    }
+
+    @ViewBuilder
+    private var sidebarScreenList: some View {
+        if let layout = peer.sharedLayout, !layout.screens.isEmpty {
+            let deviceOrder = layout.screens.reduce(into: [String]()) { acc, s in
+                if !acc.contains(s.deviceID) { acc.append(s.deviceID) }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(deviceOrder.enumerated()), id: \.element) { idx, devID in
+                    let group = layout.screens.filter { $0.deviceID == devID }
+                    let isLocal = devID == peer.localDeviceID
+                    let devLabel = isLocal ? "\(peer.localName) (本机)" : (peer.peerName ?? "远端设备")
+                    let color = idx % 2 == 0 ? Theme.accent : Color(red: 13/255, green: 148/255, blue: 136/255)
+                    Text("\(devLabel) · \(group.count) 屏")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(color)
+                        .padding(.top, 2)
+                    ForEach(Array(group.enumerated()), id: \.element.id) { sIdx, screen in
+                        let focused = peer.routeEnabled && peer.focusScreenID == screen.id
+                        HStack(spacing: 8) {
+                            Image(systemName: screen.height > screen.width ? "rectangle.portrait" : (isLocal ? "laptopcomputer" : "display"))
+                                .font(.system(size: 12))
+                                .foregroundStyle(color)
+                            Text("屏幕 \(sIdx + 1) (\(Int(screen.width))×\(Int(screen.height)))")
+                                .font(.system(size: 12))
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(focused ? Theme.subtle : Theme.background, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+        } else if !peer.localDisplays.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("\(peer.localName) (本机) · \(peer.localDisplays.count) 屏")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.accent)
+                ForEach(Array(peer.localDisplays.enumerated()), id: \.element.id) { idx, d in
+                    HStack(spacing: 8) {
+                        Image(systemName: "laptopcomputer")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.accent)
+                        Text("屏幕 \(idx + 1) (\(Int(d.width))×\(Int(d.height)))")
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Theme.background, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        } else {
+            Text("正在读取显示器…")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+        }
     }
 
     private var mainWorkspace: some View {
@@ -269,7 +405,7 @@ struct WorkspaceView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
-                StatusBadge(title: peer.statusTitle, active: peer.isSharing)
+                StatusBadge(title: isAuthMismatch ? "等待密码匹配" : peer.statusTitle, active: peer.isSharing)
             }
 
             if let notice = layoutNotice {
@@ -307,7 +443,12 @@ struct WorkspaceView: View {
             }
 
             HStack {
-                Text(peer.peerName.map { "已连接：\($0)" + (peer.peerAddress.map { " (\($0))" } ?? "") } ?? "正在局域网自动发现设备…")
+                let connText: String = {
+                    guard let name = peer.peerName else { return "正在自动发现附近设备…" }
+                    let route = [peer.activeChannelLabel, peer.peerAddress].compactMap { $0 }.joined(separator: " · ")
+                    return route.isEmpty ? "已连接：\(name)" : "已连接：\(name) (\(route))"
+                }()
+                Text(connText)
                 Spacer()
                 Text("对等架构 · Windows ↔ Mac 双向跨屏")
             }
@@ -380,14 +521,12 @@ struct WorkspaceView: View {
             Image(systemName: "dot.radiowaves.left.and.right")
                 .font(.system(size: 38, weight: .light))
                 .foregroundStyle(Theme.accent)
-            Text("正在自动发现局域网设备")
+            Text("正在自动发现附近设备")
                 .font(.headline)
-            Text(peer.authMode == "passphrase"
-                 ? "已启用共享密码模式。在另一台电脑设置相同密码后将自动连接并同步屏幕。"
-                 : "在另一台电脑打开 Crossflow 后将自动连接、同步屏幕排列并开启共享，无需手动配对。")
+            Text("另一台电脑打开 Crossflow 后将自动选择最优信道连接并同步屏幕排列。")
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 440)
+                .frame(maxWidth: 420)
             if !peer.localDisplays.isEmpty {
                 Text("已识别本机 \(peer.localDisplays.count) 块显示器")
                     .font(.caption)

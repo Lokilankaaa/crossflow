@@ -26,27 +26,36 @@ internal sealed class MainWindow : Window
     private readonly Button primaryAction = new();
     private readonly StackPanel peersPanel = new() { Spacing = 6 };
     private readonly TextBlock peerHint = new() { TextWrapping = TextWrapping.Wrap };
-    private readonly ToggleSwitch passphraseToggle = new();
-    private readonly StackPanel passphraseBoxPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
-    private readonly PasswordBox passphraseBox = new();
-    private readonly Button applyPassphraseButton = new();
+
+    // Network channel selector
+    private readonly ComboBox channelCombo = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
+    private readonly StackPanel directPeerPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
+    private readonly TextBox directPeerBox = new();
+    private readonly Button applyDirectPeerButton = new();
+    private bool updatingChannelUi;
+    private string lastChannelListSig = "";
+
+    // Minimal password configuration (已配置 / 未配置)
+    private readonly TextBlock passwordStateBadge = new();
+    private readonly StackPanel passwordButtonsRow = new() { Orientation = Orientation.Horizontal, Spacing = 6 };
+    private readonly Button editPasswordButton = new();
+    private readonly Button clearPasswordButton = new();
+    private readonly StackPanel passwordEditorPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
+    private readonly PasswordBox passwordBox = new();
+    private readonly Button savePasswordButton = new();
+    private readonly Button cancelPasswordButton = new();
+
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
     private readonly InfoBar notice = new() { IsOpen = false, IsClosable = true };
     private readonly Canvas canvas = new();
-    private readonly StackPanel inspector = new() { Spacing = 12, Padding = new Thickness(16) };
     private readonly TextBlock footerStatus = new();
 
-    private Grid? editorGrid;
-    private Border? propertiesPanel;
-    private ScrollViewer? propertiesScroll;
     private Button? undoLayout, redoLayout;
-    private bool compact;
 
     private readonly PeerMeshController peerMesh = new();
     private PeerMeshSnapshot currentSnap = PeerMeshSnapshot.Initial;
     private PeerSharedLayout? activeSharedLayout;
-    private string? activePassphrase;
     private bool coreReady, busy, closing, allowClose;
     private string? lastShownError;
 
@@ -77,7 +86,6 @@ internal sealed class MainWindow : Window
         BuildSidebar();
         BuildWorkspace();
 
-        root.SizeChanged += (_, _) => ApplyAdaptiveLayout();
         Content = root;
         AppWindow.Resize(new global::Windows.Graphics.SizeInt32(
             (int)theme.Number("window", "width"),
@@ -118,7 +126,7 @@ internal sealed class MainWindow : Window
         statusDetail.FontSize = 12;
         statusDetail.Foreground = theme.Brush("text_secondary");
         statusDetail.MinHeight = 36;
-        statusDetail.Text = "正在初始化局域网自动发现…";
+        statusDetail.Text = "正在初始化自动发现…";
 
         var statusCardContent = new StackPanel { Spacing = 8 };
         statusCardContent.Children.Add(statusHeader);
@@ -147,86 +155,129 @@ internal sealed class MainWindow : Window
         });
 
         // LAN Devices section
-        sidebar.Children.Add(new TextBlock
-        {
-            Text = "局域网设备",
-            FontSize = 12,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            Foreground = theme.Brush("text_secondary"),
-            Margin = new Thickness(2, 6, 0, 2)
-        });
-
+        sidebar.Children.Add(SectionLabel("附近设备"));
         peerHint.FontSize = 12;
         peerHint.Foreground = theme.Brush("text_secondary");
-        peerHint.Text = "在另一台电脑打开 Crossflow 即可自动发现并连接。";
+        peerHint.Text = "另一台电脑打开 Crossflow 后自动连接。";
         peerHint.Margin = new Thickness(2, 0, 0, 4);
         sidebar.Children.Add(peerHint);
         sidebar.Children.Add(peersPanel);
 
         sidebar.Children.Add(Divider());
 
-        // Security Mode (optional passphrase)
-        sidebar.Children.Add(new TextBlock
+        // Network Channel selector
+        sidebar.Children.Add(SectionLabel("网络信道"));
+        channelCombo.FontSize = 12;
+        channelCombo.SelectionChanged += async (_, _) =>
         {
-            Text = "连接安全",
-            FontSize = 12,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            Foreground = theme.Brush("text_secondary"),
-            Margin = new Thickness(2, 0, 0, 2)
-        });
-
-        passphraseToggle.Header = null;
-        passphraseToggle.OffContent = "局域网自动连接（免密码）";
-        passphraseToggle.OnContent = "仅限共享密码连接";
-        passphraseToggle.FontSize = 12;
-        passphraseToggle.Toggled += async (_, _) =>
-        {
-            passphraseBoxPanel.Visibility = passphraseToggle.IsOn ? Visibility.Visible : Visibility.Collapsed;
-            if (!passphraseToggle.IsOn && activePassphrase is not null)
+            if (updatingChannelUi) return;
+            if (channelCombo.SelectedItem is ComboBoxItem { Tag: string channelId })
             {
-                activePassphrase = null;
-                passphraseBox.Password = "";
-                await RestartPeerAsync();
+                bool showDirect = channelId != "auto";
+                directPeerPanel.Visibility = showDirect ? Visibility.Visible : Visibility.Collapsed;
+                string? direct = showDirect ? directPeerBox.Text.Trim() : null;
+                await peerMesh.SetChannelAsync(channelId, direct);
             }
         };
-        sidebar.Children.Add(passphraseToggle);
+        sidebar.Children.Add(channelCombo);
 
-        passphraseBox.PlaceholderText = "输入两台设备一致的密码";
-        passphraseBox.FontSize = 12;
-        applyPassphraseButton.Content = "应用密码并重连";
-        applyPassphraseButton.HorizontalAlignment = HorizontalAlignment.Stretch;
-        applyPassphraseButton.Background = theme.Brush("background");
-        applyPassphraseButton.BorderBrush = theme.Brush("border");
-        applyPassphraseButton.BorderThickness = new Thickness(1);
-        applyPassphraseButton.CornerRadius = new CornerRadius(8);
-        applyPassphraseButton.Padding = new Thickness(10, 7, 10, 7);
-        applyPassphraseButton.Click += async (_, _) =>
+        directPeerBox.PlaceholderText = "对方 IP（可选，如 192.168.194.59）";
+        directPeerBox.FontSize = 12;
+        applyDirectPeerButton.Content = "指定连接";
+        applyDirectPeerButton.FontSize = 12;
+        applyDirectPeerButton.HorizontalAlignment = HorizontalAlignment.Stretch;
+        applyDirectPeerButton.Background = theme.Brush("background");
+        applyDirectPeerButton.BorderBrush = theme.Brush("border");
+        applyDirectPeerButton.BorderThickness = new Thickness(1);
+        applyDirectPeerButton.CornerRadius = new CornerRadius(8);
+        applyDirectPeerButton.Padding = new Thickness(10, 6, 10, 6);
+        applyDirectPeerButton.Click += async (_, _) =>
         {
-            string secret = passphraseBox.Password.Trim();
-            if (string.IsNullOrEmpty(secret))
-            {
-                ShowNotice("请输入共享密码，或关闭开关恢复免密码自动连接。", isError: true);
-                return;
-            }
-            activePassphrase = secret;
-            ClearNotice();
-            await RestartPeerAsync();
+            string channelId = (channelCombo.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
+            await peerMesh.SetChannelAsync(channelId, directPeerBox.Text.Trim());
         };
-        passphraseBoxPanel.Children.Add(passphraseBox);
-        passphraseBoxPanel.Children.Add(applyPassphraseButton);
-        sidebar.Children.Add(passphraseBoxPanel);
+        directPeerPanel.Children.Add(directPeerBox);
+        directPeerPanel.Children.Add(applyDirectPeerButton);
+        sidebar.Children.Add(directPeerPanel);
 
         sidebar.Children.Add(Divider());
 
-        // Screens list
-        sidebar.Children.Add(new TextBlock
+        // Minimal Password Configuration (已配置 / 未配置)
+        var passHeader = new Grid { Margin = new Thickness(2, 2, 0, 2) };
+        passHeader.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        passHeader.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        passHeader.Children.Add(new TextBlock
         {
-            Text = "屏幕",
+            Text = "连接密码",
             FontSize = 12,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             Foreground = theme.Brush("text_secondary"),
-            Margin = new Thickness(2, 0, 0, 2)
+            VerticalAlignment = VerticalAlignment.Center
         });
+        passwordStateBadge.Text = "未配置";
+        passwordStateBadge.FontSize = 11;
+        passwordStateBadge.Foreground = theme.Brush("text_secondary");
+        passwordStateBadge.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(passwordStateBadge, 1);
+        passHeader.Children.Add(passwordStateBadge);
+        sidebar.Children.Add(passHeader);
+
+        StyleCompactButton(editPasswordButton, "配置密码");
+        StyleCompactButton(clearPasswordButton, "清除");
+        clearPasswordButton.Visibility = Visibility.Collapsed;
+        editPasswordButton.Click += (_, _) =>
+        {
+            passwordBox.Password = "";
+            passwordEditorPanel.Visibility = Visibility.Visible;
+            passwordButtonsRow.Visibility = Visibility.Collapsed;
+            passwordBox.Focus(FocusState.Programmatic);
+        };
+        clearPasswordButton.Click += async (_, _) =>
+        {
+            passwordBox.Password = "";
+            passwordEditorPanel.Visibility = Visibility.Collapsed;
+            passwordButtonsRow.Visibility = Visibility.Visible;
+            await peerMesh.SetPassphraseAsync(null);
+        };
+        passwordButtonsRow.Children.Add(editPasswordButton);
+        passwordButtonsRow.Children.Add(clearPasswordButton);
+        sidebar.Children.Add(passwordButtonsRow);
+
+        passwordBox.PlaceholderText = "输入共享密码";
+        passwordBox.FontSize = 12;
+        StyleCompactButton(savePasswordButton, "保存");
+        StyleCompactButton(cancelPasswordButton, "取消");
+        savePasswordButton.Click += async (_, _) =>
+        {
+            string secret = passwordBox.Password.Trim();
+            if (string.IsNullOrEmpty(secret))
+            {
+                ShowNotice("密码不能为空。", isError: true);
+                return;
+            }
+            ClearNotice();
+            passwordBox.Password = "";
+            passwordEditorPanel.Visibility = Visibility.Collapsed;
+            passwordButtonsRow.Visibility = Visibility.Visible;
+            await peerMesh.SetPassphraseAsync(secret);
+        };
+        cancelPasswordButton.Click += (_, _) =>
+        {
+            passwordBox.Password = "";
+            passwordEditorPanel.Visibility = Visibility.Collapsed;
+            passwordButtonsRow.Visibility = Visibility.Visible;
+        };
+        var editActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        editActions.Children.Add(savePasswordButton);
+        editActions.Children.Add(cancelPasswordButton);
+        passwordEditorPanel.Children.Add(passwordBox);
+        passwordEditorPanel.Children.Add(editActions);
+        sidebar.Children.Add(passwordEditorPanel);
+
+        sidebar.Children.Add(Divider());
+
+        // Screens list (identical to macOS sidebar)
+        sidebar.Children.Add(SectionLabel("屏幕"));
         sidebar.Children.Add(screenListPanel);
 
         sidebarScroll.Content = sidebar;
@@ -240,6 +291,27 @@ internal sealed class MainWindow : Window
         Grid.SetColumn(sidebarBorder, 0);
         root.Children.Add(sidebarBorder);
     }
+
+    private void StyleCompactButton(Button button, string text)
+    {
+        button.Content = text;
+        button.FontSize = 12;
+        button.Background = theme.Brush("background");
+        button.Foreground = theme.Brush("text");
+        button.BorderBrush = theme.Brush("border");
+        button.BorderThickness = new Thickness(1);
+        button.CornerRadius = new CornerRadius(8);
+        button.Padding = new Thickness(12, 6, 12, 6);
+    }
+
+    private TextBlock SectionLabel(string text) => new()
+    {
+        Text = text,
+        FontSize = 12,
+        FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        Foreground = theme.Brush("text_secondary"),
+        Margin = new Thickness(2, 4, 0, 2)
+    };
 
     private void BuildWorkspace()
     {
@@ -274,11 +346,7 @@ internal sealed class MainWindow : Window
         Grid.SetRow(notice, 1);
         workspace.Children.Add(notice);
 
-        var editor = new Grid { ColumnSpacing = 16 };
-        editorGrid = editor;
-        editor.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
-        editor.ColumnDefinitions.Add(new() { Width = new GridLength(240) });
-
+        // Full-width draggable canvas (matching macOS — no coordinate inspector!)
         var board = new Border
         {
             Background = theme.Brush("surface"),
@@ -287,23 +355,8 @@ internal sealed class MainWindow : Window
             CornerRadius = new CornerRadius(12),
             Child = canvas
         };
-        editor.Children.Add(board);
-
-        var scroll = new ScrollViewer { Content = inspector, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-        propertiesScroll = scroll;
-        var properties = new Border
-        {
-            Child = scroll,
-            Background = theme.Brush("surface"),
-            BorderThickness = new Thickness(1),
-            BorderBrush = theme.Brush("border"),
-            CornerRadius = new CornerRadius(12)
-        };
-        propertiesPanel = properties;
-        Grid.SetColumn(properties, 1);
-        editor.Children.Add(properties);
-        Grid.SetRow(editor, 2);
-        workspace.Children.Add(editor);
+        Grid.SetRow(board, 2);
+        workspace.Children.Add(board);
 
         footerStatus.FontSize = 12;
         footerStatus.Foreground = theme.Brush("text_secondary");
@@ -357,7 +410,6 @@ internal sealed class MainWindow : Window
             }
 
             Draw();
-            Inspect();
             await RestartPeerAsync();
         };
 
@@ -396,13 +448,10 @@ internal sealed class MainWindow : Window
     private async Task RestartPeerAsync()
     {
         if (closing) return;
-        try
-        {
-            await peerMesh.StartAsync(activePassphrase);
-        }
+        try { await peerMesh.StartAsync(); }
         catch (Exception ex)
         {
-            ShowNotice(ex is InvalidOperationException ? ex.Message : "无法启动局域网自动发现服务。", isError: true);
+            ShowNotice(ex is InvalidOperationException ? ex.Message : "无法启动对等自动发现服务。", isError: true);
         }
     }
 
@@ -411,15 +460,9 @@ internal sealed class MainWindow : Window
         if (closing) return;
         switch (currentSnap.State)
         {
-            case "sharing":
-                await peerMesh.PauseAsync();
-                break;
-            case "paused":
-                await peerMesh.ResumeAsync();
-                break;
-            default:
-                await RestartPeerAsync();
-                break;
+            case "sharing": await peerMesh.PauseAsync(); break;
+            case "paused": await peerMesh.ResumeAsync(); break;
+            default: await RestartPeerAsync(); break;
         }
     }
 
@@ -453,11 +496,13 @@ internal sealed class MainWindow : Window
         };
 
         string focus = FocusDescription(snap);
+        string routeInfo = snap.ActiveChannelLabel is { Length: > 0 } ch
+            ? $"{ch} · {snap.PeerAddress}"
+            : snap.PeerAddress ?? "";
         statusDetail.Text = snap.Error is not null ? snap.Error
-            : snap.State == "sharing" ? (focus.Length > 0 ? focus : $"已连接 {snap.PeerName ?? "远端设备"}（{snap.PeerAddress}）")
-            : snap.State == "paused" ? $"已连接 {snap.PeerName ?? "远端设备"} · 点击下方按钮恢复共享"
-            : snap.State == "searching"
-                ? (snap.AuthMode == "passphrase" ? "已启用共享密码 · 正在自动搜索匹配设备…" : "正在自动搜索同一局域网中的 Crossflow 设备…")
+            : snap.State == "sharing" ? (focus.Length > 0 ? focus : $"已连接 {snap.PeerName ?? "远端设备"}（{routeInfo}）")
+            : snap.State == "paused" ? $"已连接 {snap.PeerName ?? "远端设备"} · 点击恢复共享"
+            : snap.State == "searching" ? "正在自动搜索附近设备…"
             : "正在初始化…";
 
         if (snap.State == "sharing")
@@ -493,17 +538,21 @@ internal sealed class MainWindow : Window
             primaryAction.Visibility = Visibility.Collapsed;
         }
 
-        // Keep peer-mesh status/auth mismatch inside the sidebar Status Card so
-        // the main canvas never jumps vertically when one peer toggles passphrase mode.
-        bool isExpectedPeerWarning = snap.Error is not null
-            && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)
-                || snap.Error.StartsWith("连接验证失败", StringComparison.Ordinal));
-        if (snap.Error is not null && !isExpectedPeerWarning && snap.Error != lastShownError)
+        // Update password badge cleanly (no verbose text)
+        passwordStateBadge.Text = snap.PassphraseConfigured ? "已配置" : "未配置";
+        passwordStateBadge.Foreground = theme.Brush(snap.PassphraseConfigured ? "accent" : "text_secondary");
+        editPasswordButton.Content = snap.PassphraseConfigured ? "修改" : "配置密码";
+        clearPasswordButton.Visibility = snap.PassphraseConfigured ? Visibility.Visible : Visibility.Collapsed;
+
+        // Sync network channel dropdown
+        SyncChannelSelector(snap);
+
+        if (snap.Error is not null && !isAuthMismatch && snap.Error != lastShownError)
         {
             lastShownError = snap.Error;
             ShowNotice(snap.Error, isError: true);
         }
-        else if ((snap.Error is null || isExpectedPeerWarning) && lastShownError is not null)
+        else if ((snap.Error is null || isAuthMismatch) && lastShownError is not null)
         {
             lastShownError = null;
             ClearNotice();
@@ -512,6 +561,36 @@ internal sealed class MainWindow : Window
         RenderDiscoveredPeers(snap);
         SyncCanvasFromSnapshot(snap);
         UpdateControls();
+    }
+
+    private void SyncChannelSelector(PeerMeshSnapshot snap)
+    {
+        string sig = snap.SelectedChannel + "|" + string.Join(",", snap.NetworkChannels.Select(c => $"{c.Id}:{c.Label}"));
+        if (sig == lastChannelListSig) return;
+        lastChannelListSig = sig;
+        updatingChannelUi = true;
+        try
+        {
+            channelCombo.Items.Clear();
+            ComboBoxItem? match = null;
+            foreach (var ch in snap.NetworkChannels)
+            {
+                var item = new ComboBoxItem { Content = ch.Label, Tag = ch.Id };
+                channelCombo.Items.Add(item);
+                if (ch.Id == snap.SelectedChannel) match = item;
+            }
+            if (match is not null) channelCombo.SelectedItem = match;
+            else if (channelCombo.Items.Count > 0) channelCombo.SelectedIndex = 0;
+
+            bool showDirect = snap.SelectedChannel != "auto";
+            directPeerPanel.Visibility = showDirect ? Visibility.Visible : Visibility.Collapsed;
+            if (!directPeerBox.FocusState.Equals(FocusState.Keyboard) && !directPeerBox.FocusState.Equals(FocusState.Pointer))
+                directPeerBox.Text = snap.DirectPeer ?? "";
+        }
+        finally
+        {
+            updatingChannelUi = false;
+        }
     }
 
     private void RenderDiscoveredPeers(PeerMeshSnapshot snap)
@@ -554,9 +633,9 @@ internal sealed class MainWindow : Window
                 TextTrimming = TextTrimming.CharacterEllipsis
             });
             string sub = peer.Connected && snap.PeerAddress is not null
-                ? snap.PeerAddress
-                : peer.Platform == "macos" ? "macOS · 局域网" : "Windows · 局域网";
-            info.Children.Add(new TextBlock { Text = sub, FontSize = 11, Foreground = theme.Brush("text_secondary") });
+                ? (snap.ActiveChannelLabel is { Length: > 0 } ch ? $"{ch} · {snap.PeerAddress}" : snap.PeerAddress)
+                : peer.Platform == "macos" ? "macOS" : "Windows";
+            info.Children.Add(new TextBlock { Text = sub, FontSize = 11, Foreground = theme.Brush("text_secondary"), TextTrimming = TextTrimming.CharacterEllipsis });
             Grid.SetColumn(info, 1);
             row.Children.Add(info);
 
@@ -603,7 +682,6 @@ internal sealed class MainWindow : Window
                 lastDrawnFocus = nextFocus;
                 RefreshScreenList();
                 Draw();
-                Inspect();
                 return;
             }
         }
@@ -623,7 +701,6 @@ internal sealed class MainWindow : Window
                 lastDrawnFocus = null;
                 RefreshScreenList();
                 Draw();
-                Inspect();
                 return;
             }
         }
@@ -631,7 +708,11 @@ internal sealed class MainWindow : Window
         if (nextFocus != lastDrawnFocus)
         {
             lastDrawnFocus = nextFocus;
-            if (layout.Screens.Count > 0) Draw();
+            if (layout.Screens.Count > 0)
+            {
+                Draw();
+                RefreshScreenList();
+            }
         }
     }
 
@@ -670,7 +751,6 @@ internal sealed class MainWindow : Window
         bool editable = CanEditLayout;
         if (undoLayout is not null) undoLayout.IsEnabled = editable && layoutHistory.CanUndo;
         if (redoLayout is not null) redoLayout.IsEnabled = editable && layoutHistory.CanRedo;
-        if (propertiesScroll is not null) propertiesScroll.IsEnabled = editable;
         if (!editable && dragOriginal is not null) CancelDrag();
     }
 
@@ -684,34 +764,6 @@ internal sealed class MainWindow : Window
 
     private void ClearNotice() => notice.IsOpen = false;
 
-    private void ApplyAdaptiveLayout()
-    {
-        bool nextCompact = root.ActualWidth > 0 && root.ActualWidth < 940;
-        if (nextCompact != compact && dragOriginal is not null) CancelDrag();
-        compact = nextCompact;
-        if (editorGrid is null || propertiesPanel is null || propertiesScroll is null) return;
-        editorGrid.ColumnDefinitions.Clear();
-        editorGrid.RowDefinitions.Clear();
-        editorGrid.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
-        if (compact)
-        {
-            editorGrid.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
-            editorGrid.RowDefinitions.Add(new() { Height = GridLength.Auto });
-            editorGrid.ColumnSpacing = 0;
-            editorGrid.RowSpacing = 12;
-            Grid.SetColumn(propertiesPanel, 0);
-            Grid.SetRow(propertiesPanel, 1);
-        }
-        else
-        {
-            editorGrid.ColumnDefinitions.Add(new() { Width = new GridLength(240) });
-            editorGrid.ColumnSpacing = 16;
-            editorGrid.RowSpacing = 0;
-            Grid.SetColumn(propertiesPanel, 1);
-            Grid.SetRow(propertiesPanel, 0);
-        }
-    }
-
     private void RefreshScreenList()
     {
         screenListPanel.Children.Clear();
@@ -720,6 +772,7 @@ internal sealed class MainWindow : Window
             screenListPanel.Children.Add(Text("正在读取显示器…", "caption", true));
             return;
         }
+        var focusId = currentSnap.RouteEnabled ? currentSnap.FocusScreenId : null;
         int groupIndex = 0;
         foreach (var group in layout.Screens.GroupBy(s => s.DeviceId))
         {
@@ -730,12 +783,12 @@ internal sealed class MainWindow : Window
             screenListPanel.Children.Add(heading);
             foreach (var screen in group)
             {
-                bool active = selectedScreenId == screen.Id;
+                bool active = selectedScreenId == screen.Id || focusId == screen.Id;
                 var line = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
                 line.Children.Add(new FontIcon { Glyph = screen.Height > screen.Width ? "\uE8EA" : "\uE7F4", FontSize = 14, Foreground = color });
                 line.Children.Add(new TextBlock
                 {
-                    Text = ScreenName(screen.Id),
+                    Text = $"{ScreenName(screen.Id)} ({screen.Width:g}×{screen.Height:g})",
                     FontSize = 12,
                     Foreground = theme.Brush("text"),
                     TextTrimming = TextTrimming.CharacterEllipsis
@@ -754,7 +807,6 @@ internal sealed class MainWindow : Window
                 {
                     selectedScreenId = screen.Id;
                     Draw();
-                    Inspect();
                     RefreshScreenList();
                 };
                 screenListPanel.Children.Add(btn);
@@ -799,7 +851,6 @@ internal sealed class MainWindow : Window
         {
             busy = false;
             Draw();
-            Inspect();
             RefreshScreenList();
             UpdateControls();
         }
@@ -908,7 +959,6 @@ internal sealed class MainWindow : Window
             button.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
             {
                 selectedScreenId = screen.Id;
-                Inspect();
                 RefreshScreenList();
                 if (!CanEditLayout || !e.GetCurrentPoint(canvas).Properties.IsLeftButtonPressed) return;
                 if (!canvas.CapturePointer(e.Pointer)) return;
@@ -941,7 +991,7 @@ internal sealed class MainWindow : Window
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(999),
                 Padding = new Thickness(14, 6, 14, 6),
-                Child = Text("正在自动发现局域网内的 Crossflow 设备…", "caption", true)
+                Child = Text("正在自动发现附近 Crossflow 设备…", "caption", true)
             };
             Canvas.SetLeft(banner, 16);
             Canvas.SetTop(banner, 14);
@@ -996,36 +1046,6 @@ internal sealed class MainWindow : Window
         dragVisual = null;
         canvas.ReleasePointerCaptures();
         Draw();
-    }
-
-    private void Inspect()
-    {
-        var screen = layout.Screens.FirstOrDefault(s => s.Id == selectedScreenId);
-        inspector.Children.Clear();
-        inspector.Children.Add(Text(screen is null ? "屏幕属性" : ScreenName(screen.Id), "section"));
-        if (screen is null)
-        {
-            inspector.Children.Add(Text("点击画布中的任意屏幕查看或微调坐标。", "caption", true));
-            return;
-        }
-        inspector.Children.Add(Text(DeviceName(screen.DeviceId), "caption", true));
-        inspector.Children.Add(Text($"{screen.Width:g} × {screen.Height:g}", "caption", true));
-
-        var x = new NumberBox { Header = "水平坐标 X", Value = screen.X, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact };
-        var y = new NumberBox { Header = "垂直坐标 Y", Value = screen.Y, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact };
-        AutomationProperties.SetAutomationId(x, "property-x");
-        AutomationProperties.SetAutomationId(y, "property-y");
-        inspector.Children.Add(x);
-        inspector.Children.Add(y);
-
-        var save = new Button { Content = "应用并同步", HorizontalAlignment = HorizontalAlignment.Stretch, IsEnabled = CanEditLayout };
-        AutomationProperties.SetAutomationId(save, "save-properties");
-        save.Click += async (_, _) =>
-        {
-            var candidate = screen with { X = x.Value, Y = y.Value };
-            await Commit(Replace(candidate));
-        };
-        inspector.Children.Add(save);
     }
 
     private Button ToolButton(string title, string aid, Action run)

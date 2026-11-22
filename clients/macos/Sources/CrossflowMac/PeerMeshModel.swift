@@ -1,6 +1,19 @@
 import Foundation
 import Observation
 
+struct NetworkChannelInfo: Sendable, Equatable, Decodable, Identifiable {
+    let id: String
+    let label: String
+    let kind: String
+    let ip: String?
+    let interfaceName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, kind, ip
+        case interfaceName = "interface_name"
+    }
+}
+
 struct PeerDisplayInfo: Sendable, Equatable, Decodable, Identifiable {
     let nativeID: String
     let wireID: UInt32
@@ -82,6 +95,11 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let localDeviceID: String
     let localName: String
     let authMode: String
+    let passphraseConfigured: Bool
+    let selectedChannel: String
+    let directPeer: String?
+    let activeChannelLabel: String?
+    let networkChannels: [NetworkChannelInfo]
     let routeEnabled: Bool
     let focusDeviceID: String?
     let focusScreenID: String?
@@ -100,6 +118,11 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case localDeviceID = "local_device_id"
         case localName = "local_name"
         case authMode = "auth_mode"
+        case passphraseConfigured = "passphrase_configured"
+        case selectedChannel = "selected_channel"
+        case directPeer = "direct_peer"
+        case activeChannelLabel = "active_channel_label"
+        case networkChannels = "network_channels"
         case routeEnabled = "route_enabled"
         case focusDeviceID = "focus_device_id"
         case focusScreenID = "focus_screen_id"
@@ -119,6 +142,22 @@ private struct ApplyLayoutCommandWire: Encodable {
     let layout: PeerSharedLayoutWire
 }
 
+private struct SetChannelCommandWire: Encodable {
+    let op = "set_channel"
+    let channel: String
+    let directPeer: String?
+
+    enum CodingKeys: String, CodingKey {
+        case op, channel
+        case directPeer = "direct_peer"
+    }
+}
+
+private struct SetPassphraseCommandWire: Encodable {
+    let op = "set_passphrase"
+    let passphrase: String?
+}
+
 private final class PeerProcessRunner: @unchecked Sendable {
     private let queue = DispatchQueue(label: "local.crossflow.peer-mesh", qos: .userInitiated)
     private let lock = NSLock()
@@ -129,7 +168,6 @@ private final class PeerProcessRunner: @unchecked Sendable {
     func start(
         executable: URL,
         arguments: [String],
-        passphrase: String?,
         onStatus: @escaping @Sendable (PeerStatusWire) -> Void,
         onExit: @escaping @Sendable (Int32, Bool) -> Void
     ) {
@@ -139,11 +177,7 @@ private final class PeerProcessRunner: @unchecked Sendable {
             proc.executableURL = executable
             proc.arguments = arguments
             var env = ProcessInfo.processInfo.environment
-            if let secret = passphrase?.trimmingCharacters(in: .whitespacesAndNewlines), !secret.isEmpty {
-                env["CROSSFLOW_LAN_PASSPHRASE"] = secret
-            } else {
-                env.removeValue(forKey: "CROSSFLOW_LAN_PASSPHRASE")
-            }
+            env.removeValue(forKey: "CROSSFLOW_LAN_PASSPHRASE")
             proc.environment = env
 
             let stdinPipe = Pipe()
@@ -170,7 +204,6 @@ private final class PeerProcessRunner: @unchecked Sendable {
                 return
             }
 
-            // Drain stderr asynchronously so child never blocks on stderr pipe.
             DispatchQueue.global(qos: .utility).async {
                 let handle = stderrPipe.fileHandleForReading
                 while true {
@@ -179,7 +212,6 @@ private final class PeerProcessRunner: @unchecked Sendable {
                 }
             }
 
-            // Read stdout line-by-line on a dedicated background thread.
             DispatchQueue.global(qos: .userInitiated).async {
                 let handle = stdoutPipe.fileHandleForReading
                 var buffer = Data()
@@ -267,6 +299,11 @@ final class PeerMeshModel {
     var localDeviceID: String?
     var localName: String = Host.current().localizedName ?? "这台 Mac"
     var authMode: String = "open"
+    var passphraseConfigured: Bool = false
+    var selectedChannel: String = "auto"
+    var directPeer: String = ""
+    var activeChannelLabel: String?
+    var networkChannels: [NetworkChannelInfo] = []
     var routeEnabled: Bool = false
     var focusDeviceID: String?
     var focusScreenID: String?
@@ -278,12 +315,11 @@ final class PeerMeshModel {
     var discoveredPeers: [DiscoveredPeerInfo] = []
     var sharedLayout: SharedLayout?
     var error: String?
-    var passphrase: String = ""
-    var usePassphrase: Bool = false
 
     @ObservationIgnored private let runner = PeerProcessRunner()
     @ObservationIgnored private var generation: Int = 0
     @ObservationIgnored private var shuttingDown = false
+    @ObservationIgnored private var syncedDirectPeerOnce = false
 
     var isSharing: Bool { state == "sharing" && routeEnabled }
     var isConnected: Bool { state == "sharing" || state == "paused" }
@@ -304,28 +340,29 @@ final class PeerMeshModel {
     var statusDetail: String {
         if state == "startup_rejected" {
             let perm = (error ?? "").contains("accessibility") ? "设备控制和数据访问（辅助功能）" : "输入监控"
-            return "请在系统设置 → 隐私与安全性 → \(perm) 中允许 Crossflow，然后重新打开或点击重新检测。"
+            return "请在系统设置 → 隐私与安全性 → \(perm) 中允许 Crossflow，然后点击重新检测。"
         }
         if let err = error, !err.isEmpty { return err }
         if state == "sharing" {
+            let route = activeChannelLabel.map { ch in
+                peerAddress.map { "\(ch) · \($0)" } ?? ch
+            } ?? (peerAddress ?? "")
             if let focusDev = focusDeviceID {
                 let devLabel = (focusDev == localDeviceID) ? "这台 Mac" : (peerName ?? "另一台电脑")
-                return "当前控制：\(devLabel)" + (peerAddress.map { " · \($0)" } ?? "")
+                return route.isEmpty ? "当前控制：\(devLabel)" : "当前控制：\(devLabel)\n\(route)"
             }
-            return "已连接 \(peerName ?? "远端设备") · 移动鼠标穿过相邻边缘即可跨屏"
+            return "已连接 \(peerName ?? "远端设备")" + (route.isEmpty ? "" : "（\(route)）")
         }
         if state == "paused" {
-            return "已连接 \(peerName ?? "远端设备") · 点击下方按钮恢复共享"
+            return "已连接 \(peerName ?? "远端设备") · 点击恢复共享"
         }
         if state == "searching" {
-            return authMode == "passphrase"
-                ? "已启用共享密码 · 正在自动搜索匹配设备…"
-                : "正在自动搜索同一局域网中的 Crossflow 设备…"
+            return "正在自动搜索附近设备…"
         }
-        return "正在初始化局域网自动发现…"
+        return "正在初始化自动发现…"
     }
 
-    func start(secret: String? = nil) {
+    func start() {
         guard !shuttingDown else { return }
         guard let exe = crossflowExecutable() else {
             state = "error"
@@ -334,10 +371,7 @@ final class PeerMeshModel {
         }
         generation += 1
         let gen = generation
-        let activeSecret = secret ?? (usePassphrase ? passphrase : nil)
-        let trimmed = activeSecret?.trimmingCharacters(in: .whitespacesAndNewlines)
         state = "starting"
-        authMode = (trimmed?.isEmpty == false) ? "passphrase" : "open"
         routeEnabled = false
         focusDeviceID = nil
         focusScreenID = nil
@@ -356,7 +390,6 @@ final class PeerMeshModel {
         runner.start(
             executable: exe,
             arguments: args,
-            passphrase: trimmed,
             onStatus: { [weak self] status in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == gen else { return }
@@ -382,6 +415,14 @@ final class PeerMeshModel {
         localDeviceID = s.localDeviceID
         localName = s.localName
         authMode = s.authMode
+        passphraseConfigured = s.passphraseConfigured
+        selectedChannel = s.selectedChannel
+        if !syncedDirectPeerOnce {
+            syncedDirectPeerOnce = true
+            directPeer = s.directPeer ?? ""
+        }
+        activeChannelLabel = s.activeChannelLabel
+        networkChannels = s.networkChannels
         routeEnabled = s.routeEnabled
         focusDeviceID = s.focusDeviceID
         focusScreenID = s.focusScreenID
@@ -401,6 +442,26 @@ final class PeerMeshModel {
 
     func resume() {
         runner.send(Data("{\"op\":\"resume\"}".utf8))
+    }
+
+    func setChannel(_ channel: String, directPeer peerIP: String?) {
+        let trimmed = peerIP?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cmd = SetChannelCommandWire(
+            channel: channel,
+            directPeer: (trimmed?.isEmpty == false) ? trimmed : nil
+        )
+        if let data = try? JSONEncoder().encode(cmd) {
+            selectedChannel = channel
+            runner.send(data)
+        }
+    }
+
+    func setPassphrase(_ secret: String?) {
+        let trimmed = secret?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cmd = SetPassphraseCommandWire(passphrase: (trimmed?.isEmpty == false) ? trimmed : nil)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
     }
 
     func applyLayout(_ layout: SharedLayout) {

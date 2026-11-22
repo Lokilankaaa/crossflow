@@ -1,13 +1,15 @@
 //! Symmetric peer-to-peer LAN mesh runner.
 //!
 //! Both Windows and macOS execute this identical peer node:
-//! - Binds a local TCP listener and advertises via mDNS (`_crossflow._tcp.local.`).
-//! - Browses the LAN for other compatible Crossflow peers.
-//! - Uses deterministic ID tie-breaking (smaller discovery ID dials; larger waits)
-//!   so two peers never collide, while any peer editing the arrangement can
-//!   proactively push its updated SharedLayout over a fast reconnect.
+//! - Enumerates active local IPv4 network channels (Wired, Wi-Fi, ZeroTier/VLAN)
+//!   and persists channel + optional shared passphrase settings in `peer-config.json`.
+//! - Binds a local TCP listener (all interfaces in `auto` mode, or a chosen interface
+//!   when a specific channel is selected) and advertises via mDNS (`_crossflow._tcp.local.`).
+//! - Browses the LAN for compatible Crossflow peers and prioritizes the best channel
+//!   automatically (Direct Wired > LAN Wired > Wi-Fi > ZeroTier), with optional direct
+//!   peer IP support for virtual networks where mDNS multicast does not traverse.
 //! - Encrypts every session with Noise_NNpsk0 (open LAN auto-connect by default,
-//!   or isolated with an optional user-supplied shared passphrase).
+//!   or isolated with an optional user-configured shared passphrase).
 //! - Automatically builds or restores the real multi-display layout and enables
 //!   bidirectional sharing once connected unless the user explicitly paused.
 
@@ -28,7 +30,7 @@ use snow::resolvers::{CryptoResolver, DefaultResolver};
 use std::{
     fs,
     io::{BufRead, BufReader, ErrorKind, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process,
     sync::{
@@ -41,6 +43,7 @@ use std::{
 };
 
 pub const PEER_UI_PROTOCOL: u8 = 3;
+const DEFAULT_PORT: u16 = 24800;
 
 pub struct Options {
     pub bind: SocketAddr,
@@ -48,6 +51,50 @@ pub struct Options {
     pub passphrase: Option<String>,
     pub seconds: f64,
     pub max_hz: u32,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct NetworkChannelInfo {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub ip: Option<String>,
+    pub interface_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalChannel {
+    id: String,
+    label: String,
+    kind: &'static str,
+    priority: u8,
+    ip: Ipv4Addr,
+    netmask: Ipv4Addr,
+    interface_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PeerConfig {
+    #[serde(default = "default_channel")]
+    channel: String,
+    #[serde(default)]
+    direct_peer: Option<String>,
+    #[serde(default)]
+    passphrase: Option<String>,
+}
+
+fn default_channel() -> String {
+    "auto".into()
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        Self {
+            channel: default_channel(),
+            direct_peer: None,
+            passphrase: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -65,6 +112,11 @@ struct PeerUiStatus {
     local_device_id: String,
     local_name: String,
     auth_mode: &'static str,
+    passphrase_configured: bool,
+    selected_channel: String,
+    direct_peer: Option<String>,
+    active_channel_label: Option<String>,
+    network_channels: Vec<NetworkChannelInfo>,
     route_enabled: bool,
     focus_device_id: Option<String>,
     focus_screen_id: Option<String>,
@@ -84,7 +136,17 @@ enum UiCommand {
     Pause,
     Resume,
     Stop,
-    ApplyLayout { layout: SharedLayout },
+    ApplyLayout {
+        layout: SharedLayout,
+    },
+    SetChannel {
+        channel: String,
+        #[serde(default)]
+        direct_peer: Option<String>,
+    },
+    SetPassphrase {
+        passphrase: Option<String>,
+    },
 }
 
 fn app_data_root() -> Result<PathBuf> {
@@ -97,6 +159,68 @@ fn app_data_root() -> Result<PathBuf> {
     {
         let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?;
         Ok(PathBuf::from(base).join("Crossflow"))
+    }
+}
+
+fn config_path() -> Result<PathBuf> {
+    let root = app_data_root()?;
+    fs::create_dir_all(&root)?;
+    Ok(root.join("peer-config.json"))
+}
+
+fn load_config(env_passphrase: Option<String>) -> PeerConfig {
+    let mut cfg = config_path()
+        .ok()
+        .and_then(|p| fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<PeerConfig>(&b).ok())
+        .unwrap_or_default();
+    if cfg.channel.trim().is_empty() {
+        cfg.channel = default_channel();
+    }
+    cfg.direct_peer = cfg
+        .direct_peer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    cfg.passphrase = cfg
+        .passphrase
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if let Some(secret) = env_passphrase
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cfg.passphrase = Some(secret.to_string());
+    }
+    cfg
+}
+
+fn save_config(cfg: &PeerConfig) {
+    let Ok(path) = config_path() else { return };
+    let Ok(bytes) = serde_json::to_vec_pretty(cfg) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            let _ = file.write_all(&bytes);
+            let _ = file.flush();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::write(&path, bytes);
     }
 }
 
@@ -164,29 +288,211 @@ fn default_friendly_name() -> String {
     discovery::default_device_name().to_string()
 }
 
-fn is_direct_lan_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    // Prioritize point-to-point direct ethernet (192.168.50.x or link-local 169.254.x.x)
-    (octets[0] == 192 && octets[1] == 168 && octets[2] == 50)
-        || (octets[0] == 169 && octets[1] == 254)
+fn is_benchmark_tun_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    // 198.18.0.0/15 is RFC 2544 (used by Clash/Meta fake-IP TUN adapters)
+    o[0] == 198 && (o[1] == 18 || o[1] == 19)
 }
 
-fn ranked_addresses(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+fn is_cgnat_vpn_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+fn is_direct_ethernet_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 192 && o[1] == 168 && o[2] == 50
+}
+
+fn classify_interface(name: &str, ip: Ipv4Addr) -> (&'static str, &'static str, u8) {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("zerotier")
+        || lower.starts_with("zt")
+        || lower.starts_with("feth")
+        || (ip.octets()[0] == 192 && ip.octets()[1] == 168 && ip.octets()[2] == 194)
+    {
+        return ("zerotier", "ZeroTier 虚拟局域网", 3);
+    }
+    if lower.contains("tailscale")
+        || lower.contains("wintun")
+        || lower.contains("wireguard")
+        || lower.starts_with("wg")
+        || lower.starts_with("utun")
+        || is_cgnat_vpn_ipv4(ip)
+    {
+        return ("zerotier", "虚拟局域网", 3);
+    }
+    if is_direct_ethernet_ipv4(ip) {
+        return ("wired", "有线直连", 0);
+    }
+    if lower.contains("wlan")
+        || lower.contains("wi-fi")
+        || lower.contains("wifi")
+        || lower.contains("wireless")
+        || (cfg!(target_os = "macos") && lower == "en0")
+    {
+        return ("wifi", "Wi-Fi", 2);
+    }
+    if name.contains("以太网")
+        || lower.contains("ethernet")
+        || lower.starts_with("eth")
+        || (cfg!(target_os = "macos") && lower.starts_with("en"))
+    {
+        return ("wired", "有线网络", 1);
+    }
+    ("lan", "局域网", 2)
+}
+
+fn enumerate_local_channels() -> Vec<LocalChannel> {
+    let Ok(addrs) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut channels = Vec::new();
+    let mut seen_ips = std::collections::HashSet::new();
+    for iface in addrs {
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            continue;
+        };
+        let ip = v4.ip;
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || ip.is_link_local()
+            || is_benchmark_tun_ipv4(ip)
+        {
+            continue;
+        }
+        let lower = iface.name.to_ascii_lowercase();
+        if lower.contains("meta")
+            || lower.contains("bluetooth")
+            || iface.name.contains("蓝牙")
+            || lower.contains("vethernet (wsl")
+        {
+            continue;
+        }
+        if !seen_ips.insert(ip) {
+            continue;
+        }
+        let (kind, prefix, priority) = classify_interface(&iface.name, ip);
+        channels.push(LocalChannel {
+            id: ip.to_string(),
+            label: format!("{prefix} · {ip}"),
+            kind,
+            priority,
+            ip,
+            netmask: v4.netmask,
+            interface_name: iface.name,
+        });
+    }
+    channels.sort_by(|a, b| (a.priority, a.ip.octets()).cmp(&(b.priority, b.ip.octets())));
+    channels
+}
+
+fn channel_infos(local: &[LocalChannel]) -> Vec<NetworkChannelInfo> {
+    let mut list = Vec::with_capacity(local.len() + 1);
+    list.push(NetworkChannelInfo {
+        id: "auto".into(),
+        label: "自动选择最优".into(),
+        kind: "auto".into(),
+        ip: None,
+        interface_name: None,
+    });
+    for ch in local {
+        list.push(NetworkChannelInfo {
+            id: ch.id.clone(),
+            label: ch.label.clone(),
+            kind: ch.kind.into(),
+            ip: Some(ch.ip.to_string()),
+            interface_name: Some(ch.interface_name.clone()),
+        });
+    }
+    list
+}
+
+fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool {
+    let m = u32::from(mask);
+    (u32::from(a) & m) == (u32::from(b) & m)
+}
+
+fn classify_active_channel(peer_addr: SocketAddr, local: &[LocalChannel]) -> Option<String> {
+    let IpAddr::V4(v4) = peer_addr.ip() else {
+        return Some("IPv6".into());
+    };
+    if let Some(ch) = local.iter().find(|c| same_subnet(v4, c.ip, c.netmask)) {
+        let short = ch.label.split(" · ").next().unwrap_or(&ch.label);
+        return Some(short.to_string());
+    }
+    let (_, prefix, _) = classify_interface("", v4);
+    Some(prefix.to_string())
+}
+
+fn ranked_addresses(
+    addresses: &[SocketAddr],
+    selected_channel: &str,
+    local: &[LocalChannel],
+) -> Vec<SocketAddr> {
+    let pinned = if selected_channel != "auto" {
+        local.iter().find(|c| c.id == selected_channel)
+    } else {
+        None
+    };
+
     let mut ranked: Vec<SocketAddr> = addresses
         .iter()
         .copied()
         .filter(|addr| match addr.ip() {
-            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_multicast(),
-            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
+            IpAddr::V4(v4) => {
+                if v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+                    || is_benchmark_tun_ipv4(v4)
+                {
+                    return false;
+                }
+                if let Some(ch) = pinned {
+                    same_subnet(v4, ch.ip, ch.netmask)
+                } else {
+                    !v4.is_link_local()
+                }
+            }
+            IpAddr::V6(v6) => {
+                pinned.is_none()
+                    && !v6.is_loopback()
+                    && !v6.is_unspecified()
+                    && !v6.is_multicast()
+            }
         })
         .collect();
+
     ranked.sort_by_key(|addr| match addr.ip() {
-        IpAddr::V4(v4) if is_direct_lan_ipv4(v4) => (0u8, addr.to_string()),
-        IpAddr::V4(v4) if v4.is_private() => (1u8, addr.to_string()),
-        IpAddr::V4(_) => (2u8, addr.to_string()),
-        IpAddr::V6(_) => (3u8, addr.to_string()),
+        IpAddr::V4(v4) => {
+            if let Some(ch) = local.iter().find(|c| same_subnet(v4, c.ip, c.netmask)) {
+                (ch.priority, addr.to_string())
+            } else if is_direct_ethernet_ipv4(v4) {
+                (0u8, addr.to_string())
+            } else if v4.is_private() {
+                (4u8, addr.to_string())
+            } else {
+                (5u8, addr.to_string())
+            }
+        }
+        IpAddr::V6(_) => (6u8, addr.to_string()),
     });
     ranked
+}
+
+fn parse_direct_peer(raw: Option<&str>) -> Option<SocketAddr> {
+    let text = raw?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(sock) = text.parse::<SocketAddr>() {
+        return Some(sock);
+    }
+    if let Ok(ip) = text.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, DEFAULT_PORT));
+    }
+    None
 }
 
 fn spawn_stdin_reader(stop: Arc<AtomicBool>) -> Receiver<UiCommand> {
@@ -201,7 +507,6 @@ fn spawn_stdin_reader(stop: Arc<AtomicBool>) -> Receiver<UiCommand> {
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) => {
-                        // Parent GUI closed its pipe -> stop cleanly.
                         stop.store(true, Ordering::Release);
                         break;
                     }
@@ -279,7 +584,10 @@ struct PeerHost<'a> {
     local_device_id: &'a str,
     local_name: &'a str,
     local_displays: Vec<Display>,
-    auth_mode: &'static str,
+    config: &'a mut PeerConfig,
+    reconfigure_requested: &'a mut bool,
+    network_channels: Vec<NetworkChannelInfo>,
+    active_channel_label: Option<String>,
     listen_endpoint: Option<String>,
     peer_device_id: String,
     peer_name: String,
@@ -338,12 +646,43 @@ impl PeerHost<'_> {
                     if layout.validate().is_ok() {
                         save_layout(&self.peer_device_id, &layout);
                         *self.pending_layout_push = Some((self.peer_device_id.clone(), layout));
-                        // Peacefully end this session so we immediately reconnect as initiator
-                        // and push the updated layout to the peer in ~50ms.
                         self.session_stop.store(true, Ordering::Release);
                         self.pending = Some(Command::Stop);
                         break;
                     }
+                }
+                Ok(UiCommand::SetChannel {
+                    channel,
+                    direct_peer,
+                }) => {
+                    let clean = channel.trim();
+                    self.config.channel = if clean.is_empty() {
+                        default_channel()
+                    } else {
+                        clean.to_string()
+                    };
+                    self.config.direct_peer = direct_peer
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string);
+                    save_config(self.config);
+                    *self.reconfigure_requested = true;
+                    self.session_stop.store(true, Ordering::Release);
+                    self.pending = Some(Command::Stop);
+                    break;
+                }
+                Ok(UiCommand::SetPassphrase { passphrase }) => {
+                    self.config.passphrase = passphrase
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string);
+                    save_config(self.config);
+                    *self.reconfigure_requested = true;
+                    self.session_stop.store(true, Ordering::Release);
+                    self.pending = Some(Command::Stop);
+                    break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -362,12 +701,9 @@ impl PeerHost<'_> {
         };
         if shortcut == Shortcut::Stop {
             if let Some(reason) = self.capture.failure() {
-                // Capture fault ends only this session; outer loop stays alive and recovers.
                 self.session_stop.store(true, Ordering::Release);
                 anyhow::bail!(reason);
             }
-            // User hit Escape / Ctrl+Alt+Esc emergency shortcut: pause sharing immediately
-            // without killing the peer service so user can resume cleanly when ready.
             *self.user_paused = true;
             return Ok(Some(Command::Pause));
         }
@@ -422,8 +758,6 @@ impl Host for PeerHost<'_> {
             *self.user_paused = false;
         }
         self.epoch = status.endpoint.epoch;
-        // Initiator auto-enables sharing on initial ready unless user explicitly paused
-        // (avoids simultaneous enable races while bringing both peers straight into sharing).
         if self.initiator
             && !self.auto_enable_sent
             && !*self.user_paused
@@ -437,11 +771,15 @@ impl Host for PeerHost<'_> {
         let state_changed = self.last_emitted_enabled != Some(status.endpoint.enabled)
             || self.last_emitted_focus_screen != status.focus_screen_id
             || self.last_emitted_peer_count != discovered.len();
-        if state_changed || self.last_emit.elapsed() >= Duration::from_millis(250) || self.pending.is_some() {
+        if state_changed
+            || self.last_emit.elapsed() >= Duration::from_millis(250)
+            || self.pending.is_some()
+        {
             self.last_emit = Instant::now();
             self.last_emitted_enabled = Some(status.endpoint.enabled);
             self.last_emitted_focus_screen = status.focus_screen_id.clone();
             self.last_emitted_peer_count = discovered.len();
+            let has_pass = self.config.passphrase.is_some();
             emit_status(
                 self.stdout,
                 &PeerUiStatus {
@@ -453,7 +791,12 @@ impl Host for PeerHost<'_> {
                     },
                     local_device_id: self.local_device_id.into(),
                     local_name: self.local_name.into(),
-                    auth_mode: self.auth_mode,
+                    auth_mode: if has_pass { "passphrase" } else { "open" },
+                    passphrase_configured: has_pass,
+                    selected_channel: self.config.channel.clone(),
+                    direct_peer: self.config.direct_peer.clone(),
+                    active_channel_label: self.active_channel_label.clone(),
+                    network_channels: self.network_channels.clone(),
                     route_enabled: status.endpoint.enabled,
                     focus_device_id: status.focus_device_id.clone(),
                     focus_screen_id: status.focus_screen_id.clone(),
@@ -494,21 +837,13 @@ pub fn run(
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(default_friendly_name);
-    let passphrase = options
-        .passphrase
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-    let auth_mode = if passphrase.is_some() {
-        "passphrase"
-    } else {
-        "open"
-    };
+    let mut config = load_config(options.passphrase);
 
     #[cfg(target_os = "macos")]
     {
         if let Err(permission) = crate::platform::macos::preflight_input_permissions() {
+            let local_channels = enumerate_local_channels();
+            let has_pass = config.passphrase.is_some();
             emit_status(
                 &stdout,
                 &PeerUiStatus {
@@ -516,7 +851,12 @@ pub fn run(
                     state: "startup_rejected".into(),
                     local_device_id,
                     local_name,
-                    auth_mode,
+                    auth_mode: if has_pass { "passphrase" } else { "open" },
+                    passphrase_configured: has_pass,
+                    selected_channel: config.channel.clone(),
+                    direct_peer: config.direct_peer.clone(),
+                    active_channel_label: None,
+                    network_channels: channel_infos(&local_channels),
                     route_enabled: false,
                     focus_device_id: None,
                     focus_screen_id: None,
@@ -535,338 +875,435 @@ pub fn run(
         }
     }
 
-    let listener = TcpListener::bind(options.bind).or_else(|_| {
-        TcpListener::bind(SocketAddr::new(options.bind.ip(), 0))
-    })?;
-    listener.set_nonblocking(true)?;
-    let bound = listener.local_addr()?;
-    let listen_endpoint = Some(bound.to_string());
-
-    let mut discovery = DiscoveryHandle::start(DiscoveryConfig {
-        local_device_id: Some(local_discovery_id.clone()),
-        advertisement: Some(Advertisement {
-            device_id: local_discovery_id.clone(),
-            friendly_name: local_name.clone(),
-            platform: std::env::consts::OS.into(),
-            protocol: u16::from(crate::protocol::WIRE_VERSION),
-            port: bound.port(),
-            listen_ip: bound.ip(),
-        }),
-        compatible_protocol: u16::from(crate::protocol::WIRE_VERSION),
-    })?;
-
     let rx = spawn_stdin_reader(stop.clone());
     let log = writer.log.clone();
     let deadline = Instant::now() + Duration::from_secs_f64(options.seconds);
     let mut user_paused = false;
     let mut pending_layout_push: Option<(String, SharedLayout)> = None;
-    let mut last_error: Option<String> = None;
-    let mut auth_backoff_until = Instant::now();
-    let mut last_status_emit = Instant::now() - Duration::from_secs(1);
-    let mut last_dial_attempt = Instant::now() - Duration::from_secs(1);
-    let mut searching_since = Instant::now();
 
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-            // Drain UI commands while idle/searching
-            loop {
-                match rx.try_recv() {
-                    Ok(UiCommand::Stop) | Err(TryRecvError::Disconnected) => {
-                        stop.store(true, Ordering::Release);
-                        break;
-                    }
-                    Ok(UiCommand::Pause) => user_paused = true,
-                    Ok(UiCommand::Resume) => user_paused = false,
-                    Ok(UiCommand::ApplyLayout { layout }) => {
-                        if layout.validate().is_ok() {
-                            let target = if layout.source_device_id == local_device_id {
-                                layout.receiver_device_id.clone()
-                            } else {
-                                layout.source_device_id.clone()
-                            };
-                            save_layout(&target, &layout);
-                            pending_layout_push = Some((target, layout));
+            let mut local_channels = enumerate_local_channels();
+            let mut last_channel_refresh = Instant::now();
+            if config.channel != "auto" && !local_channels.iter().any(|c| c.id == config.channel) {
+                // Selected IP disappeared (e.g. Ethernet unplugged): fall back gracefully to auto.
+                config.channel = default_channel();
+            }
+
+            let bind_ip: IpAddr = if config.channel == "auto" {
+                options.bind.ip()
+            } else {
+                config
+                    .channel
+                    .parse::<Ipv4Addr>()
+                    .map(IpAddr::V4)
+                    .unwrap_or_else(|_| options.bind.ip())
+            };
+            let bind_addr = SocketAddr::new(bind_ip, options.bind.port());
+            let listener = TcpListener::bind(bind_addr)
+                .or_else(|_| TcpListener::bind(SocketAddr::new(bind_ip, 0)))
+                .or_else(|_| TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)))?;
+            listener.set_nonblocking(true)?;
+            let bound = listener.local_addr()?;
+            let listen_endpoint = Some(bound.to_string());
+
+            let mut discovery = DiscoveryHandle::start(DiscoveryConfig {
+                local_device_id: Some(local_discovery_id.clone()),
+                advertisement: Some(Advertisement {
+                    device_id: local_discovery_id.clone(),
+                    friendly_name: local_name.clone(),
+                    platform: std::env::consts::OS.into(),
+                    protocol: u16::from(crate::protocol::WIRE_VERSION),
+                    port: bound.port(),
+                    listen_ip: bound.ip(),
+                }),
+                compatible_protocol: u16::from(crate::protocol::WIRE_VERSION),
+            })?;
+
+            let mut reconfigure_requested = false;
+            let mut last_error: Option<String> = None;
+            let mut auth_backoff_until = Instant::now();
+            let mut last_status_emit = Instant::now() - Duration::from_secs(1);
+            let mut last_dial_attempt = Instant::now() - Duration::from_secs(1);
+            let mut searching_since = Instant::now();
+
+            while !stop.load(Ordering::Acquire)
+                && !reconfigure_requested
+                && Instant::now() < deadline
+            {
+                if last_channel_refresh.elapsed() >= Duration::from_secs(3) {
+                    last_channel_refresh = Instant::now();
+                    local_channels = enumerate_local_channels();
+                }
+
+                // Drain UI commands while searching
+                loop {
+                    match rx.try_recv() {
+                        Ok(UiCommand::Stop) | Err(TryRecvError::Disconnected) => {
+                            stop.store(true, Ordering::Release);
+                            break;
                         }
+                        Ok(UiCommand::Pause) => user_paused = true,
+                        Ok(UiCommand::Resume) => user_paused = false,
+                        Ok(UiCommand::ApplyLayout { layout }) => {
+                            if layout.validate().is_ok() {
+                                let target = if layout.source_device_id == local_device_id {
+                                    layout.receiver_device_id.clone()
+                                } else {
+                                    layout.source_device_id.clone()
+                                };
+                                save_layout(&target, &layout);
+                                pending_layout_push = Some((target, layout));
+                            }
+                        }
+                        Ok(UiCommand::SetChannel {
+                            channel,
+                            direct_peer,
+                        }) => {
+                            let clean = channel.trim();
+                            config.channel = if clean.is_empty() {
+                                default_channel()
+                            } else {
+                                clean.to_string()
+                            };
+                            config.direct_peer = direct_peer
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToString::to_string);
+                            save_config(&config);
+                            reconfigure_requested = true;
+                            break;
+                        }
+                        Ok(UiCommand::SetPassphrase { passphrase }) => {
+                            config.passphrase = passphrase
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToString::to_string);
+                            save_config(&config);
+                            reconfigure_requested = true;
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
                     }
-                    Err(TryRecvError::Empty) => break,
                 }
-            }
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-
-            let candidates: Vec<Candidate> = discovery
-                .try_snapshot()
-                .map(|s| s.candidates.into_iter().filter(|c| c.compatible).collect())
-                .unwrap_or_default();
-
-            if last_status_emit.elapsed() >= Duration::from_millis(250) {
-                last_status_emit = Instant::now();
-                let local_displays = (platform.inventory)().unwrap_or_default();
-                emit_status(
-                    &stdout,
-                    &PeerUiStatus {
-                        protocol: PEER_UI_PROTOCOL,
-                        state: "searching".into(),
-                        local_device_id: local_device_id.clone(),
-                        local_name: local_name.clone(),
-                        auth_mode,
-                        route_enabled: false,
-                        focus_device_id: None,
-                        focus_screen_id: None,
-                        peer_device_id: None,
-                        peer_name: None,
-                        peer_address: None,
-                        listen_endpoint: listen_endpoint.clone(),
-                        local_displays,
-                        discovered_peers: candidates
-                            .iter()
-                            .map(|c| DiscoveredPeerInfo {
-                                id: c.device_id.clone(),
-                                name: c.friendly_name.clone(),
-                                platform: c.platform.clone(),
-                                connected: false,
-                            })
-                            .collect(),
-                        shared_layout: None,
-                        error: last_error.clone(),
-                    },
-                );
-            }
-
-            // 1. Check inbound connection first (unless we are actively pushing a layout edit)
-            let mut connected: Option<(TcpStream, bool, Option<String>, Option<String>)> = None;
-            if pending_layout_push.is_none() {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        connected = Some((stream, false, None, None));
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(e.into()),
+                if stop.load(Ordering::Acquire) || reconfigure_requested {
+                    break;
                 }
-            }
 
-            // 2. Otherwise auto-dial discovered LAN peer if we win tie-break, have a layout push,
-            //    or have waited >1.5s without an inbound connection (handles asymmetric firewalls).
-            let fallback_dial = searching_since.elapsed() >= Duration::from_millis(1500);
-            let in_auth_backoff = Instant::now() < auth_backoff_until;
-            let can_dial = !in_auth_backoff
-                && (pending_layout_push.is_some()
-                    || last_dial_attempt.elapsed()
-                        >= Duration::from_millis(if fallback_dial { 1200 } else { 350 }));
-            if connected.is_none() && can_dial {
-                last_dial_attempt = Instant::now();
-                for candidate in &candidates {
-                    let has_push = pending_layout_push
-                        .as_ref()
-                        .is_some_and(|(id, _)| id.starts_with(&candidate.device_id));
-                    let should_dial = has_push || local_discovery_id < candidate.device_id || fallback_dial;
-                    if !should_dial {
-                        continue;
+                let candidates: Vec<Candidate> = discovery
+                    .try_snapshot()
+                    .map(|s| s.candidates.into_iter().filter(|c| c.compatible).collect())
+                    .unwrap_or_default();
+
+                if last_status_emit.elapsed() >= Duration::from_millis(250) {
+                    last_status_emit = Instant::now();
+                    let local_displays = (platform.inventory)().unwrap_or_default();
+                    let has_pass = config.passphrase.is_some();
+                    emit_status(
+                        &stdout,
+                        &PeerUiStatus {
+                            protocol: PEER_UI_PROTOCOL,
+                            state: "searching".into(),
+                            local_device_id: local_device_id.clone(),
+                            local_name: local_name.clone(),
+                            auth_mode: if has_pass { "passphrase" } else { "open" },
+                            passphrase_configured: has_pass,
+                            selected_channel: config.channel.clone(),
+                            direct_peer: config.direct_peer.clone(),
+                            active_channel_label: None,
+                            network_channels: channel_infos(&local_channels),
+                            route_enabled: false,
+                            focus_device_id: None,
+                            focus_screen_id: None,
+                            peer_device_id: None,
+                            peer_name: None,
+                            peer_address: None,
+                            listen_endpoint: listen_endpoint.clone(),
+                            local_displays,
+                            discovered_peers: candidates
+                                .iter()
+                                .map(|c| DiscoveredPeerInfo {
+                                    id: c.device_id.clone(),
+                                    name: c.friendly_name.clone(),
+                                    platform: c.platform.clone(),
+                                    connected: false,
+                                })
+                                .collect(),
+                            shared_layout: None,
+                            error: last_error.clone(),
+                        },
+                    );
+                }
+
+                // 1. Accept inbound connection (unless pushing layout)
+                let mut connected: Option<(TcpStream, bool, Option<String>, Option<String>)> = None;
+                if pending_layout_push.is_none() {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            connected = Some((stream, false, None, None));
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e.into()),
                     }
-                    for addr in ranked_addresses(&candidate.addresses) {
-                        if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
-                            connected = Some((
-                                stream,
-                                true,
-                                Some(candidate.friendly_name.clone()),
-                                Some(candidate.device_id.clone()),
-                            ));
+                }
+
+                // 2. Auto-dial discovered peer OR configured direct peer (e.g. ZeroTier IP)
+                let fallback_dial = searching_since.elapsed() >= Duration::from_millis(1500);
+                let in_auth_backoff = Instant::now() < auth_backoff_until;
+                let can_dial = !in_auth_backoff
+                    && (pending_layout_push.is_some()
+                        || last_dial_attempt.elapsed()
+                            >= Duration::from_millis(if fallback_dial { 1200 } else { 350 }));
+                if connected.is_none() && can_dial {
+                    last_dial_attempt = Instant::now();
+                    for candidate in &candidates {
+                        let has_push = pending_layout_push
+                            .as_ref()
+                            .is_some_and(|(id, _)| id.starts_with(&candidate.device_id));
+                        let should_dial =
+                            has_push || local_discovery_id < candidate.device_id || fallback_dial;
+                        if !should_dial {
+                            continue;
+                        }
+                        for addr in
+                            ranked_addresses(&candidate.addresses, &config.channel, &local_channels)
+                        {
+                            if let Ok(stream) =
+                                TcpStream::connect_timeout(&addr, Duration::from_millis(250))
+                            {
+                                connected = Some((
+                                    stream,
+                                    true,
+                                    Some(candidate.friendly_name.clone()),
+                                    Some(candidate.device_id.clone()),
+                                ));
+                                break;
+                            }
+                        }
+                        if connected.is_some() {
                             break;
                         }
                     }
-                    if connected.is_some() {
-                        break;
+
+                    // Direct peer IP fallback (useful for ZeroTier / cross-subnet links)
+                    if connected.is_none()
+                        && let Some(direct_addr) = parse_direct_peer(config.direct_peer.as_deref())
+                        && let Ok(stream) =
+                            TcpStream::connect_timeout(&direct_addr, Duration::from_millis(300))
+                    {
+                        connected = Some((stream, true, None, None));
                     }
                 }
-            }
 
-            // Fallback: if layout push didn't dial yet, still accept inbound connections so we never deadlock
-            if connected.is_none() && pending_layout_push.is_some() {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        connected = Some((stream, false, None, None));
+                // Fallback accept if layout push hasn't dialed yet
+                if connected.is_none() && pending_layout_push.is_some() {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            connected = Some((stream, false, None, None));
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e.into()),
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(e.into()),
                 }
-            }
 
-            let Some((stream, initiator, known_name, known_discovery_id)) = connected else {
-                thread::sleep(Duration::from_millis(25));
-                continue;
-            };
+                let Some((stream, initiator, known_name, known_discovery_id)) = connected else {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                };
 
-            let peer_address = stream
-                .peer_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "unknown".into());
-            let local_hello = hello(&local_device_id, &platform)?;
-            let preferred_layout = if initiator {
-                if let Some((_, layout)) = pending_layout_push.take() {
-                    Some(layout)
-                } else {
-                    known_discovery_id
-                        .as_deref()
-                        .and_then(find_saved_layout_by_prefix)
-                }
-            } else {
-                None
-            };
-
-            let session_stop = Arc::new(AtomicBool::new(false));
-            let established = PairConnection::establish_peer(
-                stream,
-                &local_device_id,
-                passphrase.as_deref(),
-                initiator,
-                local_hello.clone(),
-                preferred_layout,
-                &stop,
-                log.clone(),
-            );
-            let mut connection = match established {
-                Ok(conn) => {
-                    last_error = None;
-                    conn
-                }
-                Err(error) => {
-                    let msg = format!("{error:#}");
-                    log.write("peer_setup_failed", serde_json::json!({"reason": msg}));
-                    let is_auth_mismatch = msg.contains("passphrase")
-                        || msg.contains("Authenticate")
-                        || msg.contains("Receive LAN Noise")
-                        || msg.contains("Read handshake");
-                    if is_auth_mismatch {
-                        last_error = Some("等待密码匹配：请确认两台设备的共享密码设置一致。".into());
-                        auth_backoff_until = Instant::now() + Duration::from_millis(2500);
+                let peer_sock = stream.peer_addr().ok();
+                let peer_address = peer_sock
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let active_channel_label =
+                    peer_sock.and_then(|a| classify_active_channel(a, &local_channels));
+                let local_hello = hello(&local_device_id, &platform)?;
+                let preferred_layout = if initiator {
+                    if let Some((_, layout)) = pending_layout_push.take() {
+                        Some(layout)
                     } else {
-                        last_error = Some(msg);
-                        auth_backoff_until = Instant::now() + Duration::from_millis(1000);
+                        known_discovery_id
+                            .as_deref()
+                            .and_then(find_saved_layout_by_prefix)
                     }
-                    searching_since = Instant::now();
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-            };
+                } else {
+                    None
+                };
 
-            // Save accepted layout on BOTH sides so either side remembers the latest arrangement!
-            let remote_id = connection.remote_device_id().to_string();
-            save_layout(&remote_id, connection.shared_layout());
-
-            let peer_name = known_name
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .find(|c| remote_id.starts_with(&c.device_id))
-                        .map(|c| c.friendly_name.clone())
-                })
-                .unwrap_or_else(|| "局域网设备".into());
-
-            connection.set_max_hz(options.max_hz)?;
-            let source = SharedSource::new(connection.runtime().clone())?;
-            let mut sink = match prepare_worker(&local_hello.inventory, log.clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_error = Some(format!("输入服务启动失败: {e:#}"));
-                    thread::sleep(Duration::from_millis(300));
-                    continue;
-                }
-            };
-            let mut capture = match (platform.capture)(source.clone(), log.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = sink.shutdown();
-                    last_error = Some(format!("输入采集启动失败: {e:#}"));
-                    thread::sleep(Duration::from_millis(300));
-                    continue;
-                }
-            };
-
-            let run_result = connection.run(
-                &source,
-                &mut sink,
-                &mut PeerHost {
-                    capture: capture.as_mut(),
-                    rx: &rx,
-                    stdout: &stdout,
-                    discovery: &discovery,
-                    session_stop: &session_stop,
-                    global_stop: &stop,
-                    deadline,
-                    local_device_id: &local_device_id,
-                    local_name: &local_name,
-                    local_displays: local_hello.inventory.clone(),
-                    auth_mode,
-                    listen_endpoint: listen_endpoint.clone(),
-                    peer_device_id: remote_id.clone(),
-                    peer_name: peer_name.clone(),
-                    peer_address: peer_address.clone(),
-                    user_paused: &mut user_paused,
-                    pending_layout_push: &mut pending_layout_push,
+                let session_stop = Arc::new(AtomicBool::new(false));
+                let established = PairConnection::establish_peer(
+                    stream,
+                    &local_device_id,
+                    config.passphrase.as_deref(),
                     initiator,
-                    status_seen: false,
-                    auto_enable_sent: false,
-                    sharing: false,
-                    epoch: 0,
-                    pending: None,
-                    last_emit: Instant::now() - Duration::from_secs(1),
-                    last_emitted_enabled: None,
-                    last_emitted_focus_screen: None,
-                    last_emitted_peer_count: usize::MAX,
-                },
-                &session_stop,
-                log.clone(),
-            );
+                    local_hello.clone(),
+                    preferred_layout,
+                    &stop,
+                    log.clone(),
+                );
+                let mut connection = match established {
+                    Ok(conn) => {
+                        last_error = None;
+                        conn
+                    }
+                    Err(error) => {
+                        let msg = format!("{error:#}");
+                        log.write("peer_setup_failed", serde_json::json!({"reason": msg}));
+                        let is_auth_mismatch = msg.contains("passphrase")
+                            || msg.contains("Authenticate")
+                            || msg.contains("Receive LAN Noise")
+                            || msg.contains("Read handshake");
+                        if is_auth_mismatch {
+                            last_error = Some("等待密码匹配：请确认两台设备的密码配置一致。".into());
+                            auth_backoff_until = Instant::now() + Duration::from_millis(2500);
+                        } else {
+                            last_error = Some(msg);
+                            auth_backoff_until = Instant::now() + Duration::from_millis(1000);
+                        }
+                        searching_since = Instant::now();
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                };
 
-            let capture_cleanup = capture.stop();
-            let sink_cleanup = sink.shutdown();
-            if capture_cleanup.is_err() || sink_cleanup.is_err() {
-                log.write(
-                    "peer_cleanup_failed",
-                    serde_json::json!({
-                        "capture_confirmed": capture_cleanup.is_ok(),
-                        "worker_confirmed": sink_cleanup.is_ok()
-                    }),
+                let remote_id = connection.remote_device_id().to_string();
+                save_layout(&remote_id, connection.shared_layout());
+
+                let peer_name = known_name
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .find(|c| remote_id.starts_with(&c.device_id))
+                            .map(|c| c.friendly_name.clone())
+                    })
+                    .unwrap_or_else(|| "局域网设备".into());
+
+                connection.set_max_hz(options.max_hz)?;
+                let source = SharedSource::new(connection.runtime().clone())?;
+                let mut sink = match prepare_worker(&local_hello.inventory, log.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_error = Some(format!("输入服务启动失败: {e:#}"));
+                        thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                };
+                let mut capture = match (platform.capture)(source.clone(), log.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = sink.shutdown();
+                        last_error = Some(format!("输入采集启动失败: {e:#}"));
+                        thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                };
+
+                let run_result = connection.run(
+                    &source,
+                    &mut sink,
+                    &mut PeerHost {
+                        capture: capture.as_mut(),
+                        rx: &rx,
+                        stdout: &stdout,
+                        discovery: &discovery,
+                        session_stop: &session_stop,
+                        global_stop: &stop,
+                        deadline,
+                        local_device_id: &local_device_id,
+                        local_name: &local_name,
+                        local_displays: local_hello.inventory.clone(),
+                        config: &mut config,
+                        reconfigure_requested: &mut reconfigure_requested,
+                        network_channels: channel_infos(&local_channels),
+                        active_channel_label,
+                        listen_endpoint: listen_endpoint.clone(),
+                        peer_device_id: remote_id.clone(),
+                        peer_name: peer_name.clone(),
+                        peer_address: peer_address.clone(),
+                        user_paused: &mut user_paused,
+                        pending_layout_push: &mut pending_layout_push,
+                        initiator,
+                        status_seen: false,
+                        auto_enable_sent: false,
+                        sharing: false,
+                        epoch: 0,
+                        pending: None,
+                        last_emit: Instant::now() - Duration::from_secs(1),
+                        last_emitted_enabled: None,
+                        last_emitted_focus_screen: None,
+                        last_emitted_peer_count: usize::MAX,
+                    },
+                    &session_stop,
+                    log.clone(),
                 );
-                anyhow::bail!("cleanup unconfirmed; restart client");
-            }
-            if let Err(error) = run_result {
-                let reason = format!("{error:#}");
-                log.write(
-                    "peer_session_ended",
-                    serde_json::json!({"reason": reason, "cleanup_confirmed": true}),
-                );
-                if pending_layout_push.is_none() && !stop.load(Ordering::Acquire) {
-                    last_error = None; // Normal disconnect/reconnect; auto-recover silently.
+
+                let capture_cleanup = capture.stop();
+                let sink_cleanup = sink.shutdown();
+                if capture_cleanup.is_err() || sink_cleanup.is_err() {
+                    log.write(
+                        "peer_cleanup_failed",
+                        serde_json::json!({
+                            "capture_confirmed": capture_cleanup.is_ok(),
+                            "worker_confirmed": sink_cleanup.is_ok()
+                        }),
+                    );
+                    anyhow::bail!("cleanup unconfirmed; restart client");
                 }
+                if let Err(error) = run_result {
+                    let reason = format!("{error:#}");
+                    log.write(
+                        "peer_session_ended",
+                        serde_json::json!({"reason": reason, "cleanup_confirmed": true}),
+                    );
+                    if pending_layout_push.is_none()
+                        && !reconfigure_requested
+                        && !stop.load(Ordering::Acquire)
+                    {
+                        last_error = None;
+                    }
+                }
+                searching_since = Instant::now();
+                if reconfigure_requested {
+                    break;
+                }
+                let pause_ms = if pending_layout_push.is_some() { 40 } else { 200 };
+                thread::sleep(Duration::from_millis(pause_ms));
             }
-            // Brief backoff before re-discovering/reconnecting (faster for layout push).
-            searching_since = Instant::now();
-            let pause_ms = if pending_layout_push.is_some() { 40 } else { 200 };
-            thread::sleep(Duration::from_millis(pause_ms));
+
+            discovery.stop();
+            let _ = discovery.wait_stopped(Duration::from_secs(2));
         }
         Ok(())
     })();
 
     stop.store(true, Ordering::Release);
-    discovery.stop();
-    let _ = discovery.wait_stopped(Duration::from_secs(2));
+    let has_pass = config.passphrase.is_some();
     emit_status(
         &stdout,
         &PeerUiStatus {
             protocol: PEER_UI_PROTOCOL,
-            state: if result.is_ok() { "stopped".into() } else { "error".into() },
+            state: if result.is_ok() {
+                "stopped".into()
+            } else {
+                "error".into()
+            },
             local_device_id,
             local_name,
-            auth_mode,
+            auth_mode: if has_pass { "passphrase" } else { "open" },
+            passphrase_configured: has_pass,
+            selected_channel: config.channel,
+            direct_peer: config.direct_peer,
+            active_channel_label: None,
+            network_channels: vec![],
             route_enabled: false,
             focus_device_id: None,
             focus_screen_id: None,
             peer_device_id: None,
             peer_name: None,
             peer_address: None,
-            listen_endpoint,
+            listen_endpoint: None,
             local_displays: vec![],
             discovered_peers: vec![],
             shared_layout: None,
@@ -896,14 +1333,90 @@ fn find_saved_layout_by_prefix(prefix: &str) -> Option<SharedLayout> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::SocketAddrV4;
+
+    fn sample_channels() -> Vec<LocalChannel> {
+        vec![
+            LocalChannel {
+                id: "192.168.50.1".into(),
+                label: "有线直连 · 192.168.50.1".into(),
+                kind: "wired",
+                priority: 0,
+                ip: Ipv4Addr::new(192, 168, 50, 1),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                interface_name: "以太网 3".into(),
+            },
+            LocalChannel {
+                id: "192.168.1.164".into(),
+                label: "Wi-Fi · 192.168.1.164".into(),
+                kind: "wifi",
+                priority: 2,
+                ip: Ipv4Addr::new(192, 168, 1, 164),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                interface_name: "WLAN".into(),
+            },
+            LocalChannel {
+                id: "192.168.194.10".into(),
+                label: "ZeroTier 虚拟局域网 · 192.168.194.10".into(),
+                kind: "zerotier",
+                priority: 3,
+                ip: Ipv4Addr::new(192, 168, 194, 10),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                interface_name: "ZeroTier One".into(),
+            },
+        ]
+    }
 
     #[test]
-    fn direct_ethernet_route_ranks_ahead_of_wifi_and_ipv6() {
+    fn auto_channel_ranks_wired_ahead_of_wifi_and_zerotier_and_filters_tun() {
+        let local = sample_channels();
         let wifi = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 188), 24800));
         let wired = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 2), 24800));
+        let zt = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 194, 59), 24800));
+        let tun = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 1), 24800));
         let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 24800));
-        let ranked = ranked_addresses(&[loopback, wifi, wired]);
-        assert_eq!(ranked, vec![wired, wifi]);
+
+        let auto_ranked = ranked_addresses(&[loopback, tun, zt, wifi, wired], "auto", &local);
+        assert_eq!(auto_ranked, vec![wired, wifi, zt]);
+    }
+
+    #[test]
+    fn pinned_channel_restricts_dialing_to_matching_subnet() {
+        let local = sample_channels();
+        let wifi = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 188), 24800));
+        let wired = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 2), 24800));
+        let zt = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 194, 59), 24800));
+
+        assert_eq!(
+            ranked_addresses(&[zt, wifi, wired], "192.168.194.10", &local),
+            vec![zt]
+        );
+        assert_eq!(
+            ranked_addresses(&[zt, wifi, wired], "192.168.1.164", &local),
+            vec![wifi]
+        );
+        assert_eq!(
+            ranked_addresses(&[zt, wifi, wired], "192.168.50.1", &local),
+            vec![wired]
+        );
+    }
+
+    #[test]
+    fn direct_peer_parser_accepts_bare_ip_or_host_port() {
+        assert_eq!(
+            parse_direct_peer(Some("192.168.194.59")),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 194, 59),
+                24800
+            )))
+        );
+        assert_eq!(
+            parse_direct_peer(Some("192.168.194.59:25000")),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 194, 59),
+                25000
+            )))
+        );
+        assert_eq!(parse_direct_peer(Some("")), None);
     }
 }

@@ -5,6 +5,13 @@ using System.Text.Json.Serialization;
 
 namespace Crossflow.Windows;
 
+internal sealed record NetworkChannelInfo(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("label")] string Label,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("ip")] string? Ip,
+    [property: JsonPropertyName("interface_name")] string? InterfaceName);
+
 internal sealed record PeerDisplayInfo(
     [property: JsonPropertyName("native_id")] string NativeId,
     [property: JsonPropertyName("wire_id")] uint WireId,
@@ -39,6 +46,11 @@ internal sealed record PeerMeshSnapshot(
     string? LocalDeviceId,
     string? LocalName,
     string AuthMode,
+    bool PassphraseConfigured,
+    string SelectedChannel,
+    string? DirectPeer,
+    string? ActiveChannelLabel,
+    IReadOnlyList<NetworkChannelInfo> NetworkChannels,
     bool RouteEnabled,
     string? FocusDeviceId,
     string? FocusScreenId,
@@ -54,7 +66,8 @@ internal sealed record PeerMeshSnapshot(
     long Generation)
 {
     internal static PeerMeshSnapshot Initial => new(
-        "idle", null, null, "open", false, null, null, null, null, null, null,
+        "idle", null, null, "open", false, "auto", null, null, [],
+        false, null, null, null, null, null, null,
         [], [], null, null, false, 0);
 }
 
@@ -79,7 +92,7 @@ internal sealed class PeerMeshController
         internal Task Completion = Task.CompletedTask;
     }
 
-    internal async Task StartAsync(string? passphrase = null, string? deviceName = null)
+    internal async Task StartAsync(string? deviceName = null)
     {
         await commands.WaitAsync();
         try
@@ -121,11 +134,7 @@ internal sealed class PeerMeshController
                 info.ArgumentList.Add("--name");
                 info.ArgumentList.Add(deviceName.Trim());
             }
-            string? trimmedSecret = string.IsNullOrWhiteSpace(passphrase) ? null : passphrase.Trim();
-            if (trimmedSecret is not null)
-                info.Environment["CROSSFLOW_LAN_PASSPHRASE"] = trimmedSecret;
-            else
-                info.Environment.Remove("CROSSFLOW_LAN_PASSPHRASE");
+            info.Environment.Remove("CROSSFLOW_LAN_PASSPHRASE");
 
             var process = new Process { StartInfo = info };
             Run run;
@@ -136,7 +145,6 @@ internal sealed class PeerMeshController
                 snapshot = PeerMeshSnapshot.Initial with
                 {
                     State = "starting",
-                    AuthMode = trimmedSecret is not null ? "passphrase" : "open",
                     ProcessRunning = true,
                     Generation = generation
                 };
@@ -182,6 +190,10 @@ internal sealed class PeerMeshController
     internal Task PauseAsync() => SendCommandAsync(new { op = "pause" });
     internal Task ResumeAsync() => SendCommandAsync(new { op = "resume" });
     internal Task ApplyLayoutAsync(PeerSharedLayout layout) => SendCommandAsync(new { op = "apply_layout", layout });
+    internal Task SetChannelAsync(string channel, string? directPeer) =>
+        SendCommandAsync(new { op = "set_channel", channel, direct_peer = string.IsNullOrWhiteSpace(directPeer) ? null : directPeer.Trim() });
+    internal Task SetPassphraseAsync(string? passphrase) =>
+        SendCommandAsync(new { op = "set_passphrase", passphrase = string.IsNullOrWhiteSpace(passphrase) ? null : passphrase.Trim() });
 
     private async Task SendCommandAsync(object payload)
     {
@@ -261,6 +273,11 @@ internal sealed class PeerMeshController
                             parsed.LocalDeviceId,
                             parsed.LocalName,
                             parsed.AuthMode ?? "open",
+                            parsed.PassphraseConfigured,
+                            parsed.SelectedChannel ?? "auto",
+                            parsed.DirectPeer,
+                            parsed.ActiveChannelLabel,
+                            parsed.NetworkChannels ?? [],
                             parsed.RouteEnabled,
                             parsed.FocusDeviceId,
                             parsed.FocusScreenId,
@@ -320,6 +337,11 @@ internal sealed class PeerMeshController
         [JsonPropertyName("local_device_id")] public string? LocalDeviceId { get; set; }
         [JsonPropertyName("local_name")] public string? LocalName { get; set; }
         [JsonPropertyName("auth_mode")] public string? AuthMode { get; set; }
+        [JsonPropertyName("passphrase_configured")] public bool PassphraseConfigured { get; set; }
+        [JsonPropertyName("selected_channel")] public string? SelectedChannel { get; set; }
+        [JsonPropertyName("direct_peer")] public string? DirectPeer { get; set; }
+        [JsonPropertyName("active_channel_label")] public string? ActiveChannelLabel { get; set; }
+        [JsonPropertyName("network_channels")] public List<NetworkChannelInfo>? NetworkChannels { get; set; }
         [JsonPropertyName("route_enabled")] public bool RouteEnabled { get; set; }
         [JsonPropertyName("focus_device_id")] public string? FocusDeviceId { get; set; }
         [JsonPropertyName("focus_screen_id")] public string? FocusScreenId { get; set; }
