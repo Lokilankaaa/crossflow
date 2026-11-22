@@ -515,17 +515,26 @@ impl MouseSink for WindowsMouseSink {
         let input = self.finish(packet)?;
         if down {
             self.checked()?;
-            let vk = media_vk(usage)
-                .unwrap_or_else(|| self.platform.key_vk(scan(usage).expect("validated usage")));
-            let valid = vk != 0 && !self.keys.contains(&usage) && !self.platform.held(vk);
-            self.finish(if valid {
-                Ok(())
+            if self.keys.contains(&usage) {
+                // Already owned by this remote session: allow genuine key auto-repeat
+                // for repeatable keys (Backspace, Delete, Arrows, letters, etc.) and
+                // treat modifier/lock repeats as benign no-ops.
+                if !crate::input::is_repeatable_key(usage) {
+                    return Ok(());
+                }
             } else {
-                Err(anyhow::anyhow!(
-                    "key is unsupported or already held locally or remotely"
-                ))
-            })?;
-            self.keys.insert(usage);
+                let vk = media_vk(usage)
+                    .unwrap_or_else(|| self.platform.key_vk(scan(usage).expect("validated usage")));
+                let valid = vk != 0 && !self.platform.held(vk);
+                self.finish(if valid {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "key is unsupported or already held locally or remotely"
+                    ))
+                })?;
+                self.keys.insert(usage);
+            }
         }
         self.send(input)?;
         if !down {
@@ -870,5 +879,17 @@ mod tests {
         assert_eq!(h.mouseData as i32, -15);
         assert_eq!(v.dwFlags, MOUSEEVENTF_WHEEL);
         assert_eq!(v.mouseData as i32, 120);
+    }
+    #[test]
+    fn owned_repeatable_keys_auto_repeat_while_modifiers_do_not() {
+        let (mut sink, state) = fake();
+        sink.key(0x2a, true).unwrap(); // Backspace down
+        state.lock().unwrap().held.insert(0x0e);
+        sink.key(0x2a, true).unwrap(); // Backspace auto-repeat
+        sink.key(0x2a, false).unwrap(); // Backspace up
+        assert_eq!(state.lock().unwrap().events.len(), 3);
+        sink.key(0xe1, true).unwrap(); // Left Shift down
+        sink.key(0xe1, true).unwrap(); // Left Shift repeat -> benign no-op
+        assert_eq!(state.lock().unwrap().events.len(), 4);
     }
 }

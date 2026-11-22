@@ -122,6 +122,11 @@ unsafe extern "C" {
     fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
     fn CGEventSetFlags(event: *mut c_void, flags: u64);
     fn CGEventSetType(event: *mut c_void, kind: u32);
+    fn CGEventKeyboardSetUnicodeString(
+        event: *mut c_void,
+        string_length: usize,
+        unicode_string: *const u16,
+    );
     fn CGEventPost(tap: u32, event: *const c_void);
     fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
     fn CGPreflightPostEventAccess() -> bool;
@@ -130,7 +135,33 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    static kCFRunLoopDefaultMode: *const c_void;
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: bool) -> i32;
+    fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+    fn CFDataGetLength(the_data: *const c_void) -> isize;
     fn CFRelease(object: *const c_void);
+}
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut c_void;
+    fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> *mut c_void;
+    fn TISGetInputSourceProperty(source: *const c_void, property_key: *const c_void)
+    -> *const c_void;
+    fn LMGetKbdType() -> u8;
+    fn UCKeyTranslate(
+        key_layout_ptr: *const c_void,
+        virtual_key_code: u16,
+        key_action: u16,
+        modifier_key_state: u32,
+        keyboard_type: u32,
+        key_translate_options: u32,
+        dead_key_state: *mut u32,
+        max_string_length: usize,
+        actual_string_length: *mut usize,
+        unicode_string: *mut u16,
+    ) -> i32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -522,6 +553,7 @@ fn mac_keycode(usage: u16) -> Option<u16> {
         0x61 => 0x5C, // Keypad 9
         0x62 => 0x52, // Keypad 0
         0x63 => 0x41, // Keypad .
+        0x64 => 0x0A, // ISO Non-US backslash / section
         0x67 => 0x51, // Keypad =
         0x68..=0x6F => HIGH_FUNCTIONS[(usage - 0x68) as usize],
         crate::keymap::HID_FN_GLOBE => 0x3F, // Fn / Globe (keycode 63)
@@ -730,6 +762,99 @@ fn key_extra_flags(usage: u16) -> u64 {
         0x54..=0x63 | 0x67 => FLAG_NUMERIC_PAD,              // Keypad keys
         0x3A..=0x45 | 0x49..=0x4E | 0x68..=0x6F => FLAG_SECONDARY_FN, // F1..F20, Insert/Home/PgUp/Del/End/PgDn
         _ => 0,
+    }
+}
+
+/// Returns true for HID usages that produce printable characters affected by
+/// Shift / Option / Caps Lock (letters, digits, punctuation, space, ISO key).
+fn is_printable_hid_usage(usage: u16) -> bool {
+    matches!(usage, 0x04..=0x27 | 0x2C..=0x38 | 0x64)
+}
+
+/// Translate `(keycode, modifier_state)` using macOS's live keyboard layout so
+/// `CGEventCreateKeyboardEvent(PRIVATE_EVENT_SOURCE, ...)` carries the actual
+/// shifted/option/caps Unicode character (e.g. `?`, `{`, `}`, `A`) instead of
+/// the stale unshifted character baked in by CoreGraphics' private event source.
+fn translate_mac_unicode_into(
+    keycode: u16,
+    down: bool,
+    is_repeat: bool,
+    shift: bool,
+    option: bool,
+    caps: bool,
+    out: &mut [u16; 8],
+) -> Option<usize> {
+    const K_UC_KEY_ACTION_DOWN: u16 = 0;
+    const K_UC_KEY_ACTION_UP: u16 = 1;
+    const K_UC_KEY_ACTION_AUTO_KEY: u16 = 2;
+    const K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_BIT: u32 = 1;
+    unsafe {
+        // Pump runloop once (0s) so TIS picks up any live input-source switches
+        // (e.g., English ABC <-> Chinese Pinyin) in the background input-worker.
+        let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false);
+        let mut src = TISCopyCurrentKeyboardLayoutInputSource();
+        let mut layout_data = if !src.is_null() {
+            TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData)
+        } else {
+            std::ptr::null()
+        };
+        if layout_data.is_null() {
+            if !src.is_null() {
+                CFRelease(src);
+            }
+            src = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
+            if src.is_null() {
+                return None;
+            }
+            layout_data = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
+        }
+        let result = if !layout_data.is_null() && CFDataGetLength(layout_data) > 0 {
+            let ptr = CFDataGetBytePtr(layout_data) as *const c_void;
+            if ptr.is_null() {
+                None
+            } else {
+                let mut mods: u32 = 0;
+                if shift {
+                    mods |= 0x02; // shiftKey >> 8
+                }
+                if caps {
+                    mods |= 0x04; // alphaLock >> 8
+                }
+                if option {
+                    mods |= 0x08; // optionKey >> 8
+                }
+                let action = if !down {
+                    K_UC_KEY_ACTION_UP
+                } else if is_repeat {
+                    K_UC_KEY_ACTION_AUTO_KEY
+                } else {
+                    K_UC_KEY_ACTION_DOWN
+                };
+                let mut dead_state: u32 = 0;
+                let mut actual_len: usize = 0;
+                let status = UCKeyTranslate(
+                    ptr,
+                    keycode,
+                    action,
+                    mods,
+                    u32::from(LMGetKbdType()),
+                    K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_BIT,
+                    &mut dead_state,
+                    out.len(),
+                    &mut actual_len,
+                    out.as_mut_ptr(),
+                );
+                if status == 0 && actual_len > 0 && actual_len <= out.len() {
+                    Some(actual_len)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        CFRelease(src);
+        result
     }
 }
 
@@ -1213,7 +1338,7 @@ impl MacMouseSink {
                 (point.y - self.position.y).round() as i64,
             );
         }
-        self.post_marked(&event, modifier_flags(&self.owned_keys));
+        self.post_marked(&event, event_modifier_flags(&self.owned_keys));
         self.position = point;
         Ok((point.x, point.y))
     }
@@ -1261,7 +1386,7 @@ impl MacMouseSink {
         if down {
             self.owned_buttons.insert(button);
         }
-        self.post_marked(&event, modifier_flags(&self.owned_keys));
+        self.post_marked(&event, event_modifier_flags(&self.owned_keys));
         if !down {
             self.owned_buttons.remove(&button);
         }
@@ -1288,10 +1413,19 @@ impl MacMouseSink {
         }
         let keycode = mac_keycode(usage)
             .ok_or_else(|| failure("Keyboard usage is unsupported by the ANSI Mac adapter"))?;
+        let is_caps = usage == crate::keymap::HID_CAPS_LOCK;
+        let is_flags_key =
+            (0xE0..=0xE7).contains(&usage) || is_caps || usage == crate::keymap::HID_FN_GLOBE;
+        let mut is_repeat = false;
         if down {
             self.check_input_ready()?;
             if self.owned_keys.contains(&usage) {
-                return Err(failure("Duplicate remote key down"));
+                // Allow genuine auto-repeat for repeatable keys (Backspace, Delete,
+                // Arrows, letters, etc.); ignore duplicate downs on modifiers/locks.
+                if is_flags_key || !crate::input::is_repeatable_key(usage) {
+                    return Ok(());
+                }
+                is_repeat = true;
             }
         }
         let event = OwnedCf::new(
@@ -1306,9 +1440,6 @@ impl MacMouseSink {
         }
         // Physical modifier keys (plus Caps Lock and Fn/Globe) on macOS must be posted as
         // kCGEventFlagsChanged (type 12) so Electron/Chromium and system shortcuts see them.
-        let is_caps = usage == crate::keymap::HID_CAPS_LOCK;
-        let is_flags_key =
-            (0xE0..=0xE7).contains(&usage) || is_caps || usage == crate::keymap::HID_FN_GLOBE;
         if is_flags_key {
             unsafe { CGEventSetType(event.as_ptr(), FLAGS_CHANGED) };
         }
@@ -1319,14 +1450,43 @@ impl MacMouseSink {
         } else {
             crate::input_state::read_caps_lock()
         };
-        // No synthesized repeat timer is implemented; each accepted down/up is
-        // explicit. Modifier flags combine both sides and are updated on up.
-        unsafe { CGEventSetIntegerValueField(event.as_ptr(), KEYBOARD_AUTOREPEAT, 0) };
+        unsafe {
+            CGEventSetIntegerValueField(
+                event.as_ptr(),
+                KEYBOARD_AUTOREPEAT,
+                if is_repeat { 1 } else { 0 },
+            );
+        }
+        let has_shift = projected.contains(&0xE1) || projected.contains(&0xE5);
+        let has_option = projected.contains(&0xE2) || projected.contains(&0xE6);
+        let has_ctrl = projected.contains(&0xE0) || projected.contains(&0xE4);
+        let has_cmd = projected.contains(&0xE3) || projected.contains(&0xE7);
+        if !is_flags_key
+            && is_printable_hid_usage(usage)
+            && (has_shift || has_option || caps_active)
+            && !has_ctrl
+            && !has_cmd
+        {
+            let mut uni_buf = [0u16; 8];
+            if let Some(len) = translate_mac_unicode_into(
+                keycode,
+                down,
+                is_repeat,
+                has_shift,
+                has_option,
+                caps_active,
+                &mut uni_buf,
+            ) {
+                unsafe {
+                    CGEventKeyboardSetUnicodeString(event.as_ptr(), len, uni_buf.as_ptr());
+                }
+            }
+        }
         if down {
             self.owned_keys.insert(usage);
         }
         let caps_flag = if caps_active { FLAG_ALPHA_SHIFT } else { 0 };
-        let flags = event_modifier_flags(&projected) | key_extra_flags(usage) | caps_flag;
+        let flags = event_modifier_flags(&projected) | key_extra_flags(usage) | caps_flag | 0x0100;
         self.post_marked(&event, flags);
         if !down {
             self.owned_keys.remove(&usage);
@@ -1361,7 +1521,7 @@ impl MacMouseSink {
                 },
                 "CoreGraphics could not allocate a scroll event",
             )?;
-            self.post_marked(&event, modifier_flags(&self.owned_keys));
+            self.post_marked(&event, event_modifier_flags(&self.owned_keys));
             Ok(())
         })?;
         self.wheel_remainder = next;

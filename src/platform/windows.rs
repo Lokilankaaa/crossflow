@@ -338,6 +338,10 @@ const SCAN_TO_HID: &[(u16, u16)] = &[
     (0xe05d, 0x65),
 ];
 fn scan_to_hid(scan: u16) -> Option<u16> {
+    if scan == 0xe036 {
+        // Windows WH_KEYBOARD_LL often sets LLKHF_EXTENDED on VK_RSHIFT (0x36).
+        return Some(0xe5);
+    }
     SCAN_TO_HID
         .iter()
         .find_map(|&(code, usage)| (code == scan).then_some(usage))

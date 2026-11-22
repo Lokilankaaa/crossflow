@@ -264,6 +264,7 @@ impl Policy {
         let mut physical = std::array::from_fn(held);
         // Windows hooks report left/right modifiers. Generic snapshot aliases
         // would otherwise remain held forever after the sided key is released.
+        physical[0x10] = false;
         physical[0x11] = false;
         physical[0x12] = false;
         Self {
@@ -491,9 +492,19 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);
                 let down = input.flags & LLKHF_UP == 0;
                 let vk = input.vkCode as usize;
-                // Map multimedia virtual keys (Fn + volume/mute/play/track) directly so
-                // keyboards emitting scanCode == 0 still forward seamlessly to macOS.
-                let media_usage = match input.vkCode {
+                // Map multimedia virtual keys and sided modifiers directly so Right Shift
+                // (which Windows WH_KEYBOARD_LL often flags with LLKHF_EXTENDED -> 0xE036)
+                // and OEM media keys with scanCode == 0 never get dropped.
+                let direct_usage = match input.vkCode {
+                    0x14 => Some(crate::keymap::HID_CAPS_LOCK),
+                    0x5B => Some(0xE3), // VK_LWIN
+                    0x5C => Some(0xE7), // VK_RWIN
+                    0xA0 => Some(0xE1), // VK_LSHIFT
+                    0xA1 => Some(0xE5), // VK_RSHIFT
+                    0xA2 => Some(0xE0), // VK_LCONTROL
+                    0xA3 => Some(0xE4), // VK_RCONTROL
+                    0xA4 => Some(0xE2), // VK_LMENU
+                    0xA5 => Some(0xE6), // VK_RMENU
                     0xAD => Some(crate::keymap::HID_MUTE),
                     0xAE => Some(crate::keymap::HID_VOLUME_DOWN),
                     0xAF => Some(crate::keymap::HID_VOLUME_UP),
@@ -502,7 +513,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     0xB3 => Some(crate::keymap::HID_MEDIA_PLAY_PAUSE),
                     _ => None,
                 };
-                let resolved_usage = if let Some(u) = media_usage {
+                let resolved_usage = if let Some(u) = direct_usage {
                     Some(u)
                 } else if input.vkCode < 0xff && input.vkCode != 0x13 {
                     let scan = if input.scanCode == 0 {
@@ -517,7 +528,11 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     } else {
                         0
                     };
-                    scan_to_hid(scan)
+                    scan_to_hid(scan).or_else(|| {
+                        let fallback =
+                            (unsafe { MapVirtualKeyW(input.vkCode, MAPVK_VK_TO_VSC_EX) }) as u16;
+                        scan_to_hid(fallback)
+                    })
                 } else {
                     None
                 };

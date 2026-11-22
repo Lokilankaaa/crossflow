@@ -80,6 +80,18 @@ pub fn is_keyboard_usage(usage: u16) -> bool {
     matches!(usage, 0x04..=0xA4 | 0xB0..=0xDD | 0xE0..=0xE7)
 }
 
+/// Returns true for keys that legitimately auto-repeat when held down
+/// (e.g., Backspace, Delete, Arrows, Letters, Digits, Punctuation, Space).
+/// Excludes modifiers, lock toggles, Fn/Globe, and media keys.
+pub fn is_repeatable_key(usage: u16) -> bool {
+    is_keyboard_usage(usage)
+        && !(0xE0..=0xE7).contains(&usage)
+        && !matches!(
+            usage,
+            0x39 | 0x47 | 0x53 | 0xA4 | 0x7F | 0x80 | 0x81 | 0x9B | 0x9C | 0x9D
+        )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureOutcome {
     Queued,
@@ -417,6 +429,9 @@ impl SourceInputQueue {
             return CaptureOutcome::Paused(reason);
         }
         if !changed {
+            if down && is_repeatable_key(usage) && self.epoch_keys.contains(&usage) {
+                return self.enqueue(InputAction::Key { usage, down: true }, now_ns);
+            }
             return CaptureOutcome::Ignored;
         }
         if down {
@@ -596,16 +611,22 @@ mod tests {
             queue.button(Button::Left, true, now);
             queue.button(Button::Left, false, now + 1);
         }
-        queue.key(0x04, true, 5);
-        assert_eq!(queue.key(0x04, true, 6), CaptureOutcome::Ignored);
-        queue.key(0x04, false, 7);
-        assert_eq!(queue.key(0x04, false, 8), CaptureOutcome::Ignored);
+        // Modifier repeats (e.g. holding Shift) remain ignored.
+        queue.key(0xE1, true, 5);
+        assert_eq!(queue.key(0xE1, true, 6), CaptureOutcome::Ignored);
+        queue.key(0xE1, false, 7);
+        assert_eq!(queue.key(0xE1, false, 8), CaptureOutcome::Ignored);
         assert_eq!(
             queue.button(Button::Right, false, 9),
             CaptureOutcome::Ignored
         );
-        assert_eq!(queue.pending_len(), 6);
-        let actions: Vec<_> = std::iter::from_fn(|| queue.pop(10).unwrap())
+        // Active-epoch Backspace repeat IS forwarded so long-press delete works.
+        assert_eq!(queue.key(0x2A, true, 10), CaptureOutcome::Queued);
+        assert_eq!(queue.key(0x2A, true, 11), CaptureOutcome::Queued);
+        assert_eq!(queue.key(0x2A, false, 12), CaptureOutcome::Queued);
+        assert_eq!(queue.key(0x2A, false, 13), CaptureOutcome::Ignored);
+        assert_eq!(queue.pending_len(), 9);
+        let actions: Vec<_> = std::iter::from_fn(|| queue.pop(14).unwrap())
             .map(|event| event.action)
             .collect();
         assert_eq!(
@@ -627,13 +648,25 @@ mod tests {
             actions[4..],
             [
                 InputAction::Key {
-                    usage: 0x04,
+                    usage: 0xE1,
                     down: true
                 },
                 InputAction::Key {
-                    usage: 0x04,
+                    usage: 0xE1,
                     down: false
-                }
+                },
+                InputAction::Key {
+                    usage: 0x2A,
+                    down: true
+                },
+                InputAction::Key {
+                    usage: 0x2A,
+                    down: true
+                },
+                InputAction::Key {
+                    usage: 0x2A,
+                    down: false
+                },
             ]
         );
     }

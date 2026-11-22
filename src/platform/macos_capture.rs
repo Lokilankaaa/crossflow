@@ -317,6 +317,7 @@ pub fn hid_usage(keycode: u16) -> Option<u16> {
         92 => 0x61,
         82 => 0x62,
         65 => 0x63,
+        10 => 0x64,
         81 => 0x67,
         63 => crate::keymap::HID_FN_GLOBE,
         59 => 0xe0,
@@ -1031,11 +1032,20 @@ mod native {
                     return false;
                 }
                 if is_repeat {
-                    return state.remote_keys[index];
+                    if remote
+                        && state.remote_keys[index]
+                        && crate::input::is_repeatable_key(usage)
+                    {
+                        suppress = true;
+                        CaptureKind::Key { usage, down: true }
+                    } else {
+                        return state.remote_keys[index];
+                    }
+                } else {
+                    update_held(&state.shared, &mut state.keys[index], down);
+                    suppress = route_press(&mut state.remote_keys[index], down, remote);
+                    CaptureKind::Key { usage, down }
                 }
-                update_held(&state.shared, &mut state.keys[index], down);
-                suppress = route_press(&mut state.remote_keys[index], down, remote);
-                CaptureKind::Key { usage, down }
             }
             14 => {
                 // NX_SYSDEFINED media keys (Volume Up/Down, Mute, Play/Pause, Next/Prev)
