@@ -235,11 +235,11 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
                 continue;
             };
             if matches!(event.kind, CaptureKind::Delta { .. })
-                && self.gate.load(Ordering::SeqCst)
-                && !event.remote_focus
+                && event.remote_focus != self.gate.load(Ordering::SeqCst)
             {
-                // Drop stale unsuppressed local cursor motion queued before
-                // set_remote_focus(true) took effect so both cursors never move in tandem.
+                // Drop stale queued movement from the opposite side of a focus transition:
+                // - gate=true, remote_focus=false: unsuppressed local motion before remote focus took effect
+                // - gate=false, remote_focus=true: frozen edge motion queued right before local return
                 let _ = self.update_focus();
                 continue;
             }

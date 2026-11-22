@@ -521,9 +521,11 @@ struct WorkspaceView: View {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 defer { group.leave() }
                 if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    box.append(url.path)
+                    let resolved = (url as NSURL).filePathURL ?? url.standardizedFileURL
+                    box.append(resolved.path)
                 } else if let url = item as? URL {
-                    box.append(url.path)
+                    let resolved = (url as NSURL).filePathURL ?? url.standardizedFileURL
+                    box.append(resolved.path)
                 }
             }
         }

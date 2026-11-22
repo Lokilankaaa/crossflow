@@ -354,10 +354,12 @@ pub(super) fn warp_local_cursor(
             )
         },
         |point| unsafe {
+            // Perform a genuine 0 -> 1 disassociate/reassociate transition around
+            // CGWarpMouseCursorPosition so macOS cancels its 250ms post-warp local
+            // event suppression interval immediately instead of freezing at the edge.
+            let _ = CGAssociateMouseAndMouseCursorPosition(0);
             let code = CGWarpMouseCursorPosition(point);
-            if code == 0 {
-                let _ = CGAssociateMouseAndMouseCursorPosition(1);
-            }
+            let _ = CGAssociateMouseAndMouseCursorPosition(1);
             code
         },
     )
