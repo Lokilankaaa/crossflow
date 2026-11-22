@@ -135,8 +135,8 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    static kCFRunLoopDefaultMode: *const c_void;
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: bool) -> i32;
+    static kCFRunLoopDefaultMode: *mut c_void;
+    fn CFRunLoopRunInMode(mode: *mut c_void, seconds: f64, return_after_source: bool) -> i32;
     fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
     fn CFDataGetLength(the_data: *const c_void) -> isize;
     fn CFRelease(object: *const c_void);

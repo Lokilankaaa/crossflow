@@ -1204,7 +1204,13 @@ impl MouseSink for OwnedSink<'_> {
     }
     fn key(&mut self, usage: u16, down: bool) -> Result<()> {
         if down {
-            ensure!(self.keys.insert(usage), "duplicate remote key down");
+            if self.keys.contains(&usage) {
+                if !crate::input::is_repeatable_key(usage) {
+                    return Ok(());
+                }
+            } else {
+                self.keys.insert(usage);
+            }
         } else {
             ensure!(
                 self.keys.contains(&usage),

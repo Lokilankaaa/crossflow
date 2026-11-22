@@ -81,15 +81,12 @@ pub fn is_keyboard_usage(usage: u16) -> bool {
 }
 
 /// Returns true for keys that legitimately auto-repeat when held down
-/// (e.g., Backspace, Delete, Arrows, Letters, Digits, Punctuation, Space).
-/// Excludes modifiers, lock toggles, Fn/Globe, and media keys.
+/// (e.g., Backspace, Delete, Arrows, Letters, Digits, Punctuation, Space, Volume Up/Down).
+/// Excludes modifiers, lock toggles, Fn/Globe, and discrete media toggles.
 pub fn is_repeatable_key(usage: u16) -> bool {
     is_keyboard_usage(usage)
         && !(0xE0..=0xE7).contains(&usage)
-        && !matches!(
-            usage,
-            0x39 | 0x47 | 0x53 | 0xA4 | 0x7F | 0x80 | 0x81 | 0x9B | 0x9C | 0x9D
-        )
+        && !matches!(usage, 0x39 | 0x47 | 0x53 | 0xA4 | 0x7F | 0x9B | 0x9C | 0x9D)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

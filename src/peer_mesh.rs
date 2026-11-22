@@ -102,7 +102,7 @@ struct PeerConfig {
     peer_channels: HashMap<String, String>,
     #[serde(default)]
     passphrase: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     smart_keymap: bool,
     #[serde(default = "default_true")]
     clipboard_sync: bool,
@@ -128,7 +128,7 @@ impl Default for PeerConfig {
             manual_peers: Vec::new(),
             peer_channels: HashMap::new(),
             passphrase: None,
-            smart_keymap: true,
+            smart_keymap: false,
             clipboard_sync: true,
             input_state_sync: true,
             hotkeys: HotkeyConfig::default(),
@@ -825,7 +825,6 @@ struct ActiveMeshPeer {
     displays: Vec<Display>,
     conn: MeshPeerConn,
     aux: AuxSession,
-    keymap: crate::keymap::KeyTranslator,
 }
 
 struct MeshNativeIo {
@@ -1591,11 +1590,6 @@ pub fn run(
                                 classify_active_channel(peer.peer_addr, &local_channels);
                             let peer_rev = peer.layout_revision;
                             let peer_screens = peer.layout_screens;
-                            let different_os = peer.platform != std::env::consts::OS;
-                            let keymap = crate::keymap::KeyTranslator::new(
-                                smart_keymap_flag.clone(),
-                                different_os,
-                            );
                             active_peers.insert(
                                 rid.clone(),
                                 ActiveMeshPeer {
@@ -1608,7 +1602,6 @@ pub fn run(
                                     displays: peer.displays,
                                     conn: peer.conn,
                                     aux,
-                                    keymap,
                                 },
                             );
                             let remotes = remote_display_map(&active_peers);
@@ -2018,7 +2011,7 @@ pub fn run(
                                     break;
                                 }
                             };
-                            let Some((target, mut frame)) = next else {
+                            let Some((target, frame)) = next else {
                                 break;
                             };
                             did_work = true;
@@ -2031,14 +2024,12 @@ pub fn run(
                                 if let Some(old_id) = active_outbound_target.take()
                                     && let Some(old_peer) = active_peers.get_mut(&old_id)
                                 {
-                                    old_peer.keymap.reset();
                                     let _ = old_peer.conn.queue_frame(&Frame::new(Kind::Pause));
                                     let _ = old_peer.conn.flush();
                                 }
                                 if let Some(ref new_id) = target
-                                    && let Some(new_peer) = active_peers.get_mut(new_id)
+                                    && let Some(new_peer) = active_peers.get(new_id)
                                 {
-                                    new_peer.keymap.reset();
                                     new_peer.aux.push_input_state_now();
                                 }
                                 active_outbound_target = target.clone();
@@ -2047,11 +2038,6 @@ pub fn run(
                             if let Some(ref tid) = active_outbound_target
                                 && let Some(peer) = active_peers.get_mut(tid)
                             {
-                                if matches!(frame.kind, Kind::Arm | Kind::Pause | Kind::Stop) {
-                                    peer.keymap.reset();
-                                } else if frame.kind == Kind::Key {
-                                    frame.code = peer.keymap.translate(frame.code, frame.down);
-                                }
                                 let _ = peer.conn.queue_frame(&frame);
                                 let _ = peer.conn.flush();
                             }

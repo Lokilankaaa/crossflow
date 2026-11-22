@@ -496,7 +496,7 @@ mod native {
                 let key_flags = data1 & 0xFFFF;
                 let key_state = (key_flags & 0xFF00) >> 8;
                 let is_repeat = (key_flags & 0x01) != 0;
-                if is_repeat {
+                if is_repeat && !matches!(key_code, 0 | 1) {
                     return None;
                 }
                 let down = match key_state {

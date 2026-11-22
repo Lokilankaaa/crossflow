@@ -536,3 +536,44 @@ fn controlled_clock_expiry_still_rejects_delayed_requests_and_slow_calls() {
     );
     assert!(!lease.active());
 }
+
+#[test]
+fn owned_sink_forwards_key_and_combo_repeats_without_terminating_worker() {
+    let mut sink = FaultSink::default();
+    let stop = AtomicBool::new(false);
+    {
+        let mut guarded = Guarded(&mut sink);
+        let mut owned = OwnedSink::new(&mut guarded, &stop);
+        // Hold Backspace: initial down + 3 auto-repeats + up
+        owned.key(0x2A, true).unwrap();
+        owned.key(0x2A, true).unwrap();
+        owned.key(0x2A, true).unwrap();
+        owned.key(0x2A, true).unwrap();
+        owned.key(0x2A, false).unwrap();
+        // Hold Shift + '/': Shift down (repeat ignored), '/' down + 2 repeats + up, Shift up
+        owned.key(0xE1, true).unwrap();
+        owned.key(0xE1, true).unwrap();
+        owned.key(0x38, true).unwrap();
+        owned.key(0x38, true).unwrap();
+        owned.key(0x38, true).unwrap();
+        owned.key(0x38, false).unwrap();
+        owned.key(0xE1, false).unwrap();
+        owned.release_owned().unwrap();
+    }
+    assert_eq!(
+        sink.events,
+        vec![
+            Event::Key(0x2A, true),
+            Event::Key(0x2A, true),
+            Event::Key(0x2A, true),
+            Event::Key(0x2A, true),
+            Event::Key(0x2A, false),
+            Event::Key(0xE1, true),
+            Event::Key(0x38, true),
+            Event::Key(0x38, true),
+            Event::Key(0x38, true),
+            Event::Key(0x38, false),
+            Event::Key(0xE1, false),
+        ]
+    );
+}
