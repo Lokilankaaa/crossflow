@@ -427,18 +427,6 @@ mod native {
         y: f64,
     }
     #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct Size {
-        width: f64,
-        height: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct Rect {
-        origin: Point,
-        size: Size,
-    }
-    #[repr(C)]
     #[derive(Default)]
     struct Timebase {
         numer: u32,
@@ -465,8 +453,6 @@ mod native {
         fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
         fn CGPreflightListenEventAccess() -> bool;
         fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
-        fn CGWarpMouseCursorPosition(point: Point) -> i32;
-        fn CGDisplayBounds(display: u32) -> Rect;
         fn CGMainDisplayID() -> u32;
         fn CGDisplayHideCursor(display: u32) -> i32;
         fn CGDisplayShowCursor(display: u32) -> i32;
@@ -527,7 +513,6 @@ mod native {
         suppressed: bool,
         disassociated: bool,
         hide_count: u32,
-        pin: Point,
     }
 
     #[derive(Default)]
@@ -558,29 +543,15 @@ mod native {
             }
         }
 
-        fn main_display_center() -> Point {
-            let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-            if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
-                Point {
-                    x: bounds.origin.x + bounds.size.width * 0.5,
-                    y: bounds.origin.y + bounds.size.height * 0.5,
-                }
-            } else {
-                Point { x: 400.0, y: 300.0 }
-            }
-        }
-
         fn set_suppressed(&self, suppress: bool) {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if suppress {
                 Self::ensure_background_cursor(&mut state);
-                if !state.suppressed {
-                    // Park the local cursor safely in the center of the main display
-                    // (away from Hot Corners, Dock, and Menu Bar) before disassociating.
-                    state.pin = Self::main_display_center();
-                    let _ = unsafe { CGWarpMouseCursorPosition(state.pin) };
-                    state.suppressed = true;
-                }
+                state.suppressed = true;
+                // Never call CGWarpMouseCursorPosition here: warping injects a massive
+                // synthetic kCGMouseEventDeltaX/Y spike on the next move that bounces
+                // remote focus straight back to Mac. Disassociation + HID tap keeps the
+                // cursor completely frozen in place with pure physical deltas.
                 if !state.disassociated && unsafe { CGAssociateMouseAndMouseCursorPosition(0) } == 0
                 {
                     state.disassociated = true;
@@ -603,24 +574,19 @@ mod native {
             }
         }
 
-        /// Re-pin and re-hide the local Mac cursor if macOS WindowServer / Trackpad
-        /// moved or un-hid it while remote focus is active.
-        fn enforce_pinned(&self, current: Point) {
+        /// Re-assert cursor hiding & disassociation (without ever warping!) if macOS
+        /// WindowServer un-hid the cursor while remote focus is active.
+        fn enforce_hidden(&self) {
             let Ok(mut state) = self.0.try_lock() else {
                 return;
             };
             if !state.suppressed {
                 return;
             }
-            let drifted =
-                (current.x - state.pin.x).abs() > 1.0 || (current.y - state.pin.y).abs() > 1.0;
-            if drifted {
-                let _ = unsafe { CGWarpMouseCursorPosition(state.pin) };
-                let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
-                state.disassociated = true;
-            }
             if state.hide_count < 4 && unsafe { CGCursorIsVisible() } {
                 Self::ensure_background_cursor(&mut state);
+                let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
+                state.disassociated = true;
                 if unsafe { CGDisplayHideCursor(CGMainDisplayID()) } == 0 {
                     state.hide_count += 1;
                 }
@@ -910,8 +876,8 @@ mod native {
                     }
                 }
                 if remote {
-                    // Re-pin & re-hide if macOS Trackpad or WindowServer moved/showed the cursor.
-                    state.cursor.enforce_pinned(point);
+                    // Re-hide if WindowServer un-hid the cursor, without ever warping.
+                    state.cursor.enforce_hidden();
                 }
                 let dx = unsafe { CGEventGetDoubleValueField(event, 4) };
                 let dy = unsafe { CGEventGetDoubleValueField(event, 5) };
@@ -1138,16 +1104,32 @@ mod native {
         let mask = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27]
             .iter()
             .fold(0u64, |m, t| m | (1u64 << t));
-        // Session/head/default permits suppression without requiring a root HID tap.
-        let port = unsafe {
+        // Prefer kCGHIDEventTap (0) so suppressed mouse/trackpad events are swallowed
+        // BEFORE WindowServer updates the local cursor; fall back to kCGSessionEventTap (1)
+        // if HID tap is unavailable under the current permissions.
+        let hid_port = unsafe {
             CGEventTapCreate(
-                1,
+                0,
                 0,
                 0,
                 mask,
                 callback,
                 (&mut *state as *mut Context).cast(),
             )
+        };
+        let port = if !hid_port.is_null() {
+            hid_port
+        } else {
+            unsafe {
+                CGEventTapCreate(
+                    1,
+                    0,
+                    0,
+                    mask,
+                    callback,
+                    (&mut *state as *mut Context).cast(),
+                )
+            }
         };
         if port.is_null() {
             shared.stop(StopReason::SetupFailed);
