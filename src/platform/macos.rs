@@ -354,13 +354,30 @@ pub(super) fn warp_local_cursor(
             )
         },
         |point| unsafe {
-            // Perform a genuine 0 -> 1 disassociate/reassociate transition around
-            // CGWarpMouseCursorPosition so macOS cancels its 250ms post-warp local
-            // event suppression interval immediately instead of freezing at the edge.
-            let _ = CGAssociateMouseAndMouseCursorPosition(0);
-            let code = CGWarpMouseCursorPosition(point);
+            // Avoid CGWarpMouseCursorPosition: on macOS Sequoia it triggers Apple's
+            // hardcoded 250ms local-event suppression timer, causing the returning
+            // mouse/trackpad cursor to pause dead at the screen boundary.
+            // Posting a marked MOUSE_MOVED event from a private source with 0.0s
+            // suppression places the cursor immediately with zero pause and is
+            // filtered by ORIGIN_MARKER in macos_capture.
             let _ = CGAssociateMouseAndMouseCursorPosition(1);
-            code
+            let source = CGEventSourceCreate(PRIVATE_EVENT_SOURCE);
+            if source.is_null() {
+                return CGWarpMouseCursorPosition(point);
+            }
+            CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0);
+            let event = CGEventCreateMouseEvent(source, MOUSE_MOVED, point, 0);
+            if event.is_null() {
+                CFRelease(source);
+                return CGWarpMouseCursorPosition(point);
+            }
+            CGEventSetIntegerValueField(event, EVENT_SOURCE_USER_DATA, ORIGIN_MARKER);
+            CGEventSetIntegerValueField(event, MOUSE_DELTA_X, 0);
+            CGEventSetIntegerValueField(event, MOUSE_DELTA_Y, 0);
+            CGEventPost(HID_EVENT_TAP, event);
+            CFRelease(event);
+            CFRelease(source);
+            0
         },
     )
 }
