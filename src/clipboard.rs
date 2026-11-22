@@ -424,6 +424,7 @@ mod windows_clip {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_op_in_unsafe_fn)]
 mod macos_clip {
     use super::*;
     use std::ffi::{CStr, c_char, c_void};

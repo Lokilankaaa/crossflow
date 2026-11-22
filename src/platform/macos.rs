@@ -46,6 +46,8 @@ const FLAG_SHIFT: u64 = 0x20000;
 const FLAG_CONTROL: u64 = 0x40000;
 const FLAG_OPTION: u64 = 0x80000;
 const FLAG_COMMAND: u64 = 0x100000;
+const FLAG_NUMERIC_PAD: u64 = 0x200000;
+const FLAG_SECONDARY_FN: u64 = 0x800000;
 const HID_EVENT_TAP: u32 = 0;
 const ESCAPE_KEYCODE: u16 = 53;
 const MOUSE_DELTA_X: u32 = 4;
@@ -506,6 +508,16 @@ fn modifier_flags(keys: &BTreeSet<u16>) -> u64 {
         }
     }
     flags
+}
+
+/// Extra macOS flags required on arrow/nav/function keys so system shortcuts
+/// such as Mission Control / Spaces (`Ctrl + Left/Right/Up/Down`) trigger reliably.
+fn key_extra_flags(usage: u16) -> u64 {
+    match usage {
+        0x4F..=0x52 => FLAG_NUMERIC_PAD | FLAG_SECONDARY_FN, // Right, Left, Down, Up arrows
+        0x3A..=0x45 | 0x4A..=0x4E => FLAG_SECONDARY_FN,      // F1..F12, Home/PgUp/Del/End/PgDn
+        _ => 0,
+    }
 }
 
 /// Full macOS CGEventFlags including device-dependent modifier bits required by
@@ -1079,7 +1091,8 @@ impl MacMouseSink {
         if down {
             self.owned_keys.insert(usage);
         }
-        self.post_marked(&event, event_modifier_flags(&projected));
+        let flags = event_modifier_flags(&projected) | key_extra_flags(usage);
+        self.post_marked(&event, flags);
         if !down {
             self.owned_keys.remove(&usage);
         }
