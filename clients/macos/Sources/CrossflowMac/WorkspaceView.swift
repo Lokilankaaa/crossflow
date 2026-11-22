@@ -1,5 +1,41 @@
 import AppKit
+import CoreGraphics
 import SwiftUI
+
+@MainActor
+private final class RemoteCursorHider {
+    static let shared = RemoteCursorHider()
+    private var hidden = false
+    private var backgroundEnabled = false
+
+    private typealias CGSMainConnFn = @convention(c) () -> UInt32
+    private typealias CGSSetPropFn = @convention(c) (UInt32, UInt32, CFString, CFTypeRef) -> Int32
+
+    private func enableBackgroundCursorIfNeeded() {
+        guard !backgroundEnabled else { return }
+        if let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+           let mainSym = dlsym(handle, "CGSMainConnectionID"),
+           let setSym = dlsym(handle, "CGSSetConnectionProperty") {
+            let mainConn = unsafeBitCast(mainSym, to: CGSMainConnFn.self)
+            let setProp = unsafeBitCast(setSym, to: CGSSetPropFn.self)
+            let cid = mainConn()
+            _ = setProp(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+            backgroundEnabled = true
+        }
+    }
+
+    func setHidden(_ hide: Bool) {
+        if hide && !hidden {
+            enableBackgroundCursorIfNeeded()
+            if CGDisplayHideCursor(CGMainDisplayID()) == .success {
+                hidden = true
+            }
+        } else if !hide && hidden {
+            _ = CGDisplayShowCursor(CGMainDisplayID())
+            hidden = false
+        }
+    }
+}
 
 struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
@@ -30,13 +66,22 @@ struct WorkspaceView: View {
         }
         .onChange(of: devices.receiverStatus) { _, status in
             model.receiveSession(devices.stopping || devices.cleanupUnconfirmed ? nil : status)
+            let remoteFocused = devices.isSharing && model.focusDeviceID != nil && model.focusDeviceID != devices.localDeviceID
+            RemoteCursorHider.shared.setHidden(remoteFocused)
         }
         .onChange(of: devices.stopping) { _, stopping in
-            if stopping { model.receiveSession(nil) }
+            if stopping {
+                model.receiveSession(nil)
+                RemoteCursorHider.shared.setHidden(false)
+            }
         }
         .onChange(of: devices.cleanupUnconfirmed) { _, unconfirmed in
-            if unconfirmed { model.receiveSession(nil) }
+            if unconfirmed {
+                model.receiveSession(nil)
+                RemoteCursorHider.shared.setHidden(false)
+            }
         }
+        .onDisappear { RemoteCursorHider.shared.setHidden(false) }
         .sheet(isPresented: $showAddDevice, onDismiss: {
             if devices.operation == .invitation { devices.stop() }
             devices.ensureListeningIfReady()
