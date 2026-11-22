@@ -156,6 +156,8 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
     var toggleSharing: String?
     var lockScreen: String?
     var quickJumpNext: String?
+    var quickJumpPrevScreen: String?
+    var quickJumpNextScreen: String?
     var quickJumpHome: String?
     var quickJumpScreenPrefix: String?
     var quickJump1: String?
@@ -166,6 +168,8 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         case toggleSharing = "toggle_sharing"
         case lockScreen = "lock_screen"
         case quickJumpNext = "quick_jump_next"
+        case quickJumpPrevScreen = "quick_jump_prev_screen"
+        case quickJumpNextScreen = "quick_jump_next_screen"
         case quickJumpHome = "quick_jump_home"
         case quickJumpScreenPrefix = "quick_jump_screen_prefix"
         case quickJump1 = "quick_jump_1"
@@ -180,6 +184,8 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         try c.encode(toggleSharing, forKey: .toggleSharing)
         try c.encode(lockScreen, forKey: .lockScreen)
         try c.encode(quickJumpNext, forKey: .quickJumpNext)
+        try c.encode(quickJumpPrevScreen, forKey: .quickJumpPrevScreen)
+        try c.encode(quickJumpNextScreen, forKey: .quickJumpNextScreen)
         try c.encode(quickJumpHome, forKey: .quickJumpHome)
         try c.encode(quickJumpScreenPrefix, forKey: .quickJumpScreenPrefix)
         try c.encode(quickJump1, forKey: .quickJump1)
@@ -191,6 +197,8 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         toggleSharing: "Ctrl+Alt+S",
         lockScreen: "Ctrl+Alt+L",
         quickJumpNext: "Ctrl+Alt+Tab",
+        quickJumpPrevScreen: nil,
+        quickJumpNextScreen: nil,
         quickJumpHome: "Ctrl+Alt+H",
         quickJumpScreenPrefix: "Ctrl+Alt",
         quickJump1: nil,

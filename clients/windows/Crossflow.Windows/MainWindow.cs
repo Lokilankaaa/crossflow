@@ -69,24 +69,16 @@ internal sealed class MainWindow : Window
     private bool updatingInputStateUi;
     private bool updatingScreenLockUi;
 
-    // Customizable Hotkeys collapsible section
+    // Customizable Hotkeys collapsible section (pure custom keyboard + mouse side button recorder)
     private readonly Button hotkeysHeaderButton = new();
     private readonly StackPanel hotkeysPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
     private readonly Dictionary<string, Button> hotkeyButtons = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Button> hotkeyClearButtons = new(StringComparer.Ordinal);
-    private readonly ComboBox screenPrefixCombo = new();
-    private bool updatingScreenPrefixUi;
-    private static readonly (string? Prefix, string Label)[] ScreenPrefixChoices =
-    [
-        ("Ctrl+Alt", "Ctrl+Alt + 1~9"),
-        ("Ctrl+Shift", "Ctrl+Shift + 1~9"),
-        ("Alt+Shift", "Alt+Shift + 1~9"),
-        ("Ctrl+Alt+Shift", "Ctrl+Alt+Shift + 1~9"),
-        ("Alt", "Alt + 1~9"),
-        ("Ctrl+Meta", "Ctrl+Win + 1~9"),
-        (null, "已关闭"),
-    ];
     private string? recordingHotkeyField;
+    private readonly HashSet<string> recordHeldMods = new(StringComparer.Ordinal);
+    private readonly HashSet<string> recordHeldKeys = new(StringComparer.Ordinal);
+    private readonly HashSet<string> recordPeakMods = new(StringComparer.Ordinal);
+    private readonly HashSet<string> recordPeakKeys = new(StringComparer.Ordinal);
     private bool hotkeysExpanded;
     private TrayIcon? trayIcon;
 
@@ -528,38 +520,14 @@ internal sealed class MainWindow : Window
 
         var rows = new (string Field, string Label)[]
         {
+            ("quick_jump_screen_prefix", "屏幕 1–9 前缀"),
+            ("quick_jump_prev_screen", "上一个屏幕"),
+            ("quick_jump_next_screen", "下一个屏幕"),
+            ("quick_jump_home", "QuickJump 回本机"),
             ("toggle_sharing", "暂停 / 恢复共享"),
             ("lock_screen", "锁定当前屏幕"),
-            ("quick_jump_next", "QuickJump 下一台"),
-            ("quick_jump_home", "QuickJump 回本机"),
             ("emergency_stop", "紧急停止"),
         };
-
-        // Dedicated QuickJump Screen 1-9 modifier prefix selector
-        var prefixRow = new StackPanel { Spacing = 4, Margin = new Thickness(0, 0, 0, 2) };
-        prefixRow.Children.Add(new TextBlock
-        {
-            Text = "QuickJump 屏幕 1–9（按画布编号直达）",
-            FontSize = 11.5,
-            Foreground = theme.Brush("text")
-        });
-        screenPrefixCombo.FontSize = 11;
-        screenPrefixCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
-        foreach (var (prefix, label) in ScreenPrefixChoices)
-            screenPrefixCombo.Items.Add(new ComboBoxItem { Content = label, Tag = prefix ?? "" });
-        screenPrefixCombo.SelectedIndex = 0;
-        screenPrefixCombo.SelectionChanged += async (_, _) =>
-        {
-            if (updatingScreenPrefixUi) return;
-            if (screenPrefixCombo.SelectedItem is ComboBoxItem item && item.Tag is string tag)
-            {
-                string? nextPrefix = string.IsNullOrEmpty(tag) ? null : tag;
-                var updated = currentSnap.Hotkeys with { QuickJumpScreenPrefix = nextPrefix, QuickJump1 = null, QuickJump2 = null };
-                await peerMesh.SetHotkeysAsync(updated);
-            }
-        };
-        prefixRow.Children.Add(screenPrefixCombo);
-        hotkeysPanel.Children.Add(prefixRow);
 
         foreach (var (field, label) in rows)
         {
@@ -579,7 +547,7 @@ internal sealed class MainWindow : Window
                 Content = "—",
                 FontSize = 11,
                 Padding = new Thickness(7, 3, 7, 3),
-                MinWidth = 76,
+                MinWidth = 86,
                 Background = theme.Brush("background"),
                 Foreground = theme.Brush("text"),
                 BorderBrush = theme.Brush("border"),
@@ -617,9 +585,10 @@ internal sealed class MainWindow : Window
         hintAndReset.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
         hintAndReset.Children.Add(new TextBlock
         {
-            Text = "点击录制 · Esc 取消 · Del 清空",
+            Text = "支持任意键盘键 + 鼠标侧键 · Esc 取消",
             FontSize = 10.5,
             Foreground = theme.Brush("text_secondary"),
+            TextWrapping = TextWrapping.Wrap,
             VerticalAlignment = VerticalAlignment.Center
         });
         var resetBtn = new Button
@@ -644,6 +613,17 @@ internal sealed class MainWindow : Window
         sidebar.Children.Add(hotkeysPanel);
 
         root.PreviewKeyDown += OnRootPreviewKeyDown;
+        root.PreviewKeyUp += OnRootPreviewKeyUp;
+        root.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(OnRootPointerPressedForHotkey), true);
+        root.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(OnRootPointerReleasedForHotkey), true);
+    }
+
+    private void ClearRecordingBuffers()
+    {
+        recordHeldMods.Clear();
+        recordHeldKeys.Clear();
+        recordPeakMods.Clear();
+        recordPeakKeys.Clear();
     }
 
     private void ToggleHotkeyRecording(string field)
@@ -654,6 +634,7 @@ internal sealed class MainWindow : Window
             return;
         }
         recordingHotkeyField = field;
+        ClearRecordingBuffers();
         _ = peerMesh.SetHotkeySuspendedAsync(true);
         RenderHotkeyButtons(currentSnap.Hotkeys);
     }
@@ -662,75 +643,228 @@ internal sealed class MainWindow : Window
     {
         if (recordingHotkeyField is null) return;
         recordingHotkeyField = null;
+        ClearRecordingBuffers();
         _ = peerMesh.SetHotkeySuspendedAsync(false);
         RenderHotkeyButtons(currentSnap.Hotkeys);
+    }
+
+    private static string? ModifierName(VirtualKey key) => key switch
+    {
+        VirtualKey.Control or VirtualKey.LeftControl or VirtualKey.RightControl => "Ctrl",
+        VirtualKey.Menu or VirtualKey.LeftMenu or VirtualKey.RightMenu => "Alt",
+        VirtualKey.Shift or VirtualKey.LeftShift or VirtualKey.RightShift => "Shift",
+        VirtualKey.LeftWindows or VirtualKey.RightWindows => "Meta",
+        _ => null
+    };
+
+    private static bool IsMouseToken(string token) => token is "MouseMid" or "Mouse4" or "Mouse5";
+
+    private static bool IsStandaloneAllowedToken(string token)
+    {
+        if (IsMouseToken(token) || token == "ScrollLock") return true;
+        return token.Length >= 2 && token[0] == 'F' && int.TryParse(token[1..], out int n) && n is >= 1 and <= 20;
+    }
+
+    private static bool IsDigit1To9Token(string token) => token.Length == 1 && token[0] is >= '1' and <= '9';
+
+    private static string FormatRecordedCombo(IEnumerable<string> mods, IEnumerable<string> keys)
+    {
+        var modSet = new HashSet<string>(mods, StringComparer.Ordinal);
+        var parts = new List<string>(6);
+        if (modSet.Contains("Ctrl")) parts.Add("Ctrl");
+        if (modSet.Contains("Alt")) parts.Add("Alt");
+        if (modSet.Contains("Shift")) parts.Add("Shift");
+        if (modSet.Contains("Meta")) parts.Add("Meta");
+        var keyList = keys.Distinct(StringComparer.Ordinal).ToList();
+        parts.AddRange(keyList.Where(k => !IsMouseToken(k)).OrderBy(k => k, StringComparer.Ordinal));
+        parts.AddRange(keyList.Where(IsMouseToken).OrderBy(k => k, StringComparer.Ordinal));
+        return string.Join("+", parts);
+    }
+
+    private async Task CommitRecordedHotkeyAsync(string field, string? newValue)
+    {
+        ClearNotice();
+        recordingHotkeyField = null;
+        ClearRecordingBuffers();
+        await peerMesh.SetHotkeySuspendedAsync(false);
+        var h = currentSnap.Hotkeys;
+        var updated = field switch
+        {
+            "quick_jump_screen_prefix" => h with { QuickJumpScreenPrefix = newValue, QuickJump1 = null, QuickJump2 = null },
+            "quick_jump_prev_screen" => h with { QuickJumpPrevScreen = newValue },
+            "quick_jump_next_screen" => h with { QuickJumpNextScreen = newValue },
+            "toggle_sharing" => h with { ToggleSharing = newValue },
+            "lock_screen" => h with { LockScreen = newValue },
+            "quick_jump_next" => h with { QuickJumpNext = newValue },
+            "quick_jump_home" => h with { QuickJumpHome = newValue },
+            "emergency_stop" => h with { EmergencyStop = newValue },
+            _ => h
+        };
+        RenderHotkeyButtons(updated);
+        await peerMesh.SetHotkeysAsync(updated);
+    }
+
+    private async Task HandleRecordTokenDownAsync(string? modToken, string? keyToken)
+    {
+        if (recordingHotkeyField is not { } field) return;
+        bool isPrefix = field == "quick_jump_screen_prefix";
+
+        if (modToken is not null)
+        {
+            recordHeldMods.Add(modToken);
+            recordPeakMods.Add(modToken);
+            RenderHotkeyButtons(currentSnap.Hotkeys);
+            return;
+        }
+        if (keyToken is null) return;
+
+        bool noOtherHeld = recordHeldMods.Count == 0 && recordHeldKeys.Count == 0;
+        if (noOtherHeld && keyToken == "Esc")
+        {
+            CancelHotkeyRecording();
+            return;
+        }
+        if (noOtherHeld && keyToken is "Backspace" or "Delete")
+        {
+            await CommitRecordedHotkeyAsync(field, null);
+            return;
+        }
+        if (isPrefix && (keyToken == "Esc" || IsDigit1To9Token(keyToken)))
+        {
+            ShowNotice("屏幕 1–9 前缀不能包含数字 1–9 或 Esc。", isError: true);
+            return;
+        }
+
+        recordHeldKeys.Add(keyToken);
+        recordPeakKeys.Add(keyToken);
+
+        if (isPrefix)
+        {
+            // Prefix commits cleanly when the user releases all held keys/buttons
+            RenderHotkeyButtons(currentSnap.Hotkeys);
+            return;
+        }
+
+        // Normal chord: commit immediately if at least one modifier is held OR 2+ keys/mouse buttons are held together!
+        if (recordHeldMods.Count > 0 || recordHeldKeys.Count >= 2)
+        {
+            string chord = FormatRecordedCombo(recordHeldMods, recordHeldKeys);
+            await CommitRecordedHotkeyAsync(field, chord);
+            return;
+        }
+
+        // Single bare key or mouse button: wait for either a 2nd key/mouse button OR release!
+        RenderHotkeyButtons(currentSnap.Hotkeys);
+    }
+
+    private async Task HandleRecordTokenUpAsync(string? modToken, string? keyToken)
+    {
+        if (recordingHotkeyField is not { } field) return;
+        bool isPrefix = field == "quick_jump_screen_prefix";
+
+        if (modToken is not null) recordHeldMods.Remove(modToken);
+        if (keyToken is not null) recordHeldKeys.Remove(keyToken);
+
+        if (recordHeldMods.Count > 0 || recordHeldKeys.Count > 0)
+        {
+            RenderHotkeyButtons(currentSnap.Hotkeys);
+            return;
+        }
+
+        // All inputs released!
+        if (isPrefix)
+        {
+            if (recordPeakMods.Count > 0 || recordPeakKeys.Count > 0)
+            {
+                string prefix = FormatRecordedCombo(recordPeakMods, recordPeakKeys);
+                await CommitRecordedHotkeyAsync(field, prefix);
+            }
+            return;
+        }
+
+        if (recordPeakMods.Count == 0 && recordPeakKeys.Count == 1)
+        {
+            string only = recordPeakKeys.First();
+            if (IsStandaloneAllowedToken(only))
+            {
+                await CommitRecordedHotkeyAsync(field, only);
+            }
+            else
+            {
+                ClearRecordingBuffers();
+                RenderHotkeyButtons(currentSnap.Hotkeys);
+                ShowNotice("单个普通键请搭配修饰键或鼠标侧键（如 Alt+Mouse4、Q+Mouse5）。", isError: true);
+            }
+        }
     }
 
     private async void OnRootPreviewKeyDown(object sender, KeyRoutedEventArgs e)
     {
         if (recordingHotkeyField is null) return;
         e.Handled = true;
-        var key = e.Key;
-        if (key is VirtualKey.Control or VirtualKey.LeftControl or VirtualKey.RightControl
-            or VirtualKey.Menu or VirtualKey.LeftMenu or VirtualKey.RightMenu
-            or VirtualKey.Shift or VirtualKey.LeftShift or VirtualKey.RightShift
-            or VirtualKey.LeftWindows or VirtualKey.RightWindows)
+        var mod = ModifierName(e.Key);
+        if (mod is not null)
         {
+            await HandleRecordTokenDownAsync(mod, null);
             return;
         }
+        string? name = VirtualKeyToChordName(e.Key);
+        if (name is not null)
+            await HandleRecordTokenDownAsync(null, name);
+    }
 
-        bool ctrl = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
-        bool alt = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Menu) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
-        bool shift = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
-        bool meta = ((Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.LeftWindows) | Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.RightWindows)) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
-        bool hasMod = ctrl || alt || shift || meta;
-
-        if (!hasMod && key == VirtualKey.Escape)
+    private async void OnRootPreviewKeyUp(object sender, KeyRoutedEventArgs e)
+    {
+        if (recordingHotkeyField is null) return;
+        e.Handled = true;
+        var mod = ModifierName(e.Key);
+        if (mod is not null)
         {
-            CancelHotkeyRecording();
+            await HandleRecordTokenUpAsync(mod, null);
             return;
         }
+        string? name = VirtualKeyToChordName(e.Key);
+        if (name is not null)
+            await HandleRecordTokenUpAsync(null, name);
+    }
 
-        string field = recordingHotkeyField;
-        string? newChord;
-        if (!hasMod && key is VirtualKey.Back or VirtualKey.Delete)
+    private static string? AuxMouseToken(Microsoft.UI.Input.PointerUpdateKind kind, out bool isDown)
+    {
+        isDown = false;
+        switch (kind)
         {
-            newChord = null;
+            case Microsoft.UI.Input.PointerUpdateKind.MiddleButtonPressed: isDown = true; return "MouseMid";
+            case Microsoft.UI.Input.PointerUpdateKind.MiddleButtonReleased: isDown = false; return "MouseMid";
+            case Microsoft.UI.Input.PointerUpdateKind.XButton1Pressed: isDown = true; return "Mouse4";
+            case Microsoft.UI.Input.PointerUpdateKind.XButton1Released: isDown = false; return "Mouse4";
+            case Microsoft.UI.Input.PointerUpdateKind.XButton2Pressed: isDown = true; return "Mouse5";
+            case Microsoft.UI.Input.PointerUpdateKind.XButton2Released: isDown = false; return "Mouse5";
+            default: return null;
         }
-        else
-        {
-            string? keyName = VirtualKeyToChordName(key);
-            bool standaloneAllowed = key >= VirtualKey.F1 && key <= VirtualKey.F20;
-            if (keyName is null || (!hasMod && !standaloneAllowed))
-            {
-                ShowNotice("请配合 Ctrl / Alt / Shift 等修饰键（或使用 F1–F20）。", isError: true);
-                return;
-            }
-            var parts = new List<string>(5);
-            if (ctrl) parts.Add("Ctrl");
-            if (alt) parts.Add("Alt");
-            if (shift) parts.Add("Shift");
-            if (meta) parts.Add("Meta");
-            parts.Add(keyName);
-            newChord = string.Join("+", parts);
-        }
+    }
 
-        ClearNotice();
-        recordingHotkeyField = null;
-        await peerMesh.SetHotkeySuspendedAsync(false);
-        var h = currentSnap.Hotkeys;
-        var updated = field switch
+    private async void OnRootPointerPressedForHotkey(object sender, PointerRoutedEventArgs e)
+    {
+        if (recordingHotkeyField is null) return;
+        var kind = e.GetCurrentPoint(root).Properties.PointerUpdateKind;
+        string? token = AuxMouseToken(kind, out bool isDown);
+        if (token is not null && isDown)
         {
-            "toggle_sharing" => h with { ToggleSharing = newChord },
-            "lock_screen" => h with { LockScreen = newChord },
-            "quick_jump_next" => h with { QuickJumpNext = newChord },
-            "quick_jump_home" => h with { QuickJumpHome = newChord },
-            "quick_jump_1" => h with { QuickJump1 = newChord },
-            "emergency_stop" => h with { EmergencyStop = newChord },
-            _ => h
-        };
-        RenderHotkeyButtons(updated);
-        await peerMesh.SetHotkeysAsync(updated);
+            e.Handled = true;
+            await HandleRecordTokenDownAsync(null, token);
+        }
+    }
+
+    private async void OnRootPointerReleasedForHotkey(object sender, PointerRoutedEventArgs e)
+    {
+        if (recordingHotkeyField is null) return;
+        var kind = e.GetCurrentPoint(root).Properties.PointerUpdateKind;
+        string? token = AuxMouseToken(kind, out bool isDown);
+        if (token is not null && !isDown)
+        {
+            e.Handled = true;
+            await HandleRecordTokenUpAsync(null, token);
+        }
     }
 
     private static string? VirtualKeyToChordName(VirtualKey key)
@@ -758,11 +892,19 @@ internal sealed class MainWindow : Window
             VirtualKey.Right => "Right",
             VirtualKey.Up => "Up",
             VirtualKey.Down => "Down",
-            (VirtualKey)189 => "-",
+            VirtualKey.CapitalLock => "CapsLock",
+            VirtualKey.Scroll => "ScrollLock",
+            (VirtualKey)186 => ";",
             (VirtualKey)187 => "=",
-            (VirtualKey)219 => "[",
-            (VirtualKey)221 => "]",
+            (VirtualKey)188 => ",",
+            (VirtualKey)189 => "-",
+            (VirtualKey)190 => ".",
+            (VirtualKey)191 => "/",
             (VirtualKey)192 => "`",
+            (VirtualKey)219 => "[",
+            (VirtualKey)220 => "\\",
+            (VirtualKey)221 => "]",
+            (VirtualKey)222 => "'",
             _ => null
         };
     }
@@ -773,11 +915,13 @@ internal sealed class MainWindow : Window
         var h = currentSnap.Hotkeys;
         var updated = field switch
         {
+            "quick_jump_screen_prefix" => h with { QuickJumpScreenPrefix = null, QuickJump1 = null, QuickJump2 = null },
+            "quick_jump_prev_screen" => h with { QuickJumpPrevScreen = null },
+            "quick_jump_next_screen" => h with { QuickJumpNextScreen = null },
             "toggle_sharing" => h with { ToggleSharing = null },
             "lock_screen" => h with { LockScreen = null },
             "quick_jump_next" => h with { QuickJumpNext = null },
             "quick_jump_home" => h with { QuickJumpHome = null },
-            "quick_jump_1" => h with { QuickJump1 = null },
             "emergency_stop" => h with { EmergencyStop = null },
             _ => h
         };
@@ -789,49 +933,44 @@ internal sealed class MainWindow : Window
     {
         string? GetVal(string f) => f switch
         {
+            "quick_jump_screen_prefix" => h.QuickJumpScreenPrefix,
+            "quick_jump_prev_screen" => h.QuickJumpPrevScreen,
+            "quick_jump_next_screen" => h.QuickJumpNextScreen,
             "toggle_sharing" => h.ToggleSharing,
             "lock_screen" => h.LockScreen,
             "quick_jump_next" => h.QuickJumpNext,
             "quick_jump_home" => h.QuickJumpHome,
-            "quick_jump_1" => h.QuickJump1,
             "emergency_stop" => h.EmergencyStop,
             _ => null
         };
+        string livePreview = FormatRecordedCombo(
+            recordHeldMods.Count > 0 || recordHeldKeys.Count > 0 ? recordHeldMods : recordPeakMods,
+            recordHeldMods.Count > 0 || recordHeldKeys.Count > 0 ? recordHeldKeys : recordPeakKeys);
+
         foreach (var (field, btn) in hotkeyButtons)
         {
             bool rec = recordingHotkeyField == field;
+            bool isPrefix = field == "quick_jump_screen_prefix";
             string? val = GetVal(field);
-            btn.Content = rec ? "请按组合键…" : (val ?? "未设置");
+            if (rec)
+            {
+                if (livePreview.Length > 0)
+                    btn.Content = isPrefix ? $"{livePreview} + 1~9" : $"{livePreview} + …";
+                else
+                    btn.Content = isPrefix ? "按住前缀后松开…" : "按下键/侧键…";
+            }
+            else if (val is not null)
+            {
+                btn.Content = isPrefix ? $"{val} + 1~9" : val;
+            }
+            else
+            {
+                btn.Content = "未设置";
+            }
             btn.BorderBrush = theme.Brush(rec ? "accent" : "border");
             btn.Foreground = theme.Brush(rec ? "accent" : (val is null ? "text_secondary" : "text"));
             if (hotkeyClearButtons.TryGetValue(field, out var clearBtn))
                 clearBtn.Visibility = (!rec && val is not null) ? Visibility.Visible : Visibility.Collapsed;
-        }
-        if (!screenPrefixCombo.IsDropDownOpen)
-        {
-            string targetTag = h.QuickJumpScreenPrefix ?? "";
-            int idx = -1;
-            for (int i = 0; i < screenPrefixCombo.Items.Count; i++)
-            {
-                if (screenPrefixCombo.Items[i] is ComboBoxItem item && string.Equals(item.Tag as string, targetTag, StringComparison.OrdinalIgnoreCase))
-                {
-                    idx = i;
-                    break;
-                }
-            }
-            if (idx < 0 && !string.IsNullOrEmpty(targetTag))
-            {
-                updatingScreenPrefixUi = true;
-                screenPrefixCombo.Items.Add(new ComboBoxItem { Content = $"{targetTag} + 1~9", Tag = targetTag });
-                idx = screenPrefixCombo.Items.Count - 1;
-                updatingScreenPrefixUi = false;
-            }
-            if (idx >= 0 && screenPrefixCombo.SelectedIndex != idx)
-            {
-                updatingScreenPrefixUi = true;
-                screenPrefixCombo.SelectedIndex = idx;
-                updatingScreenPrefixUi = false;
-            }
         }
     }
 

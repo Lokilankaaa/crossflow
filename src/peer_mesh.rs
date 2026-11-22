@@ -2167,6 +2167,43 @@ pub fn run(
                                             Some((QuickJumpTarget::Device(t), Instant::now()));
                                     }
                                 }
+                                HotkeyAction::QuickJumpPrevScreen
+                                | HotkeyAction::QuickJumpNextScreen => {
+                                    if !user_paused && !numbered_screens.is_empty() {
+                                        let forward = matches!(
+                                            action,
+                                            HotkeyAction::QuickJumpNextScreen
+                                        );
+                                        let base_screen_id = match &pending_quick_jump {
+                                            Some((QuickJumpTarget::Screen(id), _)) => {
+                                                Some(id.clone())
+                                            }
+                                            _ => io.source.focus_identity().1,
+                                        };
+                                        let n = numbered_screens.len();
+                                        let next_idx = match base_screen_id
+                                            .as_deref()
+                                            .and_then(|cur| {
+                                                numbered_screens
+                                                    .iter()
+                                                    .position(|s| s.screen_id == cur)
+                                            }) {
+                                            Some(i) if forward => (i + 1) % n,
+                                            Some(i) => (i + n - 1) % n,
+                                            None if forward => numbered_screens
+                                                .iter()
+                                                .position(|s| s.device_id != local_device_id)
+                                                .unwrap_or(0),
+                                            None => n - 1,
+                                        };
+                                        pending_quick_jump = Some((
+                                            QuickJumpTarget::Screen(
+                                                numbered_screens[next_idx].screen_id.clone(),
+                                            ),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
                                 HotkeyAction::QuickJumpHome => {
                                     if !user_paused {
                                         pending_quick_jump = Some((

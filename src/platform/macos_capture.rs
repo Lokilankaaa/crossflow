@@ -832,6 +832,7 @@ mod native {
         remote_keys: [bool; 128],
         remote_buttons: [bool; 5],
         hotkey_suppressed: [bool; 128],
+        hotkey_suppressed_buttons: [bool; 5],
         wheel: WheelRemainder,
         permission: Option<PermissionProbe>,
     }
@@ -935,6 +936,9 @@ mod native {
                         if state.buttons[b] {
                             update_held(&state.shared, &mut state.buttons[b], false);
                             state.remote_buttons[b] = false;
+                            if let Some(btn) = button(b) {
+                                crate::hotkeys::active_observe_button(btn, false);
+                            }
                         }
                     }
                 }
@@ -962,6 +966,18 @@ mod native {
                     return false;
                 };
                 let down = matches!(kind, 1 | 3 | 25);
+                if crate::hotkeys::has_active_engine() {
+                    if state.hotkey_suppressed_buttons[number] {
+                        if !down {
+                            state.hotkey_suppressed_buttons[number] = false;
+                        }
+                        return true;
+                    }
+                    if crate::hotkeys::active_observe_button(button, down).is_some() {
+                        state.hotkey_suppressed_buttons[number] = true;
+                        return true;
+                    }
+                }
                 update_held(&state.shared, &mut state.buttons[number], down);
                 suppress = route_press(&mut state.remote_buttons[number], down, remote);
                 CaptureKind::Button { button, down }
@@ -1195,6 +1211,7 @@ mod native {
             remote_keys: [false; 128],
             remote_buttons: [false; 5],
             hotkey_suppressed: [false; 128],
+            hotkey_suppressed_buttons: [false; 5],
             wheel: WheelRemainder::default(),
             permission: None,
         });

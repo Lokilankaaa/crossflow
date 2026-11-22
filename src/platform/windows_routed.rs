@@ -610,15 +610,42 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
             let suppress = with_policy(|state| {
                 let remote =
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);
-                if let Some((button, down)) = mouse_button(wparam as u32, input.mouseData) {
-                    let decision = state.policy.transition(button, down, remote, false, false);
-                    let button = match button {
+                if let Some((button_vk, down)) = mouse_button(wparam as u32, input.mouseData) {
+                    let button = match button_vk {
                         1 => Button::Left,
                         2 => Button::Right,
                         4 => Button::Middle,
                         5 => Button::Back,
                         _ => Button::Forward,
                     };
+                    if crate::hotkeys::has_active_engine()
+                        && button_vk < state.policy.hotkey_suppressed.len()
+                    {
+                        if state.policy.hotkey_suppressed[button_vk] {
+                            state.policy.physical[button_vk] = down;
+                            if !down {
+                                state.policy.hotkey_suppressed[button_vk] = false;
+                                state.policy.delivered[button_vk] = false;
+                                state.policy.suppressed[button_vk] = false;
+                            }
+                            return Decision {
+                                suppress: true,
+                                command: None,
+                            };
+                        }
+                        let was_down = state.policy.physical[button_vk];
+                        if (!down || !was_down)
+                            && crate::hotkeys::active_observe_button(button, down).is_some()
+                        {
+                            state.policy.physical[button_vk] = true;
+                            state.policy.hotkey_suppressed[button_vk] = true;
+                            return Decision {
+                                suppress: true,
+                                command: None,
+                            };
+                        }
+                    }
+                    let decision = state.policy.transition(button_vk, down, remote, false, false);
                     state.enqueue(CaptureEvent::Button {
                         button,
                         down,

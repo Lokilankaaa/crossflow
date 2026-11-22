@@ -38,18 +38,42 @@ private final class RemoteCursorHider {
     }
 }
 
+private enum RecordedInputEvent: Sendable {
+    case keyDown(UInt16)
+    case keyUp(UInt16)
+    case flagsChanged(NSEvent.ModifierFlags)
+    case otherMouseDown(Int)
+    case otherMouseUp(Int)
+}
+
 @MainActor
 private final class HotkeyKeyMonitor {
     static let shared = HotkeyKeyMonitor()
     private var monitor: Any?
 
-    func start(onEvent: @escaping @MainActor (UInt16, NSEvent.ModifierFlags) -> Bool) {
+    func start(onEvent: @escaping @MainActor (RecordedInputEvent) -> Bool) {
         stop()
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            let code = event.keyCode
-            let flags = event.modifierFlags
+        let mask: NSEvent.EventTypeMask = [.keyDown, .keyUp, .flagsChanged, .otherMouseDown, .otherMouseUp]
+        monitor = NSEvent.addLocalMonitorForEvents(matching: mask) { event in
+            let parsed: RecordedInputEvent?
+            switch event.type {
+            case .keyDown:
+                if event.isARepeat { return nil }
+                parsed = .keyDown(event.keyCode)
+            case .keyUp:
+                parsed = .keyUp(event.keyCode)
+            case .flagsChanged:
+                parsed = .flagsChanged(event.modifierFlags)
+            case .otherMouseDown:
+                parsed = .otherMouseDown(event.buttonNumber)
+            case .otherMouseUp:
+                parsed = .otherMouseUp(event.buttonNumber)
+            default:
+                parsed = nil
+            }
+            guard let ev = parsed else { return event }
             let consumed = MainActor.assumeIsolated {
-                onEvent(code, flags)
+                onEvent(ev)
             }
             return consumed ? nil : event
         }
@@ -73,6 +97,10 @@ struct WorkspaceView: View {
     @ViewState private var passwordInput = ""
     @ViewState private var hotkeysExpanded = false
     @ViewState private var recordingHotkeyField: String?
+    @ViewState private var recordHeldMods: Set<String> = []
+    @ViewState private var recordHeldKeys: Set<String> = []
+    @ViewState private var recordPeakMods: Set<String> = []
+    @ViewState private var recordPeakKeys: Set<String> = []
     @ViewState private var expandedPeerID: String?
     @ViewState private var addingManualPeer = false
     @ViewState private var manualPeerAddress = ""
@@ -576,45 +604,19 @@ struct WorkspaceView: View {
             .buttonStyle(.plain)
 
             if hotkeysExpanded {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("QuickJump 屏幕 1–9（按画布编号直达）")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(Theme.text)
-                    let prefixBinding = Binding<String>(
-                        get: { peer.hotkeys.quickJumpScreenPrefix ?? "" },
-                        set: { next in
-                            var updated = peer.hotkeys
-                            updated.quickJumpScreenPrefix = next.isEmpty ? nil : next
-                            updated.quickJump1 = nil
-                            updated.quickJump2 = nil
-                            peer.setHotkeys(updated)
-                        }
-                    )
-                    Picker("", selection: prefixBinding) {
-                        Text("Ctrl+Option + 1~9").tag("Ctrl+Alt")
-                        Text("Ctrl+Shift + 1~9").tag("Ctrl+Shift")
-                        Text("Option+Shift + 1~9").tag("Alt+Shift")
-                        Text("Ctrl+Option+Shift + 1~9").tag("Ctrl+Alt+Shift")
-                        Text("Option + 1~9").tag("Alt")
-                        Text("Ctrl+Cmd + 1~9").tag("Ctrl+Meta")
-                        Text("已关闭").tag("")
-                    }
-                    .labelsHidden()
-                    .controlSize(.small)
-                    .frame(maxWidth: .infinity)
-                }
-                .padding(.bottom, 2)
-
+                hotkeyRow(field: "quick_jump_screen_prefix", label: "屏幕 1–9 前缀", value: peer.hotkeys.quickJumpScreenPrefix)
+                hotkeyRow(field: "quick_jump_prev_screen", label: "上一个屏幕", value: peer.hotkeys.quickJumpPrevScreen)
+                hotkeyRow(field: "quick_jump_next_screen", label: "下一个屏幕", value: peer.hotkeys.quickJumpNextScreen)
+                hotkeyRow(field: "quick_jump_home", label: "QuickJump 回本机", value: peer.hotkeys.quickJumpHome)
                 hotkeyRow(field: "toggle_sharing", label: "暂停 / 恢复共享", value: peer.hotkeys.toggleSharing)
                 hotkeyRow(field: "lock_screen", label: "锁定当前屏幕", value: peer.hotkeys.lockScreen)
-                hotkeyRow(field: "quick_jump_next", label: "QuickJump 下一台", value: peer.hotkeys.quickJumpNext)
-                hotkeyRow(field: "quick_jump_home", label: "QuickJump 回本机", value: peer.hotkeys.quickJumpHome)
                 hotkeyRow(field: "emergency_stop", label: "紧急停止", value: peer.hotkeys.emergencyStop)
 
                 HStack {
-                    Text("点击录制 · Esc 取消 · Del 清空")
+                    Text("支持任意键盘键 + 鼠标侧键 · Esc 取消")
                         .font(.system(size: 10.5))
                         .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer()
                     Button("恢复默认") {
                         cancelHotkeyRecording()
@@ -628,8 +630,50 @@ struct WorkspaceView: View {
         }
     }
 
+    private func isMouseToken(_ token: String) -> Bool {
+        token == "MouseMid" || token == "Mouse4" || token == "Mouse5"
+    }
+
+    private func isStandaloneAllowedToken(_ token: String) -> Bool {
+        if isMouseToken(token) || token == "ScrollLock" { return true }
+        return token.hasPrefix("F") && token.count >= 2 && token.dropFirst().allSatisfy(\.isNumber)
+    }
+
+    private func isDigit1To9Token(_ token: String) -> Bool {
+        token.count == 1 && token >= "1" && token <= "9"
+    }
+
+    private func formatRecordedCombo(mods: Set<String>, keys: Set<String>) -> String {
+        var parts: [String] = []
+        if mods.contains("Ctrl") { parts.append("Ctrl") }
+        if mods.contains("Alt") { parts.append("Alt") }
+        if mods.contains("Shift") { parts.append("Shift") }
+        if mods.contains("Meta") { parts.append("Meta") }
+        parts.append(contentsOf: keys.filter { !isMouseToken($0) }.sorted())
+        parts.append(contentsOf: keys.filter { isMouseToken($0) }.sorted())
+        return parts.joined(separator: "+")
+    }
+
     private func hotkeyRow(field: String, label: String, value: String?) -> some View {
         let isRecording = recordingHotkeyField == field
+        let isPrefix = field == "quick_jump_screen_prefix"
+        let livePreview: String = {
+            let mods = (!recordHeldMods.isEmpty || !recordHeldKeys.isEmpty) ? recordHeldMods : recordPeakMods
+            let keys = (!recordHeldMods.isEmpty || !recordHeldKeys.isEmpty) ? recordHeldKeys : recordPeakKeys
+            return formatRecordedCombo(mods: mods, keys: keys)
+        }()
+        let displayText: String = {
+            if isRecording {
+                if !livePreview.isEmpty {
+                    return isPrefix ? "\(livePreview) + 1~9" : "\(livePreview) + …"
+                }
+                return isPrefix ? "按住前缀后松开…" : "按下键/侧键…"
+            }
+            if let v = value {
+                return isPrefix ? "\(v) + 1~9" : v
+            }
+            return "未设置"
+        }()
         return HStack(spacing: 4) {
             Text(label)
                 .font(.system(size: 11.5))
@@ -639,12 +683,12 @@ struct WorkspaceView: View {
             Button {
                 toggleHotkeyRecording(field)
             } label: {
-                Text(isRecording ? "请按组合键…" : (value ?? "未设置"))
+                Text(displayText)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(isRecording ? Theme.accent : (value == nil ? Theme.secondary : Theme.text))
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
-                    .frame(minWidth: 74)
+                    .frame(minWidth: 86)
                     .background(Theme.background, in: RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(isRecording ? Theme.accent : Theme.border, lineWidth: 1))
             }
@@ -663,19 +707,36 @@ struct WorkspaceView: View {
         }
     }
 
-    private func clearHotkey(_ field: String) {
+    private func clearRecordingBuffers() {
+        recordHeldMods.removeAll()
+        recordHeldKeys.removeAll()
+        recordPeakMods.removeAll()
+        recordPeakKeys.removeAll()
+    }
+
+    private func commitRecordedHotkey(field: String, value: String?) {
+        layoutNotice = nil
         cancelHotkeyRecording()
         var updated = peer.hotkeys
         switch field {
-        case "toggle_sharing": updated.toggleSharing = nil
-        case "lock_screen": updated.lockScreen = nil
-        case "quick_jump_next": updated.quickJumpNext = nil
-        case "quick_jump_home": updated.quickJumpHome = nil
-        case "quick_jump_1": updated.quickJump1 = nil
-        case "emergency_stop": updated.emergencyStop = nil
+        case "quick_jump_screen_prefix":
+            updated.quickJumpScreenPrefix = value
+            updated.quickJump1 = nil
+            updated.quickJump2 = nil
+        case "quick_jump_prev_screen": updated.quickJumpPrevScreen = value
+        case "quick_jump_next_screen": updated.quickJumpNextScreen = value
+        case "toggle_sharing": updated.toggleSharing = value
+        case "lock_screen": updated.lockScreen = value
+        case "quick_jump_next": updated.quickJumpNext = value
+        case "quick_jump_home": updated.quickJumpHome = value
+        case "emergency_stop": updated.emergencyStop = value
         default: break
         }
         peer.setHotkeys(updated)
+    }
+
+    private func clearHotkey(_ field: String) {
+        commitRecordedHotkey(field: field, value: nil)
     }
 
     private func toggleHotkeyRecording(_ field: String) {
@@ -684,65 +745,110 @@ struct WorkspaceView: View {
             return
         }
         recordingHotkeyField = field
+        clearRecordingBuffers()
         peer.setHotkeySuspended(true)
-        HotkeyKeyMonitor.shared.start { keyCode, modifierFlags in
-            handleRecordedKeyEvent(keyCode: keyCode, modifierFlags: modifierFlags, field: field)
+        HotkeyKeyMonitor.shared.start { event in
+            handleRecordedInputEvent(event, field: field)
         }
     }
 
     private func cancelHotkeyRecording() {
         if recordingHotkeyField != nil {
             recordingHotkeyField = nil
+            clearRecordingBuffers()
             peer.setHotkeySuspended(false)
         }
         HotkeyKeyMonitor.shared.stop()
     }
 
-    private func handleRecordedKeyEvent(keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags, field: String) -> Bool {
-        let flags = modifierFlags.intersection([.control, .option, .shift, .command])
-        let hasMod = !flags.isEmpty
+    private func handleRecordedInputEvent(_ event: RecordedInputEvent, field: String) -> Bool {
+        let isPrefix = field == "quick_jump_screen_prefix"
 
-        if !hasMod && keyCode == 53 {
-            cancelHotkeyRecording()
+        func checkAllReleased() {
+            guard recordHeldMods.isEmpty && recordHeldKeys.isEmpty else { return }
+            if isPrefix {
+                if !recordPeakMods.isEmpty || !recordPeakKeys.isEmpty {
+                    let prefix = formatRecordedCombo(mods: recordPeakMods, keys: recordPeakKeys)
+                    commitRecordedHotkey(field: field, value: prefix)
+                }
+                return
+            }
+            if recordPeakMods.isEmpty && recordPeakKeys.count == 1, let only = recordPeakKeys.first {
+                if isStandaloneAllowedToken(only) {
+                    commitRecordedHotkey(field: field, value: only)
+                } else {
+                    clearRecordingBuffers()
+                    layoutNotice = "单个普通键请搭配修饰键或鼠标侧键（如 Alt+Mouse4、Q+Mouse5）。"
+                }
+            }
+        }
+
+        func handleKeyDownToken(_ token: String) -> Bool {
+            let noOtherHeld = recordHeldMods.isEmpty && recordHeldKeys.isEmpty
+            if noOtherHeld && token == "Esc" {
+                cancelHotkeyRecording()
+                return true
+            }
+            if noOtherHeld && (token == "Backspace" || token == "Delete") {
+                commitRecordedHotkey(field: field, value: nil)
+                return true
+            }
+            if isPrefix && (token == "Esc" || isDigit1To9Token(token)) {
+                layoutNotice = "屏幕 1–9 前缀不能包含数字 1–9 或 Esc。"
+                return true
+            }
+            recordHeldKeys.insert(token)
+            recordPeakKeys.insert(token)
+            if isPrefix {
+                return true
+            }
+            if !recordHeldMods.isEmpty || recordHeldKeys.count >= 2 {
+                let chord = formatRecordedCombo(mods: recordHeldMods, keys: recordHeldKeys)
+                commitRecordedHotkey(field: field, value: chord)
+            }
             return true
         }
 
-        let newChord: String?
-        if !hasMod && (keyCode == 51 || keyCode == 117) {
-            newChord = nil
-        } else {
-            guard let keyName = macKeyCodeToChordName(keyCode) else {
-                layoutNotice = "不支持该按键，请选择字母、数字、Tab、Esc 或功能键。"
-                return true
-            }
-            let standaloneAllowed = keyName.hasPrefix("F") && keyName.count >= 2 && keyName.dropFirst().allSatisfy(\.isNumber)
-            if !hasMod && !standaloneAllowed {
-                layoutNotice = "请配合 Control / Option / Shift / Command 等修饰键（或使用 F1–F20）。"
-                return true
-            }
-            var parts: [String] = []
-            if flags.contains(.control) { parts.append("Ctrl") }
-            if flags.contains(.option) { parts.append("Alt") }
-            if flags.contains(.shift) { parts.append("Shift") }
-            if flags.contains(.command) { parts.append("Meta") }
-            parts.append(keyName)
-            newChord = parts.joined(separator: "+")
+        func handleKeyUpToken(_ token: String) -> Bool {
+            recordHeldKeys.remove(token)
+            checkAllReleased()
+            return true
         }
 
-        layoutNotice = nil
-        cancelHotkeyRecording()
-        var updated = peer.hotkeys
-        switch field {
-        case "toggle_sharing": updated.toggleSharing = newChord
-        case "lock_screen": updated.lockScreen = newChord
-        case "quick_jump_next": updated.quickJumpNext = newChord
-        case "quick_jump_home": updated.quickJumpHome = newChord
-        case "quick_jump_1": updated.quickJump1 = newChord
-        case "emergency_stop": updated.emergencyStop = newChord
-        default: break
+        switch event {
+        case .flagsChanged(let rawFlags):
+            let flags = rawFlags.intersection([.control, .option, .shift, .command])
+            var currentMods: Set<String> = []
+            if flags.contains(.control) { currentMods.insert("Ctrl") }
+            if flags.contains(.option) { currentMods.insert("Alt") }
+            if flags.contains(.shift) { currentMods.insert("Shift") }
+            if flags.contains(.command) { currentMods.insert("Meta") }
+            recordHeldMods = currentMods
+            recordPeakMods.formUnion(currentMods)
+            checkAllReleased()
+            return true
+        case .keyDown(let keyCode):
+            guard let token = macKeyCodeToChordName(keyCode) else { return true }
+            return handleKeyDownToken(token)
+        case .keyUp(let keyCode):
+            guard let token = macKeyCodeToChordName(keyCode) else { return true }
+            return handleKeyUpToken(token)
+        case .otherMouseDown(let buttonNumber):
+            guard let token = macMouseButtonToToken(buttonNumber) else { return false }
+            return handleKeyDownToken(token)
+        case .otherMouseUp(let buttonNumber):
+            guard let token = macMouseButtonToToken(buttonNumber) else { return false }
+            return handleKeyUpToken(token)
         }
-        peer.setHotkeys(updated)
-        return true
+    }
+
+    private func macMouseButtonToToken(_ buttonNumber: Int) -> String? {
+        switch buttonNumber {
+        case 2: "MouseMid"
+        case 3: "Mouse4"
+        case 4: "Mouse5"
+        default: nil
+        }
     }
 
     private func macKeyCodeToChordName(_ code: UInt16) -> String? {
