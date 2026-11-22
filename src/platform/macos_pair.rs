@@ -221,16 +221,6 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
             let Some(event) = self.native.try_next() else {
                 break;
             };
-            if matches!(
-                event.kind,
-                CaptureKind::Key {
-                    usage: 0x29,
-                    down: true
-                }
-            ) {
-                self.halt("local Escape shortcut", None);
-                break;
-            }
             let Some(mapped) = source_event(event.kind, event.native_x, event.native_y) else {
                 continue;
             };
@@ -295,6 +285,11 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
 
     fn failure(&self) -> Option<&'static str> {
         self.failure
+    }
+
+    fn warp_local(&mut self, point: Point) -> Result<()> {
+        self.native.set_remote_focus(false);
+        self.native.warp_local(point.x, point.y)
     }
 }
 
@@ -472,28 +467,30 @@ mod tests {
         assert!(f.capture.failure().is_some(), "cleanup erased the fault");
     }
     #[test]
-    fn emergency_and_plain_escape_are_normal_terminal_stops() {
-        for native_shortcut in [true, false] {
-            let mut f = Fixture::new();
-            if native_shortcut {
-                f.capture
-                    .native
-                    .reason
-                    .set(Some(StopReason::EmergencyShortcut));
-            } else {
-                f.push(
-                    CaptureKind::Key {
-                        usage: 0x29,
-                        down: true,
-                    },
-                    false,
-                );
-            }
-            f.capture.poll(0).unwrap();
-            assert_eq!(f.capture.command(), Some(Shortcut::Stop));
-            assert_eq!(f.capture.failure(), None);
-            assert_eq!(f.capture.source.activity_counter(), 0);
-        }
+    fn emergency_shortcut_stops_while_plain_escape_forwards_normally() {
+        let mut f = Fixture::new();
+        f.capture
+            .native
+            .reason
+            .set(Some(StopReason::EmergencyShortcut));
+        f.capture.poll(0).unwrap();
+        assert_eq!(f.capture.command(), Some(Shortcut::Stop));
+        assert_eq!(f.capture.failure(), None);
+        assert_eq!(f.capture.source.activity_counter(), 0);
+
+        // Plain Escape must NOT stop sharing; it is forwarded like any normal key.
+        let mut f2 = Fixture::new();
+        f2.push(
+            CaptureKind::Key {
+                usage: 0x29,
+                down: true,
+            },
+            false,
+        );
+        f2.capture.poll(0).unwrap();
+        assert_eq!(f2.capture.command(), None);
+        assert_eq!(f2.capture.failure(), None);
+        assert_eq!(f2.capture.source.activity_counter(), 1);
     }
     #[test]
     fn explicit_cleanup_does_not_create_another_stop_or_fault() {

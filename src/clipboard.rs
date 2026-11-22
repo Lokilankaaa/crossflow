@@ -7,7 +7,7 @@ use snow::resolvers::{CryptoResolver, DefaultResolver};
 use std::path::PathBuf;
 
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardItem {
@@ -304,6 +304,184 @@ mod windows_clip {
         fn GlobalSize(mem: *mut c_void) -> usize;
     }
 
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CreateStreamOnHGlobal(
+            h_global: *mut c_void,
+            delete_on_release: i32,
+            ppstm: *mut *mut c_void,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    struct GdiplusStartupInput {
+        gdiplus_version: u32,
+        debug_event_callback: *const c_void,
+        suppress_background_thread: i32,
+        suppress_external_codecs: i32,
+    }
+
+    #[repr(C)]
+    struct GpRect {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    }
+
+    #[repr(C)]
+    struct BitmapData {
+        width: u32,
+        height: u32,
+        stride: i32,
+        pixel_format: i32,
+        scan0: *mut u8,
+        reserved: usize,
+    }
+
+    #[link(name = "gdiplus")]
+    unsafe extern "system" {
+        fn GdiplusStartup(
+            token: *mut usize,
+            input: *const GdiplusStartupInput,
+            output: *mut c_void,
+        ) -> i32;
+        fn GdipCreateBitmapFromStream(stream: *mut c_void, bitmap: *mut *mut c_void) -> i32;
+        fn GdipGetImageWidth(image: *mut c_void, width: *mut u32) -> i32;
+        fn GdipGetImageHeight(image: *mut c_void, height: *mut u32) -> i32;
+        fn GdipBitmapLockBits(
+            bitmap: *mut c_void,
+            rect: *const GpRect,
+            flags: u32,
+            format: i32,
+            locked: *mut BitmapData,
+        ) -> i32;
+        fn GdipBitmapUnlockBits(bitmap: *mut c_void, locked: *mut BitmapData) -> i32;
+        fn GdipDisposeImage(image: *mut c_void) -> i32;
+    }
+
+    fn ensure_gdiplus() -> bool {
+        static INIT: OnceLock<bool> = OnceLock::new();
+        *INIT.get_or_init(|| {
+            let mut token: usize = 0;
+            let input = GdiplusStartupInput {
+                gdiplus_version: 1,
+                debug_event_callback: std::ptr::null(),
+                suppress_background_thread: 0,
+                suppress_external_codecs: 0,
+            };
+            unsafe { GdiplusStartup(&mut token, &input, null_mut()) == 0 }
+        })
+    }
+
+    /// Decode PNG bytes into a universal 32-bit bottom-up Windows `CF_DIB`
+    /// (`BITMAPINFOHEADER` + BGRA pixels) using built-in Windows GDI+.
+    pub(super) fn png_to_dib(png: &[u8]) -> Option<Vec<u8>> {
+        if png.len() < 8 || !png.starts_with(&[137, 80, 78, 71]) || !ensure_gdiplus() {
+            return None;
+        }
+        let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, png.len()) };
+        if hmem.is_null() {
+            return None;
+        }
+        let ptr = unsafe { GlobalLock(hmem) };
+        if ptr.is_null() {
+            unsafe {
+                let _ = GlobalFree(hmem);
+            }
+            return None;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(png.as_ptr(), ptr.cast::<u8>(), png.len());
+            let _ = GlobalUnlock(hmem);
+        }
+        let mut stream: *mut c_void = null_mut();
+        if unsafe { CreateStreamOnHGlobal(hmem, 1, &mut stream) } != 0 || stream.is_null() {
+            unsafe {
+                let _ = GlobalFree(hmem);
+            }
+            return None;
+        }
+        let mut bitmap: *mut c_void = null_mut();
+        let status = unsafe { GdipCreateBitmapFromStream(stream, &mut bitmap) };
+        // Release IStream (vtable slot 2 = IUnknown::Release)
+        unsafe {
+            let vtbl = *(stream as *const *const usize);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*vtbl.add(2));
+            release(stream);
+        }
+        if status != 0 || bitmap.is_null() {
+            return None;
+        }
+        let result = (|| -> Option<Vec<u8>> {
+            let mut width: u32 = 0;
+            let mut height: u32 = 0;
+            if unsafe { GdipGetImageWidth(bitmap, &mut width) } != 0
+                || unsafe { GdipGetImageHeight(bitmap, &mut height) } != 0
+            {
+                return None;
+            }
+            if width == 0 || height == 0 || width > 8192 || height > 8192 {
+                return None;
+            }
+            let rect = GpRect {
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+            };
+            let mut data = BitmapData {
+                width: 0,
+                height: 0,
+                stride: 0,
+                pixel_format: 0,
+                scan0: null_mut(),
+                reserved: 0,
+            };
+            // ImageLockModeRead = 1, PixelFormat32bppARGB = 0x0026200A (BGRA in memory)
+            if unsafe { GdipBitmapLockBits(bitmap, &rect, 1, 0x0026_200A, &mut data) } != 0
+                || data.scan0.is_null()
+            {
+                return None;
+            }
+            let w = width as usize;
+            let h = height as usize;
+            let row_bytes = w.checked_mul(4)?;
+            let pixel_bytes = row_bytes.checked_mul(h)?;
+            if pixel_bytes > MAX_IMAGE_BYTES * 2 {
+                unsafe {
+                    let _ = GdipBitmapUnlockBits(bitmap, &mut data);
+                }
+                return None;
+            }
+            let mut dib = Vec::with_capacity(40 + pixel_bytes);
+            dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+            dib.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
+            dib.extend_from_slice(&(height as i32).to_le_bytes()); // biHeight (positive = bottom-up)
+            dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+            dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+            dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+            dib.extend_from_slice(&(pixel_bytes as u32).to_le_bytes()); // biSizeImage
+            dib.extend_from_slice(&[0u8; 16]); // XPelsPerMeter, YPelsPerMeter, ClrUsed, ClrImportant
+            let stride = data.stride as isize;
+            for y in 0..h {
+                let src_y = (h - 1 - y) as isize;
+                let row_ptr = unsafe { data.scan0.offset(src_y * stride) };
+                let row = unsafe { std::slice::from_raw_parts(row_ptr, row_bytes) };
+                dib.extend_from_slice(row);
+            }
+            unsafe {
+                let _ = GdipBitmapUnlockBits(bitmap, &mut data);
+            }
+            Some(dib)
+        })();
+        unsafe {
+            let _ = GdipDisposeImage(bitmap);
+        }
+        result
+    }
+
     fn png_format() -> u32 {
         static FMT: OnceLock<u32> = OnceLock::new();
         *FMT.get_or_init(|| {
@@ -461,8 +639,19 @@ mod windows_clip {
                 set_global_bytes(CF_UNICODETEXT, &bytes)
             }
             ClipboardItem::Png(png) => {
+                // Write BOTH universal CF_DIB (for Paint, WeChat, QQ, Chrome, Office, Explorer)
+                // AND registered "PNG" (for transparency-aware apps and Crossflow itself).
+                let mut ok = false;
+                if let Some(dib) = png_to_dib(png)
+                    && set_global_bytes(CF_DIB, &dib)
+                {
+                    ok = true;
+                }
                 let fmt = png_format();
-                fmt != 0 && set_global_bytes(fmt, png)
+                if fmt != 0 && set_global_bytes(fmt, png) {
+                    ok = true;
+                }
+                ok
             }
             ClipboardItem::Files(paths) => {
                 if paths.is_empty() {
@@ -577,6 +766,47 @@ mod macos_clip {
             std::mem::transmute(objc_msgSend as *const ());
         f(obj, sel, a1, a2)
     }
+    unsafe fn msg2_usize_id_id(obj: Id, sel: Sel, a1: usize, a2: Id) -> Id {
+        let f: unsafe extern "C" fn(Id, Sel, usize, Id) -> Id =
+            std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel, a1, a2)
+    }
+
+    unsafe fn nsdata_to_vec(ns_data: Id, limit: usize) -> Option<Vec<u8>> {
+        if ns_data.is_null() {
+            return None;
+        }
+        let len = msg0_usize(ns_data, sel_registerName(c"length".as_ptr()));
+        if len <= 8 || len > limit {
+            return None;
+        }
+        let ptr = msg0_ptr(ns_data, sel_registerName(c"bytes".as_ptr()));
+        if ptr.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(ptr, len).to_vec())
+    }
+
+    /// Convert arbitrary AppKit image data (`public.tiff`, `public.jpeg`, etc.) to PNG bytes.
+    unsafe fn image_data_to_png(ns_data: Id) -> Option<Vec<u8>> {
+        if ns_data.is_null() {
+            return None;
+        }
+        let rep_cls = objc_getClass(c"NSBitmapImageRep".as_ptr());
+        let rep = msg1_id(rep_cls, sel_registerName(c"imageRepWithData:".as_ptr()), ns_data);
+        if rep.is_null() {
+            return None;
+        }
+        // NSBitmapImageFileTypePNG = 4
+        let png_data = msg2_usize_id_id(
+            rep,
+            sel_registerName(c"representationUsingType:properties:".as_ptr()),
+            4,
+            std::ptr::null_mut(),
+        );
+        let bytes = nsdata_to_vec(png_data, MAX_IMAGE_BYTES)?;
+        bytes.starts_with(&[137, 80, 78, 71]).then_some(bytes)
+    }
 
     unsafe fn nsstring(s: &CStr) -> Id {
         let cls = objc_getClass(c"NSString".as_ptr());
@@ -619,6 +849,7 @@ mod macos_clip {
                     let obj_at_sel = sel_registerName(c"objectAtIndex:".as_ptr());
                     let nsurl_cls = objc_getClass(c"NSURL".as_ptr());
                     let url_with_str_sel = sel_registerName(c"URLWithString:".as_ptr());
+                    let file_path_url_sel = sel_registerName(c"filePathURL".as_ptr());
                     let path_sel = sel_registerName(c"path".as_ptr());
                     let utf8_sel = sel_registerName(c"UTF8String".as_ptr());
                     let mut paths = Vec::new();
@@ -635,7 +866,9 @@ mod macos_clip {
                         if url.is_null() {
                             continue;
                         }
-                        let path_ns = msg0_id(url, path_sel);
+                        let resolved = msg0_id(url, file_path_url_sel);
+                        let target_url = if resolved.is_null() { url } else { resolved };
+                        let path_ns = msg0_id(target_url, path_sel);
                         if path_ns.is_null() {
                             continue;
                         }
@@ -653,7 +886,17 @@ mod macos_clip {
                     }
                 }
             }
-            // Prefer plain UTF-8 text
+            // Check direct PNG image first (screenshots, browser/chat "Copy Image").
+            // Apps that copy rich text (Word/Excel/Pages) put RTF/TIFF, not raw PNG.
+            let data_sel = sel_registerName(c"dataForType:".as_ptr());
+            let png_type = nsstring(c"public.png");
+            let ns_png = msg1_id(pb, data_sel, png_type);
+            if let Some(bytes) = nsdata_to_vec(ns_png, MAX_IMAGE_BYTES)
+                && bytes.starts_with(&[137, 80, 78, 71])
+            {
+                return Some(ClipboardItem::Png(bytes));
+            }
+            // Prefer plain UTF-8 text next
             let text_type = nsstring(c"public.utf8-plain-text");
             let str_sel = sel_registerName(c"stringForType:".as_ptr());
             let ns_str = msg1_id(pb, str_sel, text_type);
@@ -667,21 +910,16 @@ mod macos_clip {
                     }
                 }
             }
-            // Fallback: PNG image
-            let png_type = nsstring(c"public.png");
-            let data_sel = sel_registerName(c"dataForType:".as_ptr());
-            let ns_data = msg1_id(pb, data_sel, png_type);
-            if !ns_data.is_null() {
-                let len = msg0_usize(ns_data, sel_registerName(c"length".as_ptr()));
-                if len > 8 && len <= MAX_IMAGE_BYTES {
-                    let ptr = msg0_ptr(ns_data, sel_registerName(c"bytes".as_ptr()));
-                    if !ptr.is_null() {
-                        let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
-                        if bytes.starts_with(&[137, 80, 78, 71]) {
-                            return Some(ClipboardItem::Png(bytes));
-                        }
-                    }
-                }
+            // Fallback: macOS Preview / Photos / Safari / WeChat TIFF or JPEG -> PNG
+            let tiff_type = nsstring(c"public.tiff");
+            let ns_tiff = msg1_id(pb, data_sel, tiff_type);
+            if let Some(bytes) = image_data_to_png(ns_tiff) {
+                return Some(ClipboardItem::Png(bytes));
+            }
+            let jpeg_type = nsstring(c"public.jpeg");
+            let ns_jpeg = msg1_id(pb, data_sel, jpeg_type);
+            if let Some(bytes) = image_data_to_png(ns_jpeg) {
+                return Some(ClipboardItem::Png(bytes));
             }
             None
         }
@@ -775,5 +1013,33 @@ mod tests {
         assert!(png.windows(4).any(|w| w == b"IHDR"));
         assert!(png.windows(4).any(|w| w == b"IDAT"));
         assert!(png.windows(4).any(|w| w == b"IEND"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_png_to_dib_roundtrip_decodes_pixels() {
+        // 2x2 RGBA image: top-left red, top-right green, bottom-left blue, bottom-right white
+        let rgba: [u8; 16] = [
+            255, 0, 0, 255, // (0,0) red
+            0, 255, 0, 255, // (1,0) green
+            0, 0, 255, 255, // (0,1) blue
+            255, 255, 255, 255, // (1,1) white
+        ];
+        let png = encode_rgba_png(2, 2, &rgba).expect("encode PNG");
+        let dib = windows_clip::png_to_dib(&png).expect("GDI+ decode PNG to CF_DIB");
+        assert_eq!(dib.len(), 40 + 16);
+        assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(dib[14..16].try_into().unwrap()), 32);
+        // Bottom-up DIB: first pixel row is y=1 (blue, white) in BGRA
+        assert_eq!(&dib[40..44], &[255, 0, 0, 255]); // blue (B=255,G=0,R=0,A=255)
+        assert_eq!(&dib[44..48], &[255, 255, 255, 255]); // white
+        // Second pixel row is y=0 (red, green) in BGRA
+        assert_eq!(&dib[48..52], &[0, 0, 255, 255]); // red
+        assert_eq!(&dib[52..56], &[0, 255, 0, 255]); // green
+        // Round-trip back to PNG via dib_to_png
+        let png2 = dib_to_png(&dib).expect("re-encode DIB to PNG");
+        assert!(png2.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]));
     }
 }

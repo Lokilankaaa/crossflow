@@ -21,6 +21,11 @@ pub trait Capture {
     /// Stop capture and local suppression; remote owned-input release belongs
     /// to the endpoint and is checked separately before process shutdown.
     fn stop(&mut self) -> Result<()>;
+    /// Move the local cursor to `point` after focus returns to this device
+    /// (e.g. via QuickJump). Default is a no-op for test doubles.
+    fn warp_local(&mut self, _point: crate::arrangement::Point) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Platform hooks used by the common app runtime. Native implementations live

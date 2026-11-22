@@ -15,6 +15,7 @@ pub struct RoutedInput {
     pub input: Arc<Mutex<SourceInputQueue>>,
     pub remote_gate: Arc<AtomicBool>,
     pub enabled: bool,
+    pub edge_locked: bool,
     pub generation: u64,
     pub routing: Arc<Mutex<crate::session_metadata::RoutingState>>,
     focus: Option<Focus>,
@@ -29,12 +30,19 @@ impl RoutedInput {
             input: Arc::new(Mutex::new(SourceInputQueue::new())),
             remote_gate: Arc::new(AtomicBool::new(false)),
             enabled: false,
+            edge_locked: false,
             generation: 0,
             routing: Arc::new(Mutex::new(crate::session_metadata::RoutingState::default())),
             focus: None,
             last_local_native: None,
             expected_queue_epoch: 0,
         })
+    }
+    pub fn set_edge_locked(&mut self, locked: bool) {
+        self.edge_locked = locked;
+    }
+    pub fn is_edge_locked(&self) -> bool {
+        self.edge_locked
     }
     pub fn sync(&mut self) -> bool {
         let q = self.input.lock().unwrap_or_else(|e| e.into_inner());
@@ -124,8 +132,31 @@ impl RoutedInput {
             return Ok(None);
         }
         let next = if let Some(f) = &self.focus {
-            self.config.advance(f, dx, dy)?
+            let candidate = self.config.advance(f, dx, dy)?;
+            if self.edge_locked {
+                let current_dev = self.config.screen(&f.screen_id)?.device_id.as_str();
+                let next_dev = self.config.screen(&candidate.screen_id)?.device_id.as_str();
+                if current_dev != next_dev {
+                    let s = self.config.screen(&f.screen_id)?;
+                    Focus {
+                        screen_id: f.screen_id.clone(),
+                        point: Point {
+                            x: (f.point.x + dx).clamp(s.x, s.right()),
+                            y: (f.point.y + dy).clamp(s.y, s.bottom()),
+                        },
+                    }
+                } else {
+                    candidate
+                }
+            } else {
+                candidate
+            }
         } else {
+            if self.edge_locked {
+                self.last_local_native = Some(native);
+                self.publish_routing();
+                return Ok(None);
+            }
             let previous = self.last_local_native;
             let segment = if let Some(previous) = previous {
                 self.config.local_segment(previous, native)?
@@ -152,6 +183,63 @@ impl RoutedInput {
                 return Ok(None);
             };
             f
+        };
+        self.apply_focus(next, t0)
+    }
+
+    /// Programmatically jump cursor/keyboard focus directly to a device (bypasses edge lock).
+    /// Returns `Ok(Some(local_point))` when returning focus to the local device so the caller
+    /// can restore the OS cursor cleanly without stealing foreground window focus.
+    pub fn quick_jump_to_device(
+        &mut self,
+        target_device_id: &str,
+        t0: u64,
+    ) -> anyhow::Result<Option<Point>> {
+        self.sync();
+        if !self.enabled {
+            return Ok(None);
+        }
+        if target_device_id == self.config.local_device_id {
+            if self.focus.is_none() {
+                return Ok(None);
+            }
+            let target = self
+                .last_local_native
+                .and_then(|p| self.config.local_focus(p))
+                .or_else(|| {
+                    self.config
+                        .layout
+                        .screens()
+                        .iter()
+                        .find(|s| s.device_id == self.config.local_device_id)
+                        .map(|s| Focus {
+                            screen_id: s.id.clone(),
+                            point: Point {
+                                x: s.x + s.width * 0.5,
+                                y: s.y + s.height * 0.5,
+                            },
+                        })
+                });
+            let Some(next) = target else {
+                return Ok(None);
+            };
+            return self.apply_focus(next, t0);
+        }
+        let Some(screen) = self
+            .config
+            .layout
+            .screens()
+            .iter()
+            .find(|s| s.device_id == target_device_id)
+        else {
+            return Ok(None);
+        };
+        let next = Focus {
+            screen_id: screen.id.clone(),
+            point: Point {
+                x: screen.x + screen.width * 0.5,
+                y: screen.y + screen.height * 0.5,
+            },
         };
         self.apply_focus(next, t0)
     }
@@ -460,5 +548,32 @@ mod tests {
                 assert!(!r.remote_gate.load(Ordering::Acquire));
             }
         }
+    }
+    #[test]
+    fn edge_lock_blocks_edge_crossing_while_quick_jump_still_switches() {
+        let mut r = routed();
+        r.set_edge_locked(true);
+        assert!(r.is_edge_locked());
+
+        // Pushing past local edge does NOT cross while locked
+        r.movement(Point { x: 99., y: 50. }, 10., 0., 1).unwrap();
+        assert!(!r.remote_gate.load(Ordering::Acquire));
+        assert_eq!(r.focus_identity(), (Some("local".into()), Some("w".into())));
+
+        // QuickJump bypasses edge lock and jumps directly to remote screen center
+        assert!(r.quick_jump_to_device("peer", 2).unwrap().is_none());
+        assert!(r.remote_gate.load(Ordering::Acquire));
+        assert_eq!(r.focus_identity(), (Some("peer".into()), Some("m".into())));
+
+        // Pushing left past remote edge stays clamped on remote while locked
+        assert!(r.movement(Point { x: 99., y: 50. }, -200., 0., 3).unwrap().is_none());
+        assert!(r.remote_gate.load(Ordering::Acquire));
+        assert_eq!(r.focus_identity(), (Some("peer".into()), Some("m".into())));
+
+        // QuickJump back to local returns a warp point and revokes remote_gate
+        let warp = r.quick_jump_to_device("local", 4).unwrap();
+        assert!(warp.is_some());
+        assert!(!r.remote_gate.load(Ordering::Acquire));
+        assert_eq!(r.focus_identity(), (Some("local".into()), Some("w".into())));
     }
 }

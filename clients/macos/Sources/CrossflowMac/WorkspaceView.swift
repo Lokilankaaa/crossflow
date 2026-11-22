@@ -38,6 +38,28 @@ private final class RemoteCursorHider {
     }
 }
 
+@MainActor
+private final class HotkeyKeyMonitor {
+    static let shared = HotkeyKeyMonitor()
+    private var monitor: Any?
+
+    func start(onEvent: @escaping @MainActor (NSEvent) -> Bool) {
+        stop()
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            MainActor.assumeIsolated {
+                onEvent(event) ? nil : event
+            }
+        }
+    }
+
+    func stop() {
+        if let m = monitor {
+            NSEvent.removeMonitor(m)
+            monitor = nil
+        }
+    }
+}
+
 struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
     @Bindable var peer: PeerMeshModel
@@ -46,6 +68,8 @@ struct WorkspaceView: View {
     @ViewState private var undoStack: [SharedLayout] = []
     @ViewState private var editingPassword = false
     @ViewState private var passwordInput = ""
+    @ViewState private var hotkeysExpanded = false
+    @ViewState private var recordingHotkeyField: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -64,7 +88,10 @@ struct WorkspaceView: View {
         .onChange(of: peer.focusDeviceID) { _, _ in updateCursorVisibility() }
         .onChange(of: peer.state) { _, _ in updateCursorVisibility() }
         .onChange(of: peer.routeEnabled) { _, _ in updateCursorVisibility() }
-        .onDisappear { RemoteCursorHider.shared.setHidden(false) }
+        .onDisappear {
+            cancelHotkeyRecording()
+            RemoteCursorHider.shared.setHidden(false)
+        }
         .sheet(isPresented: $showDetails) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("内核信息").font(.title2.bold())
@@ -333,7 +360,23 @@ struct WorkspaceView: View {
                     }
                     .toggleStyle(.switch)
                     .controlSize(.small)
+
+                    let screenLockBinding = Binding<Bool>(
+                        get: { peer.screenLocked },
+                        set: { peer.setScreenLock($0) }
+                    )
+                    Toggle(isOn: screenLockBinding) {
+                        Text(peer.screenLocked ? "已锁定当前屏幕（防误触）" : "锁定当前屏幕（防误触）")
+                            .font(.system(size: 12))
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
                 }
+
+                Divider().overlay(Theme.border).padding(.vertical, 2)
+
+                // Customizable Hotkeys (collapsible, 1:1 with Windows)
+                hotkeysSection
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
@@ -346,7 +389,7 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
-                Text("快捷键：本机按 Escape 随时暂停共享。")
+                Text("快捷键：\(peer.hotkeys.toggleSharing ?? "未设置") 暂停/恢复 · \(peer.hotkeys.quickJumpNext ?? "未设置") 快速切屏 · \(peer.hotkeys.lockScreen ?? "未设置") 锁定屏幕")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -355,6 +398,165 @@ struct WorkspaceView: View {
         }
         .frame(maxHeight: .infinity)
         .background(Theme.surface)
+    }
+
+    private var hotkeysSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                hotkeysExpanded.toggle()
+                if !hotkeysExpanded {
+                    cancelHotkeyRecording()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(hotkeysExpanded ? "▾ 快捷键自定义" : "▸ 快捷键自定义")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.secondary)
+                    Spacer()
+                }
+            }
+            .buttonStyle(.plain)
+
+            if hotkeysExpanded {
+                hotkeyRow(field: "toggle_sharing", label: "暂停 / 恢复共享", value: peer.hotkeys.toggleSharing)
+                hotkeyRow(field: "lock_screen", label: "锁定当前屏幕", value: peer.hotkeys.lockScreen)
+                hotkeyRow(field: "quick_jump_next", label: "QuickJump 下一台", value: peer.hotkeys.quickJumpNext)
+                hotkeyRow(field: "quick_jump_home", label: "QuickJump 回本机", value: peer.hotkeys.quickJumpHome)
+                hotkeyRow(field: "quick_jump_1", label: "QuickJump 设备 #1", value: peer.hotkeys.quickJump1)
+                hotkeyRow(field: "emergency_stop", label: "紧急停止", value: peer.hotkeys.emergencyStop)
+
+                HStack {
+                    Text("点击录制 · Esc 取消 · Del 清空")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.secondary)
+                    Spacer()
+                    Button("恢复默认") {
+                        cancelHotkeyRecording()
+                        peer.setHotkeys(.defaults)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    private func hotkeyRow(field: String, label: String, value: String?) -> some View {
+        let isRecording = recordingHotkeyField == field
+        return HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.text)
+                .lineLimit(1)
+            Spacer()
+            Button {
+                toggleHotkeyRecording(field)
+            } label: {
+                Text(isRecording ? "请按组合键…" : (value ?? "未设置"))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(isRecording ? Theme.accent : (value == nil ? Theme.secondary : Theme.text))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .frame(minWidth: 82)
+                    .background(Theme.background, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(isRecording ? Theme.accent : Theme.border, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func toggleHotkeyRecording(_ field: String) {
+        if recordingHotkeyField == field {
+            cancelHotkeyRecording()
+            return
+        }
+        recordingHotkeyField = field
+        peer.setHotkeySuspended(true)
+        HotkeyKeyMonitor.shared.start { event in
+            handleRecordedKeyEvent(event, field: field)
+        }
+    }
+
+    private func cancelHotkeyRecording() {
+        if recordingHotkeyField != nil {
+            recordingHotkeyField = nil
+            peer.setHotkeySuspended(false)
+        }
+        HotkeyKeyMonitor.shared.stop()
+    }
+
+    private func handleRecordedKeyEvent(_ event: NSEvent, field: String) -> Bool {
+        let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
+        let hasMod = !flags.isEmpty
+        let keyCode = event.keyCode
+
+        if !hasMod && keyCode == 53 {
+            cancelHotkeyRecording()
+            return true
+        }
+
+        let newChord: String?
+        if !hasMod && (keyCode == 51 || keyCode == 117) {
+            newChord = nil
+        } else {
+            guard let keyName = macKeyCodeToChordName(keyCode) else {
+                layoutNotice = "不支持该按键，请选择字母、数字、Tab、Esc 或功能键。"
+                return true
+            }
+            let standaloneAllowed = keyName.hasPrefix("F") && keyName.count >= 2 && keyName.dropFirst().allSatisfy(\.isNumber)
+            if !hasMod && !standaloneAllowed {
+                layoutNotice = "请配合 Control / Option / Shift / Command 等修饰键（或使用 F1–F20）。"
+                return true
+            }
+            var parts: [String] = []
+            if flags.contains(.control) { parts.append("Ctrl") }
+            if flags.contains(.option) { parts.append("Alt") }
+            if flags.contains(.shift) { parts.append("Shift") }
+            if flags.contains(.command) { parts.append("Meta") }
+            parts.append(keyName)
+            newChord = parts.joined(separator: "+")
+        }
+
+        layoutNotice = nil
+        cancelHotkeyRecording()
+        var updated = peer.hotkeys
+        switch field {
+        case "toggle_sharing": updated.toggleSharing = newChord
+        case "lock_screen": updated.lockScreen = newChord
+        case "quick_jump_next": updated.quickJumpNext = newChord
+        case "quick_jump_home": updated.quickJumpHome = newChord
+        case "quick_jump_1": updated.quickJump1 = newChord
+        case "emergency_stop": updated.emergencyStop = newChord
+        default: break
+        }
+        peer.setHotkeys(updated)
+        return true
+    }
+
+    private func macKeyCodeToChordName(_ code: UInt16) -> String? {
+        switch code {
+        case 0: "A"; case 11: "B"; case 8: "C"; case 2: "D"; case 14: "E"
+        case 3: "F"; case 5: "G"; case 4: "H"; case 34: "I"; case 38: "J"
+        case 40: "K"; case 37: "L"; case 46: "M"; case 45: "N"; case 31: "O"
+        case 35: "P"; case 12: "Q"; case 15: "R"; case 1: "S"; case 17: "T"
+        case 32: "U"; case 9: "V"; case 13: "W"; case 7: "X"; case 16: "Y"
+        case 6: "Z"
+        case 18: "1"; case 19: "2"; case 20: "3"; case 21: "4"; case 23: "5"
+        case 22: "6"; case 26: "7"; case 28: "8"; case 25: "9"; case 29: "0"
+        case 36: "Enter"; case 53: "Esc"; case 51: "Backspace"; case 48: "Tab"; case 49: "Space"
+        case 27: "-"; case 24: "="; case 33: "["; case 30: "]"; case 42: "\\"
+        case 41: ";"; case 39: "'"; case 50: "`"; case 43: ","; case 47: "."; case 44: "/"
+        case 122: "F1"; case 120: "F2"; case 99: "F3"; case 118: "F4"
+        case 96: "F5"; case 97: "F6"; case 98: "F7"; case 100: "F8"
+        case 101: "F9"; case 109: "F10"; case 103: "F11"; case 111: "F12"
+        case 105: "F13"; case 107: "F14"; case 113: "F15"; case 106: "F16"
+        case 64: "F17"; case 79: "F18"; case 80: "F19"; case 90: "F20"
+        case 115: "Home"; case 116: "PageUp"; case 117: "Delete"
+        case 119: "End"; case 121: "PageDown"
+        case 123: "Left"; case 124: "Right"; case 125: "Down"; case 126: "Up"
+        default: nil
+        }
     }
 
     @ViewBuilder

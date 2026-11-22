@@ -110,6 +110,36 @@ struct TransferStatusInfo: Sendable, Equatable, Decodable {
     }
 }
 
+struct HotkeyConfigInfo: Sendable, Equatable, Codable {
+    var toggleSharing: String?
+    var lockScreen: String?
+    var quickJumpNext: String?
+    var quickJumpHome: String?
+    var quickJump1: String?
+    var quickJump2: String?
+    var emergencyStop: String?
+
+    enum CodingKeys: String, CodingKey {
+        case toggleSharing = "toggle_sharing"
+        case lockScreen = "lock_screen"
+        case quickJumpNext = "quick_jump_next"
+        case quickJumpHome = "quick_jump_home"
+        case quickJump1 = "quick_jump_1"
+        case quickJump2 = "quick_jump_2"
+        case emergencyStop = "emergency_stop"
+    }
+
+    static let defaults = HotkeyConfigInfo(
+        toggleSharing: "Ctrl+Alt+S",
+        lockScreen: "Ctrl+Alt+L",
+        quickJumpNext: "Ctrl+Alt+Tab",
+        quickJumpHome: "Ctrl+Alt+H",
+        quickJump1: "Ctrl+Alt+1",
+        quickJump2: "Ctrl+Alt+2",
+        emergencyStop: "Ctrl+Alt+Shift+Esc"
+    )
+}
+
 struct PeerStatusWire: Sendable, Equatable, Decodable {
     let protocolVersion: Int
     let state: String
@@ -120,6 +150,8 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let smartKeymap: Bool
     let clipboardSync: Bool
     let inputStateSync: Bool?
+    let screenLocked: Bool?
+    let hotkeys: HotkeyConfigInfo?
     let selectedChannel: String
     let directPeer: String?
     let activeChannelLabel: String?
@@ -147,6 +179,8 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case smartKeymap = "smart_keymap"
         case clipboardSync = "clipboard_sync"
         case inputStateSync = "input_state_sync"
+        case screenLocked = "screen_locked"
+        case hotkeys
         case selectedChannel = "selected_channel"
         case directPeer = "direct_peer"
         case activeChannelLabel = "active_channel_label"
@@ -200,6 +234,31 @@ private struct SetClipboardCommandWire: Encodable {
 private struct SetInputStateSyncCommandWire: Encodable {
     let op = "set_input_state_sync"
     let enabled: Bool
+}
+
+private struct SetHotkeysCommandWire: Encodable {
+    let op = "set_hotkeys"
+    let hotkeys: HotkeyConfigInfo
+}
+
+private struct SetHotkeySuspendedCommandWire: Encodable {
+    let op = "set_hotkey_suspended"
+    let suspended: Bool
+}
+
+private struct SetScreenLockCommandWire: Encodable {
+    let op = "set_screen_lock"
+    let locked: Bool
+}
+
+private struct QuickJumpCommandWire: Encodable {
+    let op = "quick_jump"
+    let targetDeviceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case op
+        case targetDeviceID = "target_device_id"
+    }
 }
 
 private struct SendFilesCommandWire: Encodable {
@@ -352,6 +411,8 @@ final class PeerMeshModel {
     var smartKeymap: Bool = true
     var clipboardSync: Bool = true
     var inputStateSync: Bool = true
+    var screenLocked: Bool = false
+    var hotkeys: HotkeyConfigInfo = .defaults
     var selectedChannel: String = "auto"
     var directPeer: String = ""
     var activeChannelLabel: String?
@@ -473,6 +534,10 @@ final class PeerMeshModel {
         smartKeymap = s.smartKeymap
         clipboardSync = s.clipboardSync
         inputStateSync = s.inputStateSync ?? true
+        screenLocked = s.screenLocked ?? false
+        if let hk = s.hotkeys {
+            hotkeys = hk
+        }
         selectedChannel = s.selectedChannel
         if !syncedDirectPeerOnce {
             syncedDirectPeerOnce = true
@@ -542,6 +607,36 @@ final class PeerMeshModel {
     func setInputStateSync(_ enabled: Bool) {
         inputStateSync = enabled
         let cmd = SetInputStateSyncCommandWire(enabled: enabled)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setHotkeys(_ updated: HotkeyConfigInfo) {
+        hotkeys = updated
+        let cmd = SetHotkeysCommandWire(hotkeys: updated)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setHotkeySuspended(_ suspended: Bool) {
+        let cmd = SetHotkeySuspendedCommandWire(suspended: suspended)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setScreenLock(_ locked: Bool) {
+        screenLocked = locked
+        let cmd = SetScreenLockCommandWire(locked: locked)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func quickJump(to targetDeviceID: String?) {
+        let cmd = QuickJumpCommandWire(targetDeviceID: targetDeviceID)
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

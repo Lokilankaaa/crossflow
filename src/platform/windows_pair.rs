@@ -310,6 +310,9 @@ impl Capture for WindowsCapture {
         }
         revoke.context("Windows source could not release local suppression")
     }
+    fn warp_local(&mut self, point: Point) -> Result<()> {
+        windows::warp_cursor(point.x, point.y).map_err(anyhow::Error::msg)
+    }
 }
 impl Drop for WindowsCapture {
     fn drop(&mut self) {

@@ -145,6 +145,34 @@ impl SharedSource {
     pub fn activity_counter(&self) -> u64 {
         self.activity.load(Ordering::Acquire)
     }
+    pub fn signal_activity(&self) {
+        self.activity.fetch_add(1, Ordering::Release);
+    }
+    pub fn set_edge_locked(&self, locked: bool) {
+        self.lock().route.set_edge_locked(locked);
+    }
+    pub fn is_edge_locked(&self) -> bool {
+        self.lock().route.is_edge_locked()
+    }
+    pub fn has_held_physical_input(&self) -> bool {
+        let state = self.lock();
+        let queue = state.route.input.lock().unwrap_or_else(|e| e.into_inner());
+        queue.has_held_local_input()
+    }
+    /// Programmatically jump cursor/keyboard focus to `target_device_id`.
+    /// Execute any returned local warp point AFTER this function returns.
+    pub fn quick_jump_to_device(
+        &self,
+        target_device_id: &str,
+        now_ns: u64,
+    ) -> Result<Option<Point>> {
+        let mut state = self.lock();
+        state.sync();
+        if !state.route.enabled || state.failure.is_some() {
+            return Ok(None);
+        }
+        state.route.quick_jump_to_device(target_device_id, now_ns)
+    }
     pub fn runtime(&self) -> RuntimeLayout {
         self.lock().route.config.clone()
     }

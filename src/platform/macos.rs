@@ -1434,10 +1434,19 @@ impl Drop for MacMouseSink {
     }
 }
 
-/// Does not record or inspect any other key. Physical mouse takeover
-/// arbitration remains a later phase-zero task.
+/// Emergency stop requires Control + Option + Escape (never bare Escape),
+/// matching Windows' emergency chord so plain Escape works normally everywhere.
 pub fn emergency_pressed() -> bool {
-    unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, ESCAPE_KEYCODE) }
+    unsafe {
+        if !CGEventSourceKeyState(HID_SYSTEM_STATE, ESCAPE_KEYCODE) {
+            return false;
+        }
+        let ctrl = CGEventSourceKeyState(HID_SYSTEM_STATE, 59)
+            || CGEventSourceKeyState(HID_SYSTEM_STATE, 62);
+        let alt = CGEventSourceKeyState(HID_SYSTEM_STATE, 58)
+            || CGEventSourceKeyState(HID_SYSTEM_STATE, 61);
+        ctrl && alt
+    }
 }
 
 /// Read metadata only. A mode refresh value is not a measured refresh rate.

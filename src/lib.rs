@@ -3,6 +3,7 @@ pub mod aux_channel;
 pub mod clipboard;
 pub mod desktop;
 pub mod discovery;
+pub mod hotkeys;
 pub mod injection_worker;
 pub mod input;
 pub mod input_state;

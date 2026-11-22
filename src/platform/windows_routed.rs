@@ -257,6 +257,7 @@ struct Policy {
     physical: [bool; 256],
     delivered: [bool; 256],
     suppressed: [bool; 256],
+    hotkey_suppressed: [bool; 256],
 }
 impl Policy {
     fn new(held: impl Fn(usize) -> bool) -> Self {
@@ -269,9 +270,17 @@ impl Policy {
             physical,
             delivered: physical,
             suppressed: [false; 256],
+            hotkey_suppressed: [false; 256],
         }
     }
-    fn transition(&mut self, key: usize, down: bool, remote: bool, keyboard: bool) -> Decision {
+    fn transition(
+        &mut self,
+        key: usize,
+        down: bool,
+        remote: bool,
+        keyboard: bool,
+        allow_legacy_chords: bool,
+    ) -> Decision {
         if key >= self.physical.len() {
             return Decision {
                 suppress: remote,
@@ -282,7 +291,14 @@ impl Policy {
         self.physical[key] = down;
         let ctrl = self.physical[0x11] || self.physical[0xa2] || self.physical[0xa3];
         let alt = self.physical[0x12] || self.physical[0xa4] || self.physical[0xa5];
-        if keyboard && down && !was_down && ctrl && alt && matches!(key, 0x20 | 0x1b) {
+        if allow_legacy_chords
+            && keyboard
+            && down
+            && !was_down
+            && ctrl
+            && alt
+            && matches!(key, 0x20 | 0x1b)
+        {
             self.suppressed[key] = true;
             return Decision {
                 suppress: true,
@@ -474,9 +490,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 let remote =
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);
                 let down = input.flags & LLKHF_UP == 0;
-                let decision = state
-                    .policy
-                    .transition(input.vkCode as usize, down, remote, true);
+                let vk = input.vkCode as usize;
                 // Map multimedia virtual keys (Fn + volume/mute/play/track) directly so
                 // keyboards emitting scanCode == 0 still forward seamlessly to macOS.
                 let media_usage = match input.vkCode {
@@ -488,13 +502,8 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     0xB3 => Some(crate::keymap::HID_MEDIA_PLAY_PAUSE),
                     _ => None,
                 };
-                if let Some(usage) = media_usage {
-                    state.enqueue(CaptureEvent::Key {
-                        usage,
-                        down,
-                        captured_at: Instant::now(),
-                        remote_at_capture: Some(remote),
-                    });
+                let resolved_usage = if let Some(u) = media_usage {
+                    Some(u)
                 } else if input.vkCode < 0xff && input.vkCode != 0x13 {
                     let scan = if input.scanCode == 0 {
                         (unsafe { MapVirtualKeyW(input.vkCode, MAPVK_VK_TO_VSC_EX) }) as u16
@@ -508,14 +517,49 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     } else {
                         0
                     };
-                    if let Some(usage) = scan_to_hid(scan) {
-                        state.enqueue(CaptureEvent::Key {
-                            usage,
-                            down,
-                            captured_at: Instant::now(),
-                            remote_at_capture: Some(remote),
-                        });
+                    scan_to_hid(scan)
+                } else {
+                    None
+                };
+
+                let has_engine = crate::hotkeys::has_active_engine();
+                if has_engine && vk < state.policy.hotkey_suppressed.len() {
+                    if state.policy.hotkey_suppressed[vk] {
+                        state.policy.physical[vk] = down;
+                        if !down {
+                            state.policy.hotkey_suppressed[vk] = false;
+                            state.policy.delivered[vk] = false;
+                            state.policy.suppressed[vk] = false;
+                        }
+                        return Decision {
+                            suppress: true,
+                            command: None,
+                        };
                     }
+                    let was_down = state.policy.physical[vk];
+                    if let Some(usage) = resolved_usage
+                        && (!down || !was_down)
+                        && crate::hotkeys::active_observe_key(usage, down).is_some()
+                    {
+                        state.policy.physical[vk] = true;
+                        state.policy.hotkey_suppressed[vk] = true;
+                        return Decision {
+                            suppress: true,
+                            command: None,
+                        };
+                    }
+                }
+
+                let decision = state
+                    .policy
+                    .transition(vk, down, remote, true, !has_engine);
+                if let Some(usage) = resolved_usage {
+                    state.enqueue(CaptureEvent::Key {
+                        usage,
+                        down,
+                        captured_at: Instant::now(),
+                        remote_at_capture: Some(remote),
+                    });
                 }
                 decision
             });
@@ -552,7 +596,7 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                 let remote =
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);
                 if let Some((button, down)) = mouse_button(wparam as u32, input.mouseData) {
-                    let decision = state.policy.transition(button, down, remote, false);
+                    let decision = state.policy.transition(button, down, remote, false, false);
                     let button = match button {
                         1 => Button::Left,
                         2 => Button::Right,
@@ -723,57 +767,57 @@ mod tests {
     fn remote_down_and_up_stay_suppressed_across_focus_return() {
         for key in [1, 2, 4, 5, 6, 0x41, 0xa2] {
             let mut policy = Policy::new(|_| false);
-            assert!(policy.transition(key, true, true, key > 6).suppress);
-            assert!(policy.transition(key, false, false, key > 6).suppress);
-            assert!(!policy.transition(key, true, false, key > 6).suppress);
-            assert!(!policy.transition(key, false, false, key > 6).suppress);
+            assert!(policy.transition(key, true, true, key > 6, true).suppress);
+            assert!(policy.transition(key, false, false, key > 6, true).suppress);
+            assert!(!policy.transition(key, true, false, key > 6, true).suppress);
+            assert!(!policy.transition(key, false, false, key > 6, true).suppress);
         }
     }
     #[test]
     fn preheld_local_release_is_not_lost_when_focus_changes() {
         for key in [1, 0x41, 0xa2] {
             let mut policy = Policy::new(|vk| vk == key);
-            assert!(policy.transition(key, true, true, key > 6).suppress);
-            assert!(!policy.transition(key, false, true, key > 6).suppress);
+            assert!(policy.transition(key, true, true, key > 6, true).suppress);
+            assert!(!policy.transition(key, false, true, key > 6, true).suppress);
         }
     }
     #[test]
     fn emergency_chords_work_even_with_suppressed_modifiers_and_do_not_repeat() {
         for (key, command) in [(0x20, TOGGLE), (0x1b, STOP)] {
             let mut policy = Policy::new(|_| false);
-            assert!(policy.transition(0xa2, true, true, true).suppress);
-            assert!(policy.transition(0xa4, true, true, true).suppress);
+            assert!(policy.transition(0xa2, true, true, true, true).suppress);
+            assert!(policy.transition(0xa4, true, true, true, true).suppress);
             assert_eq!(
-                policy.transition(key, true, true, true),
+                policy.transition(key, true, true, true, true),
                 Decision {
                     suppress: true,
                     command: Some(command)
                 }
             );
             assert_eq!(
-                policy.transition(key, true, false, true),
+                policy.transition(key, true, false, true, true),
                 Decision {
                     suppress: true,
                     command: None
                 }
             );
-            assert!(policy.transition(key, false, false, true).suppress);
-            assert!(policy.transition(0xa2, false, false, true).suppress);
-            assert!(policy.transition(0xa4, false, false, true).suppress);
+            assert!(policy.transition(key, false, false, true, true).suppress);
+            assert!(policy.transition(0xa2, false, false, true, true).suppress);
+            assert!(policy.transition(0xa4, false, false, true, true).suppress);
         }
     }
     #[test]
     fn local_chords_are_consumed_once_without_stranding_local_modifiers() {
         let mut policy = Policy::new(|_| false);
-        assert!(!policy.transition(0xa3, true, false, true).suppress);
-        assert!(!policy.transition(0xa5, true, false, true).suppress);
+        assert!(!policy.transition(0xa3, true, false, true, true).suppress);
+        assert!(!policy.transition(0xa5, true, false, true, true).suppress);
         assert_eq!(
-            policy.transition(0x20, true, false, true).command,
+            policy.transition(0x20, true, false, true, true).command,
             Some(TOGGLE)
         );
-        assert!(policy.transition(0x20, false, false, true).suppress);
-        assert!(!policy.transition(0xa3, false, false, true).suppress);
-        assert!(!policy.transition(0xa5, false, false, true).suppress);
+        assert!(policy.transition(0x20, false, false, true, true).suppress);
+        assert!(!policy.transition(0xa3, false, false, true, true).suppress);
+        assert!(!policy.transition(0xa5, false, false, true, true).suppress);
     }
     #[test]
     fn physical_context_is_nested_and_restored_after_unwind_without_input() {

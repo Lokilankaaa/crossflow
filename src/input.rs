@@ -216,6 +216,10 @@ impl SourceInputQueue {
         self.connected
     }
 
+    pub fn has_held_local_input(&self) -> bool {
+        !self.local_keys.is_empty() || !self.local_buttons.is_empty()
+    }
+
     /// Changes even when a pause and re-arm occur between transport polls.
     /// A new Arm must reset/release remote state before this epoch's input.
     pub fn control_epoch(&self) -> u64 {

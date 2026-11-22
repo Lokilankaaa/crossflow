@@ -52,6 +52,25 @@ internal sealed record TransferStatusInfo(
     [property: JsonPropertyName("saved_dir")] string? SavedDir,
     [property: JsonPropertyName("error")] string? Error);
 
+internal sealed record HotkeyConfigInfo(
+    [property: JsonPropertyName("toggle_sharing")] string? ToggleSharing,
+    [property: JsonPropertyName("lock_screen")] string? LockScreen,
+    [property: JsonPropertyName("quick_jump_next")] string? QuickJumpNext,
+    [property: JsonPropertyName("quick_jump_home")] string? QuickJumpHome,
+    [property: JsonPropertyName("quick_jump_1")] string? QuickJump1,
+    [property: JsonPropertyName("quick_jump_2")] string? QuickJump2,
+    [property: JsonPropertyName("emergency_stop")] string? EmergencyStop)
+{
+    internal static HotkeyConfigInfo Defaults => new(
+        "Ctrl+Alt+S",
+        "Ctrl+Alt+L",
+        "Ctrl+Alt+Tab",
+        "Ctrl+Alt+H",
+        "Ctrl+Alt+1",
+        "Ctrl+Alt+2",
+        "Ctrl+Alt+Shift+Esc");
+}
+
 internal sealed record PeerMeshSnapshot(
     string State,
     string? LocalDeviceId,
@@ -61,6 +80,8 @@ internal sealed record PeerMeshSnapshot(
     bool SmartKeymap,
     bool ClipboardSync,
     bool InputStateSync,
+    bool ScreenLocked,
+    HotkeyConfigInfo Hotkeys,
     string SelectedChannel,
     string? DirectPeer,
     string? ActiveChannelLabel,
@@ -81,7 +102,7 @@ internal sealed record PeerMeshSnapshot(
     long Generation)
 {
     internal static PeerMeshSnapshot Initial => new(
-        "idle", null, null, "open", false, true, true, true, "auto", null, null, [],
+        "idle", null, null, "open", false, true, true, true, false, HotkeyConfigInfo.Defaults, "auto", null, null, [],
         false, null, null, null, null, null, null,
         [], [], null, null, null, false, 0);
 }
@@ -215,6 +236,14 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_clipboard", enabled });
     internal Task SetInputStateSyncAsync(bool enabled) =>
         SendCommandAsync(new { op = "set_input_state_sync", enabled });
+    internal Task SetHotkeysAsync(HotkeyConfigInfo hotkeys) =>
+        SendCommandAsync(new { op = "set_hotkeys", hotkeys });
+    internal Task SetHotkeySuspendedAsync(bool suspended) =>
+        SendCommandAsync(new { op = "set_hotkey_suspended", suspended });
+    internal Task SetScreenLockAsync(bool locked) =>
+        SendCommandAsync(new { op = "set_screen_lock", locked });
+    internal Task QuickJumpAsync(string? targetDeviceId) =>
+        SendCommandAsync(new { op = "quick_jump", target_device_id = targetDeviceId });
     internal Task SendFilesAsync(IReadOnlyList<string> paths) =>
         SendCommandAsync(new { op = "send_files", paths });
     internal Task CancelTransferAsync() =>
@@ -302,6 +331,8 @@ internal sealed class PeerMeshController
                             parsed.SmartKeymap,
                             parsed.ClipboardSync,
                             parsed.InputStateSync,
+                            parsed.ScreenLocked,
+                            parsed.Hotkeys ?? HotkeyConfigInfo.Defaults,
                             parsed.SelectedChannel ?? "auto",
                             parsed.DirectPeer,
                             parsed.ActiveChannelLabel,
@@ -370,6 +401,8 @@ internal sealed class PeerMeshController
         [JsonPropertyName("smart_keymap")] public bool SmartKeymap { get; set; } = true;
         [JsonPropertyName("clipboard_sync")] public bool ClipboardSync { get; set; } = true;
         [JsonPropertyName("input_state_sync")] public bool InputStateSync { get; set; } = true;
+        [JsonPropertyName("screen_locked")] public bool ScreenLocked { get; set; }
+        [JsonPropertyName("hotkeys")] public HotkeyConfigInfo? Hotkeys { get; set; }
         [JsonPropertyName("selected_channel")] public string? SelectedChannel { get; set; }
         [JsonPropertyName("direct_peer")] public string? DirectPeer { get; set; }
         [JsonPropertyName("active_channel_label")] public string? ActiveChannelLabel { get; set; }

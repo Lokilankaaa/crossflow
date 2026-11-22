@@ -830,6 +830,7 @@ mod native {
         buttons: [bool; 5],
         remote_keys: [bool; 128],
         remote_buttons: [bool; 5],
+        hotkey_suppressed: [bool; 128],
         wheel: WheelRemainder,
         permission: Option<PermissionProbe>,
     }
@@ -919,6 +920,9 @@ mod native {
             if state.keys[mod_key] && modifier_down(mod_key as u16, flags) == Some(false) {
                 update_held(&state.shared, &mut state.keys[mod_key], false);
                 state.remote_keys[mod_key] = false;
+                if let Some(u) = hid_usage(mod_key as u16) {
+                    crate::hotkeys::active_observe_key(u, false);
+                }
             }
         }
         let mut suppress = remote;
@@ -1004,17 +1008,29 @@ mod native {
                 } else {
                     kind == 10
                 };
-                if key == 53 && down && flags & 0x40000 != 0 && flags & 0x80000 != 0 {
-                    state.shared.stop(StopReason::EmergencyShortcut);
-                    return false;
-                }
                 let Some(usage) = hid_usage(key as u16) else {
                     if !remote && (kind == 10 || kind == 12) {
                         state.shared.activity.fetch_add(1, Ordering::Release);
                     }
                     return false;
                 };
-                if kind == 10 && unsafe { CGEventGetIntegerValueField(event, 8) } != 0 {
+                let is_repeat = kind == 10 && unsafe { CGEventGetIntegerValueField(event, 8) } != 0;
+                if crate::hotkeys::has_active_engine() {
+                    if state.hotkey_suppressed[index] {
+                        if !down {
+                            state.hotkey_suppressed[index] = false;
+                        }
+                        return true;
+                    }
+                    if !is_repeat && crate::hotkeys::active_observe_key(usage, down).is_some() {
+                        state.hotkey_suppressed[index] = true;
+                        return true;
+                    }
+                } else if key == 53 && down && flags & 0x40000 != 0 && flags & 0x80000 != 0 {
+                    state.shared.stop(StopReason::EmergencyShortcut);
+                    return false;
+                }
+                if is_repeat {
                     return state.remote_keys[index];
                 }
                 update_held(&state.shared, &mut state.keys[index], down);
@@ -1168,6 +1184,7 @@ mod native {
             buttons: [false; 5],
             remote_keys: [false; 128],
             remote_buttons: [false; 5],
+            hotkey_suppressed: [false; 128],
             wheel: WheelRemainder::default(),
             permission: None,
         });

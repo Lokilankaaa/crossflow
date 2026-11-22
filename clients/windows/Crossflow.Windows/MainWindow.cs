@@ -53,8 +53,17 @@ internal sealed class MainWindow : Window
 
     private readonly ToggleSwitch clipboardToggle = new();
     private readonly ToggleSwitch inputStateToggle = new();
+    private readonly ToggleSwitch screenLockToggle = new();
     private bool updatingClipboardUi;
     private bool updatingInputStateUi;
+    private bool updatingScreenLockUi;
+
+    // Customizable Hotkeys collapsible section
+    private readonly Button hotkeysHeaderButton = new();
+    private readonly StackPanel hotkeysPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
+    private readonly Dictionary<string, Button> hotkeyButtons = new(StringComparer.Ordinal);
+    private string? recordingHotkeyField;
+    private bool hotkeysExpanded;
     private TrayIcon? trayIcon;
 
     [DllImport("user32.dll")]
@@ -354,6 +363,23 @@ internal sealed class MainWindow : Window
         };
         sidebar.Children.Add(inputStateToggle);
 
+        screenLockToggle.Header = null;
+        screenLockToggle.IsOn = false;
+        screenLockToggle.OnContent = "已锁定当前屏幕（防误触）";
+        screenLockToggle.OffContent = "锁定当前屏幕（防误触）";
+        screenLockToggle.FontSize = 12;
+        screenLockToggle.Toggled += async (_, _) =>
+        {
+            if (updatingScreenLockUi) return;
+            await peerMesh.SetScreenLockAsync(screenLockToggle.IsOn);
+        };
+        sidebar.Children.Add(screenLockToggle);
+
+        sidebar.Children.Add(Divider());
+
+        // Customizable Hotkeys (collapsible so sidebar stays clean)
+        BuildHotkeysSection();
+
         sidebar.Children.Add(Divider());
 
         // Screens list (identical to macOS sidebar)
@@ -392,6 +418,245 @@ internal sealed class MainWindow : Window
         Foreground = theme.Brush("text_secondary"),
         Margin = new Thickness(2, 4, 0, 2)
     };
+
+    private void BuildHotkeysSection()
+    {
+        hotkeysHeaderButton.Content = "▸ 快捷键自定义";
+        hotkeysHeaderButton.FontSize = 12;
+        hotkeysHeaderButton.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
+        hotkeysHeaderButton.Foreground = theme.Brush("text_secondary");
+        hotkeysHeaderButton.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        hotkeysHeaderButton.BorderThickness = new Thickness(0);
+        hotkeysHeaderButton.Padding = new Thickness(2, 4, 2, 4);
+        hotkeysHeaderButton.HorizontalAlignment = HorizontalAlignment.Stretch;
+        hotkeysHeaderButton.HorizontalContentAlignment = HorizontalAlignment.Left;
+        hotkeysHeaderButton.Click += (_, _) =>
+        {
+            hotkeysExpanded = !hotkeysExpanded;
+            hotkeysHeaderButton.Content = hotkeysExpanded ? "▾ 快捷键自定义" : "▸ 快捷键自定义";
+            hotkeysPanel.Visibility = hotkeysExpanded ? Visibility.Visible : Visibility.Collapsed;
+            if (!hotkeysExpanded && recordingHotkeyField is not null)
+                CancelHotkeyRecording();
+        };
+        sidebar.Children.Add(hotkeysHeaderButton);
+
+        var rows = new (string Field, string Label)[]
+        {
+            ("toggle_sharing", "暂停 / 恢复共享"),
+            ("lock_screen", "锁定当前屏幕"),
+            ("quick_jump_next", "QuickJump 下一台"),
+            ("quick_jump_home", "QuickJump 回本机"),
+            ("quick_jump_1", "QuickJump 设备 #1"),
+            ("emergency_stop", "紧急停止"),
+        };
+
+        foreach (var (field, label) in rows)
+        {
+            var row = new Grid { ColumnSpacing = 6 };
+            row.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+            row.Children.Add(new TextBlock
+            {
+                Text = label,
+                FontSize = 11.5,
+                Foreground = theme.Brush("text"),
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            var btn = new Button
+            {
+                Content = "—",
+                FontSize = 11,
+                Padding = new Thickness(8, 3, 8, 3),
+                MinWidth = 86,
+                Background = theme.Brush("background"),
+                Foreground = theme.Brush("text"),
+                BorderBrush = theme.Brush("border"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6)
+            };
+            string captured = field;
+            btn.Click += (_, _) => ToggleHotkeyRecording(captured);
+            Grid.SetColumn(btn, 1);
+            row.Children.Add(btn);
+            hotkeyButtons[field] = btn;
+            hotkeysPanel.Children.Add(row);
+        }
+
+        var hintAndReset = new Grid { Margin = new Thickness(0, 2, 0, 0) };
+        hintAndReset.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        hintAndReset.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        hintAndReset.Children.Add(new TextBlock
+        {
+            Text = "点击录制 · Esc 取消 · Del 清空",
+            FontSize = 10.5,
+            Foreground = theme.Brush("text_secondary"),
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        var resetBtn = new Button
+        {
+            Content = "恢复默认",
+            FontSize = 11,
+            Padding = new Thickness(8, 3, 8, 3),
+            Background = theme.Brush("background"),
+            Foreground = theme.Brush("text_secondary"),
+            BorderBrush = theme.Brush("border"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6)
+        };
+        resetBtn.Click += async (_, _) =>
+        {
+            CancelHotkeyRecording();
+            await peerMesh.SetHotkeysAsync(HotkeyConfigInfo.Defaults);
+        };
+        Grid.SetColumn(resetBtn, 1);
+        hintAndReset.Children.Add(resetBtn);
+        hotkeysPanel.Children.Add(hintAndReset);
+        sidebar.Children.Add(hotkeysPanel);
+
+        root.PreviewKeyDown += OnRootPreviewKeyDown;
+    }
+
+    private void ToggleHotkeyRecording(string field)
+    {
+        if (recordingHotkeyField == field)
+        {
+            CancelHotkeyRecording();
+            return;
+        }
+        recordingHotkeyField = field;
+        _ = peerMesh.SetHotkeySuspendedAsync(true);
+        RenderHotkeyButtons(currentSnap.Hotkeys);
+    }
+
+    private void CancelHotkeyRecording()
+    {
+        if (recordingHotkeyField is null) return;
+        recordingHotkeyField = null;
+        _ = peerMesh.SetHotkeySuspendedAsync(false);
+        RenderHotkeyButtons(currentSnap.Hotkeys);
+    }
+
+    private async void OnRootPreviewKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (recordingHotkeyField is null) return;
+        e.Handled = true;
+        var key = e.Key;
+        if (key is VirtualKey.Control or VirtualKey.LeftControl or VirtualKey.RightControl
+            or VirtualKey.Menu or VirtualKey.LeftMenu or VirtualKey.RightMenu
+            or VirtualKey.Shift or VirtualKey.LeftShift or VirtualKey.RightShift
+            or VirtualKey.LeftWindows or VirtualKey.RightWindows)
+        {
+            return;
+        }
+
+        bool ctrl = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool alt = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Menu) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool shift = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool meta = ((Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.LeftWindows) | Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.RightWindows)) & global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+        bool hasMod = ctrl || alt || shift || meta;
+
+        if (!hasMod && key == VirtualKey.Escape)
+        {
+            CancelHotkeyRecording();
+            return;
+        }
+
+        string field = recordingHotkeyField;
+        string? newChord;
+        if (!hasMod && key is VirtualKey.Back or VirtualKey.Delete)
+        {
+            newChord = null;
+        }
+        else
+        {
+            string? keyName = VirtualKeyToChordName(key);
+            bool standaloneAllowed = key >= VirtualKey.F1 && key <= VirtualKey.F20;
+            if (keyName is null || (!hasMod && !standaloneAllowed))
+            {
+                ShowNotice("请配合 Ctrl / Alt / Shift 等修饰键（或使用 F1–F20）。", isError: true);
+                return;
+            }
+            var parts = new List<string>(5);
+            if (ctrl) parts.Add("Ctrl");
+            if (alt) parts.Add("Alt");
+            if (shift) parts.Add("Shift");
+            if (meta) parts.Add("Meta");
+            parts.Add(keyName);
+            newChord = string.Join("+", parts);
+        }
+
+        ClearNotice();
+        recordingHotkeyField = null;
+        await peerMesh.SetHotkeySuspendedAsync(false);
+        var h = currentSnap.Hotkeys;
+        var updated = field switch
+        {
+            "toggle_sharing" => h with { ToggleSharing = newChord },
+            "lock_screen" => h with { LockScreen = newChord },
+            "quick_jump_next" => h with { QuickJumpNext = newChord },
+            "quick_jump_home" => h with { QuickJumpHome = newChord },
+            "quick_jump_1" => h with { QuickJump1 = newChord },
+            "emergency_stop" => h with { EmergencyStop = newChord },
+            _ => h
+        };
+        RenderHotkeyButtons(updated);
+        await peerMesh.SetHotkeysAsync(updated);
+    }
+
+    private static string? VirtualKeyToChordName(VirtualKey key)
+    {
+        if (key >= VirtualKey.A && key <= VirtualKey.Z)
+            return ((char)('A' + (key - VirtualKey.A))).ToString();
+        if (key >= VirtualKey.Number0 && key <= VirtualKey.Number9)
+            return ((char)('0' + (key - VirtualKey.Number0))).ToString();
+        if (key >= VirtualKey.F1 && key <= VirtualKey.F20)
+            return $"F{(int)(key - VirtualKey.F1) + 1}";
+        return key switch
+        {
+            VirtualKey.Escape => "Esc",
+            VirtualKey.Tab => "Tab",
+            VirtualKey.Space => "Space",
+            VirtualKey.Enter => "Enter",
+            VirtualKey.Back => "Backspace",
+            VirtualKey.Delete => "Delete",
+            VirtualKey.Insert => "Insert",
+            VirtualKey.Home => "Home",
+            VirtualKey.End => "End",
+            VirtualKey.PageUp => "PageUp",
+            VirtualKey.PageDown => "PageDown",
+            VirtualKey.Left => "Left",
+            VirtualKey.Right => "Right",
+            VirtualKey.Up => "Up",
+            VirtualKey.Down => "Down",
+            (VirtualKey)189 => "-",
+            (VirtualKey)187 => "=",
+            (VirtualKey)219 => "[",
+            (VirtualKey)221 => "]",
+            (VirtualKey)192 => "`",
+            _ => null
+        };
+    }
+
+    private void RenderHotkeyButtons(HotkeyConfigInfo h)
+    {
+        string? GetVal(string f) => f switch
+        {
+            "toggle_sharing" => h.ToggleSharing,
+            "lock_screen" => h.LockScreen,
+            "quick_jump_next" => h.QuickJumpNext,
+            "quick_jump_home" => h.QuickJumpHome,
+            "quick_jump_1" => h.QuickJump1,
+            "emergency_stop" => h.EmergencyStop,
+            _ => null
+        };
+        foreach (var (field, btn) in hotkeyButtons)
+        {
+            bool rec = recordingHotkeyField == field;
+            btn.Content = rec ? "请按组合键…" : (GetVal(field) ?? "未设置");
+            btn.BorderBrush = theme.Brush(rec ? "accent" : "border");
+            btn.Foreground = theme.Brush(rec ? "accent" : (GetVal(field) is null ? "text_secondary" : "text"));
+        }
+    }
 
     private void BuildWorkspace()
     {
@@ -566,6 +831,8 @@ internal sealed class MainWindow : Window
             trayIcon.ShowOrRestoreRequested += () => DispatcherQueue.TryEnqueue(ShowAndActivate);
             trayIcon.HideRequested += () => DispatcherQueue.TryEnqueue(() => AppWindow.Hide());
             trayIcon.ToggleSharingRequested += () => DispatcherQueue.TryEnqueue(async () => await OnPrimaryActionClickAsync());
+            trayIcon.ToggleScreenLockRequested += locked => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetScreenLockAsync(locked));
+            trayIcon.QuickJumpRequested += target => DispatcherQueue.TryEnqueue(async () => await peerMesh.QuickJumpAsync(target));
             trayIcon.ToggleClipboardRequested += enabled => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetClipboardAsync(enabled));
             trayIcon.ToggleInputStateRequested += enabled => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetInputStateSyncAsync(enabled));
             trayIcon.SelectChannelRequested += chId => DispatcherQueue.TryEnqueue(async () =>
@@ -750,6 +1017,17 @@ internal sealed class MainWindow : Window
             inputStateToggle.IsOn = snap.InputStateSync;
             updatingInputStateUi = false;
         }
+        if (screenLockToggle.IsOn != snap.ScreenLocked)
+        {
+            updatingScreenLockUi = true;
+            screenLockToggle.IsOn = snap.ScreenLocked;
+            updatingScreenLockUi = false;
+        }
+        RenderHotkeyButtons(snap.Hotkeys);
+        string hkToggle = snap.Hotkeys.ToggleSharing ?? "未设置";
+        string hkJump = snap.Hotkeys.QuickJumpNext ?? "未设置";
+        string hkLock = snap.Hotkeys.LockScreen ?? "未设置";
+        footerStatus.Text = $"快捷键：{hkToggle} 暂停/恢复 · {hkJump} 快速切屏（手柄直通）· {hkLock} 锁定屏幕 · 支持拖入文件跨屏直传";
 
         bool isRemoteFocus = snap.State == "sharing"
             && snap.FocusDeviceId is not null
@@ -778,7 +1056,7 @@ internal sealed class MainWindow : Window
             _ => $"状态：{statusTitle.Text}"
         };
         string? focusMenuLine = snap.State == "sharing" && snap.FocusDeviceId is not null
-            ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}"
+            ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}{(snap.ScreenLocked ? "（已锁定）" : "")}"
             : null;
 
         trayIcon?.UpdateState(
@@ -789,6 +1067,9 @@ internal sealed class MainWindow : Window
             connected: snap.State is "sharing" or "paused",
             canToggle: snap.State is "sharing" or "paused",
             sharing: snap.State == "sharing",
+            locked: snap.ScreenLocked,
+            remotePeerId: snap.PeerDeviceId,
+            remotePeerName: snap.PeerName,
             clipboardSync: snap.ClipboardSync,
             inputStateSync: snap.InputStateSync,
             channelId: snap.SelectedChannel,

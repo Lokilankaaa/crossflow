@@ -15,6 +15,7 @@
 
 use crate::{
     discovery::{self, Advertisement, Candidate, DiscoveryConfig, DiscoveryHandle},
+    hotkeys::{HotkeyAction, HotkeyConfig, SharedHotkeyEngine},
     injection_worker::WorkerProxy,
     metrics::{Log, LogWriter},
     pair_native::{Capture, Platform, Shortcut},
@@ -87,6 +88,8 @@ struct PeerConfig {
     clipboard_sync: bool,
     #[serde(default = "default_true")]
     input_state_sync: bool,
+    #[serde(default)]
+    hotkeys: HotkeyConfig,
 }
 
 fn default_channel() -> String {
@@ -106,6 +109,7 @@ impl Default for PeerConfig {
             smart_keymap: true,
             clipboard_sync: true,
             input_state_sync: true,
+            hotkeys: HotkeyConfig::default(),
         }
     }
 }
@@ -129,6 +133,8 @@ struct PeerUiStatus {
     smart_keymap: bool,
     clipboard_sync: bool,
     input_state_sync: bool,
+    screen_locked: bool,
+    hotkeys: HotkeyConfig,
     selected_channel: String,
     direct_peer: Option<String>,
     active_channel_label: Option<String>,
@@ -172,6 +178,19 @@ enum UiCommand {
     },
     SetInputStateSync {
         enabled: bool,
+    },
+    SetHotkeys {
+        hotkeys: HotkeyConfig,
+    },
+    SetHotkeySuspended {
+        suspended: bool,
+    },
+    SetScreenLock {
+        locked: bool,
+    },
+    QuickJump {
+        #[serde(default)]
+        target_device_id: Option<String>,
     },
     SendFiles {
         paths: Vec<String>,
@@ -226,6 +245,7 @@ fn load_config(env_passphrase: Option<String>) -> PeerConfig {
     {
         cfg.passphrase = Some(secret.to_string());
     }
+    cfg.hotkeys = cfg.hotkeys.normalized();
     cfg
 }
 
@@ -603,8 +623,17 @@ fn prepare_worker(inventory: &[Display], log: Log) -> Result<WorkerProxy> {
     Ok(sink)
 }
 
+struct ActiveHotkeyGuard;
+impl Drop for ActiveHotkeyGuard {
+    fn drop(&mut self) {
+        crate::hotkeys::install_active_engine(None);
+    }
+}
+
 struct PeerHost<'a> {
     capture: &'a mut dyn Capture,
+    source: &'a SharedSource,
+    hotkey_engine: &'a SharedHotkeyEngine,
     rx: &'a Receiver<UiCommand>,
     stdout: &'a Mutex<std::io::Stdout>,
     discovery: &'a DiscoveryHandle,
@@ -628,7 +657,9 @@ struct PeerHost<'a> {
     peer_name: String,
     peer_address: String,
     user_paused: &'a mut bool,
+    screen_locked: &'a mut bool,
     pending_layout_push: &'a mut Option<(String, SharedLayout)>,
+    pending_quick_jump: Option<(String, Instant)>,
     initiator: bool,
     status_seen: bool,
     auto_enable_sent: bool,
@@ -639,6 +670,8 @@ struct PeerHost<'a> {
     last_emitted_enabled: Option<bool>,
     last_emitted_focus_screen: Option<String>,
     last_emitted_peer_count: usize,
+    last_emitted_locked: Option<bool>,
+    last_emitted_hotkeys: Option<HotkeyConfig>,
 }
 
 impl PeerHost<'_> {
@@ -734,6 +767,22 @@ impl PeerHost<'_> {
                     self.input_state_sync_flag.store(enabled, Ordering::Relaxed);
                     save_config(self.config);
                 }
+                Ok(UiCommand::SetHotkeys { hotkeys }) => {
+                    self.config.hotkeys = hotkeys.normalized();
+                    self.hotkey_engine.update_config(&self.config.hotkeys);
+                    save_config(self.config);
+                }
+                Ok(UiCommand::SetHotkeySuspended { suspended }) => {
+                    self.hotkey_engine.set_suspended(suspended);
+                }
+                Ok(UiCommand::SetScreenLock { locked }) => {
+                    *self.screen_locked = locked;
+                    self.source.set_edge_locked(locked);
+                }
+                Ok(UiCommand::QuickJump { target_device_id }) => {
+                    let target = self.resolve_quick_jump_target(target_device_id.as_deref());
+                    self.queue_quick_jump(target);
+                }
                 Ok(UiCommand::SendFiles { paths }) => {
                     if let Some(aux) = self.aux {
                         let list: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
@@ -754,6 +803,89 @@ impl PeerHost<'_> {
                 }
             }
         }
+    }
+
+    fn resolve_quick_jump_target(&self, target: Option<&str>) -> String {
+        match target.map(str::trim).filter(|s| !s.is_empty()) {
+            None => {
+                // Cycle between local and peer
+                if self.source.status().remote_focus {
+                    self.local_device_id.to_string()
+                } else {
+                    self.peer_device_id.clone()
+                }
+            }
+            Some("local") => self.local_device_id.to_string(),
+            Some(id) if id == self.local_device_id => self.local_device_id.to_string(),
+            Some(_) => self.peer_device_id.clone(),
+        }
+    }
+
+    fn queue_quick_jump(&mut self, target_device_id: String) {
+        if !self.sharing {
+            return;
+        }
+        self.pending_quick_jump = Some((target_device_id, Instant::now()));
+        if !self.source.status().enabled {
+            // Request local control authority from pair_session so QuickJump can proceed.
+            self.source.signal_activity();
+        }
+    }
+
+    fn process_hotkeys_and_quick_jump(&mut self, now_ns: u64) -> Result<()> {
+        for action in self.hotkey_engine.drain_actions() {
+            match action {
+                HotkeyAction::EmergencyStop => {
+                    *self.user_paused = true;
+                    self.pending_quick_jump = None;
+                    self.pending = Some(Command::Pause);
+                }
+                HotkeyAction::ToggleSharing => {
+                    if self.sharing {
+                        *self.user_paused = true;
+                        self.pending_quick_jump = None;
+                        self.pending = Some(Command::Pause);
+                    } else {
+                        *self.user_paused = false;
+                        if self.status_seen {
+                            self.pending = Some(Command::Enable { epoch: self.epoch });
+                        }
+                    }
+                }
+                HotkeyAction::ToggleLockScreen => {
+                    *self.screen_locked = !*self.screen_locked;
+                    self.source.set_edge_locked(*self.screen_locked);
+                }
+                HotkeyAction::QuickJumpNext => {
+                    let target = self.resolve_quick_jump_target(None);
+                    self.queue_quick_jump(target);
+                }
+                HotkeyAction::QuickJumpHome => {
+                    self.queue_quick_jump(self.local_device_id.to_string());
+                }
+                HotkeyAction::QuickJumpDevice(idx) => {
+                    if idx == 0 {
+                        self.queue_quick_jump(self.peer_device_id.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some((target, created_at)) = self.pending_quick_jump.clone() {
+            if !self.sharing || created_at.elapsed() >= Duration::from_secs(2) {
+                self.pending_quick_jump = None;
+            } else if !self.source.status().enabled {
+                // Keep waiting briefly for local authority grant
+            } else if !self.hotkey_engine.any_modifier_held()
+                && !self.source.has_held_physical_input()
+            {
+                self.pending_quick_jump = None;
+                if let Some(local_pt) = self.source.quick_jump_to_device(&target, now_ns)? {
+                    let _ = self.capture.warp_local(local_pt);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn poll_native_shortcut(&mut self) -> Result<Option<Command>> {
@@ -795,6 +927,7 @@ impl Host for PeerHost<'_> {
             self.session_stop.store(true, Ordering::Release);
         }
         result?;
+        self.process_hotkeys_and_quick_jump(now_ns)?;
         if let Some(cmd) = self.poll_native_shortcut()? {
             self.pending = Some(cmd);
         }
@@ -845,6 +978,8 @@ impl Host for PeerHost<'_> {
         let state_changed = self.last_emitted_enabled != Some(status.endpoint.enabled)
             || self.last_emitted_focus_screen != status.focus_screen_id
             || self.last_emitted_peer_count != discovered.len()
+            || self.last_emitted_locked != Some(*self.screen_locked)
+            || self.last_emitted_hotkeys.as_ref() != Some(&self.config.hotkeys)
             || transfer.as_ref().is_some_and(|t| t.state == "active");
         if state_changed
             || self.last_emit.elapsed() >= Duration::from_millis(250)
@@ -854,6 +989,8 @@ impl Host for PeerHost<'_> {
             self.last_emitted_enabled = Some(status.endpoint.enabled);
             self.last_emitted_focus_screen = status.focus_screen_id.clone();
             self.last_emitted_peer_count = discovered.len();
+            self.last_emitted_locked = Some(*self.screen_locked);
+            self.last_emitted_hotkeys = Some(self.config.hotkeys.clone());
             let has_pass = self.config.passphrase.is_some();
             emit_status(
                 self.stdout,
@@ -871,6 +1008,8 @@ impl Host for PeerHost<'_> {
                     smart_keymap: self.config.smart_keymap,
                     clipboard_sync: self.config.clipboard_sync,
                     input_state_sync: self.config.input_state_sync,
+                    screen_locked: *self.screen_locked,
+                    hotkeys: self.config.hotkeys.clone(),
                     selected_channel: self.config.channel.clone(),
                     direct_peer: self.config.direct_peer.clone(),
                     active_channel_label: self.active_channel_label.clone(),
@@ -917,6 +1056,9 @@ pub fn run(
         .map(ToString::to_string)
         .unwrap_or_else(default_friendly_name);
     let mut config = load_config(options.passphrase);
+    let hotkey_engine = SharedHotkeyEngine::new(&config.hotkeys);
+    crate::hotkeys::install_active_engine(Some(hotkey_engine.clone()));
+    let _hotkey_guard = ActiveHotkeyGuard;
     let smart_keymap_flag = Arc::new(AtomicBool::new(config.smart_keymap));
     let clipboard_sync_flag = Arc::new(AtomicBool::new(config.clipboard_sync));
     let input_state_sync_flag = Arc::new(AtomicBool::new(config.input_state_sync));
@@ -939,6 +1081,8 @@ pub fn run(
                     smart_keymap: config.smart_keymap,
                     clipboard_sync: config.clipboard_sync,
                     input_state_sync: config.input_state_sync,
+                    screen_locked: false,
+                    hotkeys: config.hotkeys.clone(),
                     selected_channel: config.channel.clone(),
                     direct_peer: config.direct_peer.clone(),
                     active_channel_label: None,
@@ -966,6 +1110,7 @@ pub fn run(
     let log = writer.log.clone();
     let deadline = Instant::now() + Duration::from_secs_f64(options.seconds);
     let mut user_paused = false;
+    let mut screen_locked = false;
     let mut pending_layout_push: Option<(String, SharedLayout)> = None;
 
     let result = (|| -> Result<()> {
@@ -1096,7 +1241,22 @@ pub fn run(
                             input_state_sync_flag.store(enabled, Ordering::Relaxed);
                             save_config(&config);
                         }
-                        Ok(UiCommand::SendFiles { .. } | UiCommand::CancelTransfer) => {}
+                        Ok(UiCommand::SetHotkeys { hotkeys }) => {
+                            config.hotkeys = hotkeys.normalized();
+                            hotkey_engine.update_config(&config.hotkeys);
+                            save_config(&config);
+                        }
+                        Ok(UiCommand::SetHotkeySuspended { suspended }) => {
+                            hotkey_engine.set_suspended(suspended);
+                        }
+                        Ok(UiCommand::SetScreenLock { locked }) => {
+                            screen_locked = locked;
+                        }
+                        Ok(
+                            UiCommand::QuickJump { .. }
+                            | UiCommand::SendFiles { .. }
+                            | UiCommand::CancelTransfer,
+                        ) => {}
                         Err(TryRecvError::Empty) => break,
                     }
                 }
@@ -1125,6 +1285,8 @@ pub fn run(
                             smart_keymap: config.smart_keymap,
                             clipboard_sync: config.clipboard_sync,
                             input_state_sync: config.input_state_sync,
+                            screen_locked,
+                            hotkeys: config.hotkeys.clone(),
                             selected_channel: config.channel.clone(),
                             direct_peer: config.direct_peer.clone(),
                             active_channel_label: None,
@@ -1308,6 +1470,9 @@ pub fn run(
                 let _ = (remote_os, different_os);
                 connection.set_key_translator(crate::keymap::KeyTranslator::passthrough());
                 let source = SharedSource::new(connection.runtime().clone())?;
+                source.set_edge_locked(screen_locked);
+                hotkey_engine.reset_modifiers();
+                let _ = hotkey_engine.drain_actions();
                 let mut sink = match prepare_worker(&local_hello.inventory, log.clone()) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1346,6 +1511,8 @@ pub fn run(
                     &mut sink,
                     &mut PeerHost {
                         capture: capture.as_mut(),
+                        source: &source,
+                        hotkey_engine: &hotkey_engine,
                         rx: &rx,
                         stdout: &stdout,
                         discovery: &discovery,
@@ -1369,7 +1536,9 @@ pub fn run(
                         peer_name: peer_name.clone(),
                         peer_address: peer_address.clone(),
                         user_paused: &mut user_paused,
+                        screen_locked: &mut screen_locked,
                         pending_layout_push: &mut pending_layout_push,
+                        pending_quick_jump: None,
                         initiator,
                         status_seen: false,
                         auto_enable_sent: false,
@@ -1380,6 +1549,8 @@ pub fn run(
                         last_emitted_enabled: None,
                         last_emitted_focus_screen: None,
                         last_emitted_peer_count: usize::MAX,
+                        last_emitted_locked: None,
+                        last_emitted_hotkeys: None,
                     },
                     &session_stop,
                     log.clone(),
@@ -1450,6 +1621,8 @@ pub fn run(
             smart_keymap: config.smart_keymap,
             clipboard_sync: config.clipboard_sync,
             input_state_sync: config.input_state_sync,
+            screen_locked,
+            hotkeys: config.hotkeys,
             selected_channel: config.channel,
             direct_peer: config.direct_peer,
             active_channel_label: None,

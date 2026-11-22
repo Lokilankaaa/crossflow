@@ -51,6 +51,10 @@ internal sealed class TrayIcon : IDisposable
     private const uint CMD_OPEN_RECEIVE_DIR = 1006;
     private const uint CMD_TOGGLE_AUTOSTART = 1007;
     private const uint CMD_EXIT = 1008;
+    private const uint CMD_TOGGLE_SCREEN_LOCK = 1009;
+    private const uint CMD_QJ_NEXT = 1010;
+    private const uint CMD_QJ_HOME = 1011;
+    private const uint CMD_QJ_PEER = 1012;
     private const uint CMD_CHANNEL_BASE = 2000;
 
     private const nuint SUBCLASS_ID = 0x4346_5452;
@@ -74,12 +78,17 @@ internal sealed class TrayIcon : IDisposable
     private bool isConnected;
     private bool clipboardEnabled = true;
     private bool inputStateEnabled = true;
+    private bool screenLocked;
+    private string? peerName;
+    private string? peerDeviceId;
     private string selectedChannel = "auto";
     private IReadOnlyList<NetworkChannelInfo> channels = [];
 
     internal event Action? ShowOrRestoreRequested;
     internal event Action? HideRequested;
     internal event Action? ToggleSharingRequested;
+    internal event Action<bool>? ToggleScreenLockRequested;
+    internal event Action<string?>? QuickJumpRequested;
     internal event Action<bool>? ToggleClipboardRequested;
     internal event Action<bool>? ToggleInputStateRequested;
     internal event Action<string>? SelectChannelRequested;
@@ -107,6 +116,9 @@ internal sealed class TrayIcon : IDisposable
         bool connected,
         bool canToggle,
         bool sharing,
+        bool locked,
+        string? remotePeerId,
+        string? remotePeerName,
         bool clipboardSync,
         bool inputStateSync,
         string channelId,
@@ -128,6 +140,9 @@ internal sealed class TrayIcon : IDisposable
         isConnected = connected;
         canToggleSharing = canToggle;
         isSharing = sharing;
+        screenLocked = locked;
+        peerDeviceId = remotePeerId;
+        peerName = remotePeerName;
         clipboardEnabled = clipboardSync;
         inputStateEnabled = inputStateSync;
         selectedChannel = channelId;
@@ -199,6 +214,7 @@ internal sealed class TrayIcon : IDisposable
     {
         IntPtr menu = CreatePopupMenu();
         IntPtr channelMenu = IntPtr.Zero;
+        IntPtr qjMenu = IntPtr.Zero;
         if (menu == IntPtr.Zero) return;
         try
         {
@@ -212,7 +228,17 @@ internal sealed class TrayIcon : IDisposable
             if (canToggleSharing)
                 AppendMenuW(menu, MF_STRING, CMD_TOGGLE_SHARE, isSharing ? "暂停共享" : "恢复共享");
 
+            if (isSharing && peerDeviceId is not null)
+            {
+                qjMenu = CreatePopupMenu();
+                AppendMenuW(qjMenu, MF_STRING, CMD_QJ_NEXT, "切到下一台设备");
+                AppendMenuW(qjMenu, MF_STRING, CMD_QJ_HOME, "回到本机");
+                AppendMenuW(qjMenu, MF_STRING, CMD_QJ_PEER, $"#1 {peerName ?? "远端设备"}");
+                AppendMenuW(menu, MF_POPUP, (nuint)qjMenu, "快速切换 (QuickJump)");
+            }
+
             AppendMenuW(menu, MF_SEPARATOR, 0, null);
+            AppendMenuW(menu, MF_STRING | (screenLocked ? MF_CHECKED : 0), CMD_TOGGLE_SCREEN_LOCK, "锁定当前屏幕（防误触）");
             AppendMenuW(menu, MF_STRING | (clipboardEnabled ? MF_CHECKED : 0), CMD_TOGGLE_CLIPBOARD, "剪贴板共享");
             AppendMenuW(menu, MF_STRING | (inputStateEnabled ? MF_CHECKED : 0), CMD_TOGGLE_INPUT_STATE, "中英文与大小写同步");
 
@@ -256,6 +282,19 @@ internal sealed class TrayIcon : IDisposable
                 case CMD_TOGGLE_SHARE:
                     ToggleSharingRequested?.Invoke();
                     break;
+                case CMD_TOGGLE_SCREEN_LOCK:
+                    ToggleScreenLockRequested?.Invoke(!screenLocked);
+                    break;
+                case CMD_QJ_NEXT:
+                    QuickJumpRequested?.Invoke(null);
+                    break;
+                case CMD_QJ_HOME:
+                    QuickJumpRequested?.Invoke("local");
+                    break;
+                case CMD_QJ_PEER:
+                    if (peerDeviceId is not null)
+                        QuickJumpRequested?.Invoke(peerDeviceId);
+                    break;
                 case CMD_TOGGLE_CLIPBOARD:
                     ToggleClipboardRequested?.Invoke(!clipboardEnabled);
                     break;
@@ -278,6 +317,7 @@ internal sealed class TrayIcon : IDisposable
         }
         finally
         {
+            if (qjMenu != IntPtr.Zero) DestroyMenu(qjMenu);
             if (channelMenu != IntPtr.Zero) DestroyMenu(channelMenu);
             DestroyMenu(menu);
         }

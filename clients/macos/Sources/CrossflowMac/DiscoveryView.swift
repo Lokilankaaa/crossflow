@@ -81,6 +81,9 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var focusMenuItem: NSMenuItem?
     private var showHideMenuItem: NSMenuItem?
     private var toggleShareMenuItem: NSMenuItem?
+    private var quickJumpParentItem: NSMenuItem?
+    private var quickJumpPeerItem: NSMenuItem?
+    private var screenLockMenuItem: NSMenuItem?
     private var clipboardMenuItem: NSMenuItem?
     private var inputStateMenuItem: NSMenuItem?
     private var channelParentItem: NSMenuItem?
@@ -183,7 +186,27 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         toggleShareEntry.isHidden = true
         menu.addItem(toggleShareEntry)
 
+        let qjParent = NSMenuItem(title: "快速切换 (QuickJump)", action: nil, keyEquivalent: "")
+        let qjSub = NSMenu()
+        let qjNext = NSMenuItem(title: "切到下一台设备", action: #selector(quickJumpNext), keyEquivalent: "")
+        qjNext.target = self
+        qjSub.addItem(qjNext)
+        let qjHome = NSMenuItem(title: "回到本机", action: #selector(quickJumpHome), keyEquivalent: "")
+        qjHome.target = self
+        qjSub.addItem(qjHome)
+        let qjPeer = NSMenuItem(title: "#1 远端设备", action: #selector(quickJumpPeer), keyEquivalent: "")
+        qjPeer.target = self
+        qjSub.addItem(qjPeer)
+        qjParent.submenu = qjSub
+        qjParent.isHidden = true
+        menu.addItem(qjParent)
+
         menu.addItem(.separator())
+
+        let lockEntry = NSMenuItem(title: "锁定当前屏幕（防误触）", action: #selector(toggleScreenLock), keyEquivalent: "")
+        lockEntry.target = self
+        lockEntry.state = .off
+        menu.addItem(lockEntry)
 
         let clipEntry = NSMenuItem(title: "剪贴板共享", action: #selector(toggleClipboardSync), keyEquivalent: "")
         clipEntry.target = self
@@ -229,6 +252,9 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         focusMenuItem = focusEntry
         showHideMenuItem = showHideEntry
         toggleShareMenuItem = toggleShareEntry
+        quickJumpParentItem = qjParent
+        quickJumpPeerItem = qjPeer
+        screenLockMenuItem = lockEntry
         clipboardMenuItem = clipEntry
         inputStateMenuItem = imeEntry
         channelParentItem = chParent
@@ -269,7 +295,8 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
         if let focusItem = focusMenuItem {
             if peer.isSharing, peer.focusDeviceID != nil {
-                focusItem.title = "当前焦点：\(isRemoteFocus ? peerTag : "这台 Mac")"
+                let lockTag = peer.screenLocked ? "（已锁定）" : ""
+                focusItem.title = "当前焦点：\(isRemoteFocus ? peerTag : "这台 Mac")\(lockTag)"
                 focusItem.isHidden = false
             } else {
                 focusItem.isHidden = true
@@ -284,6 +311,9 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             toggleItem.title = peer.isSharing ? "暂停共享" : "恢复共享"
         }
 
+        quickJumpParentItem?.isHidden = !(peer.isSharing && peer.peerDeviceID != nil)
+        quickJumpPeerItem?.title = "#1 \(peerTag)"
+        screenLockMenuItem?.state = peer.screenLocked ? .on : .off
         clipboardMenuItem?.state = peer.clipboardSync ? .on : .off
         inputStateMenuItem?.state = peer.inputStateSync ? .on : .off
         sendFilesMenuItem?.isEnabled = peer.isConnected
@@ -425,6 +455,25 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             peer.pause()
         } else if peer.state == "paused" {
             peer.resume()
+        }
+    }
+
+    @objc private func toggleScreenLock() {
+        peer.setScreenLock(!peer.screenLocked)
+        refreshMenuBar()
+    }
+
+    @objc private func quickJumpNext() {
+        peer.quickJump(to: nil)
+    }
+
+    @objc private func quickJumpHome() {
+        peer.quickJump(to: "local")
+    }
+
+    @objc private func quickJumpPeer() {
+        if let id = peer.peerDeviceID {
+            peer.quickJump(to: id)
         }
     }
 
