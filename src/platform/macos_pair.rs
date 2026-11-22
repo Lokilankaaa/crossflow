@@ -178,7 +178,7 @@ impl<T: NativeTap> MacPairCapture<T> {
             self.fail("reverse capture/source failed");
         } else if self.display_epoch != macos::capture_display_epoch() {
             if let Some(next_epoch) = macos::capture_display_epoch()
-                && macos::native_displays()
+                && inventory()
                     .ok()
                     .is_some_and(|actual| validate_startup_inventory(&self.source, &actual).is_ok())
             {
