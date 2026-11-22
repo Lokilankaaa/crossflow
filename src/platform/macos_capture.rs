@@ -640,6 +640,7 @@ mod native {
     struct Context {
         shared: Arc<Shared>,
         clock: Clock,
+        tap_port: Ptr,
         keys: [bool; 128],
         buttons: [bool; 5],
         remote_keys: [bool; 128],
@@ -664,6 +665,15 @@ mod native {
     }
     fn handle(state: &mut Context, kind: u32, event: Ptr) -> bool {
         if kind == u32::MAX || kind == u32::MAX - 1 {
+            // macOS sends kCGEventTapDisabledByTimeout (u32::MAX - 1) on transient
+            // scheduler or WindowServer stalls. Re-enable immediately per Apple docs;
+            // only stop if the tap refuses to re-enable (e.g. revoked permission).
+            if !state.tap_port.is_null() && state.shared.stop.load(Ordering::SeqCst) == 0 {
+                unsafe { CGEventTapEnable(state.tap_port, true) };
+                if unsafe { CGEventTapIsEnabled(state.tap_port) } {
+                    return false;
+                }
+            }
             state.shared.stop(StopReason::TapDisabled);
             return false;
         }
@@ -896,6 +906,7 @@ mod native {
         let mut state = Box::new(Context {
             shared: Arc::clone(&shared),
             clock,
+            tap_port: std::ptr::null_mut(),
             keys: [false; 128],
             buttons: [false; 5],
             remote_keys: [false; 128],
@@ -924,7 +935,9 @@ mod native {
             ));
             return;
         }
-        // Keep the new tap disabled while startup permission RPCs may block.
+        state.tap_port = port;
+        // Keep the new tap disabled while startup permission/key queries run so
+        // WindowServer cannot time out an un-pumped tap before CFRunLoop starts.
         unsafe { CGEventTapEnable(port, false) };
         let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null_mut(), port, 0) };
         let loop_ = unsafe { CFRunLoopGetCurrent() };
@@ -962,15 +975,8 @@ mod native {
                 return;
             }
         }
-        shared.loop_tick.store(clock.now(), Ordering::Release);
-        unsafe {
-            CFRunLoopAddSource(loop_, source, kCFRunLoopDefaultMode);
-            CGEventTapEnable(port, true);
-        }
-        // Enable interception BEFORE sampling held input. A press after its
-        // key was sampled can now only be delivered through our callback, so
-        // no local down can disappear into a snapshot-to-enable gap. The run
-        // loop has not dispatched callbacks yet; this thread owns the arrays.
+        // Sample currently held input BEFORE enabling the tap so WindowServer
+        // never sends events to an enabled tap whose run loop is not pumping yet.
         let mut snapshot = HeldSnapshot::default();
         for key in 0..128 {
             let Some(usage) = hid_usage(key as u16) else {
@@ -989,10 +995,12 @@ mod native {
                 snapshot.buttons.push(button(number).unwrap());
             }
         }
-        // Refresh loop_tick after sampling 128 keys so startup latency is never
-        // misclassified as a run-loop stall.
         let ready_now = clock.now();
         shared.loop_tick.store(ready_now, Ordering::Release);
+        unsafe {
+            CFRunLoopAddSource(loop_, source, kCFRunLoopDefaultMode);
+            CGEventTapEnable(port, true);
+        }
         shared.remote(ready_now);
         if state
             .permission
@@ -1002,7 +1010,10 @@ mod native {
             shared.stop(StopReason::PermissionsLost);
         }
         if !unsafe { CGEventTapIsEnabled(port) } {
-            shared.stop(StopReason::TapDisabled);
+            unsafe { CGEventTapEnable(port, true) };
+            if !unsafe { CGEventTapIsEnabled(port) } {
+                shared.stop(StopReason::TapDisabled);
+            }
         }
         if shared.stop.load(Ordering::SeqCst) != 0 {
             let _ = ready.send(Err(
@@ -1045,8 +1056,11 @@ mod native {
             }
             shared.loop_tick.store(now, Ordering::Release);
             if !unsafe { CGEventTapIsEnabled(port) } {
-                shared.stop(StopReason::TapDisabled);
-                break;
+                unsafe { CGEventTapEnable(port, true) };
+                if !unsafe { CGEventTapIsEnabled(port) } {
+                    shared.stop(StopReason::TapDisabled);
+                    break;
+                }
             }
             unsafe {
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.005, true);
