@@ -286,6 +286,8 @@ struct PeerHost<'a> {
     peer_address: String,
     user_paused: &'a mut bool,
     pending_layout_push: &'a mut Option<(String, SharedLayout)>,
+    initiator: bool,
+    status_seen: bool,
     auto_enable_sent: bool,
     sharing: bool,
     epoch: u64,
@@ -328,7 +330,7 @@ impl PeerHost<'_> {
                 }
                 Ok(UiCommand::Resume) => {
                     *self.user_paused = false;
-                    if self.epoch > 0 {
+                    if self.status_seen {
                         self.pending = Some(Command::Enable { epoch: self.epoch });
                     }
                 }
@@ -414,10 +416,20 @@ impl Host for PeerHost<'_> {
     }
 
     fn publish(&mut self, status: &SessionStatus) -> Result<()> {
+        self.status_seen = true;
         self.sharing = status.endpoint.enabled;
+        if self.sharing {
+            *self.user_paused = false;
+        }
         self.epoch = status.endpoint.epoch;
-        // Auto-enable sharing on initial ready if user hasn't explicitly paused!
-        if !self.auto_enable_sent && !*self.user_paused && status.capture_ready && !self.sharing && self.epoch > 0 {
+        // Initiator auto-enables sharing on initial ready unless user explicitly paused
+        // (avoids simultaneous enable races while bringing both peers straight into sharing).
+        if self.initiator
+            && !self.auto_enable_sent
+            && !*self.user_paused
+            && status.capture_ready
+            && !self.sharing
+        {
             self.auto_enable_sent = true;
             self.pending = Some(Command::Enable { epoch: self.epoch });
         }
@@ -781,6 +793,8 @@ pub fn run(
                     peer_address: peer_address.clone(),
                     user_paused: &mut user_paused,
                     pending_layout_push: &mut pending_layout_push,
+                    initiator,
+                    status_seen: false,
                     auto_enable_sent: false,
                     sharing: false,
                     epoch: 0,
