@@ -316,9 +316,8 @@ struct WorkspaceView: View {
         let previous = peer.sharedLayout
         let doc = LayoutDocument(
             screens: candidate.screens.map {
-                Screen(id: $0.id, deviceID: $0.deviceID, x: $0.x, y: $0.y, width: $0.width, height: $0.height)
-            },
-            extra: [:]
+                ScreenDraft(screenID: $0.id, deviceID: $0.deviceID, x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            }
         )
         Task {
             do {
