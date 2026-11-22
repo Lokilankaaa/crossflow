@@ -458,6 +458,132 @@ impl PairConnection {
             thread::sleep(Duration::from_micros(500));
         }
     }
+
+    /// Symmetric peer-to-peer connection over LAN (open LAN or optional shared passphrase).
+    /// Initiator proposes either a saved/user-edited SharedLayout (if still valid for both
+    /// peers' live monitors) or an automatic side-by-side arrangement.
+    pub fn establish_peer(
+        stream: TcpStream,
+        local_device_id: &str,
+        passphrase: Option<&str>,
+        initiator: bool,
+        local: Hello,
+        preferred_layout: Option<SharedLayout>,
+        stop: &AtomicBool,
+        log: Log,
+    ) -> Result<Self> {
+        let end = Instant::now() + PREPARE_TIMEOUT;
+        setup_alive(stop, end)?;
+        let mut peer = PairPeer::handshake_lan_psk(
+            stream,
+            local_device_id,
+            passphrase,
+            initiator,
+            Duration::from_secs(2),
+        )?;
+        let (remote, mut pending) = exchange_hello(&mut peer, local.clone(), stop, end)?;
+        let revision = 1;
+        let mut layout = if initiator {
+            let chosen = match preferred_layout {
+                Some(ref saved) => PairLayout::from_shared_ids(
+                    saved,
+                    peer.local_device_id(),
+                    peer.remote_device_id(),
+                    &local,
+                    &remote,
+                )
+                .ok(),
+                None => None,
+            };
+            let built = match chosen {
+                Some(l) => l,
+                None => PairLayout::auto_arrange(&local, &remote)?,
+            };
+            peer.queue(Message::Layout {
+                revision,
+                layout: built.shared().clone(),
+            })?;
+            Some(built)
+        } else {
+            None
+        };
+        let mut peer_accepted = false;
+        let mut accepted_sent = false;
+        let mut early_peer_ready = false;
+        loop {
+            setup_alive(stop, end)?;
+            pending.extend(peer.pump()?.into_iter().map(|record| record.message));
+            while let Some(message) = pending.pop_front() {
+                match message {
+                    Message::Layout {
+                        revision: received,
+                        layout: shared,
+                    } => {
+                        ensure!(
+                            !initiator && layout.is_none() && received == revision,
+                            "unexpected initial peer arrangement"
+                        );
+                        layout = Some(PairLayout::from_shared_ids(
+                            &shared,
+                            peer.local_device_id(),
+                            peer.remote_device_id(),
+                            &local,
+                            &remote,
+                        )?);
+                    }
+                    Message::LayoutReady { revision: received } => {
+                        ensure!(
+                            layout.is_some() && !peer_accepted && received == revision,
+                            "unexpected peer layout acceptance"
+                        );
+                        if !initiator {
+                            ensure!(
+                                accepted_sent,
+                                "initiator acknowledged before local validation"
+                            );
+                        }
+                        peer_accepted = true;
+                    }
+                    Message::SessionReady { revision: received } => {
+                        ensure!(
+                            peer_accepted
+                                && accepted_sent
+                                && received == revision
+                                && !early_peer_ready,
+                            "native ready before layout confirmation"
+                        );
+                        early_peer_ready = true;
+                    }
+                    _ => bail!("runtime record before accepted peer arrangement"),
+                }
+            }
+            if layout.is_some()
+                && !accepted_sent
+                && (!initiator || peer_accepted)
+                && !peer.pending()
+            {
+                peer.queue(Message::LayoutReady { revision })?;
+                accepted_sent = true;
+            }
+            if peer_accepted && accepted_sent && !peer.pending() {
+                let layout = layout.context("missing accepted peer layout")?;
+                let runtime = layout.runtime_for(peer.local_device_id())?;
+                log.write(
+                    "pair_layout_accepted",
+                    serde_json::json!({"revision":revision,"screens":layout.shared().screens.len(),"mode":"lan_peer"}),
+                );
+                return Ok(Self {
+                    peer,
+                    layout,
+                    runtime,
+                    revision,
+                    early_peer_ready,
+                    max_hz: 1000,
+                });
+            }
+            thread::sleep(Duration::from_micros(500));
+        }
+    }
     pub fn runtime(&self) -> &RuntimeLayout {
         &self.runtime
     }

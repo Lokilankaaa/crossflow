@@ -21,8 +21,8 @@ struct CrossflowApp: App {
     @ViewState private var model = WorkspaceModel()
     var body: some Scene {
         Window("Crossflow", id: "workspace") {
-            WorkspaceView(model: model, discovery: appDelegate.discovery, devices: appDelegate.devices)
-                .onDisappear { Task { _ = await appDelegate.devices.shutdown() } }
+            WorkspaceView(model: model, peer: appDelegate.peer)
+                .onDisappear { Task { _ = await appDelegate.peer.shutdown() } }
                 .preferredColorScheme(.light)
                 .frame(minWidth: Theme.number("window", "minimum_width", fallback: 880),
                        minHeight: Theme.number("window", "minimum_height", fallback: 600))

@@ -26,6 +26,22 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Symmetric LAN peer node with zero-config auto-discovery and optional shared passphrase.
+    Peer {
+        #[arg(long, default_value = "0.0.0.0:24800")]
+        bind: std::net::SocketAddr,
+        #[arg(long)]
+        name: Option<String>,
+        /// Environment variable holding an optional shared passphrase (never passed in argv).
+        #[arg(long, default_value = "CROSSFLOW_LAN_PASSPHRASE")]
+        passphrase_env: String,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long, default_value_t = 86400.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 1000)]
+        max_hz: u32,
+    },
     /// Private Mac client listener for an authenticated bidirectional session.
     #[command(hide = true)]
     PairReceive {
@@ -259,7 +275,8 @@ fn main() -> Result<()> {
     // Keep the handler alive until workers, adapters and log writers finish.
     let _shutdown = if matches!(
         &args.command,
-        Command::Receive { .. }
+        Command::Peer { .. }
+            | Command::Receive { .. }
             | Command::PairReceive { .. }
             | Command::Send { .. }
             | Command::Capture { .. }
@@ -275,6 +292,58 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
     match args.command {
+        Command::Peer {
+            bind,
+            name,
+            passphrase_env,
+            log,
+            seconds,
+            max_hz,
+        } => {
+            ensure!(
+                seconds.is_finite() && seconds > 0.0 && seconds <= 86400.0,
+                "seconds must be >0 and <=86400"
+            );
+            let passphrase = std::env::var(&passphrase_env)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let mut meta = metadata("peer_mesh");
+            meta["movement_only"] = json!(false);
+            meta["transport"] = json!("Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s over TCP_NODELAY");
+            meta["pair_protocol"] = json!(crossflow::pair_wire::PAIR_VERSION);
+            meta["auth_mode"] = json!(if passphrase.is_some() {
+                "passphrase"
+            } else {
+                "open"
+            });
+            let writer = LogWriter::new(&log, meta)?;
+            #[cfg(windows)]
+            let platform = crossflow::pair_native::windows::platform();
+            #[cfg(target_os = "macos")]
+            let platform = crossflow::pair_native::macos::platform();
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                crossflow::peer_mesh::run(
+                    crossflow::peer_mesh::Options {
+                        bind,
+                        device_name: name,
+                        passphrase,
+                        seconds,
+                        max_hz,
+                    },
+                    writer,
+                    stop,
+                    platform,
+                )?;
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                let _ = (bind, name, passphrase, seconds, max_hz);
+                writer.finish()?;
+                anyhow::bail!("peer mode is not installed for this platform");
+            }
+        }
         Command::PairReceive {
             peer,
             bind,

@@ -67,15 +67,17 @@ final class DiscoveryModel {
 final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate {
     let discovery = DiscoveryModel()
     let devices = DeviceModel()
+    let peer = PeerMeshModel()
     private var awaitingShutdown = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !awaitingShutdown else { return .terminateLater }
         awaitingShutdown = true
         Task {
+            let peerStopped = await peer.shutdown()
             let devicesStopped = await devices.shutdown()
             let discoveryStopped = await discovery.shutdown()
             awaitingShutdown = false
-            sender.reply(toApplicationShouldTerminate: devicesStopped && discoveryStopped)
+            sender.reply(toApplicationShouldTerminate: peerStopped && devicesStopped && discoveryStopped)
         }
         return .terminateLater
     }

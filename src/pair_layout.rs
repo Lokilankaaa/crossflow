@@ -9,7 +9,7 @@ use crate::{
     pair_wire::{Display, Hello, validate_inventory},
     screen_runtime::{Binding, NativeRect, RuntimeLayout},
     security::Identity,
-    session_metadata::SharedLayout,
+    session_metadata::{SharedLayout, SharedScreen},
 };
 use anyhow::{Result, ensure};
 use std::collections::{HashMap, HashSet};
@@ -66,20 +66,32 @@ fn validate_hello(hello: &Hello) -> Result<()> {
     }
     Ok(())
 }
-fn authenticate_inventories(identity: &Identity, local: &Hello, peer: &Hello) -> Result<()> {
-    identity.validate()?;
+fn authenticate_peer_ids(
+    local_id: &str,
+    remote_id: &str,
+    local: &Hello,
+    peer: &Hello,
+) -> Result<()> {
     validate_hello(local)?;
     validate_hello(peer)?;
     ensure!(
-        local.device_id == identity.public_key_hex()
-            && peer.device_id == identity.peer_public_key_hex(),
-        "inventory identities do not match the authenticated pair"
+        local.device_id == local_id && peer.device_id == remote_id && local_id != remote_id,
+        "inventory identities do not match the authenticated peer session"
     );
     ensure!(
         local.inventory.len() + peer.inventory.len() <= 32,
         "paired arrangement supports at most 32 displays total"
     );
     Ok(())
+}
+fn authenticate_inventories(identity: &Identity, local: &Hello, peer: &Hello) -> Result<()> {
+    identity.validate()?;
+    authenticate_peer_ids(
+        &identity.public_key_hex(),
+        &identity.peer_public_key_hex(),
+        local,
+        peer,
+    )
 }
 fn find_inventory<'a>(id: &str, local: &'a Hello, peer: &'a Hello) -> Result<&'a Hello> {
     if id == local.device_id {
@@ -161,7 +173,25 @@ impl PairLayout {
         local_actual: &Hello,
         peer_authenticated: &Hello,
     ) -> Result<Self> {
-        authenticate_inventories(identity, local_actual, peer_authenticated)?;
+        identity.validate()?;
+        Self::from_shared_ids(
+            shared,
+            &identity.public_key_hex(),
+            &identity.peer_public_key_hex(),
+            local_actual,
+            peer_authenticated,
+        )
+    }
+
+    /// Identity-file-free variant for symmetric LAN peer sessions.
+    pub fn from_shared_ids(
+        shared: &SharedLayout,
+        local_id: &str,
+        remote_id: &str,
+        local_actual: &Hello,
+        peer_authenticated: &Hello,
+    ) -> Result<Self> {
+        authenticate_peer_ids(local_id, remote_id, local_actual, peer_authenticated)?;
         shared.validate()?;
         let pair = HashSet::from([
             local_actual.device_id.as_str(),
@@ -194,6 +224,89 @@ impl PairLayout {
         result.runtime_for(&local_actual.device_id)?;
         result.runtime_for(&peer_authenticated.device_id)?;
         Ok(result)
+    }
+
+    /// Automatically arrange two peers' real displays side-by-side without overlaps,
+    /// placing the remote group flush against the rightmost edge of the local group,
+    /// vertically centered so cursor crossing works immediately out of the box.
+    pub fn auto_arrange(local_actual: &Hello, peer_authenticated: &Hello) -> Result<Self> {
+        authenticate_peer_ids(
+            &local_actual.device_id,
+            &peer_authenticated.device_id,
+            local_actual,
+            peer_authenticated,
+        )?;
+        let local_right = local_actual
+            .inventory
+            .iter()
+            .map(|d| d.x + d.width)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let right_anchor = local_actual
+            .inventory
+            .iter()
+            .filter(|d| (d.x + d.width - local_right).abs() < 1.0)
+            .min_by(|a, b| a.y.total_cmp(&b.y))
+            .unwrap_or(&local_actual.inventory[0]);
+        let anchor_center_y = right_anchor.y + right_anchor.height / 2.0;
+
+        let peer_min_x = peer_authenticated
+            .inventory
+            .iter()
+            .map(|d| d.x)
+            .fold(f64::INFINITY, f64::min);
+        let peer_min_y = peer_authenticated
+            .inventory
+            .iter()
+            .map(|d| d.y)
+            .fold(f64::INFINITY, f64::min);
+        let peer_max_y = peer_authenticated
+            .inventory
+            .iter()
+            .map(|d| d.y + d.height)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let peer_center_y = (peer_min_y + peer_max_y) / 2.0;
+        let dx = local_right - peer_min_x;
+        let dy = (anchor_center_y - peer_center_y).round();
+
+        let mut screens =
+            Vec::with_capacity(local_actual.inventory.len() + peer_authenticated.inventory.len());
+        let local_prefix = &local_actual.device_id[..8];
+        let peer_prefix = &peer_authenticated.device_id[..8];
+        for (idx, d) in local_actual.inventory.iter().enumerate() {
+            screens.push(SharedScreen {
+                id: format!("dev-{local_prefix}-{}", idx + 1),
+                device_id: local_actual.device_id.clone(),
+                native_id: d.native_id.clone(),
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+            });
+        }
+        for (idx, d) in peer_authenticated.inventory.iter().enumerate() {
+            screens.push(SharedScreen {
+                id: format!("dev-{peer_prefix}-{}", idx + 1),
+                device_id: peer_authenticated.device_id.clone(),
+                native_id: d.native_id.clone(),
+                x: d.x + dx,
+                y: d.y + dy,
+                width: d.width,
+                height: d.height,
+            });
+        }
+        let shared = SharedLayout {
+            schema: 1,
+            source_device_id: local_actual.device_id.clone(),
+            receiver_device_id: peer_authenticated.device_id.clone(),
+            screens,
+        };
+        Self::from_shared_ids(
+            &shared,
+            &local_actual.device_id,
+            &peer_authenticated.device_id,
+            local_actual,
+            peer_authenticated,
+        )
     }
 
     pub fn shared(&self) -> &SharedLayout {
@@ -518,5 +631,22 @@ mod tests {
         let (a, _, win, mac, mut shared) = fixture();
         shared.screens[0].native_id = win.inventory[0].wire_id.to_string();
         assert!(PairLayout::from_shared(&shared, &a, &win, &mac).is_err());
+    }
+
+    #[test]
+    fn auto_arrange_connects_multi_display_peers_with_immediate_crossing() {
+        let (_, _, win, mac, _) = fixture();
+        let pair = PairLayout::auto_arrange(&win, &mac).unwrap();
+        let w = pair.runtime_for(&win.device_id).unwrap();
+        let m = pair.runtime_for(&mac.device_id).unwrap();
+        assert_eq!(w.layout, m.layout);
+        assert_eq!(pair.shared().screens.len(), 4);
+        // Crossing off the right edge of Windows DISPLAY1 (x=3840) lands on Mac display "7"
+        let crossed = w
+            .local_exit(Point { x: 3839., y: 1080. }, 4., 0.)
+            .unwrap()
+            .expect("auto-arranged remote screen must be flush on right edge");
+        assert!(!w.is_local(&crossed));
+        assert!(m.is_local(&crossed));
     }
 }

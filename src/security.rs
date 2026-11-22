@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
+pub const LAN_PSK_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 pub const MAX_CIPHERTEXT: usize = 65_535;
 pub const MAX_PLAINTEXT: usize = MAX_CIPHERTEXT - 16;
 const MAX_HANDSHAKE: usize = 1_024;
 const PROLOGUE: &[u8] = b"Crossflow/phase0/pinned-noise/v1/";
+const LAN_PSK_PROLOGUE: &[u8] = b"Crossflow/lan-peer/nnpsk0/v1/";
 #[cfg(not(target_os = "macos"))]
 pub(crate) const PROTECTED_FILE: &str = "identity.dpapi";
 #[cfg(target_os = "macos")]
@@ -645,6 +647,126 @@ pub fn handshake(
         .set_write_timeout(Some(write_timeout))
         .context("Restore write timeout after handshake")?;
     finish_handshake(state, identity).context("Finish local Noise handshake")
+}
+
+fn valid_device_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Derives a 32-byte Noise PSK for LAN peer connections.
+/// Empty or omitted passphrase uses the built-in open LAN domain (ShareMouse-like
+/// zero-config LAN discovery); setting a shared passphrase isolates peers to that secret.
+pub fn derive_lan_psk(passphrase: Option<&str>) -> Result<[u8; 32]> {
+    let mut hasher = DefaultResolver
+        .resolve_hash(&snow::params::HashChoice::Blake2s)
+        .context("BLAKE2s unavailable in this build")?;
+    hasher.reset();
+    match passphrase.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(secret) => {
+            hasher.input(b"Crossflow/lan-peer/psk/v1/");
+            hasher.input(secret.as_bytes());
+        }
+        None => {
+            hasher.input(b"Crossflow/lan-peer/open/v1");
+        }
+    }
+    let mut out = [0u8; 32];
+    hasher.result(&mut out);
+    Ok(out)
+}
+
+/// Performs an encrypted Noise_NNpsk0 handshake over TCP and exchanges canonical
+/// 64-hex peer device IDs inside the encrypted handshake payloads.
+pub fn handshake_lan_psk(
+    stream: &mut TcpStream,
+    local_device_id: &str,
+    passphrase: Option<&str>,
+    initiator: bool,
+) -> Result<(SecureChannel, String)> {
+    ensure!(
+        valid_device_id(local_device_id),
+        "Local peer device ID must be 64 lowercase hex characters"
+    );
+    let read_timeout = stream
+        .read_timeout()?
+        .context("Finite handshake read timeout required")?;
+    let write_timeout = stream
+        .write_timeout()?
+        .context("Finite handshake write timeout required")?;
+    let deadline = Instant::now() + read_timeout.min(write_timeout).min(Duration::from_secs(3));
+    stream
+        .set_nonblocking(false)
+        .context("Set blocking handshake mode")?;
+    stream
+        .set_nodelay(true)
+        .context("Enable TCP_NODELAY before handshake")?;
+    let psk = derive_lan_psk(passphrase)?;
+    let builder = snow::Builder::new(LAN_PSK_PATTERN.parse()?)
+        .psk(0, &psk)?
+        .prologue(LAN_PSK_PROLOGUE)?;
+    let mut state = if initiator {
+        builder.build_initiator()?
+    } else {
+        builder.build_responder()?
+    };
+    let mut stream = DeadlineIo {
+        socket: stream,
+        deadline,
+    };
+    let mut output = [0u8; MAX_HANDSHAKE];
+    let mut payload = [0u8; MAX_HANDSHAKE];
+    let remote_len = if initiator {
+        let length = state
+            .write_message(local_device_id.as_bytes(), &mut output)
+            .context("Create LAN Noise request")?;
+        write_handshake_frame(&mut stream, &output[..length]).context("Send LAN Noise request")?;
+        let response = read_handshake_frame(&mut stream).context("Receive LAN Noise response")?;
+        state
+            .read_message(&response, &mut payload)
+            .context("Authenticate LAN Noise response (check shared passphrase)")?
+    } else {
+        let request = read_handshake_frame(&mut stream).context("Receive LAN Noise request")?;
+        let len = state
+            .read_message(&request, &mut payload)
+            .context("Authenticate LAN Noise request (check shared passphrase)")?;
+        let length = state
+            .write_message(local_device_id.as_bytes(), &mut output)
+            .context("Create LAN Noise response")?;
+        write_handshake_frame(&mut stream, &output[..length])
+            .context("Send LAN Noise response")?;
+        len
+    };
+    let remote_id = std::str::from_utf8(&payload[..remote_len])
+        .context("Peer device ID is not UTF-8")?
+        .to_string();
+    ensure!(
+        valid_device_id(&remote_id),
+        "Peer device ID must be 64 lowercase hex characters"
+    );
+    ensure!(
+        remote_id != local_device_id,
+        "Refusing peer loopback to identical device ID"
+    );
+    remaining_timeout(deadline).context("Finish LAN handshake within total deadline")?;
+    stream
+        .socket
+        .set_read_timeout(Some(read_timeout))
+        .context("Restore read timeout after handshake")?;
+    stream
+        .socket
+        .set_write_timeout(Some(write_timeout))
+        .context("Restore write timeout after handshake")?;
+    ensure!(state.is_handshake_finished(), "LAN Noise handshake incomplete");
+    Ok((
+        SecureChannel {
+            state: state.into_transport_mode()?,
+            failed: false,
+        },
+        remote_id,
+    ))
 }
 
 pub struct SecureChannel {
@@ -1337,5 +1459,73 @@ mod tests {
             elapsed < Duration::from_millis(300),
             "Drip-fed handshake exceeded total deadline tolerance: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn lan_psk_derivation_distinguishes_open_and_passphrase_modes() {
+        let open_none = derive_lan_psk(None).unwrap();
+        let open_empty = derive_lan_psk(Some("   ")).unwrap();
+        let secret_a = derive_lan_psk(Some("alpha-key")).unwrap();
+        let secret_a_trimmed = derive_lan_psk(Some("  alpha-key  ")).unwrap();
+        let secret_b = derive_lan_psk(Some("beta-key")).unwrap();
+        assert_eq!(open_none, open_empty);
+        assert_eq!(secret_a, secret_a_trimmed);
+        assert_ne!(open_none, secret_a);
+        assert_ne!(secret_a, secret_b);
+    }
+
+    #[test]
+    fn lan_psk_handshake_supports_open_matching_and_rejects_mismatch_or_self() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let run_pair = |id_a: &str, id_b: &str, pass_a: Option<&str>, pass_b: Option<&str>| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let id_b = id_b.to_string();
+            let pass_b = pass_b.map(str::to_string);
+            let worker = thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                s.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                handshake_lan_psk(&mut s, &id_b, pass_b.as_deref(), false)
+            });
+            let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let res_a = handshake_lan_psk(&mut client, id_a, pass_a, true);
+            let res_b = worker.join().unwrap();
+            (res_a, res_b)
+        };
+
+        let id_a = "1".repeat(64);
+        let id_b = "2".repeat(64);
+
+        // Open LAN mode succeeds and exchanges full 64-hex device IDs + encrypted traffic
+        let (a_open, b_open) = run_pair(&id_a, &id_b, None, None);
+        let (mut ch_a, seen_b) = a_open.unwrap();
+        let (mut ch_b, seen_a) = b_open.unwrap();
+        assert_eq!(seen_b, id_b);
+        assert_eq!(seen_a, id_a);
+        assert_eq!(
+            ch_b.decrypt(&ch_a.encrypt(b"hello-peer").unwrap()).unwrap(),
+            b"hello-peer"
+        );
+
+        // Matching passphrase succeeds
+        let (a_psk, b_psk) = run_pair(&id_a, &id_b, Some("my-desk-42"), Some("my-desk-42"));
+        assert!(a_psk.is_ok() && b_psk.is_ok());
+
+        // Mismatched passphrase is rejected cleanly
+        let (a_bad, b_bad) = run_pair(&id_a, &id_b, Some("my-desk-42"), Some("wrong-key"));
+        assert!(a_bad.is_err() && b_bad.is_err());
+
+        // Open peer vs passphrase-protected peer is rejected
+        let (a_mix, b_mix) = run_pair(&id_a, &id_b, None, Some("my-desk-42"));
+        assert!(a_mix.is_err() && b_mix.is_err());
+
+        // Identical device ID loopback is rejected
+        let (a_self, b_self) = run_pair(&id_a, &id_a, None, None);
+        assert!(a_self.is_err() && b_self.is_err());
     }
 }

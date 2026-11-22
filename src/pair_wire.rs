@@ -568,6 +568,57 @@ impl PairPeer {
             terminal: false,
         })
     }
+
+    /// Symmetric LAN peer handshake using Noise_NNpsk0 (open LAN by default, or
+    /// isolated with an optional shared passphrase). No identity files needed.
+    pub fn handshake_lan_psk(
+        mut socket: TcpStream,
+        local_id: &str,
+        passphrase: Option<&str>,
+        initiator: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
+        ensure!(
+            !timeout.is_zero() && timeout <= Duration::from_secs(2),
+            "handshake budget must be 0..2 seconds"
+        );
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
+        let (secure, remote_id) =
+            security::handshake_lan_psk(&mut socket, local_id, passphrase, initiator)?;
+        socket.set_nonblocking(true)?;
+        socket.set_nodelay(true)?;
+        ensure!(
+            local_id != remote_id,
+            "peer devices must have distinct identities"
+        );
+        let local_side = if local_id < remote_id.as_str() {
+            Side::A
+        } else {
+            Side::B
+        };
+        Ok(Self {
+            socket,
+            secure,
+            local_id: local_id.to_string(),
+            remote_id,
+            local_side,
+            sequence_out: 0,
+            sequence_in: 0,
+            output: vec![],
+            offset: 0,
+            output_started: Instant::now(),
+            pending_kind: None,
+            input: vec![],
+            input_started: None,
+            hello_queued: false,
+            hello_sent: false,
+            hello_received: false,
+            layout_sent: false,
+            layout_received: false,
+            terminal: false,
+        })
+    }
     pub fn local_device_id(&self) -> &str {
         &self.local_id
     }

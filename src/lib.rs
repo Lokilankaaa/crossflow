@@ -15,6 +15,7 @@ pub mod pair_session;
 pub mod pair_source;
 pub mod pair_ui;
 pub mod pair_wire;
+pub mod peer_mesh;
 pub mod peers;
 pub mod permission_probe;
 pub mod platform;
