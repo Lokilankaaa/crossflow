@@ -250,8 +250,8 @@ impl Drop for RoutingGuard<'_> {
     }
 }
 
-/// Physical position mapping, deliberately matching the existing Mac sink.
-/// Caps Lock, Fn, media and keypad lock semantics remain unsupported.
+/// Physical position mapping matching the Mac sink (including Caps Lock, Fn/Globe,
+/// Insert/Help, Numpad, and F13–F20).
 pub fn hid_usage(keycode: u16) -> Option<u16> {
     const LETTERS: [u16; 26] = [
         0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16,
@@ -259,6 +259,7 @@ pub fn hid_usage(keycode: u16) -> Option<u16> {
     ];
     const DIGITS: [u16; 10] = [18, 19, 20, 21, 23, 22, 26, 28, 25, 29];
     const FUNCTIONS: [u16; 12] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111];
+    const HIGH_FUNCTIONS: [u16; 8] = [105, 107, 113, 106, 64, 79, 80, 90]; // F13..F20
     if let Some(index) = LETTERS.iter().position(|v| *v == keycode) {
         return Some(4 + index as u16);
     }
@@ -267,6 +268,9 @@ pub fn hid_usage(keycode: u16) -> Option<u16> {
     }
     if let Some(index) = FUNCTIONS.iter().position(|v| *v == keycode) {
         return Some(0x3a + index as u16);
+    }
+    if let Some(index) = HIGH_FUNCTIONS.iter().position(|v| *v == keycode) {
+        return Some(0x68 + index as u16);
     }
     Some(match keycode {
         36 => 0x28,
@@ -285,6 +289,8 @@ pub fn hid_usage(keycode: u16) -> Option<u16> {
         43 => 0x36,
         47 => 0x37,
         44 => 0x38,
+        57 => crate::keymap::HID_CAPS_LOCK,
+        114 => 0x49,
         115 => 0x4a,
         116 => 0x4b,
         117 => 0x4c,
@@ -294,6 +300,25 @@ pub fn hid_usage(keycode: u16) -> Option<u16> {
         123 => 0x50,
         125 => 0x51,
         126 => 0x52,
+        71 => 0x53,
+        75 => 0x54,
+        67 => 0x55,
+        78 => 0x56,
+        69 => 0x57,
+        76 => 0x58,
+        83 => 0x59,
+        84 => 0x5a,
+        85 => 0x5b,
+        86 => 0x5c,
+        87 => 0x5d,
+        88 => 0x5e,
+        89 => 0x5f,
+        91 => 0x60,
+        92 => 0x61,
+        82 => 0x62,
+        65 => 0x63,
+        81 => 0x67,
+        63 => crate::keymap::HID_FN_GLOBE,
         59 => 0xe0,
         56 => 0xe1,
         58 => 0xe2,
@@ -332,6 +357,7 @@ fn modifier_down(key: u16, flags: u64) -> Option<bool> {
         58 => 32,
         61 => 64,
         62 => 8192,
+        63 => 0x0080_0000, // kCGEventFlagMaskSecondaryFn (Fn / Globe)
         _ => return None,
     };
     Some(flags & mask != 0)
@@ -395,10 +421,22 @@ mod native {
     use std::time::Duration;
     type Ptr = *mut c_void;
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct Point {
         x: f64,
         y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Size {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        origin: Point,
+        size: Size,
     }
     #[repr(C)]
     #[derive(Default)]
@@ -427,9 +465,12 @@ mod native {
         fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
         fn CGPreflightListenEventAccess() -> bool;
         fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+        fn CGWarpMouseCursorPosition(point: Point) -> i32;
+        fn CGDisplayBounds(display: u32) -> Rect;
         fn CGMainDisplayID() -> u32;
         fn CGDisplayHideCursor(display: u32) -> i32;
         fn CGDisplayShowCursor(display: u32) -> i32;
+        fn CGCursorIsVisible() -> bool;
         fn CGSMainConnectionID() -> u32;
         fn CGSSetConnectionProperty(cid: u32, target_cid: u32, key: Ptr, value: Ptr) -> i32;
     }
@@ -483,8 +524,10 @@ mod native {
     #[derive(Default)]
     struct CursorState {
         bg_enabled: bool,
+        suppressed: bool,
         disassociated: bool,
-        hidden: bool,
+        hide_count: u32,
+        pin: Point,
     }
 
     #[derive(Default)]
@@ -515,25 +558,71 @@ mod native {
             }
         }
 
+        fn main_display_center() -> Point {
+            let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+            if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
+                Point {
+                    x: bounds.origin.x + bounds.size.width * 0.5,
+                    y: bounds.origin.y + bounds.size.height * 0.5,
+                }
+            } else {
+                Point { x: 400.0, y: 300.0 }
+            }
+        }
+
         fn set_suppressed(&self, suppress: bool) {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if suppress {
                 Self::ensure_background_cursor(&mut state);
+                if !state.suppressed {
+                    // Park the local cursor safely in the center of the main display
+                    // (away from Hot Corners, Dock, and Menu Bar) before disassociating.
+                    state.pin = Self::main_display_center();
+                    let _ = unsafe { CGWarpMouseCursorPosition(state.pin) };
+                    state.suppressed = true;
+                }
                 if !state.disassociated && unsafe { CGAssociateMouseAndMouseCursorPosition(0) } == 0
                 {
                     state.disassociated = true;
                 }
-                if !state.hidden && unsafe { CGDisplayHideCursor(CGMainDisplayID()) } == 0 {
-                    state.hidden = true;
+                if state.hide_count == 0
+                    && unsafe { CGDisplayHideCursor(CGMainDisplayID()) } == 0
+                {
+                    state.hide_count = 1;
                 }
             } else {
-                if state.hidden {
+                state.suppressed = false;
+                while state.hide_count > 0 {
                     let _ = unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
-                    state.hidden = false;
+                    state.hide_count -= 1;
                 }
                 if state.disassociated {
                     let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
                     state.disassociated = false;
+                }
+            }
+        }
+
+        /// Re-pin and re-hide the local Mac cursor if macOS WindowServer / Trackpad
+        /// moved or un-hid it while remote focus is active.
+        fn enforce_pinned(&self, current: Point) {
+            let Ok(mut state) = self.0.try_lock() else {
+                return;
+            };
+            if !state.suppressed {
+                return;
+            }
+            let drifted =
+                (current.x - state.pin.x).abs() > 1.0 || (current.y - state.pin.y).abs() > 1.0;
+            if drifted {
+                let _ = unsafe { CGWarpMouseCursorPosition(state.pin) };
+                let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
+                state.disassociated = true;
+            }
+            if state.hide_count < 4 && unsafe { CGCursorIsVisible() } {
+                Self::ensure_background_cursor(&mut state);
+                if unsafe { CGDisplayHideCursor(CGMainDisplayID()) } == 0 {
+                    state.hide_count += 1;
                 }
             }
         }
@@ -640,6 +729,16 @@ mod native {
                         break;
                     }
                 }
+                // Self-heal stale `held` count (e.g. if macOS Secure Input, Spotlight,
+                // or Cmd+Tab swallowed a key-up) after confirming hardware has nothing held.
+                if !accepted
+                    && self.shared.stop.load(Ordering::SeqCst) == 0
+                    && self.shared.held.load(Ordering::SeqCst) != 0
+                    && !any_hardware_input_held()
+                {
+                    self.shared.held.store(0, Ordering::SeqCst);
+                    accepted = self.shared.focus(true, self.clock.now());
+                }
             }
             if !remote {
                 self.cursor.set_suppressed(false);
@@ -680,8 +779,27 @@ mod native {
             }
         }
     }
+    fn any_hardware_input_held() -> bool {
+        for key in 0..128u16 {
+            if key == 57 {
+                // Caps Lock is a toggle lock on macOS, not a held key.
+                continue;
+            }
+            if hid_usage(key).is_some() && unsafe { CGEventSourceKeyState(1, key) } {
+                return true;
+            }
+        }
+        for number in 0..5u32 {
+            if unsafe { CGEventSourceButtonState(1, number) } {
+                return true;
+            }
+        }
+        false
+    }
+
     struct Context {
         shared: Arc<Shared>,
+        cursor: Arc<CursorSuppression>,
         clock: Clock,
         tap_port: Ptr,
         keys: [bool; 128],
@@ -772,9 +890,29 @@ mod native {
             return drain_release(state, kind, event);
         }
         let flags = unsafe { CGEventGetFlags(event) };
+        // Reconcile stale modifier bits if macOS (e.g. Spotlight / Secure Input) dropped a key-up.
+        for &mod_key in &[59usize, 56, 60, 55, 54, 58, 61, 62, 63] {
+            if state.keys[mod_key] && modifier_down(mod_key as u16, flags) == Some(false) {
+                update_held(&state.shared, &mut state.keys[mod_key], false);
+                state.remote_keys[mod_key] = false;
+            }
+        }
         let mut suppress = remote;
         let captured_kind = match kind {
             5 | 6 | 7 | 27 => {
+                if kind == 5 {
+                    // Plain MouseMoved (not Dragged): no mouse button is physically held.
+                    for b in 0..5 {
+                        if state.buttons[b] {
+                            update_held(&state.shared, &mut state.buttons[b], false);
+                            state.remote_buttons[b] = false;
+                        }
+                    }
+                }
+                if remote {
+                    // Re-pin & re-hide if macOS Trackpad or WindowServer moved/showed the cursor.
+                    state.cursor.enforce_pinned(point);
+                }
                 let dx = unsafe { CGEventGetDoubleValueField(event, 4) };
                 let dy = unsafe { CGEventGetDoubleValueField(event, 5) };
                 if !dx.is_finite() || !dy.is_finite() || dx.abs() > 20000.0 || dy.abs() > 20000.0 {
@@ -806,6 +944,35 @@ mod native {
                         state.shared.activity.fetch_add(1, Ordering::Release);
                     }
                     return false;
+                }
+                // Caps Lock on macOS fires a single FlagsChanged event (toggle semantics, no
+                // guaranteed release). Never count it in `held`; when remote, forward a clean tap.
+                if key == 57 {
+                    state.shared.activity.fetch_add(1, Ordering::Release);
+                    if !remote {
+                        return false;
+                    }
+                    let ts = unsafe { CGEventGetTimestamp(event) };
+                    let captured_at = Instant::now();
+                    for tap_down in [true, false] {
+                        let ev = CapturedEvent {
+                            kind: CaptureKind::Key {
+                                usage: crate::keymap::HID_CAPS_LOCK,
+                                down: tap_down,
+                            },
+                            captured_at,
+                            native_x: point.x,
+                            native_y: point.y,
+                            native_timestamp_ns: ts,
+                            modifiers: flags,
+                            remote_focus: true,
+                        };
+                        if !unsafe { state.shared.queue.push(ev) } {
+                            state.shared.stop(StopReason::QueueOverflow);
+                            break;
+                        }
+                    }
+                    return true;
                 }
                 let index = key as usize;
                 let down = if kind == 12 {
@@ -958,6 +1125,7 @@ mod native {
     ) {
         let mut state = Box::new(Context {
             shared: Arc::clone(&shared),
+            cursor: Arc::clone(&cursor),
             clock,
             tap_port: std::ptr::null_mut(),
             keys: [false; 128],
@@ -1032,6 +1200,10 @@ mod native {
         // never sends events to an enabled tap whose run loop is not pumping yet.
         let mut snapshot = HeldSnapshot::default();
         for key in 0..128 {
+            if key == 57 {
+                // Caps Lock is a toggle lock on macOS, never a held physical key.
+                continue;
+            }
             let Some(usage) = hid_usage(key as u16) else {
                 continue;
             };
@@ -1141,7 +1313,10 @@ mod tests {
         assert_eq!(hid_usage(0), Some(4));
         assert_eq!(hid_usage(62), Some(0xe4));
         assert_eq!(hid_usage(59), Some(0xe0));
-        assert_eq!(hid_usage(57), None);
+        assert_eq!(hid_usage(57), Some(crate::keymap::HID_CAPS_LOCK));
+        assert_eq!(hid_usage(63), Some(crate::keymap::HID_FN_GLOBE));
+        assert_eq!(hid_usage(82), Some(0x62)); // Keypad 0
+        assert_eq!(hid_usage(127), None);
     }
     #[test]
     fn own_and_foreign_injection_are_not_activity() {

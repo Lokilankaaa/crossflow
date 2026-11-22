@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
@@ -9,6 +10,7 @@ using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.Storage;
 using Windows.System;
+using WinRT.Interop;
 
 namespace Crossflow.Windows;
 
@@ -49,7 +51,16 @@ internal sealed class MainWindow : Window
     private readonly Button cancelPasswordButton = new();
 
     private readonly ToggleSwitch clipboardToggle = new();
+    private readonly ToggleSwitch inputStateToggle = new();
     private bool updatingClipboardUi;
+    private bool updatingInputStateUi;
+    private TrayIcon? trayIcon;
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
@@ -288,8 +299,8 @@ internal sealed class MainWindow : Window
 
         sidebar.Children.Add(Divider());
 
-        // Clipboard sync toggle
-        sidebar.Children.Add(SectionLabel("剪贴板"));
+        // Sync toggles (Clipboard + Chinese/English IME & Caps Lock)
+        sidebar.Children.Add(SectionLabel("共享同步"));
         clipboardToggle.Header = null;
         clipboardToggle.IsOn = true;
         clipboardToggle.OnContent = "剪贴板共享已开启";
@@ -301,6 +312,18 @@ internal sealed class MainWindow : Window
             await peerMesh.SetClipboardAsync(clipboardToggle.IsOn);
         };
         sidebar.Children.Add(clipboardToggle);
+
+        inputStateToggle.Header = null;
+        inputStateToggle.IsOn = true;
+        inputStateToggle.OnContent = "中英文与大小写同步已开启";
+        inputStateToggle.OffContent = "中英文与大小写同步已关闭";
+        inputStateToggle.FontSize = 12;
+        inputStateToggle.Toggled += async (_, _) =>
+        {
+            if (updatingInputStateUi) return;
+            await peerMesh.SetInputStateSyncAsync(inputStateToggle.IsOn);
+        };
+        sidebar.Children.Add(inputStateToggle);
 
         sidebar.Children.Add(Divider());
 
@@ -512,24 +535,55 @@ internal sealed class MainWindow : Window
                 AppWindow.Resize(new global::Windows.Graphics.SizeInt32(Math.Max(minW, AppWindow.Size.Width), Math.Max(minH, AppWindow.Size.Height)));
         };
 
-        AppWindow.Closing += async (_, args) =>
+        AppWindow.Closing += (_, args) =>
         {
             if (allowClose) return;
+            // Minimize cleanly to the system tray on X click so sharing keeps running.
             args.Cancel = true;
-            if (closing) return;
-            closing = true;
-            try
-            {
-                await peerMesh.StopAsync();
-                allowClose = true;
-                Close();
-            }
-            catch
-            {
-                closing = false;
-                ShowNotice("停止对等服务时发生错误，请重试。", isError: true);
-            }
+            AppWindow.Hide();
         };
+
+        try
+        {
+            trayIcon = new TrayIcon(this, () => AppWindow.IsVisible);
+            trayIcon.ShowOrRestoreRequested += () => DispatcherQueue.TryEnqueue(ShowAndActivate);
+            trayIcon.HideRequested += () => DispatcherQueue.TryEnqueue(() => AppWindow.Hide());
+            trayIcon.ToggleSharingRequested += () => DispatcherQueue.TryEnqueue(async () => await OnPrimaryActionClickAsync());
+            trayIcon.ExitRequested += () => DispatcherQueue.TryEnqueue(async () => await ExitApplicationAsync());
+        }
+        catch { }
+    }
+
+    private void ShowAndActivate()
+    {
+        AppWindow.Show();
+        IntPtr hwnd = WindowNative.GetWindowHandle(this);
+        if (hwnd != IntPtr.Zero)
+        {
+            ShowWindow(hwnd, 9); // SW_RESTORE
+            SetForegroundWindow(hwnd);
+        }
+        Activate();
+    }
+
+    private async Task ExitApplicationAsync()
+    {
+        if (closing) return;
+        closing = true;
+        try
+        {
+            trayIcon?.Dispose();
+            trayIcon = null;
+            await peerMesh.StopAsync();
+            allowClose = true;
+            Close();
+        }
+        catch
+        {
+            closing = false;
+            ShowAndActivate();
+            ShowNotice("停止对等服务时发生错误，请重试。", isError: true);
+        }
     }
 
     private async Task RestartPeerAsync()
@@ -637,6 +691,25 @@ internal sealed class MainWindow : Window
             clipboardToggle.IsOn = snap.ClipboardSync;
             updatingClipboardUi = false;
         }
+        if (inputStateToggle.IsOn != snap.InputStateSync)
+        {
+            updatingInputStateUi = true;
+            inputStateToggle.IsOn = snap.InputStateSync;
+            updatingInputStateUi = false;
+        }
+
+        string trayTip = snap.State switch
+        {
+            "sharing" => snap.PeerName is not null ? $"Crossflow · 已连接 {snap.PeerName}" : "Crossflow · 跨屏共享中",
+            "paused" => "Crossflow · 已暂停",
+            "searching" => "Crossflow · 正在发现设备",
+            _ => "Crossflow"
+        };
+        trayIcon?.UpdateStatus(
+            trayTip,
+            $"状态：{statusTitle.Text}",
+            canToggle: snap.State is "sharing" or "paused",
+            sharing: snap.State == "sharing");
 
         // Sync network channel dropdown
         SyncChannelSelector(snap);

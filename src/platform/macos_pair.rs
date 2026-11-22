@@ -234,6 +234,15 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
             let Some(mapped) = source_event(event.kind, event.native_x, event.native_y) else {
                 continue;
             };
+            if matches!(event.kind, CaptureKind::Delta { .. })
+                && self.gate.load(Ordering::SeqCst)
+                && !event.remote_focus
+            {
+                // Drop stale unsuppressed local cursor motion queued before
+                // set_remote_focus(true) took effect so both cursors never move in tandem.
+                let _ = self.update_focus();
+                continue;
+            }
             if !matches!(event.kind, CaptureKind::Delta { .. })
                 && event.remote_focus != self.gate.load(Ordering::SeqCst)
             {

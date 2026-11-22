@@ -29,6 +29,8 @@ use std::{
 const CHUNK_SIZE: usize = 32 * 1024;
 const MAX_FRAME_CIPHERTEXT: usize = 48 * 1024;
 const CLIP_POLL_INTERVAL: Duration = Duration::from_millis(160);
+const INPUT_STATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INPUT_STATE_ECHO_COOLDOWN: Duration = Duration::from_millis(450);
 const PING_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_BATCH_FILES: usize = 1000;
 const MAX_BATCH_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
@@ -75,6 +77,10 @@ enum AuxHeader {
     },
     FileCancel {
         batch_id: u64,
+    },
+    InputState {
+        caps_lock: bool,
+        ime_chinese: Option<bool>,
     },
 }
 
@@ -740,6 +746,7 @@ fn recv_file_batch(
 pub struct AuxSession {
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    push_state_now: Arc<AtomicBool>,
     send_tx: Sender<Vec<PathBuf>>,
     transfer_slot: Arc<Mutex<Option<(TransferStatus, Instant)>>>,
     worker: Option<JoinHandle<()>>,
@@ -755,14 +762,18 @@ impl AuxSession {
         expected_remote_id: String,
         passphrase: Option<String>,
         clipboard_enabled: Arc<AtomicBool>,
+        input_state_sync_enabled: Arc<AtomicBool>,
+        local_has_focus: Arc<AtomicBool>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
+        let push_state_now = Arc::new(AtomicBool::new(false));
         let transfer_slot = Arc::new(Mutex::new(None));
         let (send_tx, send_rx) = mpsc::channel();
 
         let worker_stop = stop.clone();
         let worker_cancel = cancel.clone();
+        let worker_push = push_state_now.clone();
         let worker_slot = transfer_slot.clone();
         let worker = thread::Builder::new()
             .name("crossflow-aux-channel".into())
@@ -775,6 +786,9 @@ impl AuxSession {
                     &expected_remote_id,
                     passphrase.as_deref(),
                     &clipboard_enabled,
+                    &input_state_sync_enabled,
+                    &local_has_focus,
+                    &worker_push,
                     send_rx,
                     &worker_cancel,
                     &worker_slot,
@@ -785,10 +799,15 @@ impl AuxSession {
         Self {
             stop,
             cancel,
+            push_state_now,
             send_tx,
             transfer_slot,
             worker,
         }
+    }
+
+    pub fn push_input_state_now(&self) {
+        self.push_state_now.store(true, Ordering::Release);
     }
 
     pub fn send_files(&self, paths: Vec<PathBuf>) {
@@ -831,6 +850,9 @@ fn run_aux(
     expected_remote_id: &str,
     passphrase: Option<&str>,
     clipboard_enabled: &AtomicBool,
+    input_state_sync_enabled: &AtomicBool,
+    local_has_focus: &AtomicBool,
+    push_state_now: &AtomicBool,
     send_rx: Receiver<Vec<PathBuf>>,
     cancel: &AtomicBool,
     transfer_slot: &Mutex<Option<(TransferStatus, Instant)>>,
@@ -887,7 +909,7 @@ fn run_aux(
         security::handshake_lan_psk(&mut stream, local_device_id, passphrase, initiator)?;
     ensure!(remote_id == expected_remote_id, "aux peer identity mismatch");
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     let receive_dir = default_receive_dir()?;
@@ -896,6 +918,9 @@ fn run_aux(
     let mut last_sent_hash: Option<String> = None;
     let mut last_remote_hash: Option<String> = None;
     let mut last_poll = Instant::now();
+    let mut last_input_state_poll = Instant::now();
+    let mut last_local_input_state: Option<crate::input_state::InputLockState> = None;
+    let mut suppress_input_sync_until = Instant::now();
     let mut last_ping = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
@@ -958,6 +983,40 @@ fn run_aux(
             }
         }
 
+        // 2b. Sync Caps Lock and Chinese/English IME state (on focus handoff or live change)
+        let force_state_push = push_state_now.swap(false, Ordering::AcqRel);
+        if input_state_sync_enabled.load(Ordering::Relaxed)
+            && (force_state_push || last_input_state_poll.elapsed() >= INPUT_STATE_POLL_INTERVAL)
+        {
+            last_input_state_poll = Instant::now();
+            if force_state_push {
+                let st = crate::input_state::read_state();
+                last_local_input_state = Some(st);
+                let msg = serde_json::to_vec(&AuxHeader::InputState {
+                    caps_lock: st.caps_lock,
+                    ime_chinese: st.ime_chinese,
+                })?;
+                write_encrypted(&mut stream, &mut ch, &msg)?;
+                stream.flush()?;
+                last_ping = Instant::now();
+            } else if local_has_focus.load(Ordering::Acquire)
+                && Instant::now() >= suppress_input_sync_until
+            {
+                let st = crate::input_state::read_state();
+                let changed = last_local_input_state.is_some_and(|prev| prev != st);
+                last_local_input_state = Some(st);
+                if changed {
+                    let msg = serde_json::to_vec(&AuxHeader::InputState {
+                        caps_lock: st.caps_lock,
+                        ime_chinese: st.ime_chinese,
+                    })?;
+                    write_encrypted(&mut stream, &mut ch, &msg)?;
+                    stream.flush()?;
+                    last_ping = Instant::now();
+                }
+            }
+        }
+
         // 3. Keepalive ping
         if last_ping.elapsed() >= PING_INTERVAL {
             last_ping = Instant::now();
@@ -966,10 +1025,27 @@ fn run_aux(
             stream.flush()?;
         }
 
-        // 4. Receive incoming remote clipboard or file batch
+        // 4. Receive incoming remote clipboard, file batch, or Caps/IME state
         if let Some(plain) = read_encrypted_nonfatal(&mut stream, &mut ch)? {
             match serde_json::from_slice::<AuxHeader>(&plain) {
                 Ok(AuxHeader::Ping) | Ok(AuxHeader::FileCancel { .. }) => {}
+                Ok(AuxHeader::InputState {
+                    caps_lock,
+                    ime_chinese,
+                }) => {
+                    if input_state_sync_enabled.load(Ordering::Relaxed) {
+                        crate::input_state::apply_state(
+                            crate::input_state::InputLockState {
+                                caps_lock,
+                                ime_chinese,
+                            },
+                            true,
+                            true,
+                        );
+                        suppress_input_sync_until = Instant::now() + INPUT_STATE_ECHO_COOLDOWN;
+                        last_local_input_state = Some(crate::input_state::read_state());
+                    }
+                }
                 Ok(AuxHeader::Clipboard { format, hash, len }) => {
                     let item = recv_clipboard_item(&mut stream, &mut ch, &format, &hash, len)?;
                     if clipboard_enabled.load(Ordering::Relaxed) {

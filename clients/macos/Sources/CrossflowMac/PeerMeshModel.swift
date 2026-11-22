@@ -119,6 +119,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let passphraseConfigured: Bool
     let smartKeymap: Bool
     let clipboardSync: Bool
+    let inputStateSync: Bool?
     let selectedChannel: String
     let directPeer: String?
     let activeChannelLabel: String?
@@ -145,6 +146,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case passphraseConfigured = "passphrase_configured"
         case smartKeymap = "smart_keymap"
         case clipboardSync = "clipboard_sync"
+        case inputStateSync = "input_state_sync"
         case selectedChannel = "selected_channel"
         case directPeer = "direct_peer"
         case activeChannelLabel = "active_channel_label"
@@ -192,6 +194,11 @@ private struct SetKeymapCommandWire: Encodable {
 
 private struct SetClipboardCommandWire: Encodable {
     let op = "set_clipboard"
+    let enabled: Bool
+}
+
+private struct SetInputStateSyncCommandWire: Encodable {
+    let op = "set_input_state_sync"
     let enabled: Bool
 }
 
@@ -344,6 +351,7 @@ final class PeerMeshModel {
     var passphraseConfigured: Bool = false
     var smartKeymap: Bool = true
     var clipboardSync: Bool = true
+    var inputStateSync: Bool = true
     var selectedChannel: String = "auto"
     var directPeer: String = ""
     var activeChannelLabel: String?
@@ -365,6 +373,7 @@ final class PeerMeshModel {
     @ObservationIgnored private var generation: Int = 0
     @ObservationIgnored private var shuttingDown = false
     @ObservationIgnored private var syncedDirectPeerOnce = false
+    @ObservationIgnored var onStatusChange: (@MainActor () -> Void)?
 
     var isSharing: Bool { state == "sharing" && routeEnabled }
     var isConnected: Bool { state == "sharing" || state == "paused" }
@@ -463,6 +472,7 @@ final class PeerMeshModel {
         passphraseConfigured = s.passphraseConfigured
         smartKeymap = s.smartKeymap
         clipboardSync = s.clipboardSync
+        inputStateSync = s.inputStateSync ?? true
         selectedChannel = s.selectedChannel
         if !syncedDirectPeerOnce {
             syncedDirectPeerOnce = true
@@ -482,6 +492,7 @@ final class PeerMeshModel {
         sharedLayout = s.sharedLayout?.toSharedLayout
         transfer = s.transfer
         error = s.error
+        onStatusChange?()
     }
 
     func pause() {
@@ -523,6 +534,14 @@ final class PeerMeshModel {
     func setClipboard(_ enabled: Bool) {
         clipboardSync = enabled
         let cmd = SetClipboardCommandWire(enabled: enabled)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setInputStateSync(_ enabled: Bool) {
+        inputStateSync = enabled
+        let cmd = SetInputStateSyncCommandWire(enabled: enabled)
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

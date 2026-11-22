@@ -22,7 +22,9 @@ struct CrossflowApp: App {
     var body: some Scene {
         Window("Crossflow", id: "workspace") {
             WorkspaceView(model: model, peer: appDelegate.peer)
-                .onDisappear { Task { _ = await appDelegate.peer.shutdown() } }
+                .background(WindowCloseHider { window in
+                    appDelegate.attachMainWindow(window)
+                })
                 .preferredColorScheme(.light)
                 .frame(minWidth: Theme.number("window", "minimum_width", fallback: 880),
                        minHeight: Theme.number("window", "minimum_height", fallback: 600))
@@ -32,6 +34,35 @@ struct CrossflowApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) { }
+        }
+    }
+}
+
+private struct WindowCloseHider: NSViewRepresentable {
+    let onWindow: @MainActor (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = WindowAttachView()
+        view.onWindow = onWindow
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        if let v = nsView as? WindowAttachView {
+            v.onWindow = onWindow
+            if let win = v.window {
+                onWindow(win)
+            }
+        }
+    }
+
+    private final class WindowAttachView: NSView {
+        var onWindow: (@MainActor (NSWindow) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let win = window {
+                onWindow?(win)
+            }
         }
     }
 }

@@ -5,6 +5,7 @@ pub mod desktop;
 pub mod discovery;
 pub mod injection_worker;
 pub mod input;
+pub mod input_state;
 pub mod keychain;
 pub mod keychain_process;
 pub mod keymap;

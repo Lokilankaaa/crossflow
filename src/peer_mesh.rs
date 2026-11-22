@@ -85,6 +85,8 @@ struct PeerConfig {
     smart_keymap: bool,
     #[serde(default = "default_true")]
     clipboard_sync: bool,
+    #[serde(default = "default_true")]
+    input_state_sync: bool,
 }
 
 fn default_channel() -> String {
@@ -103,6 +105,7 @@ impl Default for PeerConfig {
             passphrase: None,
             smart_keymap: true,
             clipboard_sync: true,
+            input_state_sync: true,
         }
     }
 }
@@ -125,6 +128,7 @@ struct PeerUiStatus {
     passphrase_configured: bool,
     smart_keymap: bool,
     clipboard_sync: bool,
+    input_state_sync: bool,
     selected_channel: String,
     direct_peer: Option<String>,
     active_channel_label: Option<String>,
@@ -164,6 +168,9 @@ enum UiCommand {
         enabled: bool,
     },
     SetClipboard {
+        enabled: bool,
+    },
+    SetInputStateSync {
         enabled: bool,
     },
     SendFiles {
@@ -610,6 +617,8 @@ struct PeerHost<'a> {
     config: &'a mut PeerConfig,
     smart_keymap_flag: &'a Arc<AtomicBool>,
     clipboard_sync_flag: &'a Arc<AtomicBool>,
+    input_state_sync_flag: &'a Arc<AtomicBool>,
+    local_has_focus: &'a Arc<AtomicBool>,
     aux: Option<&'a crate::aux_channel::AuxSession>,
     reconfigure_requested: &'a mut bool,
     network_channels: Vec<NetworkChannelInfo>,
@@ -720,6 +729,11 @@ impl PeerHost<'_> {
                     self.clipboard_sync_flag.store(enabled, Ordering::Relaxed);
                     save_config(self.config);
                 }
+                Ok(UiCommand::SetInputStateSync { enabled }) => {
+                    self.config.input_state_sync = enabled;
+                    self.input_state_sync_flag.store(enabled, Ordering::Relaxed);
+                    save_config(self.config);
+                }
                 Ok(UiCommand::SendFiles { paths }) => {
                     if let Some(aux) = self.aux {
                         let list: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
@@ -814,6 +828,19 @@ impl Host for PeerHost<'_> {
             self.auto_enable_sent = true;
             self.pending = Some(Command::Enable { epoch: self.epoch });
         }
+        // Track focus ownership and immediately push Caps Lock + IME state when
+        // cursor leaves this device for the peer.
+        let now_local_focus = status
+            .focus_device_id
+            .as_deref()
+            .is_none_or(|id| id == self.local_device_id);
+        let prev_local_focus = self.local_has_focus.swap(now_local_focus, Ordering::AcqRel);
+        if prev_local_focus
+            && !now_local_focus
+            && let Some(aux) = self.aux
+        {
+            aux.push_input_state_now();
+        }
         let discovered = self.discovered_list();
         let transfer = self.aux.and_then(|a| a.current_transfer());
         let state_changed = self.last_emitted_enabled != Some(status.endpoint.enabled)
@@ -844,6 +871,7 @@ impl Host for PeerHost<'_> {
                     passphrase_configured: has_pass,
                     smart_keymap: self.config.smart_keymap,
                     clipboard_sync: self.config.clipboard_sync,
+                    input_state_sync: self.config.input_state_sync,
                     selected_channel: self.config.channel.clone(),
                     direct_peer: self.config.direct_peer.clone(),
                     active_channel_label: self.active_channel_label.clone(),
@@ -892,6 +920,7 @@ pub fn run(
     let mut config = load_config(options.passphrase);
     let smart_keymap_flag = Arc::new(AtomicBool::new(config.smart_keymap));
     let clipboard_sync_flag = Arc::new(AtomicBool::new(config.clipboard_sync));
+    let input_state_sync_flag = Arc::new(AtomicBool::new(config.input_state_sync));
     let _keep_awake = crate::power::KeepAwakeGuard::acquire();
 
     #[cfg(target_os = "macos")]
@@ -910,6 +939,7 @@ pub fn run(
                     passphrase_configured: has_pass,
                     smart_keymap: config.smart_keymap,
                     clipboard_sync: config.clipboard_sync,
+                    input_state_sync: config.input_state_sync,
                     selected_channel: config.channel.clone(),
                     direct_peer: config.direct_peer.clone(),
                     active_channel_label: None,
@@ -1062,6 +1092,11 @@ pub fn run(
                             clipboard_sync_flag.store(enabled, Ordering::Relaxed);
                             save_config(&config);
                         }
+                        Ok(UiCommand::SetInputStateSync { enabled }) => {
+                            config.input_state_sync = enabled;
+                            input_state_sync_flag.store(enabled, Ordering::Relaxed);
+                            save_config(&config);
+                        }
                         Ok(UiCommand::SendFiles { .. } | UiCommand::CancelTransfer) => {}
                         Err(TryRecvError::Empty) => break,
                     }
@@ -1090,6 +1125,7 @@ pub fn run(
                             passphrase_configured: has_pass,
                             smart_keymap: config.smart_keymap,
                             clipboard_sync: config.clipboard_sync,
+                            input_state_sync: config.input_state_sync,
                             selected_channel: config.channel.clone(),
                             direct_peer: config.direct_peer.clone(),
                             active_channel_label: None,
@@ -1291,6 +1327,7 @@ pub fn run(
                     }
                 };
 
+                let local_has_focus = Arc::new(AtomicBool::new(true));
                 let aux_session = peer_sock.map(|sock| {
                     crate::aux_channel::AuxSession::spawn(
                         aux_listener.clone(),
@@ -1300,6 +1337,8 @@ pub fn run(
                         remote_id.clone(),
                         config.passphrase.clone(),
                         clipboard_sync_flag.clone(),
+                        input_state_sync_flag.clone(),
+                        local_has_focus.clone(),
                     )
                 });
 
@@ -1320,6 +1359,8 @@ pub fn run(
                         config: &mut config,
                         smart_keymap_flag: &smart_keymap_flag,
                         clipboard_sync_flag: &clipboard_sync_flag,
+                        input_state_sync_flag: &input_state_sync_flag,
+                        local_has_focus: &local_has_focus,
                         aux: aux_session.as_ref(),
                         reconfigure_requested: &mut reconfigure_requested,
                         network_channels: channel_infos(&local_channels),
@@ -1409,6 +1450,7 @@ pub fn run(
             passphrase_configured: has_pass,
             smart_keymap: config.smart_keymap,
             clipboard_sync: config.clipboard_sync,
+            input_state_sync: config.input_state_sync,
             selected_channel: config.channel,
             direct_peer: config.direct_peer,
             active_channel_label: None,

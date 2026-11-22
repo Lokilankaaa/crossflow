@@ -307,9 +307,9 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
-                // Clipboard sync toggle (1:1 with Windows)
+                // Sync toggles: Clipboard + Chinese/English IME & Caps Lock (1:1 with Windows)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("剪贴板")
+                    Text("共享同步")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Theme.secondary)
                     let clipBinding = Binding<Bool>(
@@ -318,6 +318,17 @@ struct WorkspaceView: View {
                     )
                     Toggle(isOn: clipBinding) {
                         Text(peer.clipboardSync ? "剪贴板共享已开启" : "剪贴板共享已关闭")
+                            .font(.system(size: 12))
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+
+                    let inputStateBinding = Binding<Bool>(
+                        get: { peer.inputStateSync },
+                        set: { peer.setInputStateSync($0) }
+                    )
+                    Toggle(isOn: inputStateBinding) {
+                        Text(peer.inputStateSync ? "中英文与大小写同步已开启" : "中英文与大小写同步已关闭")
                             .font(.system(size: 12))
                     }
                     .toggleStyle(.switch)

@@ -60,6 +60,7 @@ internal sealed record PeerMeshSnapshot(
     bool PassphraseConfigured,
     bool SmartKeymap,
     bool ClipboardSync,
+    bool InputStateSync,
     string SelectedChannel,
     string? DirectPeer,
     string? ActiveChannelLabel,
@@ -80,7 +81,7 @@ internal sealed record PeerMeshSnapshot(
     long Generation)
 {
     internal static PeerMeshSnapshot Initial => new(
-        "idle", null, null, "open", false, true, true, "auto", null, null, [],
+        "idle", null, null, "open", false, true, true, true, "auto", null, null, [],
         false, null, null, null, null, null, null,
         [], [], null, null, null, false, 0);
 }
@@ -212,6 +213,8 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_keymap", enabled });
     internal Task SetClipboardAsync(bool enabled) =>
         SendCommandAsync(new { op = "set_clipboard", enabled });
+    internal Task SetInputStateSyncAsync(bool enabled) =>
+        SendCommandAsync(new { op = "set_input_state_sync", enabled });
     internal Task SendFilesAsync(IReadOnlyList<string> paths) =>
         SendCommandAsync(new { op = "send_files", paths });
     internal Task CancelTransferAsync() =>
@@ -298,6 +301,7 @@ internal sealed class PeerMeshController
                             parsed.PassphraseConfigured,
                             parsed.SmartKeymap,
                             parsed.ClipboardSync,
+                            parsed.InputStateSync,
                             parsed.SelectedChannel ?? "auto",
                             parsed.DirectPeer,
                             parsed.ActiveChannelLabel,
@@ -365,6 +369,7 @@ internal sealed class PeerMeshController
         [JsonPropertyName("passphrase_configured")] public bool PassphraseConfigured { get; set; }
         [JsonPropertyName("smart_keymap")] public bool SmartKeymap { get; set; } = true;
         [JsonPropertyName("clipboard_sync")] public bool ClipboardSync { get; set; } = true;
+        [JsonPropertyName("input_state_sync")] public bool InputStateSync { get; set; } = true;
         [JsonPropertyName("selected_channel")] public string? SelectedChannel { get; set; }
         [JsonPropertyName("direct_peer")] public string? DirectPeer { get; set; }
         [JsonPropertyName("active_channel_label")] public string? ActiveChannelLabel { get; set; }

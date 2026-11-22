@@ -47,6 +47,7 @@ const FLAG_CONTROL: u64 = 0x40000;
 const FLAG_OPTION: u64 = 0x80000;
 const FLAG_COMMAND: u64 = 0x100000;
 const FLAG_NUMERIC_PAD: u64 = 0x200000;
+const FLAG_ALPHA_SHIFT: u64 = 0x10000;
 const FLAG_SECONDARY_FN: u64 = 0x800000;
 const HID_EVENT_TAP: u32 = 0;
 const ESCAPE_KEYCODE: u16 = 53;
@@ -123,6 +124,7 @@ unsafe extern "C" {
     fn CGEventSetType(event: *mut c_void, kind: u32);
     fn CGEventPost(tap: u32, event: *const c_void);
     fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+    fn CGEventSourceFlagsState(state: i32) -> u64;
     fn CGPreflightPostEventAccess() -> bool;
     fn CGPreflightListenEventAccess() -> bool;
 }
@@ -442,9 +444,8 @@ fn next_point(
 }
 
 /// USB HID Keyboard page -> physical ANSI position in HIToolbox/Events.h.
-/// This does not translate characters or bypass the target keyboard layout/IME.
-/// Caps Lock, Fn, media, keypad and international-specific keys are deliberately
-/// unsupported until their lock/layout semantics are implemented and tested.
+/// Maps canonical USB HID Keyboard/Keypad usages (plus Crossflow's canonical Fn/Globe
+/// `0xA4`) to macOS ANSI virtual keycodes.
 fn mac_keycode(usage: u16) -> Option<u16> {
     const LETTERS: [u16; 26] = [
         0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F,
@@ -454,6 +455,7 @@ fn mac_keycode(usage: u16) -> Option<u16> {
     const FUNCTIONS: [u16; 12] = [
         0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6D, 0x67, 0x6F,
     ];
+    const HIGH_FUNCTIONS: [u16; 8] = [0x69, 0x6B, 0x71, 0x6A, 0x40, 0x4F, 0x50, 0x5A]; // F13..F20
     Some(match usage {
         0x04..=0x1D => LETTERS[(usage - 0x04) as usize],
         0x1E..=0x27 => DIGITS[(usage - 0x1E) as usize],
@@ -473,7 +475,9 @@ fn mac_keycode(usage: u16) -> Option<u16> {
         0x36 => 0x2B, // Comma
         0x37 => 0x2F, // Period
         0x38 => 0x2C, // Slash
+        0x39 => 0x39, // Caps Lock (keycode 57)
         0x3A..=0x45 => FUNCTIONS[(usage - 0x3A) as usize],
+        0x49 => 0x72, // Insert / Help (keycode 114)
         0x4A => 0x73, // Home
         0x4B => 0x74, // Page up
         0x4C => 0x75, // Forward delete
@@ -483,6 +487,26 @@ fn mac_keycode(usage: u16) -> Option<u16> {
         0x50 => 0x7B, // Left
         0x51 => 0x7D, // Down
         0x52 => 0x7E, // Up
+        0x53 => 0x47, // Num Lock / Keypad Clear
+        0x54 => 0x4B, // Keypad /
+        0x55 => 0x43, // Keypad *
+        0x56 => 0x4E, // Keypad -
+        0x57 => 0x45, // Keypad +
+        0x58 => 0x4C, // Keypad Enter
+        0x59 => 0x53, // Keypad 1
+        0x5A => 0x54, // Keypad 2
+        0x5B => 0x55, // Keypad 3
+        0x5C => 0x56, // Keypad 4
+        0x5D => 0x57, // Keypad 5
+        0x5E => 0x58, // Keypad 6
+        0x5F => 0x59, // Keypad 7
+        0x60 => 0x5B, // Keypad 8
+        0x61 => 0x5C, // Keypad 9
+        0x62 => 0x52, // Keypad 0
+        0x63 => 0x41, // Keypad .
+        0x67 => 0x51, // Keypad =
+        0x68..=0x6F => HIGH_FUNCTIONS[(usage - 0x68) as usize],
+        crate::keymap::HID_FN_GLOBE => 0x3F, // Fn / Globe (keycode 63)
         0xE0 => 0x3B, // Left Control
         0xE1 => 0x38, // Left Shift
         0xE2 => 0x3A, // Left Alt -> Option
@@ -507,15 +531,19 @@ fn modifier_flags(keys: &BTreeSet<u16>) -> u64 {
             flags |= mask;
         }
     }
+    if keys.contains(&crate::keymap::HID_FN_GLOBE) {
+        flags |= FLAG_SECONDARY_FN;
+    }
     flags
 }
 
-/// Extra macOS flags required on arrow/nav/function keys so system shortcuts
+/// Extra macOS flags required on arrow/nav/function/keypad keys so system shortcuts
 /// such as Mission Control / Spaces (`Ctrl + Left/Right/Up/Down`) trigger reliably.
 fn key_extra_flags(usage: u16) -> u64 {
     match usage {
         0x4F..=0x52 => FLAG_NUMERIC_PAD | FLAG_SECONDARY_FN, // Right, Left, Down, Up arrows
-        0x3A..=0x45 | 0x4A..=0x4E => FLAG_SECONDARY_FN,      // F1..F12, Home/PgUp/Del/End/PgDn
+        0x54..=0x63 | 0x67 => FLAG_NUMERIC_PAD,              // Keypad keys
+        0x3A..=0x45 | 0x49..=0x4E | 0x68..=0x6F => FLAG_SECONDARY_FN, // F1..F20, Insert/Home/PgUp/Del/End/PgDn
         _ => 0,
     }
 }
@@ -1080,18 +1108,28 @@ impl MacMouseSink {
         } else {
             projected.remove(&usage);
         }
-        // Physical modifier keys on macOS must be posted as kCGEventFlagsChanged
-        // (type 12) rather than KeyDown/KeyUp so Electron/Chromium apps track Cmd/Ctrl chords.
-        if (0xE0..=0xE7).contains(&usage) {
+        // Physical modifier keys (plus Caps Lock and Fn/Globe) on macOS must be posted as
+        // kCGEventFlagsChanged (type 12) so Electron/Chromium and system shortcuts see them.
+        let is_caps = usage == crate::keymap::HID_CAPS_LOCK;
+        let is_flags_key =
+            (0xE0..=0xE7).contains(&usage) || is_caps || usage == crate::keymap::HID_FN_GLOBE;
+        if is_flags_key {
             unsafe { CGEventSetType(event.as_ptr(), FLAGS_CHANGED) };
         }
+        // Toggle real IOKit Caps Lock state on press so macOS WindowServer & LED update.
+        let caps_active = if is_caps && down {
+            crate::input_state::toggle_caps_lock()
+        } else {
+            (unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) } & FLAG_ALPHA_SHIFT) != 0
+        };
         // No synthesized repeat timer is implemented; each accepted down/up is
         // explicit. Modifier flags combine both sides and are updated on up.
         unsafe { CGEventSetIntegerValueField(event.as_ptr(), KEYBOARD_AUTOREPEAT, 0) };
         if down {
             self.owned_keys.insert(usage);
         }
-        let flags = event_modifier_flags(&projected) | key_extra_flags(usage);
+        let caps_flag = if caps_active { FLAG_ALPHA_SHIFT } else { 0 };
+        let flags = event_modifier_flags(&projected) | key_extra_flags(usage) | caps_flag;
         self.post_marked(&event, flags);
         if !down {
             self.owned_keys.remove(&usage);
@@ -1549,7 +1587,10 @@ mod tests {
             (0x28, 0x24),
             (0x29, 0x35),
             (0x2A, 0x33),
+            (0x39, 0x39),
             (0x4C, 0x75),
+            (0x53, 0x47),
+            (crate::keymap::HID_FN_GLOBE, 0x3F),
             (0xE0, 0x3B),
             (0xE4, 0x3E),
             (0xE3, 0x37),
@@ -1557,7 +1598,7 @@ mod tests {
         ] {
             assert_eq!(mac_keycode(hid), Some(mac));
         }
-        for hid in [0, 1, 3, 0x32, 0x39, 0x46, 0x53, 0x65, 0x87, 0xE8, u16::MAX] {
+        for hid in [0, 1, 3, 0x32, 0x46, 0x65, 0x87, 0xE8, u16::MAX] {
             assert_eq!(mac_keycode(hid), None);
         }
     }

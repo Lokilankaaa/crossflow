@@ -14,6 +14,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+pub const HID_CAPS_LOCK: u16 = 0x39;
+/// Canonical usage ID used by Crossflow for the Apple Fn / Globe modifier key
+/// (fits inside `input::is_keyboard_usage` without colliding with standard keys).
+pub const HID_FN_GLOBE: u16 = 0xA4;
 pub const HID_LEFT_CTRL: u16 = 0xE0;
 pub const HID_LEFT_GUI: u16 = 0xE3;
 pub const HID_RIGHT_CTRL: u16 = 0xE4;

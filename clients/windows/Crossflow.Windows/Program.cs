@@ -37,6 +37,7 @@ internal static class Program
             var existing = FindWindow(null, "Crossflow");
             if (existing != IntPtr.Zero)
             {
+                ShowWindow(existing, 5); // SW_SHOW (unhide if minimized to tray)
                 ShowWindow(existing, 9); // SW_RESTORE
                 SetForegroundWindow(existing);
             }

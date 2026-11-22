@@ -477,6 +477,11 @@ impl MouseSink for WindowsMouseSink {
         Ok(())
     }
     fn key(&mut self, usage: u16, down: bool) -> Result<()> {
+        if usage == crate::keymap::HID_FN_GLOBE {
+            // Apple Fn/Globe has no Windows hardware scan code; treat as a benign no-op
+            // so pressing Fn on Mac while controlling Windows never aborts injection.
+            return Ok(());
+        }
         if !down && !self.keys.contains(&usage) {
             return Ok(());
         }
