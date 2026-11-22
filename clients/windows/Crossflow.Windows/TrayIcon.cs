@@ -54,8 +54,11 @@ internal sealed class TrayIcon : IDisposable
     private const uint CMD_TOGGLE_SCREEN_LOCK = 1009;
     private const uint CMD_QJ_NEXT = 1010;
     private const uint CMD_QJ_HOME = 1011;
-    private const uint CMD_QJ_PEER = 1012;
+    private const uint CMD_SEND_FILES_ALL = 1012;
     private const uint CMD_CHANNEL_BASE = 2000;
+    private const uint CMD_QJ_PEER_BASE = 3000;
+    private const uint CMD_SEND_PEER_BASE = 4000;
+    private const uint CMD_PEER_CHANNEL_BASE = 5000; // stride 64 per peer
 
     private const nuint SUBCLASS_ID = 0x4346_5452;
 
@@ -79,8 +82,7 @@ internal sealed class TrayIcon : IDisposable
     private bool clipboardEnabled = true;
     private bool inputStateEnabled = true;
     private bool screenLocked;
-    private string? peerName;
-    private string? peerDeviceId;
+    private IReadOnlyList<PeerInfo> connectedPeers = [];
     private string selectedChannel = "auto";
     private IReadOnlyList<NetworkChannelInfo> channels = [];
 
@@ -92,7 +94,8 @@ internal sealed class TrayIcon : IDisposable
     internal event Action<bool>? ToggleClipboardRequested;
     internal event Action<bool>? ToggleInputStateRequested;
     internal event Action<string>? SelectChannelRequested;
-    internal event Action? SendFilesDialogRequested;
+    internal event Action<string, string>? SelectPeerChannelRequested;
+    internal event Action<string?>? SendFilesDialogRequested;
     internal event Action? OpenReceiveFolderRequested;
     internal event Action? ExitRequested;
 
@@ -117,8 +120,7 @@ internal sealed class TrayIcon : IDisposable
         bool canToggle,
         bool sharing,
         bool locked,
-        string? remotePeerId,
-        string? remotePeerName,
+        IReadOnlyList<PeerInfo> activePeers,
         bool clipboardSync,
         bool inputStateSync,
         string channelId,
@@ -141,8 +143,7 @@ internal sealed class TrayIcon : IDisposable
         canToggleSharing = canToggle;
         isSharing = sharing;
         screenLocked = locked;
-        peerDeviceId = remotePeerId;
-        peerName = remotePeerName;
+        connectedPeers = activePeers;
         clipboardEnabled = clipboardSync;
         inputStateEnabled = inputStateSync;
         selectedChannel = channelId;
@@ -213,8 +214,7 @@ internal sealed class TrayIcon : IDisposable
     private void ShowContextMenu()
     {
         IntPtr menu = CreatePopupMenu();
-        IntPtr channelMenu = IntPtr.Zero;
-        IntPtr qjMenu = IntPtr.Zero;
+        var submenus = new List<IntPtr>();
         if (menu == IntPtr.Zero) return;
         try
         {
@@ -228,12 +228,20 @@ internal sealed class TrayIcon : IDisposable
             if (canToggleSharing)
                 AppendMenuW(menu, MF_STRING, CMD_TOGGLE_SHARE, isSharing ? "暂停共享" : "恢复共享");
 
-            if (isSharing && peerDeviceId is not null)
+            if (isSharing && connectedPeers.Count > 0)
             {
-                qjMenu = CreatePopupMenu();
+                IntPtr qjMenu = CreatePopupMenu();
+                submenus.Add(qjMenu);
                 AppendMenuW(qjMenu, MF_STRING, CMD_QJ_NEXT, "切到下一台设备");
                 AppendMenuW(qjMenu, MF_STRING, CMD_QJ_HOME, "回到本机");
-                AppendMenuW(qjMenu, MF_STRING, CMD_QJ_PEER, $"#1 {peerName ?? "远端设备"}");
+                AppendMenuW(qjMenu, MF_SEPARATOR, 0, null);
+                for (int i = 0; i < connectedPeers.Count && i < 16; i++)
+                {
+                    var p = connectedPeers[i];
+                    int slot = p.Slot ?? (i + 1);
+                    uint flags = MF_STRING | (p.Focused ? MF_CHECKED : 0);
+                    AppendMenuW(qjMenu, flags, CMD_QJ_PEER_BASE + (uint)i, $"#{slot} {p.Name}");
+                }
                 AppendMenuW(menu, MF_POPUP, (nuint)qjMenu, "快速切换 (QuickJump)");
             }
 
@@ -244,18 +252,58 @@ internal sealed class TrayIcon : IDisposable
 
             if (channels.Count > 0)
             {
-                channelMenu = CreatePopupMenu();
+                IntPtr channelMenu = CreatePopupMenu();
+                submenus.Add(channelMenu);
+                AppendMenuW(channelMenu, MF_STRING | MF_GRAYED, 0, "全局默认信道");
                 for (int i = 0; i < channels.Count && i < 32; i++)
                 {
                     var ch = channels[i];
                     uint flags = MF_STRING | (string.Equals(ch.Id, selectedChannel, StringComparison.Ordinal) ? MF_CHECKED : 0);
                     AppendMenuW(channelMenu, flags, CMD_CHANNEL_BASE + (uint)i, ch.Label);
                 }
+                if (connectedPeers.Count > 0)
+                {
+                    AppendMenuW(channelMenu, MF_SEPARATOR, 0, null);
+                    for (int pi = 0; pi < connectedPeers.Count && pi < 16; pi++)
+                    {
+                        var peer = connectedPeers[pi];
+                        IntPtr peerChMenu = CreatePopupMenu();
+                        submenus.Add(peerChMenu);
+                        for (int ci = 0; ci < channels.Count && ci < 32; ci++)
+                        {
+                            var ch = channels[ci];
+                            string label = ci == 0 ? "跟随全局默认" : ch.Label;
+                            uint flags = MF_STRING | (string.Equals(ch.Id, peer.PreferredChannel, StringComparison.Ordinal) ? MF_CHECKED : 0);
+                            AppendMenuW(peerChMenu, flags, CMD_PEER_CHANNEL_BASE + (uint)(pi * 64 + ci), label);
+                        }
+                        string activeTag = string.IsNullOrWhiteSpace(peer.ActiveChannelLabel) ? "" : $" ({peer.ActiveChannelLabel})";
+                        AppendMenuW(channelMenu, MF_POPUP, (nuint)peerChMenu, $"{peer.Name}{activeTag}");
+                    }
+                }
                 AppendMenuW(menu, MF_POPUP, (nuint)channelMenu, "网络信道");
             }
 
             AppendMenuW(menu, MF_SEPARATOR, 0, null);
-            AppendMenuW(menu, MF_STRING | (isConnected ? 0 : MF_GRAYED), CMD_SEND_FILES, "发送文件到对端…");
+            if (isConnected && connectedPeers.Count > 0)
+            {
+                IntPtr sendMenu = CreatePopupMenu();
+                submenus.Add(sendMenu);
+                for (int i = 0; i < connectedPeers.Count && i < 16; i++)
+                {
+                    var p = connectedPeers[i];
+                    AppendMenuW(sendMenu, MF_STRING, CMD_SEND_PEER_BASE + (uint)i, $"发送给 {p.Name}…");
+                }
+                if (connectedPeers.Count > 1)
+                {
+                    AppendMenuW(sendMenu, MF_SEPARATOR, 0, null);
+                    AppendMenuW(sendMenu, MF_STRING, CMD_SEND_FILES_ALL, "发送给全部已连接设备…");
+                }
+                AppendMenuW(menu, MF_POPUP, (nuint)sendMenu, "发送文件到");
+            }
+            else
+            {
+                AppendMenuW(menu, MF_STRING | MF_GRAYED, CMD_SEND_FILES, "发送文件到对端…");
+            }
             AppendMenuW(menu, MF_STRING, CMD_OPEN_RECEIVE_DIR, "打开接收文件夹");
 
             AppendMenuW(menu, MF_SEPARATOR, 0, null);
@@ -271,6 +319,25 @@ internal sealed class TrayIcon : IDisposable
             if (cmd >= CMD_CHANNEL_BASE && cmd < CMD_CHANNEL_BASE + (uint)channels.Count)
             {
                 SelectChannelRequested?.Invoke(channels[(int)(cmd - CMD_CHANNEL_BASE)].Id);
+                return;
+            }
+            if (cmd >= CMD_QJ_PEER_BASE && cmd < CMD_QJ_PEER_BASE + (uint)connectedPeers.Count)
+            {
+                QuickJumpRequested?.Invoke(connectedPeers[(int)(cmd - CMD_QJ_PEER_BASE)].Id);
+                return;
+            }
+            if (cmd >= CMD_SEND_PEER_BASE && cmd < CMD_SEND_PEER_BASE + (uint)connectedPeers.Count)
+            {
+                SendFilesDialogRequested?.Invoke(connectedPeers[(int)(cmd - CMD_SEND_PEER_BASE)].Id);
+                return;
+            }
+            if (cmd >= CMD_PEER_CHANNEL_BASE && cmd < CMD_PEER_CHANNEL_BASE + 16 * 64)
+            {
+                int offset = (int)(cmd - CMD_PEER_CHANNEL_BASE);
+                int pi = offset / 64;
+                int ci = offset % 64;
+                if (pi < connectedPeers.Count && ci < channels.Count)
+                    SelectPeerChannelRequested?.Invoke(connectedPeers[pi].Id, channels[ci].Id);
                 return;
             }
             switch (cmd)
@@ -291,18 +358,14 @@ internal sealed class TrayIcon : IDisposable
                 case CMD_QJ_HOME:
                     QuickJumpRequested?.Invoke("local");
                     break;
-                case CMD_QJ_PEER:
-                    if (peerDeviceId is not null)
-                        QuickJumpRequested?.Invoke(peerDeviceId);
+                case CMD_SEND_FILES_ALL:
+                    SendFilesDialogRequested?.Invoke(null);
                     break;
                 case CMD_TOGGLE_CLIPBOARD:
                     ToggleClipboardRequested?.Invoke(!clipboardEnabled);
                     break;
                 case CMD_TOGGLE_INPUT_STATE:
                     ToggleInputStateRequested?.Invoke(!inputStateEnabled);
-                    break;
-                case CMD_SEND_FILES:
-                    SendFilesDialogRequested?.Invoke();
                     break;
                 case CMD_OPEN_RECEIVE_DIR:
                     OpenReceiveFolderRequested?.Invoke();
@@ -317,8 +380,8 @@ internal sealed class TrayIcon : IDisposable
         }
         finally
         {
-            if (qjMenu != IntPtr.Zero) DestroyMenu(qjMenu);
-            if (channelMenu != IntPtr.Zero) DestroyMenu(channelMenu);
+            foreach (var sub in submenus)
+                if (sub != IntPtr.Zero) DestroyMenu(sub);
             DestroyMenu(menu);
         }
     }

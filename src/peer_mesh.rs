@@ -29,6 +29,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -74,12 +75,25 @@ struct LocalChannel {
     interface_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualPeer {
+    pub address: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default = "default_channel")]
+    pub channel: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PeerConfig {
     #[serde(default = "default_channel")]
     channel: String,
     #[serde(default)]
     direct_peer: Option<String>,
+    #[serde(default)]
+    manual_peers: Vec<ManualPeer>,
+    #[serde(default)]
+    peer_channels: HashMap<String, String>,
     #[serde(default)]
     passphrase: Option<String>,
     #[serde(default = "default_true")]
@@ -105,6 +119,8 @@ impl Default for PeerConfig {
         Self {
             channel: default_channel(),
             direct_peer: None,
+            manual_peers: Vec::new(),
+            peer_channels: HashMap::new(),
             passphrase: None,
             smart_keymap: true,
             clipboard_sync: true,
@@ -120,6 +136,19 @@ pub struct DiscoveredPeerInfo {
     pub name: String,
     pub platform: String,
     pub connected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PeerInfo {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub connected: bool,
+    pub focused: bool,
+    pub slot: Option<usize>,
+    pub address: Option<String>,
+    pub active_channel_label: Option<String>,
+    pub preferred_channel: String,
 }
 
 #[derive(Serialize)]
@@ -139,6 +168,8 @@ struct PeerUiStatus {
     direct_peer: Option<String>,
     active_channel_label: Option<String>,
     network_channels: Vec<NetworkChannelInfo>,
+    manual_peers: Vec<ManualPeer>,
+    peers: Vec<PeerInfo>,
     route_enabled: bool,
     focus_device_id: Option<String>,
     focus_screen_id: Option<String>,
@@ -167,6 +198,20 @@ enum UiCommand {
         #[serde(default)]
         direct_peer: Option<String>,
     },
+    SetPeerChannel {
+        device_id: String,
+        channel: String,
+    },
+    AddManualPeer {
+        address: String,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default = "default_channel")]
+        channel: String,
+    },
+    RemoveManualPeer {
+        address: String,
+    },
     SetPassphrase {
         passphrase: Option<String>,
     },
@@ -193,6 +238,8 @@ enum UiCommand {
         target_device_id: Option<String>,
     },
     SendFiles {
+        #[serde(default)]
+        target_device_id: Option<String>,
         paths: Vec<String>,
     },
     CancelTransfer,
@@ -217,12 +264,118 @@ fn config_path() -> Result<PathBuf> {
     Ok(root.join("peer-config.json"))
 }
 
-fn load_config(env_passphrase: Option<String>) -> PeerConfig {
-    let mut cfg = config_path()
-        .ok()
-        .and_then(|p| fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<PeerConfig>(&b).ok())
-        .unwrap_or_default();
+fn ids_match(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a == b || a.starts_with(b) || b.starts_with(a))
+}
+
+fn peer_channel_override(peer_channels: &HashMap<String, String>, device_id: &str) -> String {
+    if let Some(ch) = peer_channels.get(device_id)
+        && !ch.trim().is_empty()
+    {
+        return ch.trim().to_string();
+    }
+    for (k, v) in peer_channels {
+        if ids_match(k, device_id) && !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    default_channel()
+}
+
+fn effective_channel_for_peer<'a>(config: &'a PeerConfig, device_id: &str) -> &'a str {
+    if let Some(ch) = config.peer_channels.get(device_id)
+        && !ch.trim().is_empty()
+        && ch.trim() != "auto"
+    {
+        return ch.trim();
+    }
+    for (k, v) in &config.peer_channels {
+        if ids_match(k, device_id) && !v.trim().is_empty() && v.trim() != "auto" {
+            return v.trim();
+        }
+    }
+    if config.channel.trim().is_empty() {
+        "auto"
+    } else {
+        config.channel.trim()
+    }
+}
+
+fn set_peer_channel(config: &mut PeerConfig, device_id: &str, channel: &str) {
+    let key = device_id.trim();
+    if key.is_empty() {
+        return;
+    }
+    let ch = channel.trim();
+    config.peer_channels.retain(|k, _| !ids_match(k, key));
+    if !ch.is_empty() && ch != "auto" {
+        config.peer_channels.insert(key.to_string(), ch.to_string());
+    }
+}
+
+fn normalize_manual_address(raw: &str) -> Option<String> {
+    let sock = parse_direct_peer(Some(raw))?;
+    if sock.port() == DEFAULT_PORT {
+        Some(sock.ip().to_string())
+    } else {
+        Some(sock.to_string())
+    }
+}
+
+fn add_manual_peer(
+    config: &mut PeerConfig,
+    address: &str,
+    label: Option<String>,
+    channel: &str,
+) -> bool {
+    let Some(norm_addr) = normalize_manual_address(address) else {
+        return false;
+    };
+    let clean_label = label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(48).collect::<String>());
+    let clean_channel = {
+        let c = channel.trim();
+        if c.is_empty() {
+            default_channel()
+        } else {
+            c.to_string()
+        }
+    };
+    if let Some(existing) = config
+        .manual_peers
+        .iter_mut()
+        .find(|p| normalize_manual_address(&p.address).as_deref() == Some(norm_addr.as_str()))
+    {
+        existing.address = norm_addr;
+        existing.label = clean_label.or(existing.label.clone());
+        existing.channel = clean_channel;
+        return true;
+    }
+    if config.manual_peers.len() >= 32 {
+        return false;
+    }
+    config.manual_peers.push(ManualPeer {
+        address: norm_addr,
+        label: clean_label,
+        channel: clean_channel,
+    });
+    true
+}
+
+fn remove_manual_peer(config: &mut PeerConfig, address: &str) -> bool {
+    let target = normalize_manual_address(address).unwrap_or_else(|| address.trim().to_string());
+    let before = config.manual_peers.len();
+    config.manual_peers.retain(|p| {
+        let cur = normalize_manual_address(&p.address).unwrap_or_else(|| p.address.trim().to_string());
+        cur != target
+    });
+    config.manual_peers.len() != before
+}
+
+fn normalize_config(cfg: &mut PeerConfig) {
     if cfg.channel.trim().is_empty() {
         cfg.channel = default_channel();
     }
@@ -232,12 +385,54 @@ fn load_config(env_passphrase: Option<String>) -> PeerConfig {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
+    // Migrate legacy single direct_peer into the multi-device manual_peers list seamlessly.
+    if let Some(legacy) = cfg.direct_peer.clone() {
+        let ch = cfg.channel.clone();
+        let _ = add_manual_peer(cfg, &legacy, None, &ch);
+    }
+    // Deduplicate & sanitize existing manual_peers
+    let mut cleaned = Vec::new();
+    for mp in std::mem::take(&mut cfg.manual_peers) {
+        if let Some(norm) = normalize_manual_address(&mp.address)
+            && !cleaned
+                .iter()
+                .any(|e: &ManualPeer| e.address == norm)
+        {
+            cleaned.push(ManualPeer {
+                address: norm,
+                label: mp
+                    .label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(48).collect()),
+                channel: if mp.channel.trim().is_empty() {
+                    default_channel()
+                } else {
+                    mp.channel.trim().to_string()
+                },
+            });
+        }
+    }
+    cfg.manual_peers = cleaned;
+    cfg.peer_channels
+        .retain(|k, v| !k.trim().is_empty() && !v.trim().is_empty() && v.trim() != "auto");
     cfg.passphrase = cfg
         .passphrase
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
+    cfg.hotkeys = cfg.hotkeys.normalized();
+}
+
+fn load_config(env_passphrase: Option<String>) -> PeerConfig {
+    let mut cfg = config_path()
+        .ok()
+        .and_then(|p| fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<PeerConfig>(&b).ok())
+        .unwrap_or_default();
+    normalize_config(&mut cfg);
     if let Some(secret) = env_passphrase
         .as_deref()
         .map(str::trim)
@@ -245,7 +440,6 @@ fn load_config(env_passphrase: Option<String>) -> PeerConfig {
     {
         cfg.passphrase = Some(secret.to_string());
     }
-    cfg.hotkeys = cfg.hotkeys.normalized();
     cfg
 }
 
@@ -655,6 +849,7 @@ struct PeerHost<'a> {
     listen_endpoint: Option<String>,
     peer_device_id: String,
     peer_name: String,
+    peer_platform: String,
     peer_address: String,
     user_paused: &'a mut bool,
     screen_locked: &'a mut bool,
@@ -672,6 +867,8 @@ struct PeerHost<'a> {
     last_emitted_peer_count: usize,
     last_emitted_locked: Option<bool>,
     last_emitted_hotkeys: Option<HotkeyConfig>,
+    last_emitted_manual_peers: Option<Vec<ManualPeer>>,
+    last_emitted_peer_channels: Option<HashMap<String, String>>,
 }
 
 impl PeerHost<'_> {
@@ -683,12 +880,44 @@ impl PeerHost<'_> {
             .into_iter()
             .filter(|c| c.compatible)
             .map(|c| DiscoveredPeerInfo {
-                connected: self.peer_device_id.starts_with(&c.device_id),
+                connected: ids_match(&self.peer_device_id, &c.device_id),
                 id: c.device_id,
                 name: c.friendly_name,
                 platform: c.platform,
             })
             .collect()
+    }
+
+    fn peers_list(&self, discovered: &[DiscoveredPeerInfo], focus_device_id: Option<&str>) -> Vec<PeerInfo> {
+        let mut list = Vec::with_capacity(discovered.len() + 1);
+        list.push(PeerInfo {
+            id: self.peer_device_id.clone(),
+            name: self.peer_name.clone(),
+            platform: self.peer_platform.clone(),
+            connected: true,
+            focused: focus_device_id == Some(self.peer_device_id.as_str()),
+            slot: Some(1),
+            address: Some(self.peer_address.clone()),
+            active_channel_label: self.active_channel_label.clone(),
+            preferred_channel: peer_channel_override(&self.config.peer_channels, &self.peer_device_id),
+        });
+        for d in discovered {
+            if ids_match(&self.peer_device_id, &d.id) {
+                continue;
+            }
+            list.push(PeerInfo {
+                id: d.id.clone(),
+                name: d.name.clone(),
+                platform: d.platform.clone(),
+                connected: false,
+                focused: false,
+                slot: None,
+                address: None,
+                active_channel_label: None,
+                preferred_channel: peer_channel_override(&self.config.peer_channels, &d.id),
+            });
+        }
+        list
     }
 
     fn drain_ui_commands(&mut self) {
@@ -734,11 +963,40 @@ impl PeerHost<'_> {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(ToString::to_string);
+                    if let Some(legacy) = self.config.direct_peer.clone() {
+                        let ch = self.config.channel.clone();
+                        let _ = add_manual_peer(self.config, &legacy, None, &ch);
+                    }
                     save_config(self.config);
                     *self.reconfigure_requested = true;
                     self.session_stop.store(true, Ordering::Release);
                     self.pending = Some(Command::Stop);
                     break;
+                }
+                Ok(UiCommand::SetPeerChannel { device_id, channel }) => {
+                    set_peer_channel(self.config, &device_id, &channel);
+                    save_config(self.config);
+                    if ids_match(&self.peer_device_id, &device_id) {
+                        *self.reconfigure_requested = true;
+                        self.session_stop.store(true, Ordering::Release);
+                        self.pending = Some(Command::Stop);
+                        break;
+                    }
+                }
+                Ok(UiCommand::AddManualPeer {
+                    address,
+                    label,
+                    channel,
+                }) => {
+                    if add_manual_peer(self.config, &address, label, &channel) {
+                        save_config(self.config);
+                    }
+                }
+                Ok(UiCommand::RemoveManualPeer { address }) => {
+                    if remove_manual_peer(self.config, &address) {
+                        self.config.direct_peer = None;
+                        save_config(self.config);
+                    }
                 }
                 Ok(UiCommand::SetPassphrase { passphrase }) => {
                     self.config.passphrase = passphrase
@@ -783,8 +1041,16 @@ impl PeerHost<'_> {
                     let target = self.resolve_quick_jump_target(target_device_id.as_deref());
                     self.queue_quick_jump(target);
                 }
-                Ok(UiCommand::SendFiles { paths }) => {
-                    if let Some(aux) = self.aux {
+                Ok(UiCommand::SendFiles {
+                    target_device_id,
+                    paths,
+                }) => {
+                    let matches_target = target_device_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_none_or(|t| ids_match(&self.peer_device_id, t));
+                    if matches_target && let Some(aux) = self.aux {
                         let list: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
                         aux.send_files(list);
                     }
@@ -980,6 +1246,8 @@ impl Host for PeerHost<'_> {
             || self.last_emitted_peer_count != discovered.len()
             || self.last_emitted_locked != Some(*self.screen_locked)
             || self.last_emitted_hotkeys.as_ref() != Some(&self.config.hotkeys)
+            || self.last_emitted_manual_peers.as_ref() != Some(&self.config.manual_peers)
+            || self.last_emitted_peer_channels.as_ref() != Some(&self.config.peer_channels)
             || transfer.as_ref().is_some_and(|t| t.state == "active");
         if state_changed
             || self.last_emit.elapsed() >= Duration::from_millis(250)
@@ -991,6 +1259,9 @@ impl Host for PeerHost<'_> {
             self.last_emitted_peer_count = discovered.len();
             self.last_emitted_locked = Some(*self.screen_locked);
             self.last_emitted_hotkeys = Some(self.config.hotkeys.clone());
+            self.last_emitted_manual_peers = Some(self.config.manual_peers.clone());
+            self.last_emitted_peer_channels = Some(self.config.peer_channels.clone());
+            let peers = self.peers_list(&discovered, status.focus_device_id.as_deref());
             let has_pass = self.config.passphrase.is_some();
             emit_status(
                 self.stdout,
@@ -1014,6 +1285,8 @@ impl Host for PeerHost<'_> {
                     direct_peer: self.config.direct_peer.clone(),
                     active_channel_label: self.active_channel_label.clone(),
                     network_channels: self.network_channels.clone(),
+                    manual_peers: self.config.manual_peers.clone(),
+                    peers,
                     route_enabled: status.endpoint.enabled,
                     focus_device_id: status.focus_device_id.clone(),
                     focus_screen_id: status.focus_screen_id.clone(),
@@ -1087,6 +1360,8 @@ pub fn run(
                     direct_peer: config.direct_peer.clone(),
                     active_channel_label: None,
                     network_channels: channel_infos(&local_channels),
+                    manual_peers: config.manual_peers.clone(),
+                    peers: vec![],
                     route_enabled: false,
                     focus_device_id: None,
                     focus_screen_id: None,
@@ -1212,9 +1487,34 @@ pub fn run(
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .map(ToString::to_string);
+                            if let Some(legacy) = config.direct_peer.clone() {
+                                let ch = config.channel.clone();
+                                let _ = add_manual_peer(&mut config, &legacy, None, &ch);
+                            }
                             save_config(&config);
                             reconfigure_requested = true;
                             break;
+                        }
+                        Ok(UiCommand::SetPeerChannel { device_id, channel }) => {
+                            set_peer_channel(&mut config, &device_id, &channel);
+                            save_config(&config);
+                            last_dial_attempt = Instant::now() - Duration::from_secs(2);
+                        }
+                        Ok(UiCommand::AddManualPeer {
+                            address,
+                            label,
+                            channel,
+                        }) => {
+                            if add_manual_peer(&mut config, &address, label, &channel) {
+                                save_config(&config);
+                                last_dial_attempt = Instant::now() - Duration::from_secs(2);
+                            }
+                        }
+                        Ok(UiCommand::RemoveManualPeer { address }) => {
+                            if remove_manual_peer(&mut config, &address) {
+                                config.direct_peer = None;
+                                save_config(&config);
+                            }
                         }
                         Ok(UiCommand::SetPassphrase { passphrase }) => {
                             config.passphrase = passphrase
@@ -1291,6 +1591,24 @@ pub fn run(
                             direct_peer: config.direct_peer.clone(),
                             active_channel_label: None,
                             network_channels: channel_infos(&local_channels),
+                            manual_peers: config.manual_peers.clone(),
+                            peers: candidates
+                                .iter()
+                                .map(|c| PeerInfo {
+                                    id: c.device_id.clone(),
+                                    name: c.friendly_name.clone(),
+                                    platform: c.platform.clone(),
+                                    connected: false,
+                                    focused: false,
+                                    slot: None,
+                                    address: None,
+                                    active_channel_label: None,
+                                    preferred_channel: peer_channel_override(
+                                        &config.peer_channels,
+                                        &c.device_id,
+                                    ),
+                                })
+                                .collect(),
                             route_enabled: false,
                             focus_device_id: None,
                             focus_screen_id: None,
@@ -1345,8 +1663,10 @@ pub fn run(
                         if !should_dial {
                             continue;
                         }
+                        let eff_channel =
+                            effective_channel_for_peer(&config, &candidate.device_id);
                         for addr in
-                            ranked_addresses(&candidate.addresses, &config.channel, &local_channels)
+                            ranked_addresses(&candidate.addresses, eff_channel, &local_channels)
                         {
                             if let Ok(stream) =
                                 TcpStream::connect_timeout(&addr, Duration::from_millis(250))
@@ -1365,13 +1685,19 @@ pub fn run(
                         }
                     }
 
-                    // Direct peer IP fallback (useful for ZeroTier / cross-subnet links)
-                    if connected.is_none()
-                        && let Some(direct_addr) = parse_direct_peer(config.direct_peer.as_deref())
-                        && let Ok(stream) =
-                            TcpStream::connect_timeout(&direct_addr, Duration::from_millis(300))
-                    {
-                        connected = Some((stream, true, None, None));
+                    // Manual peer IP list fallback (ZeroTier / cross-subnet static peers)
+                    if connected.is_none() {
+                        for mp in &config.manual_peers {
+                            if let Some(direct_addr) = parse_direct_peer(Some(&mp.address))
+                                && let Ok(stream) = TcpStream::connect_timeout(
+                                    &direct_addr,
+                                    Duration::from_millis(280),
+                                )
+                            {
+                                connected = Some((stream, true, mp.label.clone(), None));
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1534,6 +1860,7 @@ pub fn run(
                         listen_endpoint: listen_endpoint.clone(),
                         peer_device_id: remote_id.clone(),
                         peer_name: peer_name.clone(),
+                        peer_platform: remote_os.to_string(),
                         peer_address: peer_address.clone(),
                         user_paused: &mut user_paused,
                         screen_locked: &mut screen_locked,
@@ -1551,6 +1878,8 @@ pub fn run(
                         last_emitted_peer_count: usize::MAX,
                         last_emitted_locked: None,
                         last_emitted_hotkeys: None,
+                        last_emitted_manual_peers: None,
+                        last_emitted_peer_channels: None,
                     },
                     &session_stop,
                     log.clone(),
@@ -1627,6 +1956,8 @@ pub fn run(
             direct_peer: config.direct_peer,
             active_channel_label: None,
             network_channels: vec![],
+            manual_peers: config.manual_peers,
+            peers: vec![],
             route_enabled: false,
             focus_device_id: None,
             focus_screen_id: None,
@@ -1762,5 +2093,58 @@ mod tests {
             )))
         );
         assert_eq!(parse_direct_peer(Some("")), None);
+    }
+
+    #[test]
+    fn peer_channel_override_supersedes_global_channel_and_matches_prefixes() {
+        let mut cfg = PeerConfig::default();
+        cfg.channel = "192.168.1.164".into();
+        let full_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let prefix = &full_id[..32];
+
+        assert_eq!(effective_channel_for_peer(&cfg, full_id), "192.168.1.164");
+        set_peer_channel(&mut cfg, prefix, "192.168.50.1");
+        assert_eq!(effective_channel_for_peer(&cfg, full_id), "192.168.50.1");
+        assert_eq!(
+            peer_channel_override(&cfg.peer_channels, full_id),
+            "192.168.50.1"
+        );
+        // Clearing back to "auto" reverts to global default
+        set_peer_channel(&mut cfg, full_id, "auto");
+        assert_eq!(effective_channel_for_peer(&cfg, prefix), "192.168.1.164");
+        assert_eq!(peer_channel_override(&cfg.peer_channels, prefix), "auto");
+    }
+
+    #[test]
+    fn legacy_direct_peer_migrates_and_manual_peers_dedup_and_remove() {
+        let mut cfg = PeerConfig {
+            direct_peer: Some("192.168.194.59:24800".into()),
+            ..PeerConfig::default()
+        };
+        normalize_config(&mut cfg);
+        assert_eq!(cfg.manual_peers.len(), 1);
+        assert_eq!(cfg.manual_peers[0].address, "192.168.194.59");
+
+        assert!(add_manual_peer(
+            &mut cfg,
+            "192.168.194.59",
+            Some("Mac Studio".into()),
+            "auto"
+        ));
+        assert_eq!(cfg.manual_peers.len(), 1);
+        assert_eq!(cfg.manual_peers[0].label.as_deref(), Some("Mac Studio"));
+
+        assert!(add_manual_peer(
+            &mut cfg,
+            "10.0.0.12:25000",
+            Some("Office PC".into()),
+            "192.168.1.164"
+        ));
+        assert_eq!(cfg.manual_peers.len(), 2);
+        assert!(!add_manual_peer(&mut cfg, "not-an-ip", None, "auto"));
+
+        assert!(remove_manual_peer(&mut cfg, "192.168.194.59:24800"));
+        assert_eq!(cfg.manual_peers.len(), 1);
+        assert_eq!(cfg.manual_peers[0].address, "10.0.0.12:25000");
     }
 }

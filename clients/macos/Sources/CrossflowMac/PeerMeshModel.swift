@@ -110,6 +110,31 @@ struct TransferStatusInfo: Sendable, Equatable, Decodable {
     }
 }
 
+struct ManualPeerInfo: Sendable, Equatable, Decodable, Identifiable {
+    let address: String
+    let label: String?
+    let channel: String
+    var id: String { address }
+}
+
+struct PeerInfo: Sendable, Equatable, Decodable, Identifiable {
+    let id: String
+    let name: String
+    let platform: String
+    let connected: Bool
+    let focused: Bool
+    let slot: Int?
+    let address: String?
+    let activeChannelLabel: String?
+    let preferredChannel: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, platform, connected, focused, slot, address
+        case activeChannelLabel = "active_channel_label"
+        case preferredChannel = "preferred_channel"
+    }
+}
+
 struct HotkeyConfigInfo: Sendable, Equatable, Codable {
     var toggleSharing: String?
     var lockScreen: String?
@@ -169,6 +194,8 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let directPeer: String?
     let activeChannelLabel: String?
     let networkChannels: [NetworkChannelInfo]
+    let manualPeers: [ManualPeerInfo]?
+    let peers: [PeerInfo]?
     let routeEnabled: Bool
     let focusDeviceID: String?
     let focusScreenID: String?
@@ -198,6 +225,8 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case directPeer = "direct_peer"
         case activeChannelLabel = "active_channel_label"
         case networkChannels = "network_channels"
+        case manualPeers = "manual_peers"
+        case peers
         case routeEnabled = "route_enabled"
         case focusDeviceID = "focus_device_id"
         case focusScreenID = "focus_screen_id"
@@ -227,6 +256,30 @@ private struct SetChannelCommandWire: Encodable {
         case op, channel
         case directPeer = "direct_peer"
     }
+}
+
+private struct SetPeerChannelCommandWire: Encodable {
+    let op = "set_peer_channel"
+    let deviceID: String
+    let channel: String
+
+    enum CodingKeys: String, CodingKey {
+        case op
+        case deviceID = "device_id"
+        case channel
+    }
+}
+
+private struct AddManualPeerCommandWire: Encodable {
+    let op = "add_manual_peer"
+    let address: String
+    let label: String?
+    let channel: String
+}
+
+private struct RemoveManualPeerCommandWire: Encodable {
+    let op = "remove_manual_peer"
+    let address: String
 }
 
 private struct SetPassphraseCommandWire: Encodable {
@@ -276,7 +329,14 @@ private struct QuickJumpCommandWire: Encodable {
 
 private struct SendFilesCommandWire: Encodable {
     let op = "send_files"
+    let targetDeviceID: String?
     let paths: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case op
+        case targetDeviceID = "target_device_id"
+        case paths
+    }
 }
 
 private final class PeerProcessRunner: @unchecked Sendable {
@@ -430,6 +490,8 @@ final class PeerMeshModel {
     var directPeer: String = ""
     var activeChannelLabel: String?
     var networkChannels: [NetworkChannelInfo] = []
+    var manualPeers: [ManualPeerInfo] = []
+    var peers: [PeerInfo] = []
     var routeEnabled: Bool = false
     var focusDeviceID: String?
     var focusScreenID: String?
@@ -558,6 +620,8 @@ final class PeerMeshModel {
         }
         activeChannelLabel = s.activeChannelLabel
         networkChannels = s.networkChannels
+        manualPeers = s.manualPeers ?? []
+        peers = s.peers ?? []
         routeEnabled = s.routeEnabled
         focusDeviceID = s.focusDeviceID
         focusScreenID = s.focusScreenID
@@ -589,6 +653,34 @@ final class PeerMeshModel {
         )
         if let data = try? JSONEncoder().encode(cmd) {
             selectedChannel = channel
+            runner.send(data)
+        }
+    }
+
+    func setPeerChannel(deviceID: String, channel: String) {
+        let cmd = SetPeerChannelCommandWire(deviceID: deviceID, channel: channel)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func addManualPeer(address: String, label: String?, channel: String = "auto") {
+        let addr = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !addr.isEmpty else { return }
+        let cleanLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cmd = AddManualPeerCommandWire(
+            address: addr,
+            label: (cleanLabel?.isEmpty == false) ? cleanLabel : nil,
+            channel: channel
+        )
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func removeManualPeer(address: String) {
+        let cmd = RemoveManualPeerCommandWire(address: address)
+        if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }
     }
@@ -655,9 +747,9 @@ final class PeerMeshModel {
         }
     }
 
-    func sendFiles(_ paths: [String]) {
+    func sendFiles(_ paths: [String], targetDeviceID: String? = nil) {
         guard !paths.isEmpty else { return }
-        let cmd = SendFilesCommandWire(paths: paths)
+        let cmd = SendFilesCommandWire(targetDeviceID: targetDeviceID, paths: paths)
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

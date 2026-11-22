@@ -82,16 +82,18 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     private var showHideMenuItem: NSMenuItem?
     private var toggleShareMenuItem: NSMenuItem?
     private var quickJumpParentItem: NSMenuItem?
-    private var quickJumpPeerItem: NSMenuItem?
+    private var quickJumpSubmenu: NSMenu?
     private var screenLockMenuItem: NSMenuItem?
     private var clipboardMenuItem: NSMenuItem?
     private var inputStateMenuItem: NSMenuItem?
     private var channelParentItem: NSMenuItem?
     private var channelSubmenu: NSMenu?
-    private var sendFilesMenuItem: NSMenuItem?
+    private var sendFilesParentItem: NSMenuItem?
+    private var sendFilesSubmenu: NSMenu?
     private var autoStartMenuItem: NSMenuItem?
     private var lastVisualState: MenuBarVisualState?
     private var lastChannelMenuSig: String = ""
+    private var lastPeersMenuSig: String = ""
     private var startedMinimized: Bool = CommandLine.arguments.contains("--minimized")
     private var didApplyInitialMinimize = false
     private weak var mainWindow: NSWindow?
@@ -188,15 +190,6 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
         let qjParent = NSMenuItem(title: "快速切换 (QuickJump)", action: nil, keyEquivalent: "")
         let qjSub = NSMenu()
-        let qjNext = NSMenuItem(title: "切到下一台设备", action: #selector(quickJumpNext), keyEquivalent: "")
-        qjNext.target = self
-        qjSub.addItem(qjNext)
-        let qjHome = NSMenuItem(title: "回到本机", action: #selector(quickJumpHome), keyEquivalent: "")
-        qjHome.target = self
-        qjSub.addItem(qjHome)
-        let qjPeer = NSMenuItem(title: "#1 远端设备", action: #selector(quickJumpPeer), keyEquivalent: "")
-        qjPeer.target = self
-        qjSub.addItem(qjPeer)
         qjParent.submenu = qjSub
         qjParent.isHidden = true
         menu.addItem(qjParent)
@@ -226,10 +219,11 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
         menu.addItem(.separator())
 
-        let sendEntry = NSMenuItem(title: "发送文件到对端…", action: #selector(pickAndSendFiles), keyEquivalent: "")
-        sendEntry.target = self
-        sendEntry.isEnabled = false
-        menu.addItem(sendEntry)
+        let sendParent = NSMenuItem(title: "发送文件到", action: nil, keyEquivalent: "")
+        let sendSub = NSMenu()
+        sendParent.submenu = sendSub
+        sendParent.isEnabled = false
+        menu.addItem(sendParent)
 
         let folderEntry = NSMenuItem(title: "打开接收文件夹", action: #selector(openReceiveFolder), keyEquivalent: "")
         folderEntry.target = self
@@ -253,13 +247,14 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         showHideMenuItem = showHideEntry
         toggleShareMenuItem = toggleShareEntry
         quickJumpParentItem = qjParent
-        quickJumpPeerItem = qjPeer
+        quickJumpSubmenu = qjSub
         screenLockMenuItem = lockEntry
         clipboardMenuItem = clipEntry
         inputStateMenuItem = imeEntry
         channelParentItem = chParent
         channelSubmenu = chSub
-        sendFilesMenuItem = sendEntry
+        sendFilesParentItem = sendParent
+        sendFilesSubmenu = sendSub
         autoStartMenuItem = autoStartEntry
     }
 
@@ -311,24 +306,102 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             toggleItem.title = peer.isSharing ? "暂停共享" : "恢复共享"
         }
 
-        quickJumpParentItem?.isHidden = !(peer.isSharing && peer.peerDeviceID != nil)
-        quickJumpPeerItem?.title = "#1 \(peerTag)"
+        var activePeers = peer.peers.filter(\.connected)
+        if activePeers.isEmpty, peer.isConnected, let pid = peer.peerDeviceID {
+            activePeers = [PeerInfo(
+                id: pid,
+                name: peerTag,
+                platform: "windows",
+                connected: true,
+                focused: isRemoteFocus,
+                slot: 1,
+                address: peer.peerAddress,
+                activeChannelLabel: peer.activeChannelLabel,
+                preferredChannel: "auto"
+            )]
+        }
+
+        quickJumpParentItem?.isHidden = !(peer.isSharing && !activePeers.isEmpty)
         screenLockMenuItem?.state = peer.screenLocked ? .on : .off
         clipboardMenuItem?.state = peer.clipboardSync ? .on : .off
         inputStateMenuItem?.state = peer.inputStateSync ? .on : .off
-        sendFilesMenuItem?.isEnabled = peer.isConnected
+        sendFilesParentItem?.isEnabled = peer.isConnected && !activePeers.isEmpty
         autoStartMenuItem?.state = isLaunchAgentEnabled() ? .on : .off
 
-        let sig = peer.selectedChannel + "|" + peer.networkChannels.map { "\($0.id):\($0.label)" }.joined(separator: ",")
+        let peersSig = activePeers.map { "\($0.id):\($0.name):\($0.focused):\($0.slot ?? 0)" }.joined(separator: "|")
+        if peersSig != lastPeersMenuSig {
+            lastPeersMenuSig = peersSig
+            if let qjSub = quickJumpSubmenu {
+                qjSub.removeAllItems()
+                let nextItem = NSMenuItem(title: "切到下一台设备", action: #selector(quickJumpNext), keyEquivalent: "")
+                nextItem.target = self
+                qjSub.addItem(nextItem)
+                let homeItem = NSMenuItem(title: "回到本机", action: #selector(quickJumpHome), keyEquivalent: "")
+                homeItem.target = self
+                qjSub.addItem(homeItem)
+                if !activePeers.isEmpty {
+                    qjSub.addItem(.separator())
+                    for (idx, p) in activePeers.enumerated() {
+                        let slot = p.slot ?? (idx + 1)
+                        let item = NSMenuItem(title: "#\(slot) \(p.name)", action: #selector(quickJumpToPeer(_:)), keyEquivalent: "")
+                        item.target = self
+                        item.representedObject = p.id
+                        item.state = p.focused ? .on : .off
+                        qjSub.addItem(item)
+                    }
+                }
+            }
+            if let sendSub = sendFilesSubmenu {
+                sendSub.removeAllItems()
+                for p in activePeers {
+                    let item = NSMenuItem(title: "发送给 \(p.name)…", action: #selector(pickAndSendFilesToPeer(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = p.id
+                    sendSub.addItem(item)
+                }
+                if activePeers.count > 1 {
+                    sendSub.addItem(.separator())
+                    let allItem = NSMenuItem(title: "发送给全部已连接设备…", action: #selector(pickAndSendFilesToPeer(_:)), keyEquivalent: "")
+                    allItem.target = self
+                    allItem.representedObject = nil
+                    sendSub.addItem(allItem)
+                }
+            }
+        }
+
+        let sig = peer.selectedChannel
+            + "|" + peer.networkChannels.map { "\($0.id):\($0.label)" }.joined(separator: ",")
+            + "|" + activePeers.map { "\($0.id):\($0.preferredChannel):\($0.activeChannelLabel ?? "")" }.joined(separator: ";")
         if sig != lastChannelMenuSig, let sub = channelSubmenu, let parent = channelParentItem {
             lastChannelMenuSig = sig
             sub.removeAllItems()
+            let hdr = NSMenuItem(title: "全局默认信道", action: nil, keyEquivalent: "")
+            hdr.isEnabled = false
+            sub.addItem(hdr)
             for ch in peer.networkChannels {
                 let item = NSMenuItem(title: ch.label, action: #selector(selectChannel(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = ch.id
                 item.state = (ch.id == peer.selectedChannel) ? .on : .off
                 sub.addItem(item)
+            }
+            if !activePeers.isEmpty {
+                sub.addItem(.separator())
+                for p in activePeers {
+                    let activeTag = p.activeChannelLabel.map { " (\($0))" } ?? ""
+                    let pItem = NSMenuItem(title: "\(p.name)\(activeTag)", action: nil, keyEquivalent: "")
+                    let pSub = NSMenu()
+                    for (idx, ch) in peer.networkChannels.enumerated() {
+                        let lbl = idx == 0 ? "跟随全局默认" : ch.label
+                        let chItem = NSMenuItem(title: lbl, action: #selector(selectPeerChannel(_:)), keyEquivalent: "")
+                        chItem.target = self
+                        chItem.representedObject = [p.id, ch.id]
+                        chItem.state = (ch.id == p.preferredChannel) ? .on : .off
+                        pSub.addItem(chItem)
+                    }
+                    pItem.submenu = pSub
+                    sub.addItem(pItem)
+                }
             }
             parent.isHidden = peer.networkChannels.isEmpty
         }
@@ -471,8 +544,8 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         peer.quickJump(to: "local")
     }
 
-    @objc private func quickJumpPeer() {
-        if let id = peer.peerDeviceID {
+    @objc private func quickJumpToPeer(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String {
             peer.quickJump(to: id)
         }
     }
@@ -489,23 +562,30 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func selectChannel(_ sender: NSMenuItem) {
         guard let chId = sender.representedObject as? String else { return }
-        peer.setChannel(chId, directPeer: chId == "auto" ? nil : peer.directPeer)
+        peer.setChannel(chId, directPeer: nil)
         refreshMenuBar()
     }
 
-    @objc private func pickAndSendFiles() {
+    @objc private func selectPeerChannel(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [String], pair.count == 2 else { return }
+        peer.setPeerChannel(deviceID: pair[0], channel: pair[1])
+        refreshMenuBar()
+    }
+
+    @objc private func pickAndSendFilesToPeer(_ sender: NSMenuItem) {
         guard peer.isConnected else { return }
+        let targetID = sender.representedObject as? String
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "发送"
-        panel.title = "选择要发送到对端的文件或文件夹"
+        panel.title = "选择要发送的文件或文件夹"
         if panel.runModal() == .OK {
             let paths = panel.urls.map { (($0 as NSURL).filePathURL ?? $0.standardizedFileURL).path }
             if !paths.isEmpty {
-                peer.sendFiles(paths)
+                peer.sendFiles(paths, targetDeviceID: targetID)
             }
         }
     }

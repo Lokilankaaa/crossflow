@@ -33,13 +33,20 @@ internal sealed class MainWindow : Window
     private readonly StackPanel peersPanel = new() { Spacing = 6 };
     private readonly TextBlock peerHint = new() { TextWrapping = TextWrapping.Wrap };
 
-    // Network channel selector
+    // Network channel selector + Multi-IP manual peers list
     private readonly ComboBox channelCombo = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
-    private readonly StackPanel directPeerPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
-    private readonly TextBox directPeerBox = new();
-    private readonly Button applyDirectPeerButton = new();
+    private readonly StackPanel manualPeersListPanel = new() { Spacing = 4 };
+    private readonly Button toggleAddManualButton = new();
+    private readonly StackPanel addManualEditorPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
+    private readonly TextBox manualIpBox = new();
+    private readonly TextBox manualLabelBox = new();
+    private readonly Button confirmAddManualButton = new();
     private bool updatingChannelUi;
     private string lastChannelListSig = "";
+    private string lastPeersListSig = "";
+    private string lastManualPeersSig = "";
+    private string? expandedPeerId;
+    private bool peerChannelDropDownOpen;
 
     // Minimal password configuration (已配置 / 未配置)
     private readonly TextBlock passwordStateBadge = new();
@@ -216,51 +223,71 @@ internal sealed class MainWindow : Window
             Margin = new Thickness(0, 0, 0, 6)
         });
 
-        // LAN Devices section
-        sidebar.Children.Add(SectionLabel("附近设备"));
+        // LAN Devices section (multi-device list + manual IP list)
+        sidebar.Children.Add(SectionLabel("设备列表"));
         peerHint.FontSize = 12;
         peerHint.Foreground = theme.Brush("text_secondary");
-        peerHint.Text = "另一台电脑打开 Crossflow 后自动连接。";
+        peerHint.Text = "其他电脑打开 Crossflow 后自动发现并连接。";
         peerHint.Margin = new Thickness(2, 0, 0, 4);
         sidebar.Children.Add(peerHint);
         sidebar.Children.Add(peersPanel);
 
+        // Manual IP list (ZeroTier / cross-subnet static peers)
+        sidebar.Children.Add(manualPeersListPanel);
+        toggleAddManualButton.Content = "+ 手动添加设备 IP";
+        toggleAddManualButton.FontSize = 11.5;
+        toggleAddManualButton.Foreground = theme.Brush("accent");
+        toggleAddManualButton.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        toggleAddManualButton.BorderThickness = new Thickness(0);
+        toggleAddManualButton.Padding = new Thickness(2, 4, 2, 2);
+        toggleAddManualButton.HorizontalAlignment = HorizontalAlignment.Left;
+        toggleAddManualButton.Click += (_, _) =>
+        {
+            bool show = addManualEditorPanel.Visibility != Visibility.Visible;
+            addManualEditorPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            if (show) manualIpBox.Focus(FocusState.Programmatic);
+        };
+        sidebar.Children.Add(toggleAddManualButton);
+
+        manualIpBox.PlaceholderText = "对方 IP（如 192.168.194.59）";
+        manualIpBox.FontSize = 12;
+        manualLabelBox.PlaceholderText = "备注名称（可选，如 办公室 Mac）";
+        manualLabelBox.FontSize = 12;
+        StyleCompactButton(confirmAddManualButton, "添加到列表");
+        confirmAddManualButton.HorizontalAlignment = HorizontalAlignment.Stretch;
+        confirmAddManualButton.Click += async (_, _) =>
+        {
+            string addr = manualIpBox.Text.Trim();
+            if (string.IsNullOrEmpty(addr))
+            {
+                ShowNotice("请输入有效的 IPv4 地址（可选 :端口）。", isError: true);
+                return;
+            }
+            ClearNotice();
+            await peerMesh.AddManualPeerAsync(addr, manualLabelBox.Text.Trim(), currentSnap.SelectedChannel);
+            manualIpBox.Text = "";
+            manualLabelBox.Text = "";
+            addManualEditorPanel.Visibility = Visibility.Collapsed;
+        };
+        addManualEditorPanel.Children.Add(manualIpBox);
+        addManualEditorPanel.Children.Add(manualLabelBox);
+        addManualEditorPanel.Children.Add(confirmAddManualButton);
+        sidebar.Children.Add(addManualEditorPanel);
+
         sidebar.Children.Add(Divider());
 
-        // Network Channel selector
-        sidebar.Children.Add(SectionLabel("网络信道"));
+        // Global Default Network Channel selector
+        sidebar.Children.Add(SectionLabel("默认网络信道"));
         channelCombo.FontSize = 12;
         channelCombo.SelectionChanged += async (_, _) =>
         {
             if (updatingChannelUi) return;
             if (channelCombo.SelectedItem is ComboBoxItem { Tag: string channelId })
             {
-                bool showDirect = channelId != "auto";
-                directPeerPanel.Visibility = showDirect ? Visibility.Visible : Visibility.Collapsed;
-                string? direct = showDirect ? directPeerBox.Text.Trim() : null;
-                await peerMesh.SetChannelAsync(channelId, direct);
+                await peerMesh.SetChannelAsync(channelId, null);
             }
         };
         sidebar.Children.Add(channelCombo);
-
-        directPeerBox.PlaceholderText = "对方 IP（可选，如 192.168.194.59）";
-        directPeerBox.FontSize = 12;
-        applyDirectPeerButton.Content = "指定连接";
-        applyDirectPeerButton.FontSize = 12;
-        applyDirectPeerButton.HorizontalAlignment = HorizontalAlignment.Stretch;
-        applyDirectPeerButton.Background = theme.Brush("background");
-        applyDirectPeerButton.BorderBrush = theme.Brush("border");
-        applyDirectPeerButton.BorderThickness = new Thickness(1);
-        applyDirectPeerButton.CornerRadius = new CornerRadius(8);
-        applyDirectPeerButton.Padding = new Thickness(10, 6, 10, 6);
-        applyDirectPeerButton.Click += async (_, _) =>
-        {
-            string channelId = (channelCombo.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
-            await peerMesh.SetChannelAsync(channelId, directPeerBox.Text.Trim());
-        };
-        directPeerPanel.Children.Add(directPeerBox);
-        directPeerPanel.Children.Add(applyDirectPeerButton);
-        sidebar.Children.Add(directPeerPanel);
 
         sidebar.Children.Add(Divider());
 
@@ -708,14 +735,20 @@ internal sealed class MainWindow : Window
         workspace.RowDefinitions.Add(new() { Height = GridLength.Auto });
         workspace.RowDefinitions.Add(new() { Height = GridLength.Auto });
 
-        // Drag & drop files anywhere onto workspace to send directly to peer!
+        // Drag & drop files onto a specific device screen (or workspace) to send!
         workspace.AllowDrop = true;
         workspace.DragOver += (_, e) =>
         {
-            if (currentSnap.PeerDeviceId is not null && e.DataView.Contains(StandardDataFormats.StorageItems))
+            var connected = currentSnap.Peers.Where(p => p.Connected).ToList();
+            if ((connected.Count > 0 || currentSnap.PeerDeviceId is not null)
+                && e.DataView.Contains(StandardDataFormats.StorageItems))
             {
                 e.AcceptedOperation = DataPackageOperation.Copy;
-                e.DragUIOverride.Caption = $"发送到 {currentSnap.PeerName ?? "对方设备"}";
+                string? hitDev = HitTestRemoteDeviceAtDrop(e);
+                string targetLabel = hitDev is not null
+                    ? DeviceName(hitDev)
+                    : (connected.Count > 1 ? "全部已连接设备" : (connected.FirstOrDefault()?.Name ?? currentSnap.PeerName ?? "对方设备"));
+                e.DragUIOverride.Caption = $"发送到 {targetLabel}";
             }
             else
             {
@@ -724,12 +757,14 @@ internal sealed class MainWindow : Window
         };
         workspace.Drop += async (_, e) =>
         {
-            if (currentSnap.PeerDeviceId is null || !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+            if ((currentSnap.Peers.All(p => !p.Connected) && currentSnap.PeerDeviceId is null)
+                || !e.DataView.Contains(StandardDataFormats.StorageItems)) return;
             try
             {
+                string? hitDev = HitTestRemoteDeviceAtDrop(e);
                 var items = await e.DataView.GetStorageItemsAsync();
                 var paths = items.Select(i => i.Path).Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
-                if (paths.Count > 0) await peerMesh.SendFilesAsync(paths);
+                if (paths.Count > 0) await peerMesh.SendFilesAsync(paths, hitDev);
             }
             catch { }
         };
@@ -877,17 +912,40 @@ internal sealed class MainWindow : Window
             trayIcon.ToggleClipboardRequested += enabled => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetClipboardAsync(enabled));
             trayIcon.ToggleInputStateRequested += enabled => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetInputStateSyncAsync(enabled));
             trayIcon.SelectChannelRequested += chId => DispatcherQueue.TryEnqueue(async () =>
-                await peerMesh.SetChannelAsync(chId, chId == "auto" ? null : directPeerBox.Text));
-            trayIcon.SendFilesDialogRequested += () => DispatcherQueue.TryEnqueue(async () => await PickAndSendFilesAsync());
+                await peerMesh.SetChannelAsync(chId, null));
+            trayIcon.SelectPeerChannelRequested += (devId, chId) => DispatcherQueue.TryEnqueue(async () =>
+                await peerMesh.SetPeerChannelAsync(devId, chId));
+            trayIcon.SendFilesDialogRequested += targetId => DispatcherQueue.TryEnqueue(async () => await PickAndSendFilesAsync(targetId));
             trayIcon.OpenReceiveFolderRequested += () => DispatcherQueue.TryEnqueue(OpenReceiveFolder);
             trayIcon.ExitRequested += () => DispatcherQueue.TryEnqueue(async () => await ExitApplicationAsync());
         }
         catch { }
     }
 
-    private async Task PickAndSendFilesAsync()
+    private string? HitTestRemoteDeviceAtDrop(DragEventArgs e)
     {
-        if (currentSnap.PeerDeviceId is null) return;
+        if (scale <= 0 || layout.Screens.Count == 0) return null;
+        try
+        {
+            var pt = e.GetPosition(canvas);
+            foreach (var s in layout.Screens)
+            {
+                if (s.DeviceId == currentSnap.LocalDeviceId || s.DeviceId == "local") continue;
+                double left = offsetX + s.X * scale;
+                double top = offsetY + s.Y * scale;
+                double w = s.Width * scale;
+                double h = s.Height * scale;
+                if (pt.X >= left && pt.X <= left + w && pt.Y >= top && pt.Y <= top + h)
+                    return s.DeviceId;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private async Task PickAndSendFilesAsync(string? targetDeviceId = null)
+    {
+        if (currentSnap.Peers.All(p => !p.Connected) && currentSnap.PeerDeviceId is null) return;
         try
         {
             var picker = new FileOpenPicker();
@@ -897,7 +955,7 @@ internal sealed class MainWindow : Window
             if (files is null || files.Count == 0) return;
             var paths = files.Select(f => f.Path).Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
             if (paths.Count > 0)
-                await peerMesh.SendFilesAsync(paths);
+                await peerMesh.SendFilesAsync(paths, targetDeviceId);
         }
         catch { }
     }
@@ -1100,6 +1158,21 @@ internal sealed class MainWindow : Window
             ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}{(snap.ScreenLocked ? "（已锁定）" : "")}"
             : null;
 
+        var activePeers = snap.Peers.Where(p => p.Connected).ToList();
+        if (activePeers.Count == 0 && snap.PeerDeviceId is not null && snap.State is "sharing" or "paused")
+        {
+            activePeers.Add(new PeerInfo(
+                snap.PeerDeviceId,
+                snap.PeerName ?? "远端设备",
+                "peer",
+                true,
+                isRemoteFocus,
+                1,
+                snap.PeerAddress,
+                snap.ActiveChannelLabel,
+                "auto"));
+        }
+
         trayIcon?.UpdateState(
             trayVisual,
             trayTip,
@@ -1109,8 +1182,7 @@ internal sealed class MainWindow : Window
             canToggle: snap.State is "sharing" or "paused",
             sharing: snap.State == "sharing",
             locked: snap.ScreenLocked,
-            remotePeerId: snap.PeerDeviceId,
-            remotePeerName: snap.PeerName,
+            activePeers: activePeers,
             clipboardSync: snap.ClipboardSync,
             inputStateSync: snap.InputStateSync,
             channelId: snap.SelectedChannel,
@@ -1131,6 +1203,7 @@ internal sealed class MainWindow : Window
         }
 
         RenderDiscoveredPeers(snap);
+        RenderManualPeers(snap);
         UpdateTransferBar(snap.Transfer);
         SyncCanvasFromSnapshot(snap);
         UpdateControls();
@@ -1215,11 +1288,6 @@ internal sealed class MainWindow : Window
             if (desiredIndex < 0 && channelCombo.Items.Count > 0) desiredIndex = 0;
             if (desiredIndex >= 0 && channelCombo.SelectedIndex != desiredIndex)
                 channelCombo.SelectedIndex = desiredIndex;
-
-            bool showDirect = snap.SelectedChannel != "auto";
-            directPeerPanel.Visibility = showDirect ? Visibility.Visible : Visibility.Collapsed;
-            if (!directPeerBox.FocusState.Equals(FocusState.Keyboard) && !directPeerBox.FocusState.Equals(FocusState.Pointer))
-                directPeerBox.Text = snap.DirectPeer ?? "";
         }
         finally
         {
@@ -1227,24 +1295,91 @@ internal sealed class MainWindow : Window
         }
     }
 
+    private void RenderManualPeers(PeerMeshSnapshot snap)
+    {
+        string sig = string.Join("|", snap.ManualPeers.Select(m => $"{m.Address}:{m.Label}:{m.Channel}"));
+        if (sig == lastManualPeersSig) return;
+        lastManualPeersSig = sig;
+        manualPeersListPanel.Children.Clear();
+        foreach (var mp in snap.ManualPeers)
+        {
+            var row = new Grid { ColumnSpacing = 6 };
+            row.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+
+            string title = string.IsNullOrWhiteSpace(mp.Label) ? mp.Address : $"{mp.Label} · {mp.Address}";
+            row.Children.Add(new TextBlock
+            {
+                Text = $"手动 · {title}",
+                FontSize = 11,
+                Foreground = theme.Brush("text_secondary"),
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+            var del = new Button
+            {
+                Content = "×",
+                FontSize = 11,
+                Padding = new Thickness(5, 1, 5, 1),
+                MinWidth = 22,
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                Foreground = theme.Brush("text_secondary"),
+                BorderThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(5)
+            };
+            string addr = mp.Address;
+            del.Click += async (_, _) => await peerMesh.RemoveManualPeerAsync(addr);
+            Grid.SetColumn(del, 1);
+            row.Children.Add(del);
+
+            manualPeersListPanel.Children.Add(new Border
+            {
+                Child = row,
+                Padding = new Thickness(8, 4, 4, 4),
+                Background = theme.Brush("background"),
+                BorderBrush = theme.Brush("border"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7)
+            });
+        }
+    }
+
     private void RenderDiscoveredPeers(PeerMeshSnapshot snap)
     {
-        peersPanel.Children.Clear();
-        peerHint.Visibility = snap.DiscoveredPeers.Count == 0 && snap.PeerName is null
-            ? Visibility.Visible
-            : Visibility.Collapsed;
+        if (peerChannelDropDownOpen) return;
 
-        var items = snap.DiscoveredPeers.ToList();
-        if (items.Count == 0 && snap.PeerName is not null && snap.PeerDeviceId is not null)
+        var items = snap.Peers.ToList();
+        if (items.Count == 0 && snap.DiscoveredPeers.Count > 0)
         {
-            items.Add(new DiscoveredPeerInfo(snap.PeerDeviceId[..Math.Min(32, snap.PeerDeviceId.Length)], snap.PeerName, "peer", true));
+            items = snap.DiscoveredPeers.Select(d => new PeerInfo(
+                d.Id, d.Name, d.Platform, d.Connected, false, d.Connected ? 1 : null,
+                d.Connected ? snap.PeerAddress : null, d.Connected ? snap.ActiveChannelLabel : null, "auto")).ToList();
         }
+        else if (items.Count == 0 && snap.PeerName is not null && snap.PeerDeviceId is not null)
+        {
+            items.Add(new PeerInfo(
+                snap.PeerDeviceId, snap.PeerName, "peer", true, false, 1,
+                snap.PeerAddress, snap.ActiveChannelLabel, "auto"));
+        }
+
+        string sig = (expandedPeerId ?? "")
+            + "|" + string.Join(",", snap.NetworkChannels.Select(c => c.Id))
+            + "|" + string.Join(";", items.Select(p => $"{p.Id}:{p.Name}:{p.Connected}:{p.Focused}:{p.Slot}:{p.Address}:{p.ActiveChannelLabel}:{p.PreferredChannel}"));
+        if (sig == lastPeersListSig) return;
+        lastPeersListSig = sig;
+
+        peersPanel.Children.Clear();
+        peerHint.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
         foreach (var peer in items)
         {
-            var row = new Grid { ColumnSpacing = 8 };
+            bool isExpanded = string.Equals(expandedPeerId, peer.Id, StringComparison.Ordinal);
+            var cardStack = new StackPanel { Spacing = 8 };
+
+            var row = new Grid { ColumnSpacing = 7 };
             row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
 
             row.Children.Add(new FontIcon
@@ -1258,16 +1393,17 @@ internal sealed class MainWindow : Window
             });
 
             var info = new StackPanel { Spacing = 1 };
+            string slotPrefix = peer.Slot is int s ? $"#{s} " : "";
             info.Children.Add(new TextBlock
             {
-                Text = peer.Name,
+                Text = $"{slotPrefix}{peer.Name}",
                 FontSize = 13,
                 FontWeight = peer.Connected ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal,
                 Foreground = theme.Brush("text"),
                 TextTrimming = TextTrimming.CharacterEllipsis
             });
-            string sub = peer.Connected && snap.PeerAddress is not null
-                ? (snap.ActiveChannelLabel is { Length: > 0 } ch ? $"{ch} · {snap.PeerAddress}" : snap.PeerAddress)
+            string sub = peer.Connected && peer.Address is not null
+                ? (peer.ActiveChannelLabel is { Length: > 0 } ch ? $"{ch} · {peer.Address}" : peer.Address)
                 : peer.Platform == "macos" ? "macOS" : "Windows";
             info.Children.Add(new TextBlock { Text = sub, FontSize = 11, Foreground = theme.Brush("text_secondary"), TextTrimming = TextTrimming.CharacterEllipsis });
             Grid.SetColumn(info, 1);
@@ -1275,20 +1411,102 @@ internal sealed class MainWindow : Window
 
             var badge = new TextBlock
             {
-                Text = peer.Connected ? "已连接" : "已发现",
+                Text = peer.Focused ? "控制中" : (peer.Connected ? "已连接" : "已发现"),
                 FontSize = 11,
-                Foreground = peer.Connected
-                    ? new SolidColorBrush(global::Windows.UI.Color.FromArgb(255, 22, 163, 74))
-                    : theme.Brush("text_secondary"),
+                Foreground = peer.Focused
+                    ? theme.Brush("accent")
+                    : peer.Connected
+                        ? new SolidColorBrush(global::Windows.UI.Color.FromArgb(255, 22, 163, 74))
+                        : theme.Brush("text_secondary"),
                 VerticalAlignment = VerticalAlignment.Center
             };
             Grid.SetColumn(badge, 2);
             row.Children.Add(badge);
 
+            var gear = new Button
+            {
+                Content = isExpanded ? "▴" : "▾",
+                FontSize = 11,
+                Padding = new Thickness(5, 2, 5, 2),
+                MinWidth = 22,
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                Foreground = theme.Brush("text_secondary"),
+                BorderThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(5)
+            };
+            string peerId = peer.Id;
+            ToolTipService.SetToolTip(gear, "该设备信道与快捷操作");
+            gear.Click += (_, _) =>
+            {
+                expandedPeerId = isExpanded ? null : peerId;
+                lastPeersListSig = "";
+                RenderDiscoveredPeers(currentSnap);
+            };
+            Grid.SetColumn(gear, 3);
+            row.Children.Add(gear);
+            cardStack.Children.Add(row);
+
+            if (isExpanded)
+            {
+                var drawer = new StackPanel { Spacing = 6, Margin = new Thickness(0, 2, 0, 0) };
+                drawer.Children.Add(new TextBlock
+                {
+                    Text = "此设备信道",
+                    FontSize = 11,
+                    Foreground = theme.Brush("text_secondary")
+                });
+                var chBox = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, FontSize = 11.5 };
+                int selIdx = 0;
+                for (int i = 0; i < snap.NetworkChannels.Count; i++)
+                {
+                    var netCh = snap.NetworkChannels[i];
+                    string lbl = i == 0 ? "跟随全局默认" : netCh.Label;
+                    chBox.Items.Add(new ComboBoxItem { Content = lbl, Tag = netCh.Id });
+                    if (string.Equals(netCh.Id, peer.PreferredChannel, StringComparison.Ordinal))
+                        selIdx = i;
+                }
+                if (chBox.Items.Count > 0) chBox.SelectedIndex = selIdx;
+                chBox.DropDownOpened += (_, _) => peerChannelDropDownOpen = true;
+                chBox.DropDownClosed += (_, _) => peerChannelDropDownOpen = false;
+                chBox.SelectionChanged += async (_, _) =>
+                {
+                    if (chBox.SelectedItem is ComboBoxItem { Tag: string cid }
+                        && !string.Equals(cid, peer.PreferredChannel, StringComparison.Ordinal))
+                    {
+                        await peerMesh.SetPeerChannelAsync(peerId, cid);
+                    }
+                };
+                drawer.Children.Add(chBox);
+
+                if (peer.Connected)
+                {
+                    var actions = new Grid { ColumnSpacing = 6 };
+                    actions.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                    actions.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+
+                    var qjBtn = new Button { HorizontalAlignment = HorizontalAlignment.Stretch };
+                    StyleCompactButton(qjBtn, "QuickJump");
+                    qjBtn.FontSize = 11;
+                    qjBtn.Padding = new Thickness(6, 4, 6, 4);
+                    qjBtn.Click += async (_, _) => await peerMesh.QuickJumpAsync(peerId);
+                    actions.Children.Add(qjBtn);
+
+                    var sendBtn = new Button { HorizontalAlignment = HorizontalAlignment.Stretch };
+                    StyleCompactButton(sendBtn, "发文件…");
+                    sendBtn.FontSize = 11;
+                    sendBtn.Padding = new Thickness(6, 4, 6, 4);
+                    sendBtn.Click += async (_, _) => await PickAndSendFilesAsync(peerId);
+                    Grid.SetColumn(sendBtn, 1);
+                    actions.Children.Add(sendBtn);
+                    drawer.Children.Add(actions);
+                }
+                cardStack.Children.Add(drawer);
+            }
+
             peersPanel.Children.Add(new Border
             {
-                Child = row,
-                Padding = new Thickness(10, 8, 10, 8),
+                Child = cardStack,
+                Padding = new Thickness(10, 8, 8, 8),
                 Background = theme.Brush(peer.Connected ? "accent_subtle" : "background"),
                 BorderBrush = theme.Brush(peer.Connected ? "accent" : "border"),
                 BorderThickness = new Thickness(1),
@@ -1366,6 +1584,8 @@ internal sealed class MainWindow : Window
     {
         snap ??= currentSnap;
         if (id == snap.LocalDeviceId || id == "local") return snap.LocalName is { Length: > 0 } ln ? $"{ln} (本机)" : "本机 Windows";
+        var matched = snap.Peers.FirstOrDefault(p => p.Id == id || id.StartsWith(p.Id, StringComparison.Ordinal) || p.Id.StartsWith(id, StringComparison.Ordinal));
+        if (matched is not null) return matched.Name;
         if (id == snap.PeerDeviceId) return snap.PeerName ?? "远端设备";
         return id.Length > 8 ? id[..8] : id;
     }

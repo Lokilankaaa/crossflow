@@ -73,6 +73,10 @@ struct WorkspaceView: View {
     @ViewState private var passwordInput = ""
     @ViewState private var hotkeysExpanded = false
     @ViewState private var recordingHotkeyField: String?
+    @ViewState private var expandedPeerID: String?
+    @ViewState private var addingManualPeer = false
+    @ViewState private var manualPeerAddress = ""
+    @ViewState private var manualPeerLabel = ""
 
     var body: some View {
         HStack(spacing: 0) {
@@ -190,45 +194,114 @@ struct WorkspaceView: View {
                 .background(Theme.background, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border, lineWidth: 1))
 
-                // Nearby Devices section
-                Text("附近设备")
+                // Multi-device list section (1:1 with Windows)
+                Text("设备列表")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.secondary)
                     .padding(.top, 2)
 
-                if peer.discoveredPeers.isEmpty && peer.peerName == nil {
-                    Text("另一台电脑打开 Crossflow 后自动连接。")
+                let displayPeers: [PeerInfo] = {
+                    if !peer.peers.isEmpty { return peer.peers }
+                    if !peer.discoveredPeers.isEmpty {
+                        return peer.discoveredPeers.map {
+                            PeerInfo(id: $0.id, name: $0.name, platform: $0.platform, connected: $0.connected, focused: false, slot: $0.connected ? 1 : nil, address: $0.connected ? peer.peerAddress : nil, activeChannelLabel: $0.connected ? peer.activeChannelLabel : nil, preferredChannel: "auto")
+                        }
+                    }
+                    if let pname = peer.peerName, let pid = peer.peerDeviceID {
+                        return [PeerInfo(id: pid, name: pname, platform: "windows", connected: true, focused: false, slot: 1, address: peer.peerAddress, activeChannelLabel: peer.activeChannelLabel, preferredChannel: "auto")]
+                    }
+                    return []
+                }()
+
+                if displayPeers.isEmpty {
+                    Text("其他电脑打开 Crossflow 后自动发现并连接。")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.secondary)
                 } else {
                     VStack(spacing: 6) {
-                        let list = peer.discoveredPeers.isEmpty && peer.peerName != nil
-                            ? [DiscoveredPeerInfo(id: peer.peerDeviceID ?? "peer", name: peer.peerName ?? "远端设备", platform: "windows", connected: true)]
-                            : peer.discoveredPeers
-                        ForEach(list) { dev in
-                            HStack(spacing: 10) {
-                                Image(systemName: dev.platform == "macos" ? "laptopcomputer" : "desktopcomputer")
-                                    .foregroundStyle(dev.connected ? Color(red: 22/255, green: 163/255, blue: 74/255) : Theme.secondary)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(dev.name)
-                                        .font(.system(size: 13, weight: dev.connected ? .semibold : .regular))
-                                        .lineLimit(1)
-                                    let sub: String = {
-                                        if dev.connected, let addr = peer.peerAddress {
-                                            if let ch = peer.activeChannelLabel { return "\(ch) · \(addr)" }
-                                            return addr
-                                        }
-                                        return dev.platform == "macos" ? "macOS" : "Windows"
-                                    }()
-                                    Text(sub)
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(Theme.secondary)
-                                        .lineLimit(1)
+                        ForEach(displayPeers) { dev in
+                            let isExpanded = expandedPeerID == dev.id
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: dev.platform == "macos" ? "laptopcomputer" : "desktopcomputer")
+                                        .foregroundStyle(dev.connected ? Color(red: 22/255, green: 163/255, blue: 74/255) : Theme.secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        let slotTag = dev.slot.map { "#\($0) " } ?? ""
+                                        Text("\(slotTag)\(dev.name)")
+                                            .font(.system(size: 13, weight: dev.connected ? .semibold : .regular))
+                                            .lineLimit(1)
+                                        let sub: String = {
+                                            if dev.connected, let addr = dev.address {
+                                                if let ch = dev.activeChannelLabel { return "\(ch) · \(addr)" }
+                                                return addr
+                                            }
+                                            return dev.platform == "macos" ? "macOS" : "Windows"
+                                        }()
+                                        Text(sub)
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Theme.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Text(dev.focused ? "控制中" : (dev.connected ? "已连接" : "已发现"))
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(dev.focused ? Theme.accent : (dev.connected ? Color(red: 22/255, green: 163/255, blue: 74/255) : Theme.secondary))
+                                    Button {
+                                        expandedPeerID = isExpanded ? nil : dev.id
+                                    } label: {
+                                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .foregroundStyle(Theme.secondary)
+                                            .padding(4)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("该设备信道与快捷操作")
                                 }
-                                Spacer()
-                                Text(dev.connected ? "已连接" : "已发现")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundStyle(dev.connected ? Color(red: 22/255, green: 163/255, blue: 74/255) : Theme.secondary)
+
+                                if isExpanded {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text("此设备信道")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Theme.secondary)
+                                        let peerChBinding = Binding<String>(
+                                            get: { dev.preferredChannel },
+                                            set: { next in
+                                                peer.setPeerChannel(deviceID: dev.id, channel: next)
+                                            }
+                                        )
+                                        Picker("", selection: peerChBinding) {
+                                            if peer.networkChannels.isEmpty {
+                                                Text("跟随全局默认").tag("auto")
+                                            } else {
+                                                ForEach(Array(peer.networkChannels.enumerated()), id: \.element.id) { idx, ch in
+                                                    Text(idx == 0 ? "跟随全局默认" : ch.label).tag(ch.id)
+                                                }
+                                            }
+                                        }
+                                        .labelsHidden()
+                                        .controlSize(.small)
+                                        .frame(maxWidth: .infinity)
+
+                                        if dev.connected {
+                                            HStack(spacing: 6) {
+                                                Button("QuickJump") {
+                                                    peer.quickJump(to: dev.id)
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .controlSize(.small)
+                                                .frame(maxWidth: .infinity)
+
+                                                Button("发文件…") {
+                                                    pickAndSendFiles(targetDeviceID: dev.id)
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .controlSize(.small)
+                                                .frame(maxWidth: .infinity)
+                                            }
+                                        }
+                                    }
+                                    .padding(.top, 2)
+                                }
                             }
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
@@ -238,18 +311,82 @@ struct WorkspaceView: View {
                     }
                 }
 
+                // Multi-IP Manual Peers list (ZeroTier / cross-subnet static peers)
+                if !peer.manualPeers.isEmpty {
+                    VStack(spacing: 4) {
+                        ForEach(peer.manualPeers) { mp in
+                            HStack(spacing: 6) {
+                                let title = (mp.label?.isEmpty == false) ? "\(mp.label!) · \(mp.address)" : mp.address
+                                Text("手动 · \(title)")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Button {
+                                    peer.removeManualPeer(address: mp.address)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(Theme.secondary.opacity(0.75))
+                                }
+                                .buttonStyle(.plain)
+                                .help("移除该手动地址")
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Theme.background, in: RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Theme.border, lineWidth: 1))
+                        }
+                    }
+                }
+
+                Button {
+                    addingManualPeer.toggle()
+                } label: {
+                    Text("+ 手动添加设备 IP")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(Theme.accent)
+                }
+                .buttonStyle(.plain)
+
+                if addingManualPeer {
+                    VStack(spacing: 6) {
+                        TextField("对方 IP（如 192.168.194.10）", text: $manualPeerAddress)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12))
+                        TextField("备注名称（可选，如 办公室 Win）", text: $manualPeerLabel)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12))
+                        Button("添加到列表") {
+                            let addr = manualPeerAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if addr.isEmpty {
+                                layoutNotice = "请输入有效的 IPv4 地址（可选 :端口）。"
+                                return
+                            }
+                            layoutNotice = nil
+                            peer.addManualPeer(address: addr, label: manualPeerLabel, channel: peer.selectedChannel)
+                            manualPeerAddress = ""
+                            manualPeerLabel = ""
+                            addingManualPeer = false
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
-                // Network Channel selector (1:1 with Windows)
+                // Global Default Network Channel selector (1:1 with Windows)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("网络信道")
+                    Text("默认网络信道")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Theme.secondary)
 
                     let channelBinding = Binding<String>(
                         get: { peer.selectedChannel },
                         set: { next in
-                            peer.setChannel(next, directPeer: next == "auto" ? nil : peer.directPeer)
+                            peer.setChannel(next, directPeer: nil)
                         }
                     )
                     Picker("", selection: channelBinding) {
@@ -263,18 +400,6 @@ struct WorkspaceView: View {
                     }
                     .labelsHidden()
                     .frame(maxWidth: .infinity)
-
-                    if peer.selectedChannel != "auto" {
-                        TextField("对方 IP（可选，如 192.168.194.10）", text: $peer.directPeer)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 12))
-                        Button("指定连接") {
-                            peer.setChannel(peer.selectedChannel, directPeer: peer.directPeer)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .frame(maxWidth: .infinity)
-                    }
                 }
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
@@ -740,6 +865,21 @@ struct WorkspaceView: View {
 
         func snapshot() -> [String] {
             lock.withLock { paths }
+        }
+    }
+
+    private func pickAndSendFiles(targetDeviceID: String?) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "发送"
+        panel.title = "选择要发送的文件或文件夹"
+        if panel.runModal() == .OK {
+            let paths = panel.urls.map { (($0 as NSURL).filePathURL ?? $0.standardizedFileURL).path }
+            if !paths.isEmpty {
+                peer.sendFiles(paths, targetDeviceID: targetDeviceID)
+            }
         }
     }
 

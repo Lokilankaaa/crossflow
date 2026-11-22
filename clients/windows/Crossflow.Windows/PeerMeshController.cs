@@ -52,6 +52,22 @@ internal sealed record TransferStatusInfo(
     [property: JsonPropertyName("saved_dir")] string? SavedDir,
     [property: JsonPropertyName("error")] string? Error);
 
+internal sealed record ManualPeerInfo(
+    [property: JsonPropertyName("address")] string Address,
+    [property: JsonPropertyName("label")] string? Label,
+    [property: JsonPropertyName("channel")] string Channel);
+
+internal sealed record PeerInfo(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("platform")] string Platform,
+    [property: JsonPropertyName("connected")] bool Connected,
+    [property: JsonPropertyName("focused")] bool Focused,
+    [property: JsonPropertyName("slot")] int? Slot,
+    [property: JsonPropertyName("address")] string? Address,
+    [property: JsonPropertyName("active_channel_label")] string? ActiveChannelLabel,
+    [property: JsonPropertyName("preferred_channel")] string PreferredChannel);
+
 internal sealed record HotkeyConfigInfo(
     [property: JsonPropertyName("toggle_sharing")] string? ToggleSharing,
     [property: JsonPropertyName("lock_screen")] string? LockScreen,
@@ -86,6 +102,8 @@ internal sealed record PeerMeshSnapshot(
     string? DirectPeer,
     string? ActiveChannelLabel,
     IReadOnlyList<NetworkChannelInfo> NetworkChannels,
+    IReadOnlyList<ManualPeerInfo> ManualPeers,
+    IReadOnlyList<PeerInfo> Peers,
     bool RouteEnabled,
     string? FocusDeviceId,
     string? FocusScreenId,
@@ -102,7 +120,7 @@ internal sealed record PeerMeshSnapshot(
     long Generation)
 {
     internal static PeerMeshSnapshot Initial => new(
-        "idle", null, null, "open", false, true, true, true, false, HotkeyConfigInfo.Defaults, "auto", null, null, [],
+        "idle", null, null, "open", false, true, true, true, false, HotkeyConfigInfo.Defaults, "auto", null, null, [], [], [],
         false, null, null, null, null, null, null,
         [], [], null, null, null, false, 0);
 }
@@ -228,6 +246,12 @@ internal sealed class PeerMeshController
     internal Task ApplyLayoutAsync(PeerSharedLayout layout) => SendCommandAsync(new { op = "apply_layout", layout });
     internal Task SetChannelAsync(string channel, string? directPeer) =>
         SendCommandAsync(new { op = "set_channel", channel, direct_peer = string.IsNullOrWhiteSpace(directPeer) ? null : directPeer.Trim() });
+    internal Task SetPeerChannelAsync(string deviceId, string channel) =>
+        SendCommandAsync(new { op = "set_peer_channel", device_id = deviceId, channel });
+    internal Task AddManualPeerAsync(string address, string? label = null, string channel = "auto") =>
+        SendCommandAsync(new { op = "add_manual_peer", address = address.Trim(), label = string.IsNullOrWhiteSpace(label) ? null : label.Trim(), channel });
+    internal Task RemoveManualPeerAsync(string address) =>
+        SendCommandAsync(new { op = "remove_manual_peer", address = address.Trim() });
     internal Task SetPassphraseAsync(string? passphrase) =>
         SendCommandAsync(new { op = "set_passphrase", passphrase = string.IsNullOrWhiteSpace(passphrase) ? null : passphrase.Trim() });
     internal Task SetKeymapAsync(bool enabled) =>
@@ -244,8 +268,8 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_screen_lock", locked });
     internal Task QuickJumpAsync(string? targetDeviceId) =>
         SendCommandAsync(new { op = "quick_jump", target_device_id = targetDeviceId });
-    internal Task SendFilesAsync(IReadOnlyList<string> paths) =>
-        SendCommandAsync(new { op = "send_files", paths });
+    internal Task SendFilesAsync(IReadOnlyList<string> paths, string? targetDeviceId = null) =>
+        SendCommandAsync(new { op = "send_files", target_device_id = targetDeviceId, paths });
     internal Task CancelTransferAsync() =>
         SendCommandAsync(new { op = "cancel_transfer" });
 
@@ -337,6 +361,8 @@ internal sealed class PeerMeshController
                             parsed.DirectPeer,
                             parsed.ActiveChannelLabel,
                             parsed.NetworkChannels ?? [],
+                            parsed.ManualPeers ?? [],
+                            parsed.Peers ?? [],
                             parsed.RouteEnabled,
                             parsed.FocusDeviceId,
                             parsed.FocusScreenId,
@@ -407,6 +433,8 @@ internal sealed class PeerMeshController
         [JsonPropertyName("direct_peer")] public string? DirectPeer { get; set; }
         [JsonPropertyName("active_channel_label")] public string? ActiveChannelLabel { get; set; }
         [JsonPropertyName("network_channels")] public List<NetworkChannelInfo>? NetworkChannels { get; set; }
+        [JsonPropertyName("manual_peers")] public List<ManualPeerInfo>? ManualPeers { get; set; }
+        [JsonPropertyName("peers")] public List<PeerInfo>? Peers { get; set; }
         [JsonPropertyName("route_enabled")] public bool RouteEnabled { get; set; }
         [JsonPropertyName("focus_device_id")] public string? FocusDeviceId { get; set; }
         [JsonPropertyName("focus_screen_id")] public string? FocusScreenId { get; set; }
