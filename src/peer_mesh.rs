@@ -829,17 +829,16 @@ impl Host for PeerHost<'_> {
             self.pending = Some(Command::Enable { epoch: self.epoch });
         }
         // Track focus ownership and immediately push Caps Lock + IME state when
-        // cursor leaves this device for the peer.
-        let now_local_focus = status
-            .focus_device_id
-            .as_deref()
-            .is_none_or(|id| id == self.local_device_id);
-        let prev_local_focus = self.local_has_focus.swap(now_local_focus, Ordering::AcqRel);
-        if prev_local_focus
-            && !now_local_focus
-            && let Some(aux) = self.aux
-        {
-            aux.push_input_state_now();
+        // cursor leaves this device for the peer (ignore transient None during handoff).
+        if let Some(focus_id) = status.focus_device_id.as_deref() {
+            let now_local_focus = focus_id == self.local_device_id;
+            let prev_local_focus = self.local_has_focus.swap(now_local_focus, Ordering::AcqRel);
+            if prev_local_focus
+                && !now_local_focus
+                && let Some(aux) = self.aux
+            {
+                aux.push_input_state_now();
+            }
         }
         let discovered = self.discovered_list();
         let transfer = self.aux.and_then(|a| a.current_transfer());

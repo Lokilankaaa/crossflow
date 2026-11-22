@@ -124,7 +124,6 @@ unsafe extern "C" {
     fn CGEventSetType(event: *mut c_void, kind: u32);
     fn CGEventPost(tap: u32, event: *const c_void);
     fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
-    fn CGEventSourceFlagsState(state: i32) -> u64;
     fn CGPreflightPostEventAccess() -> bool;
     fn CGPreflightListenEventAccess() -> bool;
 }
@@ -1313,11 +1312,12 @@ impl MacMouseSink {
         if is_flags_key {
             unsafe { CGEventSetType(event.as_ptr(), FLAGS_CHANGED) };
         }
-        // Toggle real IOKit Caps Lock state on press so macOS WindowServer & LED update.
+        // Toggle real IOKit Caps Lock state on press so macOS WindowServer & LED update,
+        // and read via IOHIDGetModifierLockState so IOKit-set Caps Lock applies to typing.
         let caps_active = if is_caps && down {
             crate::input_state::toggle_caps_lock()
         } else {
-            (unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) } & FLAG_ALPHA_SHIFT) != 0
+            crate::input_state::read_caps_lock()
         };
         // No synthesized repeat timer is implemented; each accepted down/up is
         // explicit. Modifier flags combine both sides and are updated on up.

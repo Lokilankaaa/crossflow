@@ -108,13 +108,14 @@ mod platform {
     use std::ptr::null_mut;
     use std::thread;
     use std::time::Duration;
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, INPUT, INPUT_0, INPUT_KEYBOARD,
         KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CAPITAL,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, SMTO_ABORTIFHUNG,
-        SendMessageTimeoutW,
+        GetForegroundWindow, GetWindowThreadProcessId, MSG, PM_NOREMOVE, PeekMessageW,
+        PostMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
     };
 
     const WM_INPUTLANGCHANGEREQUEST: u32 = 0x0050;
@@ -135,7 +136,26 @@ mod platform {
     }
 
     pub fn read_caps_lock() -> bool {
-        unsafe { (GetKeyState(VK_CAPITAL as i32) & 1) != 0 }
+        unsafe {
+            // Pump message queue state and attach briefly to foreground thread so
+            // GetKeyState(VK_CAPITAL) returns the true live global Caps Lock toggle
+            // rather than a stale background-thread snapshot.
+            let mut msg: MSG = std::mem::zeroed();
+            let _ = PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
+            let cur_tid = GetCurrentThreadId();
+            let hwnd = GetForegroundWindow();
+            let fg_tid = if !hwnd.is_null() {
+                GetWindowThreadProcessId(hwnd, null_mut())
+            } else {
+                0
+            };
+            let attached = fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0;
+            let state = (GetKeyState(VK_CAPITAL as i32) & 1) != 0;
+            if attached {
+                let _ = AttachThreadInput(cur_tid, fg_tid, 0);
+            }
+            state
+        }
     }
 
     pub fn set_caps_lock(desired: bool) -> bool {
@@ -282,8 +302,9 @@ mod platform {
                 let cur_conv = query_ime_control(ime_wnd, IMC_GETCONVERSIONMODE, 0).unwrap_or(0);
                 let next_conv = (cur_conv & !(IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE)) as isize;
                 let _ = query_ime_control(ime_wnd, IMC_SETCONVERSIONMODE, next_conv);
+                let _ = query_ime_control(ime_wnd, IMC_SETOPENSTATUS, 0);
             }
-            thread::sleep(Duration::from_millis(12));
+            thread::sleep(Duration::from_millis(20));
             if read_ime_chinese() == Some(true)
                 && let Some(target_en) = en_hkl
             {
@@ -303,18 +324,11 @@ mod platform {
     use std::ptr::null;
     use std::sync::Mutex;
 
-    const HID_SYSTEM_STATE: i32 = 1;
-    const FLAG_ALPHA_SHIFT: u64 = 0x0001_0000;
     const K_IOHID_PARAM_CONNECT_TYPE: u32 = 1;
     const K_IOHID_CAPS_LOCK_STATE: i32 = 1;
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
     static PREFERRED_SOURCES: Mutex<(Option<String>, Option<String>)> = Mutex::new((None, None));
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGEventSourceFlagsState(state_id: i32) -> u64;
-    }
 
     #[link(name = "IOKit", kind = "framework")]
     unsafe extern "C" {
@@ -323,6 +337,7 @@ mod platform {
         fn IOServiceOpen(service: u32, owning_task: u32, connect_type: u32, connect: *mut u32) -> i32;
         fn IOServiceClose(connect: u32) -> i32;
         fn IOObjectRelease(object: u32) -> i32;
+        fn IOHIDGetModifierLockState(handle: u32, selector: i32, state: *mut bool) -> i32;
         fn IOHIDSetModifierLockState(handle: u32, selector: i32, state: bool) -> i32;
     }
 
@@ -335,8 +350,14 @@ mod platform {
         fn CFRelease(cf: *const c_void);
         fn CFEqual(cf1: *const c_void, cf2: *const c_void) -> bool;
         fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+        fn CFGetTypeID(cf: *const c_void) -> usize;
+        fn CFArrayGetTypeID() -> usize;
+        fn CFDictionaryGetTypeID() -> usize;
+        fn CFStringGetTypeID() -> usize;
         fn CFArrayGetCount(array: *const c_void) -> isize;
         fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFStringCreateWithCString(alloc: *const c_void, c_str: *const c_char, encoding: u32) -> *mut c_void;
         fn CFStringGetLength(string: *const c_void) -> isize;
         fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
         fn CFStringGetCString(
@@ -345,6 +366,8 @@ mod platform {
             buffer_size: isize,
             encoding: u32,
         ) -> bool;
+        fn CFPreferencesAppSynchronize(app_id: *const c_void) -> bool;
+        fn CFPreferencesCopyAppValue(key: *const c_void, app_id: *const c_void) -> *mut c_void;
     }
 
     #[link(name = "Carbon", kind = "framework")]
@@ -363,7 +386,29 @@ mod platform {
     }
 
     pub fn read_caps_lock() -> bool {
-        unsafe { (CGEventSourceFlagsState(HID_SYSTEM_STATE) & FLAG_ALPHA_SHIFT) != 0 }
+        unsafe {
+            // Use IOHIDGetModifierLockState rather than CGEventSourceFlagsState: on
+            // macOS Sequoia, CGEventSourceFlagsState does not reflect Caps Lock set
+            // via IOHIDSetModifierLockState.
+            let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+            if matching.is_null() {
+                return false;
+            }
+            let svc = IOServiceGetMatchingService(0, matching);
+            if svc == 0 {
+                return false;
+            }
+            let mut conn: u32 = 0;
+            let mut state = false;
+            if IOServiceOpen(svc, mach_task_self_, K_IOHID_PARAM_CONNECT_TYPE, &mut conn) == 0
+                && conn != 0
+            {
+                let _ = IOHIDGetModifierLockState(conn, K_IOHID_CAPS_LOCK_STATE, &mut state);
+                IOServiceClose(conn);
+            }
+            IOObjectRelease(svc);
+            state
+        }
     }
 
     pub fn set_caps_lock(desired: bool) -> bool {
@@ -427,8 +472,98 @@ mod platform {
         Some((id, langs))
     }
 
+    unsafe fn cf_str(s: &std::ffi::CStr) -> *mut c_void {
+        CFStringCreateWithCString(null(), s.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+    }
+
+    unsafe fn dict_string(dict: *const c_void, key: &std::ffi::CStr) -> Option<String> {
+        let k = cf_str(key);
+        if k.is_null() {
+            return None;
+        }
+        let val = CFDictionaryGetValue(dict, k);
+        CFRelease(k);
+        if val.is_null() || CFGetTypeID(val) != CFStringGetTypeID() {
+            return None;
+        }
+        cfstring_to_string(val)
+    }
+
+    /// Reads the live system-wide selected input source directly from `cfprefsd`
+    /// (`com.apple.HIToolbox` -> `AppleSelectedInputSources`), avoiding the stale
+    /// in-process cache of `TISCopyCurrentKeyboardInputSource` on non-runloop threads.
+    unsafe fn read_live_hitoolbox_chinese() -> Option<bool> {
+        let app_id = cf_str(c"com.apple.HIToolbox");
+        let key = cf_str(c"AppleSelectedInputSources");
+        if app_id.is_null() || key.is_null() {
+            if !app_id.is_null() {
+                CFRelease(app_id);
+            }
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            return None;
+        }
+        let _ = CFPreferencesAppSynchronize(app_id);
+        let arr = CFPreferencesCopyAppValue(key, app_id);
+        CFRelease(key);
+        CFRelease(app_id);
+        if arr.is_null() {
+            return None;
+        }
+        let result = if CFGetTypeID(arr) == CFArrayGetTypeID() {
+            let count = CFArrayGetCount(arr);
+            let mut found = None;
+            for i in 0..count {
+                let item = CFArrayGetValueAtIndex(arr, i);
+                if item.is_null() || CFGetTypeID(item) != CFDictionaryGetTypeID() {
+                    continue;
+                }
+                let kind = dict_string(item, c"InputSourceKind").unwrap_or_default();
+                if kind == "Non Keyboard Input Method" {
+                    continue;
+                }
+                if let Some(mode) = dict_string(item, c"Input Mode") {
+                    let is_zh = classify_macos_tis_chinese(&mode, &[]);
+                    if let Ok(mut pref) = PREFERRED_SOURCES.lock() {
+                        if is_zh {
+                            pref.1 = Some(mode);
+                        } else {
+                            pref.0 = Some(mode);
+                        }
+                    }
+                    found = Some(is_zh);
+                    break;
+                }
+                if let Some(layout_name) = dict_string(item, c"KeyboardLayout Name") {
+                    let pseudo_id = format!("com.apple.keylayout.{layout_name}");
+                    let is_zh = classify_macos_tis_chinese(&pseudo_id, &[]);
+                    if let Ok(mut pref) = PREFERRED_SOURCES.lock() {
+                        if !is_zh {
+                            pref.0 = Some(pseudo_id);
+                        }
+                    }
+                    found = Some(is_zh);
+                    break;
+                }
+                if let Some(bundle) = dict_string(item, c"Bundle ID") {
+                    found = Some(classify_macos_tis_chinese(&bundle, &[]));
+                    break;
+                }
+            }
+            found
+        } else {
+            None
+        };
+        CFRelease(arr);
+        result
+    }
+
     pub fn read_ime_chinese() -> Option<bool> {
         unsafe {
+            if let Some(live) = read_live_hitoolbox_chinese() {
+                return Some(live);
+            }
             let cur = TISCopyCurrentKeyboardInputSource();
             if cur.is_null() {
                 return None;
