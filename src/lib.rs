@@ -1,4 +1,6 @@
 pub mod arrangement;
+pub mod aux_channel;
+pub mod clipboard;
 pub mod desktop;
 pub mod discovery;
 pub mod injection_worker;

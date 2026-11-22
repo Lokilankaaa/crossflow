@@ -97,6 +97,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
     let authMode: String
     let passphraseConfigured: Bool
     let smartKeymap: Bool
+    let clipboardSync: Bool
     let selectedChannel: String
     let directPeer: String?
     let activeChannelLabel: String?
@@ -121,6 +122,7 @@ struct PeerStatusWire: Sendable, Equatable, Decodable {
         case authMode = "auth_mode"
         case passphraseConfigured = "passphrase_configured"
         case smartKeymap = "smart_keymap"
+        case clipboardSync = "clipboard_sync"
         case selectedChannel = "selected_channel"
         case directPeer = "direct_peer"
         case activeChannelLabel = "active_channel_label"
@@ -162,6 +164,11 @@ private struct SetPassphraseCommandWire: Encodable {
 
 private struct SetKeymapCommandWire: Encodable {
     let op = "set_keymap"
+    let enabled: Bool
+}
+
+private struct SetClipboardCommandWire: Encodable {
+    let op = "set_clipboard"
     let enabled: Bool
 }
 
@@ -308,6 +315,7 @@ final class PeerMeshModel {
     var authMode: String = "open"
     var passphraseConfigured: Bool = false
     var smartKeymap: Bool = true
+    var clipboardSync: Bool = true
     var selectedChannel: String = "auto"
     var directPeer: String = ""
     var activeChannelLabel: String?
@@ -425,6 +433,7 @@ final class PeerMeshModel {
         authMode = s.authMode
         passphraseConfigured = s.passphraseConfigured
         smartKeymap = s.smartKeymap
+        clipboardSync = s.clipboardSync
         selectedChannel = s.selectedChannel
         if !syncedDirectPeerOnce {
             syncedDirectPeerOnce = true
@@ -476,6 +485,14 @@ final class PeerMeshModel {
     func setKeymap(_ enabled: Bool) {
         smartKeymap = enabled
         let cmd = SetKeymapCommandWire(enabled: enabled)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setClipboard(_ enabled: Bool) {
+        clipboardSync = enabled
+        let cmd = SetClipboardCommandWire(enabled: enabled)
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

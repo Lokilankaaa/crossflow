@@ -45,8 +45,8 @@ internal sealed class MainWindow : Window
     private readonly Button savePasswordButton = new();
     private readonly Button cancelPasswordButton = new();
 
-    private readonly ToggleSwitch smartKeymapToggle = new();
-    private bool updatingKeymapUi;
+    private readonly ToggleSwitch clipboardToggle = new();
+    private bool updatingClipboardUi;
 
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
@@ -279,19 +279,19 @@ internal sealed class MainWindow : Window
 
         sidebar.Children.Add(Divider());
 
-        // Cross-OS smart keymap toggle (Ctrl <-> Cmd)
-        sidebar.Children.Add(SectionLabel("键盘转换"));
-        smartKeymapToggle.Header = null;
-        smartKeymapToggle.IsOn = true;
-        smartKeymapToggle.OnContent = "自动转换 Ctrl ↔ Cmd";
-        smartKeymapToggle.OffContent = "原始键位直通";
-        smartKeymapToggle.FontSize = 12;
-        smartKeymapToggle.Toggled += async (_, _) =>
+        // Clipboard sync toggle
+        sidebar.Children.Add(SectionLabel("剪贴板"));
+        clipboardToggle.Header = null;
+        clipboardToggle.IsOn = true;
+        clipboardToggle.OnContent = "剪贴板共享已开启";
+        clipboardToggle.OffContent = "剪贴板共享已关闭";
+        clipboardToggle.FontSize = 12;
+        clipboardToggle.Toggled += async (_, _) =>
         {
-            if (updatingKeymapUi) return;
-            await peerMesh.SetKeymapAsync(smartKeymapToggle.IsOn);
+            if (updatingClipboardUi) return;
+            await peerMesh.SetClipboardAsync(clipboardToggle.IsOn);
         };
-        sidebar.Children.Add(smartKeymapToggle);
+        sidebar.Children.Add(clipboardToggle);
 
         sidebar.Children.Add(Divider());
 
@@ -563,11 +563,11 @@ internal sealed class MainWindow : Window
         editPasswordButton.Content = snap.PassphraseConfigured ? "修改" : "配置密码";
         clearPasswordButton.Visibility = snap.PassphraseConfigured ? Visibility.Visible : Visibility.Collapsed;
 
-        if (smartKeymapToggle.IsOn != snap.SmartKeymap)
+        if (clipboardToggle.IsOn != snap.ClipboardSync)
         {
-            updatingKeymapUi = true;
-            smartKeymapToggle.IsOn = snap.SmartKeymap;
-            updatingKeymapUi = false;
+            updatingClipboardUi = true;
+            clipboardToggle.IsOn = snap.ClipboardSync;
+            updatingClipboardUi = false;
         }
 
         // Sync network channel dropdown

@@ -306,17 +306,17 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
-                // Cross-OS smart keymap toggle (Ctrl <-> Cmd — 1:1 with Windows)
+                // Clipboard sync toggle (1:1 with Windows)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("键盘转换")
+                    Text("剪贴板")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Theme.secondary)
-                    let keymapBinding = Binding<Bool>(
-                        get: { peer.smartKeymap },
-                        set: { peer.setKeymap($0) }
+                    let clipBinding = Binding<Bool>(
+                        get: { peer.clipboardSync },
+                        set: { peer.setClipboard($0) }
                     )
-                    Toggle(isOn: keymapBinding) {
-                        Text(peer.smartKeymap ? "自动转换 Ctrl ↔ Cmd" : "原始键位直通")
+                    Toggle(isOn: clipBinding) {
+                        Text(peer.clipboardSync ? "剪贴板共享已开启" : "剪贴板共享已关闭")
                             .font(.system(size: 12))
                     }
                     .toggleStyle(.switch)

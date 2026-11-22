@@ -38,6 +38,7 @@ const RIGHT_MOUSE_DRAGGED: u32 = 7;
 const OTHER_MOUSE_DOWN: u32 = 25;
 const OTHER_MOUSE_UP: u32 = 26;
 const OTHER_MOUSE_DRAGGED: u32 = 27;
+const FLAGS_CHANGED: u32 = 12;
 const MOUSE_CLICK_STATE: u32 = 1;
 const KEYBOARD_AUTOREPEAT: u32 = 8;
 const SCROLL_UNIT_LINE: u32 = 1;
@@ -117,6 +118,7 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
     fn CGEventSetFlags(event: *mut c_void, flags: u64);
+    fn CGEventSetType(event: *mut c_void, kind: u32);
     fn CGEventPost(tap: u32, event: *const c_void);
     fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
     fn CGPreflightPostEventAccess() -> bool;
@@ -502,6 +504,31 @@ fn modifier_flags(keys: &BTreeSet<u16>) -> u64 {
         if keys.contains(&left) || keys.contains(&right) {
             flags |= mask;
         }
+    }
+    flags
+}
+
+/// Full macOS CGEventFlags including device-dependent modifier bits required by
+/// Chromium/Electron/VS Code/Antigravity to recognize synthetic Cmd/Ctrl chords.
+fn event_modifier_flags(keys: &BTreeSet<u16>) -> u64 {
+    let mut flags = modifier_flags(keys);
+    const DEVICE_BITS: [(u16, u64); 8] = [
+        (0xE0, 0x0001), // NX_DEVICELCTLKEYMASK
+        (0xE4, 0x2000), // NX_DEVICERCTLKEYMASK
+        (0xE1, 0x0002), // NX_DEVICELSHIFTKEYMASK
+        (0xE5, 0x0004), // NX_DEVICERSHIFTKEYMASK
+        (0xE2, 0x0020), // NX_DEVICELALTKEYMASK
+        (0xE6, 0x0040), // NX_DEVICERALTKEYMASK
+        (0xE3, 0x0008), // NX_DEVICELCMDKEYMASK
+        (0xE7, 0x0010), // NX_DEVICERCMDKEYMASK
+    ];
+    for (usage, bit) in DEVICE_BITS {
+        if keys.contains(&usage) {
+            flags |= bit;
+        }
+    }
+    if flags != 0 {
+        flags |= 0x0100; // NX_NONCOALESCEDMASK
     }
     flags
 }
@@ -1041,13 +1068,18 @@ impl MacMouseSink {
         } else {
             projected.remove(&usage);
         }
+        // Physical modifier keys on macOS must be posted as kCGEventFlagsChanged
+        // (type 12) rather than KeyDown/KeyUp so Electron/Chromium apps track Cmd/Ctrl chords.
+        if (0xE0..=0xE7).contains(&usage) {
+            unsafe { CGEventSetType(event.as_ptr(), FLAGS_CHANGED) };
+        }
         // No synthesized repeat timer is implemented; each accepted down/up is
         // explicit. Modifier flags combine both sides and are updated on up.
         unsafe { CGEventSetIntegerValueField(event.as_ptr(), KEYBOARD_AUTOREPEAT, 0) };
         if down {
             self.owned_keys.insert(usage);
         }
-        self.post_marked(&event, modifier_flags(&projected));
+        self.post_marked(&event, event_modifier_flags(&projected));
         if !down {
             self.owned_keys.remove(&usage);
         }

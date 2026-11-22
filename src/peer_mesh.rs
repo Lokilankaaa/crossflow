@@ -83,6 +83,8 @@ struct PeerConfig {
     passphrase: Option<String>,
     #[serde(default = "default_true")]
     smart_keymap: bool,
+    #[serde(default = "default_true")]
+    clipboard_sync: bool,
 }
 
 fn default_channel() -> String {
@@ -100,6 +102,7 @@ impl Default for PeerConfig {
             direct_peer: None,
             passphrase: None,
             smart_keymap: true,
+            clipboard_sync: true,
         }
     }
 }
@@ -121,6 +124,7 @@ struct PeerUiStatus {
     auth_mode: &'static str,
     passphrase_configured: bool,
     smart_keymap: bool,
+    clipboard_sync: bool,
     selected_channel: String,
     direct_peer: Option<String>,
     active_channel_label: Option<String>,
@@ -156,6 +160,9 @@ enum UiCommand {
         passphrase: Option<String>,
     },
     SetKeymap {
+        enabled: bool,
+    },
+    SetClipboard {
         enabled: bool,
     },
 }
@@ -597,6 +604,7 @@ struct PeerHost<'a> {
     local_displays: Vec<Display>,
     config: &'a mut PeerConfig,
     smart_keymap_flag: &'a Arc<AtomicBool>,
+    clipboard_sync_flag: &'a Arc<AtomicBool>,
     reconfigure_requested: &'a mut bool,
     network_channels: Vec<NetworkChannelInfo>,
     active_channel_label: Option<String>,
@@ -699,6 +707,11 @@ impl PeerHost<'_> {
                 Ok(UiCommand::SetKeymap { enabled }) => {
                     self.config.smart_keymap = enabled;
                     self.smart_keymap_flag.store(enabled, Ordering::Relaxed);
+                    save_config(self.config);
+                }
+                Ok(UiCommand::SetClipboard { enabled }) => {
+                    self.config.clipboard_sync = enabled;
+                    self.clipboard_sync_flag.store(enabled, Ordering::Relaxed);
                     save_config(self.config);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -811,6 +824,7 @@ impl Host for PeerHost<'_> {
                     auth_mode: if has_pass { "passphrase" } else { "open" },
                     passphrase_configured: has_pass,
                     smart_keymap: self.config.smart_keymap,
+                    clipboard_sync: self.config.clipboard_sync,
                     selected_channel: self.config.channel.clone(),
                     direct_peer: self.config.direct_peer.clone(),
                     active_channel_label: self.active_channel_label.clone(),
@@ -857,6 +871,7 @@ pub fn run(
         .unwrap_or_else(default_friendly_name);
     let mut config = load_config(options.passphrase);
     let smart_keymap_flag = Arc::new(AtomicBool::new(config.smart_keymap));
+    let clipboard_sync_flag = Arc::new(AtomicBool::new(config.clipboard_sync));
     let _keep_awake = crate::power::KeepAwakeGuard::acquire();
 
     #[cfg(target_os = "macos")]
@@ -874,6 +889,7 @@ pub fn run(
                     auth_mode: if has_pass { "passphrase" } else { "open" },
                     passphrase_configured: has_pass,
                     smart_keymap: config.smart_keymap,
+                    clipboard_sync: config.clipboard_sync,
                     selected_channel: config.channel.clone(),
                     direct_peer: config.direct_peer.clone(),
                     active_channel_label: None,
@@ -927,6 +943,15 @@ pub fn run(
             listener.set_nonblocking(true)?;
             let bound = listener.local_addr()?;
             let listen_endpoint = Some(bound.to_string());
+            let aux_listener = TcpListener::bind(SocketAddr::new(
+                bound.ip(),
+                bound.port().saturating_add(1),
+            ))
+            .ok()
+            .and_then(|l| {
+                l.set_nonblocking(true).ok()?;
+                Some(Arc::new(l))
+            });
 
             let mut discovery = DiscoveryHandle::start(DiscoveryConfig {
                 local_device_id: Some(local_discovery_id.clone()),
@@ -1011,6 +1036,11 @@ pub fn run(
                             smart_keymap_flag.store(enabled, Ordering::Relaxed);
                             save_config(&config);
                         }
+                        Ok(UiCommand::SetClipboard { enabled }) => {
+                            config.clipboard_sync = enabled;
+                            clipboard_sync_flag.store(enabled, Ordering::Relaxed);
+                            save_config(&config);
+                        }
                         Err(TryRecvError::Empty) => break,
                     }
                 }
@@ -1037,6 +1067,7 @@ pub fn run(
                             auth_mode: if has_pass { "passphrase" } else { "open" },
                             passphrase_configured: has_pass,
                             smart_keymap: config.smart_keymap,
+                            clipboard_sync: config.clipboard_sync,
                             selected_channel: config.channel.clone(),
                             direct_peer: config.direct_peer.clone(),
                             active_channel_label: None,
@@ -1215,10 +1246,9 @@ pub fn run(
                 let different_os = remote_os != std::env::consts::OS;
 
                 connection.set_max_hz(options.max_hz)?;
-                connection.set_key_translator(crate::keymap::KeyTranslator::new(
-                    smart_keymap_flag.clone(),
-                    different_os,
-                ));
+                // Preserve native Ctrl and Cmd/Win keys so macOS Ctrl shortcuts stay intact.
+                let _ = (remote_os, different_os);
+                connection.set_key_translator(crate::keymap::KeyTranslator::passthrough());
                 let source = SharedSource::new(connection.runtime().clone())?;
                 let mut sink = match prepare_worker(&local_hello.inventory, log.clone()) {
                     Ok(s) => s,
@@ -1238,6 +1268,18 @@ pub fn run(
                     }
                 };
 
+                let _aux_session = peer_sock.map(|sock| {
+                    crate::aux_channel::AuxSession::spawn(
+                        aux_listener.clone(),
+                        sock,
+                        initiator,
+                        local_device_id.clone(),
+                        remote_id.clone(),
+                        config.passphrase.clone(),
+                        clipboard_sync_flag.clone(),
+                    )
+                });
+
                 let run_result = connection.run(
                     &source,
                     &mut sink,
@@ -1254,6 +1296,7 @@ pub fn run(
                         local_displays: local_hello.inventory.clone(),
                         config: &mut config,
                         smart_keymap_flag: &smart_keymap_flag,
+                        clipboard_sync_flag: &clipboard_sync_flag,
                         reconfigure_requested: &mut reconfigure_requested,
                         network_channels: channel_infos(&local_channels),
                         active_channel_label,
@@ -1341,6 +1384,7 @@ pub fn run(
             auth_mode: if has_pass { "passphrase" } else { "open" },
             passphrase_configured: has_pass,
             smart_keymap: config.smart_keymap,
+            clipboard_sync: config.clipboard_sync,
             selected_channel: config.channel,
             direct_peer: config.direct_peer,
             active_channel_label: None,
