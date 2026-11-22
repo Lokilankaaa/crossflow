@@ -132,7 +132,6 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     private func hideMainWindow(_ window: NSWindow) {
         window.orderOut(nil)
-        NSApp.setActivationPolicy(.accessory)
         refreshMenuBar()
     }
 
@@ -406,14 +405,9 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     func showMainWindow() {
-        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         if let win = resolvedMainWindow() {
             win.makeKeyAndOrderFront(nil)
-            DispatchQueue.main.async { [weak win] in
-                NSApp.activate(ignoringOtherApps: true)
-                win?.makeKeyAndOrderFront(nil)
-            }
         }
         refreshMenuBar()
     }
