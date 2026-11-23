@@ -504,6 +504,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     0x14 => Some(crate::keymap::HID_CAPS_LOCK),
                     0x5B => Some(0xE3), // VK_LWIN
                     0x5C => Some(0xE7), // VK_RWIN
+                    0x7C..=0x87 => Some(0x68 + (input.vkCode - 0x7C) as u16), // VK_F13..VK_F24
                     0xA0 => Some(0xE1), // VK_LSHIFT
                     0xA1 => Some(0xE5), // VK_RSHIFT
                     0xA2 => Some(0xE0), // VK_LCONTROL

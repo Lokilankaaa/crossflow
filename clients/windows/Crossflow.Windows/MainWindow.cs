@@ -89,10 +89,28 @@ internal sealed class MainWindow : Window
     private readonly HashSet<string> recordHeldKeys = new(StringComparer.Ordinal);
     private readonly HashSet<string> recordPeakMods = new(StringComparer.Ordinal);
     private readonly HashSet<string> recordPeakKeys = new(StringComparer.Ordinal);
-    private readonly DispatcherTimer hotkeyPollTimer = new() { Interval = TimeSpan.FromMilliseconds(15) };
-    private bool pollPrevMid, pollPrevBack, pollPrevForward;
+    private delegate IntPtr LowLevelHookProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private LowLevelHookProc? recordMouseProc;
+    private LowLevelHookProc? recordKeyProc;
+    private IntPtr recordMouseHook;
+    private IntPtr recordKeyHook;
     private bool hotkeysExpanded;
     private TrayIcon? trayIcon;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public int ptX, ptY;
+        public uint mouseData, flags, time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode, scanCode, flags, time;
+        public IntPtr dwExtraInfo;
+    }
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -100,8 +118,17 @@ internal sealed class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookExW(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
     [DllImport("user32.dll")]
-    private static extern short GetAsyncKeyState(int vKey);
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
@@ -146,8 +173,15 @@ internal sealed class MainWindow : Window
         root.RequestedTheme = ElementTheme.Light;
         root.Background = theme.Brush("background");
         root.ColumnDefinitions.Add(sidebarColumn);
-        root.ColumnDefinitions.Add(new() { Width = new GridLength(6) });
+        root.ColumnDefinitions.Add(new() { Width = new GridLength(8) });
         root.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+
+        if (AppWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter presenter)
+        {
+            presenter.IsMaximizable = true;
+            presenter.IsMinimizable = true;
+            presenter.IsResizable = true;
+        }
 
         BuildSidebar();
         BuildSidebarSplitter();
@@ -197,8 +231,15 @@ internal sealed class MainWindow : Window
         sidebar.Padding = new Thickness(18, 22, 18, 20);
         sidebar.Background = theme.Brush("surface");
 
-        // Brand
-        var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Margin = new Thickness(2, 0, 0, 12) };
+        // Brand (double-click top bar maximizes/restores cleanly)
+        var brand = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+            Margin = new Thickness(2, 0, 0, 12),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent)
+        };
+        brand.DoubleTapped += (_, _) => ToggleMaximize();
         brand.Children.Add(new FontIcon { Glyph = "\uE71B", FontSize = 22, Foreground = theme.Brush("accent") });
         brand.Children.Add(new TextBlock
         {
@@ -497,11 +538,12 @@ internal sealed class MainWindow : Window
     {
         var indicator = new Border
         {
-            Width = 2,
+            Width = 3,
+            Height = 44,
             HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Stretch,
-            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
-            CornerRadius = new CornerRadius(1)
+            VerticalAlignment = VerticalAlignment.Center,
+            Background = theme.Brush("border"),
+            CornerRadius = new CornerRadius(2)
         };
         var splitter = new SplitterHost
         {
@@ -511,10 +553,10 @@ internal sealed class MainWindow : Window
         };
         splitter.Children.Add(indicator);
         splitter.SetResizeCursor();
-        splitter.PointerEntered += (_, _) => indicator.Background = theme.Brush("border");
+        splitter.PointerEntered += (_, _) => indicator.Background = theme.Brush("accent");
         splitter.PointerExited += (_, _) =>
         {
-            if (!draggingSplitter) indicator.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            if (!draggingSplitter) indicator.Background = theme.Brush("border");
         };
         splitter.PointerPressed += (_, e) =>
         {
@@ -530,7 +572,7 @@ internal sealed class MainWindow : Window
         {
             if (!draggingSplitter) return;
             double dx = e.GetCurrentPoint(root).Position.X - splitterStartX;
-            double maxW = Math.Max(320, Math.Min(540, root.ActualWidth * 0.55));
+            double maxW = Math.Max(360, Math.Min(600, root.ActualWidth * 0.60));
             double next = Math.Clamp(splitterStartWidth + dx, 240, maxW);
             sidebarColumn.Width = new GridLength(Math.Round(next));
             e.Handled = true;
@@ -540,13 +582,13 @@ internal sealed class MainWindow : Window
             if (!draggingSplitter) return;
             draggingSplitter = false;
             splitter.ReleasePointerCapture(e.Pointer);
-            indicator.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            indicator.Background = theme.Brush("border");
             e.Handled = true;
         };
         splitter.PointerCaptureLost += (_, _) =>
         {
             draggingSplitter = false;
-            indicator.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            indicator.Background = theme.Brush("border");
         };
         Grid.SetColumn(splitter, 1);
         root.Children.Add(splitter);
@@ -693,7 +735,6 @@ internal sealed class MainWindow : Window
         root.PreviewKeyUp += OnRootPreviewKeyUp;
         root.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(OnRootPointerPressedForHotkey), true);
         root.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(OnRootPointerReleasedForHotkey), true);
-        hotkeyPollTimer.Tick += OnHotkeyPollTick;
     }
 
     private void ClearRecordingBuffers()
@@ -706,51 +747,105 @@ internal sealed class MainWindow : Window
 
     private void StartHotkeyMousePoll()
     {
-        pollPrevMid = (GetAsyncKeyState(0x04) & 0x8000) != 0;
-        pollPrevBack = ((GetAsyncKeyState(0x05) | GetAsyncKeyState(0xA6)) & 0x8000) != 0;
-        pollPrevForward = ((GetAsyncKeyState(0x06) | GetAsyncKeyState(0xA7)) & 0x8000) != 0;
-        hotkeyPollTimer.Start();
+        StopHotkeyMousePoll();
+        IntPtr hMod = GetModuleHandleW(null);
+        recordMouseProc = OnRecordLowLevelMouse;
+        recordKeyProc = OnRecordLowLevelKeyboard;
+        recordMouseHook = SetWindowsHookExW(14 /* WH_MOUSE_LL */, recordMouseProc, hMod, 0);
+        recordKeyHook = SetWindowsHookExW(13 /* WH_KEYBOARD_LL */, recordKeyProc, hMod, 0);
     }
 
     private void StopHotkeyMousePoll()
     {
-        hotkeyPollTimer.Stop();
-        pollPrevMid = false;
-        pollPrevBack = false;
-        pollPrevForward = false;
+        if (recordMouseHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(recordMouseHook);
+            recordMouseHook = IntPtr.Zero;
+        }
+        if (recordKeyHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(recordKeyHook);
+            recordKeyHook = IntPtr.Zero;
+        }
+        recordMouseProc = null;
+        recordKeyProc = null;
     }
 
-    private async void OnHotkeyPollTick(object? sender, object e)
+    private IntPtr OnRecordLowLevelMouse(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (recordingHotkeyField is null)
+        if (nCode >= 0 && recordingHotkeyField is not null && lParam != IntPtr.Zero)
         {
-            StopHotkeyMousePoll();
-            return;
+            int msg = wParam.ToInt32();
+            bool isDown = msg is 0x0207 /* WM_MBUTTONDOWN */ or 0x020B /* WM_XBUTTONDOWN */;
+            bool isUp = msg is 0x0208 /* WM_MBUTTONUP */ or 0x020C /* WM_XBUTTONUP */;
+            if (isDown || isUp)
+            {
+                var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                uint xbtn = info.mouseData >> 16;
+                string? token = msg is 0x0207 or 0x0208
+                    ? "MouseMid"
+                    : xbtn switch
+                    {
+                        1 => "Mouse4",
+                        2 => "Mouse5",
+                        _ => null
+                    };
+                if (token is not null)
+                {
+                    string captured = token;
+                    bool down = isDown;
+                    DispatcherQueue.TryEnqueue(async () =>
+                    {
+                        if (down) await HandleRecordTokenDownAsync(null, captured);
+                        else await HandleRecordTokenUpAsync(null, captured);
+                    });
+                    return (IntPtr)1; // Suppress auxiliary mouse button during recording!
+                }
+                if (isDown)
+                {
+                    uint rawBtn = xbtn;
+                    DispatcherQueue.TryEnqueue(() =>
+                        ShowNotice($"检测到未映射鼠标侧键（xbtn={rawBtn}），请反馈该编号以便支持。", isError: true));
+                    return (IntPtr)1;
+                }
+            }
         }
-        bool mid = (GetAsyncKeyState(0x04) & 0x8000) != 0;
-        bool back = ((GetAsyncKeyState(0x05) | GetAsyncKeyState(0xA6)) & 0x8000) != 0;
-        bool forward = ((GetAsyncKeyState(0x06) | GetAsyncKeyState(0xA7)) & 0x8000) != 0;
+        return CallNextHookEx(recordMouseHook, nCode, wParam, lParam);
+    }
 
-        if (mid != pollPrevMid)
+    private IntPtr OnRecordLowLevelKeyboard(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && recordingHotkeyField is not null && lParam != IntPtr.Zero)
         {
-            pollPrevMid = mid;
-            if (mid) await HandleRecordTokenDownAsync(null, "MouseMid");
-            else await HandleRecordTokenUpAsync(null, "MouseMid");
-            if (recordingHotkeyField is null) return;
+            int msg = wParam.ToInt32();
+            bool isDown = msg is 0x0100 /* WM_KEYDOWN */ or 0x0104 /* WM_SYSKEYDOWN */;
+            bool isUp = msg is 0x0101 /* WM_KEYUP */ or 0x0105 /* WM_SYSKEYUP */;
+            if (isDown || isUp)
+            {
+                var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                var vk = (VirtualKey)info.vkCode;
+                string? mod = ModifierName(vk);
+                string? keyToken = mod is null ? VirtualKeyToChordName(vk) : null;
+                if (mod is not null || keyToken is not null)
+                {
+                    bool down = isDown;
+                    DispatcherQueue.TryEnqueue(async () =>
+                    {
+                        if (down) await HandleRecordTokenDownAsync(mod, keyToken);
+                        else await HandleRecordTokenUpAsync(mod, keyToken);
+                    });
+                    return (IntPtr)1;
+                }
+                if (isDown)
+                {
+                    uint rawVk = info.vkCode;
+                    DispatcherQueue.TryEnqueue(() =>
+                        ShowNotice($"检测到未映射按键（vk=0x{rawVk:X2}），请反馈该键码以便支持。", isError: true));
+                    return (IntPtr)1;
+                }
+            }
         }
-        if (back != pollPrevBack)
-        {
-            pollPrevBack = back;
-            if (back) await HandleRecordTokenDownAsync(null, "Mouse4");
-            else await HandleRecordTokenUpAsync(null, "Mouse4");
-            if (recordingHotkeyField is null) return;
-        }
-        if (forward != pollPrevForward)
-        {
-            pollPrevForward = forward;
-            if (forward) await HandleRecordTokenDownAsync(null, "Mouse5");
-            else await HandleRecordTokenUpAsync(null, "Mouse5");
-        }
+        return CallNextHookEx(recordKeyHook, nCode, wParam, lParam);
     }
 
     private void ToggleHotkeyRecording(string field)
@@ -791,7 +886,7 @@ internal sealed class MainWindow : Window
     private static bool IsStandaloneAllowedToken(string token)
     {
         if (IsMouseToken(token) || token == "ScrollLock") return true;
-        return token.Length >= 2 && token[0] == 'F' && int.TryParse(token[1..], out int n) && n is >= 1 and <= 20;
+        return token.Length >= 2 && token[0] == 'F' && int.TryParse(token[1..], out int n) && n is >= 1 and <= 24;
     }
 
     private static bool IsDigit1To9Token(string token) => token.Length == 1 && token[0] is >= '1' and <= '9';
@@ -1004,7 +1099,7 @@ internal sealed class MainWindow : Window
             return ((char)('A' + (key - VirtualKey.A))).ToString();
         if (key >= VirtualKey.Number0 && key <= VirtualKey.Number9)
             return ((char)('0' + (key - VirtualKey.Number0))).ToString();
-        if (key >= VirtualKey.F1 && key <= VirtualKey.F20)
+        if (key >= VirtualKey.F1 && key <= VirtualKey.F24)
             return $"F{(int)(key - VirtualKey.F1) + 1}";
         return key switch
         {
@@ -1150,7 +1245,12 @@ internal sealed class MainWindow : Window
             catch { }
         };
 
-        var header = new Grid { Margin = new Thickness(0, 0, 0, 14) };
+        var header = new Grid
+        {
+            Margin = new Thickness(0, 0, 0, 14),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent)
+        };
+        header.DoubleTapped += (_, _) => ToggleMaximize();
         header.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
         header.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
 
@@ -1265,6 +1365,11 @@ internal sealed class MainWindow : Window
         AppWindow.Changed += (_, change) =>
         {
             if (!change.DidSizeChange || root.XamlRoot is null) return;
+            if (AppWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter p
+                && p.State == Microsoft.UI.Windowing.OverlappedPresenterState.Maximized)
+            {
+                return;
+            }
             double density = root.XamlRoot.RasterizationScale;
             var work = Microsoft.UI.Windowing.DisplayArea.GetFromWindowId(
                 AppWindow.Id, Microsoft.UI.Windowing.DisplayAreaFallback.Primary).WorkArea;
@@ -1276,6 +1381,7 @@ internal sealed class MainWindow : Window
 
         AppWindow.Closing += (_, args) =>
         {
+            CancelHotkeyRecording();
             if (allowClose) return;
             // Minimize cleanly to the system tray on X click so sharing keeps running.
             args.Cancel = true;
@@ -1354,6 +1460,17 @@ internal sealed class MainWindow : Window
         catch { }
     }
 
+    private void ToggleMaximize()
+    {
+        if (AppWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter presenter)
+        {
+            if (presenter.State == Microsoft.UI.Windowing.OverlappedPresenterState.Maximized)
+                presenter.Restore();
+            else
+                presenter.Maximize();
+        }
+    }
+
     private void ShowAndActivate()
     {
         AppWindow.Show();
@@ -1372,6 +1489,7 @@ internal sealed class MainWindow : Window
         closing = true;
         try
         {
+            StopHotkeyMousePoll();
             trayIcon?.Dispose();
             trayIcon = null;
             await peerMesh.StopAsync();

@@ -317,7 +317,7 @@ pub fn parse_chord(raw: &str) -> Option<HotkeyBinding> {
     if !has_mod && keys.len() == 1 {
         let &only = keys.iter().next()?;
         let is_standalone_allowed =
-            matches!(only, 0x3A..=0x45 | 0x47 | 0x68..=0x6F) || is_mouse_input_code(only);
+            matches!(only, 0x3A..=0x45 | 0x47 | 0x68..=0x73) || is_mouse_input_code(only);
         if !is_standalone_allowed {
             return None;
         }
@@ -394,6 +394,10 @@ pub fn key_name_to_hid(name: &str) -> Option<u16> {
         "f18" => 0x6D,
         "f19" => 0x6E,
         "f20" => 0x6F,
+        "f21" => 0x70,
+        "f22" => 0x71,
+        "f23" => 0x72,
+        "f24" => 0x73,
         "mousemid" | "mousemiddle" | "middle" | "mouse3" | "mmb" => INPUT_MOUSE_MIDDLE,
         "mouse4" | "mouseback" | "xbutton1" | "mb4" => INPUT_MOUSE_BACK,
         "mouse5" | "mouseforward" | "xbutton2" | "mb5" => INPUT_MOUSE_FORWARD,
@@ -416,7 +420,7 @@ pub fn hid_to_key_name(usage: u16) -> Option<String> {
     if (0x3A..=0x45).contains(&usage) {
         return Some(format!("F{}", usage - 0x3A + 1));
     }
-    if (0x68..=0x6F).contains(&usage) {
+    if (0x68..=0x73).contains(&usage) {
         return Some(format!("F{}", usage - 0x68 + 13));
     }
     Some(

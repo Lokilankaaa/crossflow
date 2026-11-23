@@ -50,6 +50,7 @@ private enum RecordedInputEvent: Sendable {
 private final class HotkeyKeyMonitor {
     static let shared = HotkeyKeyMonitor()
     private var monitor: Any?
+    private var globalMouseMonitor: Any?
     private var pollTimer: Timer?
     private var prevMid = false
     private var prevBack = false
@@ -81,8 +82,15 @@ private final class HotkeyKeyMonitor {
             }
             return consumed ? nil : event
         }
-        // Poll CGEventSource button state so Mouse4/Mouse5 (Back/Forward) are always
-        // captured even if AppKit/SwiftUI swallows otherMouseDown for side buttons.
+        // Global monitor catches fast side-button clicks even outside controls or < 15ms pulses.
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.otherMouseDown, .otherMouseUp]) { event in
+            let btn = event.buttonNumber
+            let isDown = event.type == .otherMouseDown
+            Task { @MainActor in
+                _ = onEvent(isDown ? .otherMouseDown(btn) : .otherMouseUp(btn))
+            }
+        }
+        // Poll CGEventSource button state as fallback if AppKit/SwiftUI swallows otherMouseDown.
         prevMid = CGEventSource.buttonState(.combinedSessionState, button: .center)
         prevBack = CGMouseButton(rawValue: 3).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false
         prevForward = CGMouseButton(rawValue: 4).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false
@@ -117,6 +125,10 @@ private final class HotkeyKeyMonitor {
         if let m = monitor {
             NSEvent.removeMonitor(m)
             monitor = nil
+        }
+        if let gm = globalMouseMonitor {
+            NSEvent.removeMonitor(gm)
+            globalMouseMonitor = nil
         }
     }
 }

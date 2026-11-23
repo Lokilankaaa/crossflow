@@ -119,12 +119,18 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         if mainWindow !== window {
             mainWindow = window
             window.delegate = self
+            window.styleMask.insert([.resizable, .miniaturizable])
+            window.collectionBehavior.insert(.fullScreenPrimary)
             if startedMinimized && !didApplyInitialMinimize {
                 didApplyInitialMinimize = true
                 hideMainWindow(window)
             }
             refreshMenuBar()
         }
+    }
+
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        window.screen?.visibleFrame ?? newFrame
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
