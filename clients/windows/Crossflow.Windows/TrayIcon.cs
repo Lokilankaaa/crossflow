@@ -26,6 +26,13 @@ internal sealed class TrayIcon : IDisposable
     private const uint WM_LBUTTONDBLCLK = 0x0203;
     private const uint WM_RBUTTONUP = 0x0205;
     private const uint WM_CONTEXTMENU = 0x007B;
+    private const uint WM_NCLBUTTONDOWN = 0x00A1;
+    private const uint WM_NCLBUTTONDBLCLK = 0x00A3;
+    private const uint HTCAPTION = 2;
+    private const int GCL_STYLE = -26;
+    private const long CS_DBLCLKS = 0x0008;
+    private const int SW_MAXIMIZE = 3;
+    private const int SW_RESTORE = 9;
 
     private const uint NIM_ADD = 0x00000000;
     private const uint NIM_MODIFY = 0x00000001;
@@ -72,6 +79,8 @@ internal sealed class TrayIcon : IDisposable
     private TrayVisualState visualState = TrayVisualState.Searching;
     private bool added;
     private bool disposed;
+    private long lastCaptionClickTick;
+    private int lastCaptionClickX, lastCaptionClickY;
 
     private string tooltip = "Crossflow";
     private string statusLine = "状态：正在发现设备";
@@ -108,6 +117,11 @@ internal sealed class TrayIcon : IDisposable
         currentIcon = GetOrCreateIcon(visualState, lightTaskbar);
         subclassDelegate = WindowProc;
         SetWindowSubclass(hwnd, subclassDelegate, SUBCLASS_ID, IntPtr.Zero);
+        // Ensure CS_DBLCLKS is set on WinUI 3's window class so double-clicking
+        // the title bar always maximizes / restores like a standard Win32 window.
+        IntPtr clsStyle = GetClassLongPtrW(hwnd, GCL_STYLE);
+        if ((clsStyle.ToInt64() & CS_DBLCLKS) == 0)
+            SetClassLongPtrW(hwnd, GCL_STYLE, new IntPtr(clsStyle.ToInt64() | CS_DBLCLKS));
         AddIcon();
     }
 
@@ -179,6 +193,32 @@ internal sealed class TrayIcon : IDisposable
 
     private IntPtr WindowProc(IntPtr hWnd, uint uMsg, UIntPtr wParam, IntPtr lParam, nuint uIdSubclass, IntPtr dwRefData)
     {
+        if (uMsg == WM_NCLBUTTONDBLCLK && wParam.ToUInt64() == HTCAPTION)
+        {
+            lastCaptionClickTick = 0;
+            ShowWindow(hWnd, IsZoomed(hWnd) ? SW_RESTORE : SW_MAXIMIZE);
+            return IntPtr.Zero;
+        }
+        if (uMsg == WM_NCLBUTTONDOWN && wParam.ToUInt64() == HTCAPTION)
+        {
+            long now = Environment.TickCount64;
+            int x = unchecked((short)(lParam.ToInt64() & 0xFFFF));
+            int y = unchecked((short)((lParam.ToInt64() >> 16) & 0xFFFF));
+            uint dblMs = GetDoubleClickTime();
+            if (dblMs == 0) dblMs = 500;
+            if (lastCaptionClickTick != 0
+                && now - lastCaptionClickTick <= dblMs
+                && Math.Abs(x - lastCaptionClickX) <= 8
+                && Math.Abs(y - lastCaptionClickY) <= 8)
+            {
+                lastCaptionClickTick = 0;
+                ShowWindow(hWnd, IsZoomed(hWnd) ? SW_RESTORE : SW_MAXIMIZE);
+                return IntPtr.Zero;
+            }
+            lastCaptionClickTick = now;
+            lastCaptionClickX = x;
+            lastCaptionClickY = y;
+        }
         if (uMsg == WM_TRAYICON)
         {
             uint mouseMsg = (uint)(lParam.ToInt64() & 0xFFFF);
@@ -719,6 +759,23 @@ internal sealed class TrayIcon : IDisposable
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool PostMessageW(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsZoomed(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDoubleClickTime();
+
+    [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")]
+    private static extern IntPtr GetClassLongPtrW(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetClassLongPtrW")]
+    private static extern IntPtr SetClassLongPtrW(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetDC(IntPtr hWnd);
