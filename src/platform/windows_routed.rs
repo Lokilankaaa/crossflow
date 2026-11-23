@@ -480,18 +480,23 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
     if code >= 0 && lparam != 0 {
         let input = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        let is_media_vk = matches!(input.vkCode, 0xAD..=0xB1 | 0xB3);
-        // OEM laptop Fn-key daemons and Windows HID Input Service (`hidserv`) often
-        // deliver Fn + Volume/Mute/Media keys with LLKHF_INJECTED set. Accept media
-        // keys unless they carry Crossflow's own INPUT_ORIGIN_TAG.
+        let is_media_or_browser_vk = matches!(input.vkCode, 0xA6 | 0xA7 | 0xAD..=0xB1 | 0xB3);
+        // OEM laptop Fn-key daemons, mouse vendor utilities (Logitech/Razer sending
+        // VK_BROWSER_BACK / VK_BROWSER_FORWARD), and Windows HID Input Service often
+        // deliver with LLKHF_INJECTED set. Accept unless tagged with Crossflow's own origin.
         let accept = (input.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) == 0)
-            || (is_media_vk && input.dwExtraInfo != INPUT_ORIGIN_TAG);
+            || (is_media_or_browser_vk && input.dwExtraInfo != INPUT_ORIGIN_TAG);
         if accept {
             let suppress = with_policy(|state| {
                 let remote =
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);
                 let down = input.flags & LLKHF_UP == 0;
                 let vk = input.vkCode as usize;
+                let browser_mouse_btn = match input.vkCode {
+                    0xA6 => Some(Button::Back),
+                    0xA7 => Some(Button::Forward),
+                    _ => None,
+                };
                 // Map multimedia virtual keys and sided modifiers directly so Right Shift
                 // (which Windows WH_KEYBOARD_LL often flags with LLKHF_EXTENDED -> 0xE036)
                 // and OEM media keys with scanCode == 0 never get dropped.
@@ -515,7 +520,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 };
                 let resolved_usage = if let Some(u) = direct_usage {
                     Some(u)
-                } else if input.vkCode < 0xff && input.vkCode != 0x13 {
+                } else if browser_mouse_btn.is_none() && input.vkCode < 0xff && input.vkCode != 0x13 {
                     let scan = if input.scanCode == 0 {
                         (unsafe { MapVirtualKeyW(input.vkCode, MAPVK_VK_TO_VSC_EX) }) as u16
                     } else if input.scanCode <= 0x7f {
@@ -552,6 +557,20 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                         };
                     }
                     let was_down = state.policy.physical[vk];
+                    if down && !was_down && !matches!(resolved_usage, Some(0xE0..=0xE7)) {
+                        sync_windows_hotkey_modifiers();
+                    }
+                    if let Some(btn) = browser_mouse_btn
+                        && (!down || !was_down)
+                        && crate::hotkeys::active_observe_button(btn, down).is_some()
+                    {
+                        state.policy.physical[vk] = true;
+                        state.policy.hotkey_suppressed[vk] = true;
+                        return Decision {
+                            suppress: true,
+                            command: None,
+                        };
+                    }
                     if let Some(usage) = resolved_usage
                         && (!down || !was_down)
                         && crate::hotkeys::active_observe_key(usage, down).is_some()
@@ -586,6 +605,14 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
+fn sync_windows_hotkey_modifiers() {
+    let ctrl = unsafe { (GetAsyncKeyState(0x11) | GetAsyncKeyState(0xA2) | GetAsyncKeyState(0xA3)) < 0 };
+    let shift = unsafe { (GetAsyncKeyState(0x10) | GetAsyncKeyState(0xA0) | GetAsyncKeyState(0xA1)) < 0 };
+    let alt = unsafe { (GetAsyncKeyState(0x12) | GetAsyncKeyState(0xA4) | GetAsyncKeyState(0xA5)) < 0 };
+    let meta = unsafe { (GetAsyncKeyState(0x5B) | GetAsyncKeyState(0x5C)) < 0 };
+    crate::hotkeys::active_sync_modifiers(ctrl, shift, alt, meta);
+}
+
 fn mouse_button(message: u32, data: u32) -> Option<(usize, bool)> {
     match message {
         WM_LBUTTONDOWN => Some((1, true)),
@@ -604,13 +631,23 @@ fn mouse_button(message: u32, data: u32) -> Option<(usize, bool)> {
 }
 
 unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
     if code >= 0 && lparam != 0 {
         let input = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
-        if input.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) == 0 {
+        let msg = wparam as u32;
+        let is_aux_mouse = matches!(
+            msg,
+            WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP
+        );
+        // Accept physical events AND vendor-driver-remapped side/middle mouse buttons
+        // (Logitech G HUB / Razer / etc.) unless tagged with Crossflow's own origin.
+        let accept = (input.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) == 0)
+            || (is_aux_mouse && input.dwExtraInfo != INPUT_ORIGIN_TAG);
+        if accept {
             let suppress = with_policy(|state| {
                 let remote =
                     state.focus.load(Ordering::Acquire) && !state.stop.load(Ordering::Acquire);
-                if let Some((button_vk, down)) = mouse_button(wparam as u32, input.mouseData) {
+                if let Some((button_vk, down)) = mouse_button(msg, input.mouseData) {
                     let button = match button_vk {
                         1 => Button::Left,
                         2 => Button::Right,
@@ -634,6 +671,9 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                             };
                         }
                         let was_down = state.policy.physical[button_vk];
+                        if down && !was_down {
+                            sync_windows_hotkey_modifiers();
+                        }
                         if (!down || !was_down)
                             && crate::hotkeys::active_observe_button(button, down).is_some()
                         {

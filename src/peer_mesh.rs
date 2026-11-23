@@ -2233,14 +2233,11 @@ pub fn run(
                             }
                         }
 
-                        // Execute latched QuickJump once modifiers & physical keys are clear
+                        // Execute latched QuickJump IMMEDIATELY (<5ms, no waiting for modifier release!)
                         if let Some((target, created_at)) = pending_quick_jump.clone() {
                             if user_paused || created_at.elapsed() >= Duration::from_secs(2) {
                                 pending_quick_jump = None;
-                            } else if io.source.status().enabled
-                                && !hotkey_engine.any_modifier_held()
-                                && !io.source.has_held_physical_input()
-                            {
+                            } else if io.source.status().enabled {
                                 pending_quick_jump = None;
                                 let warp = match target {
                                     QuickJumpTarget::Device(dev_id) => io
@@ -2250,6 +2247,7 @@ pub fn run(
                                         .source
                                         .quick_jump_to_screen_with_clock(&screen_id, || log.ns()),
                                 };
+                                cap.sync_focus_after_quick_jump();
                                 if let Ok(Some(local_pt)) = warp {
                                     let _ = cap.warp_local(local_pt);
                                 }

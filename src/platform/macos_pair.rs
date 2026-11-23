@@ -107,6 +107,9 @@ fn validate_startup_inventory(source: &SharedSource, actual: &[Display]) -> Resu
 trait NativeTap: Send {
     fn try_next(&mut self) -> Option<CapturedEvent>;
     fn set_remote_focus(&self, remote: bool) -> bool;
+    fn set_remote_focus_allow_held(&self, remote: bool) -> bool {
+        self.set_remote_focus(remote)
+    }
     fn warp_local(&mut self, x: f64, y: f64) -> Result<()>;
     fn stop_reason(&self) -> Option<StopReason>;
     fn stop(&self);
@@ -118,6 +121,9 @@ impl NativeTap for MacCapture {
     }
     fn set_remote_focus(&self, remote: bool) -> bool {
         MacCapture::set_remote_focus(self, remote)
+    }
+    fn set_remote_focus_allow_held(&self, remote: bool) -> bool {
+        MacCapture::set_remote_focus_allow_held(self, remote)
     }
     fn warp_local(&mut self, x: f64, y: f64) -> Result<()> {
         MacCapture::warp_local(self, x, y)
@@ -233,8 +239,12 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
                 let _ = self.update_focus();
                 continue;
             }
-            if !matches!(event.kind, CaptureKind::Delta { .. })
-                && event.remote_focus != self.gate.load(Ordering::SeqCst)
+            if !matches!(
+                event.kind,
+                CaptureKind::Delta { .. }
+                    | CaptureKind::Key { down: false, .. }
+                    | CaptureKind::Button { down: false, .. }
+            ) && event.remote_focus != self.gate.load(Ordering::SeqCst)
             {
                 // A queued local down must never be forwarded just because an
                 // earlier queued movement has since crossed the shared edge.
@@ -290,6 +300,11 @@ impl<T: NativeTap> Capture for MacPairCapture<T> {
     fn warp_local(&mut self, point: Point) -> Result<()> {
         self.native.set_remote_focus(false);
         self.native.warp_local(point.x, point.y)
+    }
+
+    fn sync_focus_after_quick_jump(&mut self) {
+        let want_remote = self.gate.load(Ordering::SeqCst);
+        let _ = self.native.set_remote_focus_allow_held(want_remote);
     }
 }
 

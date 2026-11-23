@@ -50,6 +50,10 @@ private enum RecordedInputEvent: Sendable {
 private final class HotkeyKeyMonitor {
     static let shared = HotkeyKeyMonitor()
     private var monitor: Any?
+    private var pollTimer: Timer?
+    private var prevMid = false
+    private var prevBack = false
+    private var prevForward = false
 
     func start(onEvent: @escaping @MainActor (RecordedInputEvent) -> Bool) {
         stop()
@@ -77,9 +81,39 @@ private final class HotkeyKeyMonitor {
             }
             return consumed ? nil : event
         }
+        // Poll CGEventSource button state so Mouse4/Mouse5 (Back/Forward) are always
+        // captured even if AppKit/SwiftUI swallows otherMouseDown for side buttons.
+        prevMid = CGEventSource.buttonState(.combinedSessionState, button: .center)
+        prevBack = CGMouseButton(rawValue: 3).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false
+        prevForward = CGMouseButton(rawValue: 4).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { _ in
+            Task { @MainActor in
+                guard HotkeyKeyMonitor.shared.pollTimer != nil else { return }
+                let mid = CGEventSource.buttonState(.combinedSessionState, button: .center)
+                let back = CGMouseButton(rawValue: 3).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false
+                let forward = CGMouseButton(rawValue: 4).map { CGEventSource.buttonState(.combinedSessionState, button: $0) } ?? false
+                if mid != HotkeyKeyMonitor.shared.prevMid {
+                    HotkeyKeyMonitor.shared.prevMid = mid
+                    _ = onEvent(mid ? .otherMouseDown(2) : .otherMouseUp(2))
+                }
+                if back != HotkeyKeyMonitor.shared.prevBack {
+                    HotkeyKeyMonitor.shared.prevBack = back
+                    _ = onEvent(back ? .otherMouseDown(3) : .otherMouseUp(3))
+                }
+                if forward != HotkeyKeyMonitor.shared.prevForward {
+                    HotkeyKeyMonitor.shared.prevForward = forward
+                    _ = onEvent(forward ? .otherMouseDown(4) : .otherMouseUp(4))
+                }
+            }
+        }
     }
 
     func stop() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        prevMid = false
+        prevBack = false
+        prevForward = false
         if let m = monitor {
             NSEvent.removeMonitor(m)
             monitor = nil
@@ -105,11 +139,40 @@ struct WorkspaceView: View {
     @ViewState private var addingManualPeer = false
     @ViewState private var manualPeerAddress = ""
     @ViewState private var manualPeerLabel = ""
+    @ViewState private var sidebarWidth: CGFloat = 304
+    @ViewState private var dragStartSidebarWidth: CGFloat? = nil
+    @ViewState private var hoveringSplitter = false
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar.frame(width: 276)
-            Divider().overlay(Theme.border)
+            sidebar.frame(width: sidebarWidth)
+            ZStack {
+                Rectangle().fill(Theme.border).frame(width: 1)
+                if hoveringSplitter || dragStartSidebarWidth != nil {
+                    Rectangle().fill(Theme.accent.opacity(0.65)).frame(width: 2)
+                }
+            }
+            .frame(width: 6)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                hoveringSplitter = hovering
+                if hovering {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { value in
+                        let base = dragStartSidebarWidth ?? sidebarWidth
+                        if dragStartSidebarWidth == nil { dragStartSidebarWidth = base }
+                        sidebarWidth = min(540, max(240, base + value.translation.width))
+                    }
+                    .onEnded { _ in
+                        dragStartSidebarWidth = nil
+                    }
+            )
             mainWorkspace
         }
         .background(Theme.background)
@@ -784,6 +847,7 @@ struct WorkspaceView: View {
         }
 
         func handleKeyDownToken(_ token: String) -> Bool {
+            if recordHeldKeys.contains(token) { return true }
             let noOtherHeld = recordHeldMods.isEmpty && recordHeldKeys.isEmpty
             if noOtherHeld && token == "Esc" {
                 cancelHotkeyRecording()

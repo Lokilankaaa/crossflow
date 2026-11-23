@@ -75,7 +75,12 @@ struct SessionLayoutView: View {
                             }
                         }()
                         let displayName = local ? localName : (deviceNames[screen.deviceID] ?? sourceName)
+                        let deviceScreenCount = screens.filter { $0.deviceID == screen.deviceID }.count
                         let globalNum = screenNumbers[screen.id] ?? 0
+                        let tileTitle: String = {
+                            let base = deviceScreenCount > 1 ? "\(displayName) · 屏 \(ordinal)" : displayName
+                            return globalNum > 0 ? "#\(globalNum)  \(base)" : base
+                        }()
                         let tileW = max(24, screen.width * scale)
                         let tileH = max(24, screen.height * scale)
 
@@ -87,12 +92,13 @@ struct SessionLayoutView: View {
                             )
                             .overlay(alignment: .topLeading) {
                                 if globalNum > 0 {
-                                    Text("\(globalNum)")
-                                        .font(.system(size: tileH <= 96 ? 10.5 : 12, weight: .bold))
+                                    Text("#\(globalNum)")
+                                        .font(.system(size: tileH <= 96 ? 11 : 13, weight: .bold))
                                         .foregroundStyle(.white)
-                                        .padding(.horizontal, tileH <= 96 ? 5 : 6)
-                                        .frame(minWidth: tileH <= 96 ? 18 : 22, minHeight: tileH <= 96 ? 18 : 22)
+                                        .padding(.horizontal, tileH <= 96 ? 6 : 8)
+                                        .frame(minWidth: tileH <= 96 ? 20 : 26, minHeight: tileH <= 96 ? 20 : 26)
                                         .background(accentColor, in: Capsule())
+                                        .overlay(Capsule().stroke(Color.white, lineWidth: 1.5))
                                         .padding(tileH <= 96 ? 5 : 7)
                                 }
                             }
@@ -101,7 +107,7 @@ struct SessionLayoutView: View {
                                     VStack(spacing: 4) {
                                         Image(systemName: local ? "laptopcomputer" : "display")
                                             .foregroundStyle(accentColor)
-                                        Text("\(displayName) · 屏 \(ordinal)")
+                                        Text(tileTitle)
                                             .font(.system(size: 13, weight: .semibold))
                                             .lineLimit(1)
                                         Text("\(Int(screen.width)) × \(Int(screen.height))")
@@ -117,7 +123,7 @@ struct SessionLayoutView: View {
                                     VStack(spacing: 2) {
                                         Image(systemName: local ? "laptopcomputer" : "display")
                                             .foregroundStyle(accentColor)
-                                        Text("屏 \(ordinal)").font(.caption2)
+                                        Text(globalNum > 0 ? "#\(globalNum)" : "屏 \(ordinal)").font(.caption2.weight(.semibold))
                                     }
                                     Image(systemName: local ? "laptopcomputer" : "display")
                                 }

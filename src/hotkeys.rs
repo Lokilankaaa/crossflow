@@ -462,11 +462,28 @@ pub fn hid_to_key_name(usage: u16) -> Option<String> {
 struct EngineInner {
     bindings: Vec<(HotkeyBinding, HotkeyAction)>,
     screen_prefix: Option<HotkeyPrefix>,
+    tracked_inputs: BTreeSet<u16>,
     screen_count: usize,
     held_mods: BTreeSet<u16>,
     held_inputs: BTreeSet<u16>,
     pending_actions: Vec<HotkeyAction>,
     suspended: bool,
+}
+
+fn compute_tracked_inputs(
+    bindings: &[(HotkeyBinding, HotkeyAction)],
+    screen_prefix: &Option<HotkeyPrefix>,
+) -> BTreeSet<u16> {
+    let mut tracked = BTreeSet::new();
+    if let Some(p) = screen_prefix {
+        tracked.extend(p.extra_keys.iter().copied());
+    }
+    for (b, _) in bindings {
+        if b.keys.len() > 1 {
+            tracked.extend(b.keys.iter().copied());
+        }
+    }
+    tracked
 }
 
 /// Thread-safe global hotkey matcher shared between native capture and PeerHost.
@@ -481,9 +498,13 @@ impl Default for SharedHotkeyEngine {
 
 impl SharedHotkeyEngine {
     pub fn new(config: &HotkeyConfig) -> Self {
+        let bindings = config.compiled();
+        let screen_prefix = config.compiled_screen_prefix();
+        let tracked_inputs = compute_tracked_inputs(&bindings, &screen_prefix);
         Self(Arc::new(Mutex::new(EngineInner {
-            bindings: config.compiled(),
-            screen_prefix: config.compiled_screen_prefix(),
+            bindings,
+            screen_prefix,
+            tracked_inputs,
             screen_count: 9,
             held_mods: BTreeSet::new(),
             held_inputs: BTreeSet::new(),
@@ -494,8 +515,13 @@ impl SharedHotkeyEngine {
 
     pub fn update_config(&self, config: &HotkeyConfig) {
         if let Ok(mut inner) = self.0.lock() {
-            inner.bindings = config.compiled();
-            inner.screen_prefix = config.compiled_screen_prefix();
+            let bindings = config.compiled();
+            let screen_prefix = config.compiled_screen_prefix();
+            let tracked = compute_tracked_inputs(&bindings, &screen_prefix);
+            inner.bindings = bindings;
+            inner.screen_prefix = screen_prefix;
+            inner.held_inputs.retain(|k| tracked.contains(k));
+            inner.tracked_inputs = tracked;
         }
     }
 
@@ -521,6 +547,37 @@ impl SharedHotkeyEngine {
         if let Ok(mut inner) = self.0.lock() {
             inner.held_mods.clear();
             inner.held_inputs.clear();
+        }
+    }
+
+    /// Reconcile modifier state against live OS hardware state so a swallowed
+    /// modifier key-up (e.g. UAC / Win+L / Alt+Tab) can never jam hotkeys.
+    pub fn sync_modifiers(&self, ctrl: bool, shift: bool, alt: bool, meta: bool) {
+        if let Ok(mut inner) = self.0.lock() {
+            if !ctrl {
+                inner.held_mods.remove(&0xE0);
+                inner.held_mods.remove(&0xE4);
+            } else if !inner.held_mods.contains(&0xE0) && !inner.held_mods.contains(&0xE4) {
+                inner.held_mods.insert(0xE0);
+            }
+            if !shift {
+                inner.held_mods.remove(&0xE1);
+                inner.held_mods.remove(&0xE5);
+            } else if !inner.held_mods.contains(&0xE1) && !inner.held_mods.contains(&0xE5) {
+                inner.held_mods.insert(0xE1);
+            }
+            if !alt {
+                inner.held_mods.remove(&0xE2);
+                inner.held_mods.remove(&0xE6);
+            } else if !inner.held_mods.contains(&0xE2) && !inner.held_mods.contains(&0xE6) {
+                inner.held_mods.insert(0xE2);
+            }
+            if !meta {
+                inner.held_mods.remove(&0xE3);
+                inner.held_mods.remove(&0xE7);
+            } else if !inner.held_mods.contains(&0xE3) && !inner.held_mods.contains(&0xE7) {
+                inner.held_mods.insert(0xE3);
+            }
         }
     }
 
@@ -582,7 +639,12 @@ impl SharedHotkeyEngine {
             return Some(act);
         }
 
-        inner.held_inputs.insert(code);
+        // Only track non-modifier keys/buttons that are actually used in a configured
+        // multi-key chord or custom screen prefix, so random everyday typing can never
+        // leave a stale key in `held_inputs`.
+        if inner.tracked_inputs.contains(&code) {
+            inner.held_inputs.insert(code);
+        }
         None
     }
 
@@ -637,6 +699,15 @@ pub fn active_observe_key(usage: u16, down: bool) -> Option<HotkeyAction> {
 pub fn active_observe_button(button: Button, down: bool) -> Option<HotkeyAction> {
     let engine = ACTIVE_ENGINE.lock().ok()?.clone()?;
     engine.observe_button(button, down)
+}
+
+/// Reconcile active hotkey engine modifiers against live OS key state.
+pub fn active_sync_modifiers(ctrl: bool, shift: bool, alt: bool, meta: bool) {
+    if let Ok(guard) = ACTIVE_ENGINE.lock()
+        && let Some(engine) = guard.as_ref()
+    {
+        engine.sync_modifiers(ctrl, shift, alt, meta);
+    }
 }
 
 #[cfg(test)]

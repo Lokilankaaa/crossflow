@@ -209,6 +209,13 @@ impl Shared {
         until != 0
     }
     fn focus(&self, remote: bool, now: u64) -> bool {
+        self.focus_inner(remote, now, false)
+    }
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn focus_allow_held(&self, remote: bool, now: u64) -> bool {
+        self.focus_inner(remote, now, true)
+    }
+    fn focus_inner(&self, remote: bool, now: u64, allow_held: bool) -> bool {
         if !remote {
             self.remote_until.store(0, Ordering::SeqCst);
             return true;
@@ -227,8 +234,10 @@ impl Shared {
             self.stop(StopReason::FocusLeaseExpired);
             return false;
         }
-        // Do not strand a key/button which was delivered to a local application.
-        if until == 0 && self.held.load(Ordering::SeqCst) != 0 {
+        // Do not strand a key/button which was delivered to a local application
+        // on edge drag; explicit QuickJump safely passes `allow_held = true`
+        // because `route_press` delivers pre-held local releases back to local macOS.
+        if !allow_held && until == 0 && self.held.load(Ordering::SeqCst) != 0 {
             return false;
         }
         self.remote_until
@@ -745,18 +754,36 @@ mod native {
         }
         /// False means focus was rejected (held local input, expired lease, stop).
         pub fn set_remote_focus(&self, remote: bool) -> bool {
-            let mut accepted = self.shared.focus(remote, self.clock.now());
+            self.set_remote_focus_inner(remote, false)
+        }
+        /// Like `set_remote_focus`, but permits immediate QuickJump focus handoff
+        /// while modifier/prefix keys are still physically held (`route_press` keeps
+        /// pre-held local releases routed back to local macOS without stranding them).
+        pub fn set_remote_focus_allow_held(&self, remote: bool) -> bool {
+            self.set_remote_focus_inner(remote, true)
+        }
+        fn set_remote_focus_inner(&self, remote: bool, allow_held: bool) -> bool {
+            let mut accepted = if allow_held {
+                self.shared.focus_allow_held(remote, self.clock.now())
+            } else {
+                self.shared.focus(remote, self.clock.now())
+            };
             if remote && !accepted && self.shared.stop.load(Ordering::SeqCst) == 0 {
                 for _ in 0..32 {
                     std::hint::spin_loop();
-                    accepted = self.shared.focus(true, self.clock.now());
+                    accepted = if allow_held {
+                        self.shared.focus_allow_held(true, self.clock.now())
+                    } else {
+                        self.shared.focus(true, self.clock.now())
+                    };
                     if accepted || self.shared.stop.load(Ordering::SeqCst) != 0 {
                         break;
                     }
                 }
                 // Self-heal stale `held` count (e.g. if macOS Secure Input, Spotlight,
                 // or Cmd+Tab swallowed a key-up) after confirming hardware has nothing held.
-                if !accepted
+                if !allow_held
+                    && !accepted
                     && self.shared.stop.load(Ordering::SeqCst) == 0
                     && self.shared.held.load(Ordering::SeqCst) != 0
                     && !any_hardware_input_held()

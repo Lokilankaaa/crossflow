@@ -26,6 +26,10 @@ pub trait Capture {
     fn warp_local(&mut self, _point: crate::arrangement::Point) -> Result<()> {
         Ok(())
     }
+    /// Immediately synchronize native capture remote-focus gate right after a
+    /// QuickJump so the jump takes effect on the spot even while modifier/prefix
+    /// keys are still physically held.
+    fn sync_focus_after_quick_jump(&mut self) {}
 }
 
 /// Platform hooks used by the common app runtime. Native implementations live

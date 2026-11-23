@@ -17,8 +17,18 @@ namespace Crossflow.Windows;
 
 internal sealed class MainWindow : Window
 {
+    private sealed class SplitterHost : Grid
+    {
+        internal void SetResizeCursor() =>
+            ProtectedCursor = Microsoft.UI.Input.InputSystemCursor.Create(Microsoft.UI.Input.InputSystemCursorShape.SizeWestEast);
+    }
+
     private readonly Theme theme;
     private readonly Grid root = new();
+    private readonly ColumnDefinition sidebarColumn = new() { Width = new GridLength(304) };
+    private bool draggingSplitter;
+    private double splitterStartX;
+    private double splitterStartWidth;
     private readonly Grid workspace = new();
     private readonly ScrollViewer sidebarScroll = new()
     {
@@ -79,6 +89,8 @@ internal sealed class MainWindow : Window
     private readonly HashSet<string> recordHeldKeys = new(StringComparer.Ordinal);
     private readonly HashSet<string> recordPeakMods = new(StringComparer.Ordinal);
     private readonly HashSet<string> recordPeakKeys = new(StringComparer.Ordinal);
+    private readonly DispatcherTimer hotkeyPollTimer = new() { Interval = TimeSpan.FromMilliseconds(15) };
+    private bool pollPrevMid, pollPrevBack, pollPrevForward;
     private bool hotkeysExpanded;
     private TrayIcon? trayIcon;
 
@@ -87,6 +99,9 @@ internal sealed class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
 
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
@@ -130,10 +145,12 @@ internal sealed class MainWindow : Window
         Title = "Crossflow";
         root.RequestedTheme = ElementTheme.Light;
         root.Background = theme.Brush("background");
-        root.ColumnDefinitions.Add(new() { Width = new GridLength(276) });
+        root.ColumnDefinitions.Add(sidebarColumn);
+        root.ColumnDefinitions.Add(new() { Width = new GridLength(6) });
         root.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
 
         BuildSidebar();
+        BuildSidebarSplitter();
         BuildWorkspace();
 
         Content = root;
@@ -476,6 +493,65 @@ internal sealed class MainWindow : Window
         root.Children.Add(sidebarBorder);
     }
 
+    private void BuildSidebarSplitter()
+    {
+        var indicator = new Border
+        {
+            Width = 2,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            CornerRadius = new CornerRadius(1)
+        };
+        var splitter = new SplitterHost
+        {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch
+        };
+        splitter.Children.Add(indicator);
+        splitter.SetResizeCursor();
+        splitter.PointerEntered += (_, _) => indicator.Background = theme.Brush("border");
+        splitter.PointerExited += (_, _) =>
+        {
+            if (!draggingSplitter) indicator.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        };
+        splitter.PointerPressed += (_, e) =>
+        {
+            if (!e.GetCurrentPoint(root).Properties.IsLeftButtonPressed) return;
+            draggingSplitter = true;
+            splitterStartX = e.GetCurrentPoint(root).Position.X;
+            splitterStartWidth = sidebarColumn.Width.Value;
+            indicator.Background = theme.Brush("accent");
+            splitter.CapturePointer(e.Pointer);
+            e.Handled = true;
+        };
+        splitter.PointerMoved += (_, e) =>
+        {
+            if (!draggingSplitter) return;
+            double dx = e.GetCurrentPoint(root).Position.X - splitterStartX;
+            double maxW = Math.Max(320, Math.Min(540, root.ActualWidth * 0.55));
+            double next = Math.Clamp(splitterStartWidth + dx, 240, maxW);
+            sidebarColumn.Width = new GridLength(Math.Round(next));
+            e.Handled = true;
+        };
+        splitter.PointerReleased += (_, e) =>
+        {
+            if (!draggingSplitter) return;
+            draggingSplitter = false;
+            splitter.ReleasePointerCapture(e.Pointer);
+            indicator.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            e.Handled = true;
+        };
+        splitter.PointerCaptureLost += (_, _) =>
+        {
+            draggingSplitter = false;
+            indicator.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        };
+        Grid.SetColumn(splitter, 1);
+        root.Children.Add(splitter);
+    }
+
     private void StyleCompactButton(Button button, string text)
     {
         button.Content = text;
@@ -540,6 +616,7 @@ internal sealed class MainWindow : Window
                 Text = label,
                 FontSize = 11.5,
                 Foreground = theme.Brush("text"),
+                TextTrimming = TextTrimming.CharacterEllipsis,
                 VerticalAlignment = VerticalAlignment.Center
             });
             var btn = new Button
@@ -616,6 +693,7 @@ internal sealed class MainWindow : Window
         root.PreviewKeyUp += OnRootPreviewKeyUp;
         root.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(OnRootPointerPressedForHotkey), true);
         root.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(OnRootPointerReleasedForHotkey), true);
+        hotkeyPollTimer.Tick += OnHotkeyPollTick;
     }
 
     private void ClearRecordingBuffers()
@@ -624,6 +702,55 @@ internal sealed class MainWindow : Window
         recordHeldKeys.Clear();
         recordPeakMods.Clear();
         recordPeakKeys.Clear();
+    }
+
+    private void StartHotkeyMousePoll()
+    {
+        pollPrevMid = (GetAsyncKeyState(0x04) & 0x8000) != 0;
+        pollPrevBack = ((GetAsyncKeyState(0x05) | GetAsyncKeyState(0xA6)) & 0x8000) != 0;
+        pollPrevForward = ((GetAsyncKeyState(0x06) | GetAsyncKeyState(0xA7)) & 0x8000) != 0;
+        hotkeyPollTimer.Start();
+    }
+
+    private void StopHotkeyMousePoll()
+    {
+        hotkeyPollTimer.Stop();
+        pollPrevMid = false;
+        pollPrevBack = false;
+        pollPrevForward = false;
+    }
+
+    private async void OnHotkeyPollTick(object? sender, object e)
+    {
+        if (recordingHotkeyField is null)
+        {
+            StopHotkeyMousePoll();
+            return;
+        }
+        bool mid = (GetAsyncKeyState(0x04) & 0x8000) != 0;
+        bool back = ((GetAsyncKeyState(0x05) | GetAsyncKeyState(0xA6)) & 0x8000) != 0;
+        bool forward = ((GetAsyncKeyState(0x06) | GetAsyncKeyState(0xA7)) & 0x8000) != 0;
+
+        if (mid != pollPrevMid)
+        {
+            pollPrevMid = mid;
+            if (mid) await HandleRecordTokenDownAsync(null, "MouseMid");
+            else await HandleRecordTokenUpAsync(null, "MouseMid");
+            if (recordingHotkeyField is null) return;
+        }
+        if (back != pollPrevBack)
+        {
+            pollPrevBack = back;
+            if (back) await HandleRecordTokenDownAsync(null, "Mouse4");
+            else await HandleRecordTokenUpAsync(null, "Mouse4");
+            if (recordingHotkeyField is null) return;
+        }
+        if (forward != pollPrevForward)
+        {
+            pollPrevForward = forward;
+            if (forward) await HandleRecordTokenDownAsync(null, "Mouse5");
+            else await HandleRecordTokenUpAsync(null, "Mouse5");
+        }
     }
 
     private void ToggleHotkeyRecording(string field)
@@ -635,12 +762,14 @@ internal sealed class MainWindow : Window
         }
         recordingHotkeyField = field;
         ClearRecordingBuffers();
+        StartHotkeyMousePoll();
         _ = peerMesh.SetHotkeySuspendedAsync(true);
         RenderHotkeyButtons(currentSnap.Hotkeys);
     }
 
     private void CancelHotkeyRecording()
     {
+        StopHotkeyMousePoll();
         if (recordingHotkeyField is null) return;
         recordingHotkeyField = null;
         ClearRecordingBuffers();
@@ -683,6 +812,7 @@ internal sealed class MainWindow : Window
 
     private async Task CommitRecordedHotkeyAsync(string field, string? newValue)
     {
+        StopHotkeyMousePoll();
         ClearNotice();
         recordingHotkeyField = null;
         ClearRecordingBuffers();
@@ -717,6 +847,7 @@ internal sealed class MainWindow : Window
             return;
         }
         if (keyToken is null) return;
+        if (recordHeldKeys.Contains(keyToken)) return;
 
         bool noOtherHeld = recordHeldMods.Count == 0 && recordHeldKeys.Count == 0;
         if (noOtherHeld && keyToken == "Esc")
@@ -894,6 +1025,8 @@ internal sealed class MainWindow : Window
             VirtualKey.Down => "Down",
             VirtualKey.CapitalLock => "CapsLock",
             VirtualKey.Scroll => "ScrollLock",
+            VirtualKey.GoBack => "Mouse4",
+            VirtualKey.GoForward => "Mouse5",
             (VirtualKey)186 => ";",
             (VirtualKey)187 => "=",
             (VirtualKey)188 => ",",
@@ -1093,7 +1226,7 @@ internal sealed class MainWindow : Window
         Grid.SetRow(footerStatus, 4);
         workspace.Children.Add(footerStatus);
 
-        Grid.SetColumn(workspace, 1);
+        Grid.SetColumn(workspace, 2);
         root.Children.Add(workspace);
     }
 
@@ -2141,13 +2274,19 @@ internal sealed class MainWindow : Window
         var deviceIds = layout.Screens.Select(s => s.DeviceId).Distinct().ToList();
         var focusId = currentSnap.RouteEnabled ? currentSnap.FocusScreenId : null;
 
+        var deviceCounts = layout.Screens.GroupBy(s => s.DeviceId).ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
         foreach (var screen in layout.Screens)
         {
+            int globalNum = ScreenNumber(screen.Id);
             bool smallTile = screen.Height * scale <= 96;
             double padding = smallTile ? 6 : 12;
             double textWidth = Math.Max(1, screen.Width * scale - padding * 2 - 4);
+            string baseTitle = deviceCounts.GetValueOrDefault(screen.DeviceId, 1) > 1
+                ? ScreenName(screen.Id)
+                : DeviceName(screen.DeviceId);
+            string displayTitle = globalNum > 0 ? $"#{globalNum}  {baseTitle}" : baseTitle;
             var label = new StackPanel { Spacing = smallTile ? 3 : 5, VerticalAlignment = VerticalAlignment.Center };
-            var screenLabel = Text(ScreenName(screen.Id), "section");
+            var screenLabel = Text(displayTitle, "section");
             screenLabel.FontSize = smallTile ? 13 : 15;
             screenLabel.MaxWidth = textWidth;
             screenLabel.TextTrimming = TextTrimming.CharacterEllipsis;
@@ -2162,7 +2301,8 @@ internal sealed class MainWindow : Window
             resLabel.MaxWidth = textWidth;
             resLabel.TextWrapping = TextWrapping.NoWrap;
             label.Children.Add(screenLabel);
-            label.Children.Add(deviceLabel);
+            if (deviceCounts.GetValueOrDefault(screen.DeviceId, 1) > 1)
+                label.Children.Add(deviceLabel);
             label.Children.Add(resLabel);
 
             bool isFocused = focusId == screen.Id;
@@ -2184,25 +2324,26 @@ internal sealed class MainWindow : Window
             AutomationProperties.SetAutomationId(button, "screen-" + screen.Id);
             var tileContent = new Grid();
             tileContent.Children.Add(button);
-            int globalNum = ScreenNumber(screen.Id);
             if (globalNum > 0)
             {
-                double badgeSize = smallTile ? 18 : 22;
+                double badgeHeight = smallTile ? 20 : 26;
                 var badge = new Border
                 {
-                    MinWidth = badgeSize,
-                    Height = badgeSize,
-                    Padding = new Thickness(smallTile ? 4 : 6, 0, smallTile ? 4 : 6, 0),
-                    CornerRadius = new CornerRadius(badgeSize / 2),
+                    MinWidth = badgeHeight,
+                    Height = badgeHeight,
+                    Padding = new Thickness(smallTile ? 6 : 8, 0, smallTile ? 6 : 8, 0),
+                    CornerRadius = new CornerRadius(badgeHeight / 2),
                     Background = new SolidColorBrush(color),
+                    BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.White),
+                    BorderThickness = new Thickness(1.5),
                     HorizontalAlignment = HorizontalAlignment.Left,
                     VerticalAlignment = VerticalAlignment.Top,
                     Margin = new Thickness(smallTile ? 5 : 8),
                     IsHitTestVisible = false,
                     Child = new TextBlock
                     {
-                        Text = globalNum.ToString(),
-                        FontSize = smallTile ? 10.5 : 12,
+                        Text = $"#{globalNum}",
+                        FontSize = smallTile ? 11 : 13,
                         FontWeight = Microsoft.UI.Text.FontWeights.Bold,
                         Foreground = new SolidColorBrush(Microsoft.UI.Colors.White),
                         HorizontalAlignment = HorizontalAlignment.Center,
