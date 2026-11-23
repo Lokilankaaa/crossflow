@@ -944,13 +944,17 @@ mod native {
             return drain_release(state, kind, event);
         }
         let flags = unsafe { CGEventGetFlags(event) };
-        // Reconcile stale modifier bits if macOS (e.g. Spotlight / Secure Input) dropped a key-up.
-        for &mod_key in &[59usize, 56, 60, 55, 54, 58, 61, 62, 63] {
-            if state.keys[mod_key] && modifier_down(mod_key as u16, flags) == Some(false) {
-                update_held(&state.shared, &mut state.keys[mod_key], false);
-                state.remote_keys[mod_key] = false;
-                if let Some(u) = hid_usage(mod_key as u16) {
-                    crate::hotkeys::active_observe_key(u, false);
+        // Reconcile stale modifier bits only while local (when remote is active,
+        // suppressed FlagsChanged events may not update WindowServer's modifier mask,
+        // while our HID event tap observes every physical key-down/up directly).
+        if !remote {
+            for &mod_key in &[59usize, 56, 60, 55, 54, 58, 61, 62, 63] {
+                if state.keys[mod_key] && modifier_down(mod_key as u16, flags) == Some(false) {
+                    update_held(&state.shared, &mut state.keys[mod_key], false);
+                    state.remote_keys[mod_key] = false;
+                    if let Some(u) = hid_usage(mod_key as u16) {
+                        crate::hotkeys::active_observe_key(u, false);
+                    }
                 }
             }
         }

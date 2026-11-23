@@ -559,7 +559,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     }
                     let was_down = state.policy.physical[vk];
                     if down && !was_down && !matches!(resolved_usage, Some(0xE0..=0xE7)) {
-                        sync_windows_hotkey_modifiers();
+                        sync_windows_hotkey_modifiers(&state.policy, remote);
                     }
                     if let Some(btn) = browser_mouse_btn
                         && (!down || !was_down)
@@ -606,11 +606,24 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
-fn sync_windows_hotkey_modifiers() {
-    let ctrl = unsafe { (GetAsyncKeyState(0x11) | GetAsyncKeyState(0xA2) | GetAsyncKeyState(0xA3)) < 0 };
-    let shift = unsafe { (GetAsyncKeyState(0x10) | GetAsyncKeyState(0xA0) | GetAsyncKeyState(0xA1)) < 0 };
-    let alt = unsafe { (GetAsyncKeyState(0x12) | GetAsyncKeyState(0xA4) | GetAsyncKeyState(0xA5)) < 0 };
-    let meta = unsafe { (GetAsyncKeyState(0x5B) | GetAsyncKeyState(0x5C)) < 0 };
+fn modifier_physically_down(policy: &Policy, remote: bool, vks: &[usize]) -> bool {
+    vks.iter().any(|&vk| {
+        if remote || policy.suppressed[vk] {
+            policy.physical[vk]
+        } else {
+            unsafe { GetAsyncKeyState(vk as i32) < 0 }
+        }
+    })
+}
+
+fn sync_windows_hotkey_modifiers(policy: &Policy, remote: bool) {
+    // While remote focus is active (or for modifiers whose key-down was suppressed
+    // during remote focus), Win32 GetAsyncKeyState stays false because WH_KEYBOARD_LL
+    // swallowed local delivery. Read true hardware state from `policy.physical` there!
+    let ctrl = modifier_physically_down(policy, remote, &[0x11, 0xA2, 0xA3]);
+    let shift = modifier_physically_down(policy, remote, &[0x10, 0xA0, 0xA1]);
+    let alt = modifier_physically_down(policy, remote, &[0x12, 0xA4, 0xA5]);
+    let meta = modifier_physically_down(policy, remote, &[0x5B, 0x5C]);
     crate::hotkeys::active_sync_modifiers(ctrl, shift, alt, meta);
 }
 
@@ -673,7 +686,7 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                         }
                         let was_down = state.policy.physical[button_vk];
                         if down && !was_down {
-                            sync_windows_hotkey_modifiers();
+                            sync_windows_hotkey_modifiers(&state.policy, remote);
                         }
                         if (!down || !was_down)
                             && crate::hotkeys::active_observe_button(button, down).is_some()
