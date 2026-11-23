@@ -352,6 +352,50 @@ fn button(number: usize) -> Option<Button> {
     .get(number)
     .copied()
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum SysDefinedMedia {
+    Key {
+        key_code: u16,
+        usage: u16,
+        down: bool,
+    },
+    SuppressRepeat,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn decode_sysdefined_fields(subtype: i16, data1: u64) -> Option<SysDefinedMedia> {
+    if subtype != 8 {
+        return None;
+    }
+    let key_code = ((data1 >> 16) & 0xFFFF) as u16;
+    let key_flags = (data1 & 0xFFFF) as u16;
+    let key_state = (key_flags & 0xFF00) >> 8;
+    let is_repeat = (key_flags & 0x01) != 0;
+    let usage = match key_code {
+        0 => crate::keymap::HID_VOLUME_UP,
+        1 => crate::keymap::HID_VOLUME_DOWN,
+        7 => crate::keymap::HID_MUTE,
+        16 => crate::keymap::HID_MEDIA_PLAY_PAUSE,
+        17 | 19 => crate::keymap::HID_MEDIA_NEXT,
+        18 | 20 => crate::keymap::HID_MEDIA_PREV,
+        _ => return None,
+    };
+    if is_repeat && !matches!(key_code, 0 | 1) {
+        return Some(SysDefinedMedia::SuppressRepeat);
+    }
+    let down = match key_state {
+        0x0A => true,
+        0x0B => false,
+        _ => return None,
+    };
+    Some(SysDefinedMedia::Key {
+        key_code,
+        usage,
+        down,
+    })
+}
+
 fn physical_source(marker: i64, pid: i64) -> bool {
     marker != ORIGIN_MARKER && pid == 0
 }
@@ -478,10 +522,10 @@ mod native {
         fn objc_autoreleasePoolPop(pool: Ptr);
         fn objc_msgSend();
     }
-    fn decode_sysdefined_media(event: Ptr) -> Option<(u16, bool)> {
+    pub(super) fn decode_sysdefined_media(event: Ptr) -> Option<SysDefinedMedia> {
         unsafe {
             let pool = objc_autoreleasePoolPush();
-            let result = (|| -> Option<(u16, bool)> {
+            let result = (|| -> Option<SysDefinedMedia> {
                 let cls = objc_getClass(c"NSEvent".as_ptr());
                 if cls.is_null() {
                     return None;
@@ -495,34 +539,10 @@ mod native {
                 let get_i16: extern "C" fn(Ptr, Ptr) -> i16 =
                     std::mem::transmute(objc_msgSend as *const ());
                 let subtype = get_i16(ns_ev, sel_registerName(c"subtype".as_ptr()));
-                if subtype != 8 {
-                    return None;
-                }
                 let get_isize: extern "C" fn(Ptr, Ptr) -> isize =
                     std::mem::transmute(objc_msgSend as *const ());
-                let data1 = get_isize(ns_ev, sel_registerName(c"data1".as_ptr()));
-                let key_code = (data1 >> 16) & 0xFFFF;
-                let key_flags = data1 & 0xFFFF;
-                let key_state = (key_flags & 0xFF00) >> 8;
-                let is_repeat = (key_flags & 0x01) != 0;
-                if is_repeat && !matches!(key_code, 0 | 1) {
-                    return None;
-                }
-                let down = match key_state {
-                    0x0A => true,
-                    0x0B => false,
-                    _ => return None,
-                };
-                let usage = match key_code {
-                    0 => crate::keymap::HID_VOLUME_UP,
-                    1 => crate::keymap::HID_VOLUME_DOWN,
-                    7 => crate::keymap::HID_MUTE,
-                    16 => crate::keymap::HID_MEDIA_PLAY_PAUSE,
-                    17 => crate::keymap::HID_MEDIA_NEXT,
-                    18 => crate::keymap::HID_MEDIA_PREV,
-                    _ => return None,
-                };
-                Some((usage, down))
+                let data1 = get_isize(ns_ev, sel_registerName(c"data1".as_ptr())) as u64;
+                decode_sysdefined_fields(subtype, data1)
             })();
             objc_autoreleasePoolPop(pool);
             result
@@ -854,10 +874,12 @@ mod native {
         cursor: Arc<CursorSuppression>,
         clock: Clock,
         tap_port: Ptr,
+        media_tap_port: Ptr,
         keys: [bool; 128],
         buttons: [bool; 5],
         remote_keys: [bool; 128],
         remote_buttons: [bool; 5],
+        remote_media_keys: u32,
         hotkey_suppressed: [bool; 128],
         hotkey_suppressed_buttons: [bool; 5],
         wheel: WheelRemainder,
@@ -882,7 +904,10 @@ mod native {
         if kind == u32::MAX || kind == u32::MAX - 1 {
             // macOS sends kCGEventTapDisabledByTimeout (u32::MAX - 1) on transient
             // scheduler or WindowServer stalls. Re-enable immediately per Apple docs;
-            // only stop if the tap refuses to re-enable (e.g. revoked permission).
+            // only stop if the primary tap refuses to re-enable (e.g. revoked permission).
+            if !state.media_tap_port.is_null() && state.shared.stop.load(Ordering::SeqCst) == 0 {
+                unsafe { CGEventTapEnable(state.media_tap_port, true) };
+            }
             if !state.tap_port.is_null() && state.shared.stop.load(Ordering::SeqCst) == 0 {
                 unsafe { CGEventTapEnable(state.tap_port, true) };
                 if unsafe { CGEventTapIsEnabled(state.tap_port) } {
@@ -904,7 +929,15 @@ mod native {
         }
         let marker = unsafe { CGEventGetIntegerValueField(event, 42) };
         let pid = unsafe { CGEventGetIntegerValueField(event, 41) };
-        if !physical_source(marker, pid) {
+        let accepted_source = if kind == 14 {
+            // NX_SYSDEFINED media/volume events (Apple Silicon function row, Control Strip,
+            // keyboard helpers) may carry a non-zero system/helper PID; only reject our own
+            // marker or our own PID to prevent feedback loops.
+            marker != ORIGIN_MARKER && pid != i64::from(std::process::id())
+        } else {
+            physical_source(marker, pid)
+        };
+        if !accepted_source {
             if marker == ORIGIN_MARKER {
                 state.shared.own_injected.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -938,11 +971,15 @@ mod native {
         if state.shared.stop.load(Ordering::SeqCst) != 0 {
             return drain_release(state, kind, event);
         }
-        let point = unsafe { CGEventGetLocation(event) };
-        if !point.x.is_finite() || !point.y.is_finite() {
+        let raw_point = unsafe { CGEventGetLocation(event) };
+        let point = if raw_point.x.is_finite() && raw_point.y.is_finite() {
+            raw_point
+        } else if kind == 14 {
+            Point::default()
+        } else {
             state.shared.stop(StopReason::UnsupportedInput);
             return drain_release(state, kind, event);
-        }
+        };
         let flags = unsafe { CGEventGetFlags(event) };
         // Reconcile stale modifier bits only while local (when remote is active,
         // suppressed FlagsChanged events may not update WindowServer's modifier mask,
@@ -1096,15 +1133,38 @@ mod native {
             }
             14 => {
                 // NX_SYSDEFINED media keys (Volume Up/Down, Mute, Play/Pause, Next/Prev)
-                let Some((usage, down)) = decode_sysdefined_media(event) else {
-                    return false;
-                };
-                state.shared.activity.fetch_add(1, Ordering::Release);
-                if !remote {
-                    return false;
+                match decode_sysdefined_media(event) {
+                    Some(SysDefinedMedia::Key {
+                        key_code,
+                        usage,
+                        down,
+                    }) => {
+                        state.shared.activity.fetch_add(1, Ordering::Release);
+                        let bit = if key_code < 32 { 1u32 << key_code } else { 0 };
+                        if down {
+                            if !remote {
+                                return false;
+                            }
+                            state.remote_media_keys |= bit;
+                            suppress = true;
+                        } else {
+                            let was_remote = (state.remote_media_keys & bit) != 0;
+                            state.remote_media_keys &= !bit;
+                            if !remote && !was_remote {
+                                return false;
+                            }
+                            suppress = true;
+                            if !remote {
+                                return true;
+                            }
+                        }
+                        CaptureKind::Key { usage, down }
+                    }
+                    Some(SysDefinedMedia::SuppressRepeat) => {
+                        return remote;
+                    }
+                    None => return false,
                 }
-                suppress = true;
-                CaptureKind::Key { usage, down }
             }
             22 => {
                 // Fixed-point line deltas retain trackpad/sub-notch precision;
@@ -1146,13 +1206,17 @@ mod native {
             }
             // This fresh down will be delivered locally: do not swallow its up.
             match captured_kind {
-                CaptureKind::Key { down: true, .. } => {
+                CaptureKind::Key { down: true, .. } if kind != 14 => {
                     let key = unsafe { CGEventGetIntegerValueField(event, 9) } as usize;
-                    state.remote_keys[key] = false;
+                    if key < state.remote_keys.len() {
+                        state.remote_keys[key] = false;
+                    }
                 }
                 CaptureKind::Button { down: true, .. } => {
                     let key = unsafe { CGEventGetIntegerValueField(event, 3) } as usize;
-                    state.remote_buttons[key] = false;
+                    if key < state.remote_buttons.len() {
+                        state.remote_buttons[key] = false;
+                    }
                 }
                 _ => {}
             }
@@ -1237,10 +1301,12 @@ mod native {
             cursor: Arc::clone(&cursor),
             clock,
             tap_port: std::ptr::null_mut(),
+            media_tap_port: std::ptr::null_mut(),
             keys: [false; 128],
             buttons: [false; 5],
             remote_keys: [false; 128],
             remote_buttons: [false; 5],
+            remote_media_keys: 0,
             hotkey_suppressed: [false; 128],
             hotkey_suppressed_buttons: [false; 5],
             wheel: WheelRemainder::default(),
@@ -1299,6 +1365,46 @@ mod native {
             let _ = ready.send(Err("Cannot create Mac event run-loop source".into()));
             return;
         }
+        // On Apple Silicon and modern macOS, NX_SYSDEFINED media/volume keys (type 14)
+        // from the built-in function row / Control Strip often enter at kCGSessionEventTap
+        // rather than kCGHIDEventTap. Attach a lightweight session-level tap for type 14
+        // whenever the primary tap is kCGHIDEventTap so volume/media keys are intercepted
+        // and suppressed cleanly before reaching BezelServices/coreaudiod.
+        let media_tap = if !hid_port.is_null() {
+            let media_port = unsafe {
+                CGEventTapCreate(
+                    1,
+                    0,
+                    0,
+                    1u64 << 14,
+                    callback,
+                    (&mut *state as *mut Context).cast(),
+                )
+            };
+            if !media_port.is_null() {
+                unsafe { CGEventTapEnable(media_port, false) };
+                let media_source =
+                    unsafe { CFMachPortCreateRunLoopSource(std::ptr::null_mut(), media_port, 0) };
+                if !media_source.is_null() {
+                    state.media_tap_port = media_port;
+                    Some(Tap {
+                        port: media_port,
+                        source: media_source,
+                        loop_,
+                    })
+                } else {
+                    unsafe {
+                        CFMachPortInvalidate(media_port);
+                        CFRelease(media_port);
+                    }
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Startup queries are allowed before dispatch starts. Once the tap is
         // active, only the separate shared permission-probe worker makes RPCs.
         if !permissions() {
@@ -1352,6 +1458,10 @@ mod native {
         unsafe {
             CFRunLoopAddSource(loop_, source, kCFRunLoopDefaultMode);
             CGEventTapEnable(port, true);
+            if let Some(ref mt) = media_tap {
+                CFRunLoopAddSource(loop_, mt.source, kCFRunLoopDefaultMode);
+                CGEventTapEnable(mt.port, true);
+            }
         }
         shared.remote(ready_now);
         if state
@@ -1414,10 +1524,16 @@ mod native {
                     break;
                 }
             }
+            if let Some(ref mt) = media_tap
+                && !unsafe { CGEventTapIsEnabled(mt.port) }
+            {
+                unsafe { CGEventTapEnable(mt.port, true) };
+            }
             unsafe {
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.005, true);
             }
         }
+        drop(media_tap);
         drop(tap); // Invalidate before freeing callback context.
         cursor.set_suppressed(false);
     }
@@ -1568,5 +1684,45 @@ mod tests {
         let mut wheel = WheelRemainder::default();
         let total: i32 = (0..10).map(|_| wheel.take(0.0, 0.005).unwrap().1).sum();
         assert!((f64::from(total) + wheel.y - 6.0).abs() < 1e-8);
+    }
+    #[test]
+    fn sysdefined_media_fields_decode_volume_mute_and_media_keys() {
+        assert_eq!(
+            decode_sysdefined_fields(8, (0u64 << 16) | (0x0A << 8)),
+            Some(SysDefinedMedia::Key {
+                key_code: 0,
+                usage: crate::keymap::HID_VOLUME_UP,
+                down: true,
+            })
+        );
+        assert_eq!(
+            decode_sysdefined_fields(8, (1u64 << 16) | (0x0A << 8) | 0x01),
+            Some(SysDefinedMedia::Key {
+                key_code: 1,
+                usage: crate::keymap::HID_VOLUME_DOWN,
+                down: true,
+            })
+        );
+        assert_eq!(
+            decode_sysdefined_fields(8, (7u64 << 16) | (0x0A << 8) | 0x01),
+            Some(SysDefinedMedia::SuppressRepeat)
+        );
+        assert_eq!(
+            decode_sysdefined_fields(8, (19u64 << 16) | (0x0B << 8)),
+            Some(SysDefinedMedia::Key {
+                key_code: 19,
+                usage: crate::keymap::HID_MEDIA_NEXT,
+                down: false,
+            })
+        );
+        assert_eq!(
+            decode_sysdefined_fields(8, (20u64 << 16) | (0x0A << 8)),
+            Some(SysDefinedMedia::Key {
+                key_code: 20,
+                usage: crate::keymap::HID_MEDIA_PREV,
+                down: true,
+            })
+        );
+        assert_eq!(decode_sysdefined_fields(7, (0u64 << 16) | (0x0A << 8)), None);
     }
 }
