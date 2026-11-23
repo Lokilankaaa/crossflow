@@ -476,8 +476,11 @@ fn with_policy(f: impl FnOnce(&mut HookState) -> Decision) -> bool {
     })
 }
 
+fn is_own_origin_tag(extra: usize) -> bool {
+    extra == super::sink::INPUT_ORIGIN_TAG || extra == 0x4352_4F53_5346_4C4F
+}
+
 unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
     if code >= 0 && lparam != 0 {
         let input = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         let is_media_or_browser_vk = matches!(input.vkCode, 0xA6..=0xB7);
@@ -487,7 +490,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         // LLKHF_INJECTED set. Accept unless tagged with Crossflow's own origin so they
         // are properly suppressed locally and routed to the focused remote device.
         let accept = (input.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) == 0)
-            || (is_media_or_browser_vk && input.dwExtraInfo != INPUT_ORIGIN_TAG);
+            || (is_media_or_browser_vk && !is_own_origin_tag(input.dwExtraInfo));
         if accept {
             let suppress = with_policy(|state| {
                 let remote =
@@ -653,7 +656,6 @@ fn mouse_button(message: u32, data: u32) -> Option<(usize, bool)> {
 }
 
 unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
     if code >= 0 && lparam != 0 {
         let input = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
         let msg = wparam as u32;
@@ -664,7 +666,7 @@ unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
         // Accept physical events AND vendor-driver-remapped side/middle mouse buttons
         // (Logitech G HUB / Razer / etc.) unless tagged with Crossflow's own origin.
         let accept = (input.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) == 0)
-            || (is_aux_mouse && input.dwExtraInfo != INPUT_ORIGIN_TAG);
+            || (is_aux_mouse && !is_own_origin_tag(input.dwExtraInfo));
         if accept {
             let suppress = with_policy(|state| {
                 let remote =

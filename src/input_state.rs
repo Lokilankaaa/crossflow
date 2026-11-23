@@ -128,7 +128,7 @@ mod platform {
     const IME_CMODE_FULLSHAPE: usize = 0x0008;
     const LANG_CHINESE_PRIMARY: u16 = 0x04;
     const LANG_ENGLISH_PRIMARY: u16 = 0x09;
-    const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
+    const INPUT_ORIGIN_TAG: usize = 0x4352_4657;
 
     #[link(name = "imm32")]
     unsafe extern "system" {
