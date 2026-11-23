@@ -575,8 +575,19 @@ fn mac_media_keytype(usage: u16) -> Option<i32> {
         crate::keymap::HID_VOLUME_DOWN => 1,      // NX_KEYTYPE_SOUND_DOWN
         crate::keymap::HID_MUTE => 7,             // NX_KEYTYPE_MUTE
         crate::keymap::HID_MEDIA_PLAY_PAUSE => 16, // NX_KEYTYPE_PLAY
-        crate::keymap::HID_MEDIA_NEXT => 17,      // NX_KEYTYPE_NEXT
-        crate::keymap::HID_MEDIA_PREV => 18,      // NX_KEYTYPE_PREVIOUS
+        crate::keymap::HID_MEDIA_NEXT => 17,       // NX_KEYTYPE_NEXT
+        crate::keymap::HID_MEDIA_PREV => 18,       // NX_KEYTYPE_PREVIOUS
+        crate::keymap::HID_MEDIA_STOP => 16,       // macOS has no separate Stop media key; toggle Play/Pause
+        _ => return None,
+    })
+}
+
+fn mac_launch_app_bundle(usage: u16) -> Option<&'static str> {
+    Some(match usage {
+        crate::keymap::HID_CALCULATOR => "com.apple.calculator",
+        crate::keymap::HID_LAUNCH_MAIL => "com.apple.mail",
+        crate::keymap::HID_LAUNCH_MEDIA => "com.apple.Music",
+        crate::keymap::HID_LAUNCH_APP1 => "com.apple.finder",
         _ => return None,
     })
 }
@@ -1407,6 +1418,31 @@ impl MacMouseSink {
             }
             post_mac_media_key(nx_key, down);
             if !down {
+                self.owned_keys.remove(&usage);
+            }
+            return Ok(());
+        }
+        if let Some(bundle_id) = mac_launch_app_bundle(usage) {
+            if down {
+                self.check_input_ready()?;
+                if self.owned_keys.insert(usage) {
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .args(["-b", bundle_id])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            } else {
+                self.owned_keys.remove(&usage);
+            }
+            return Ok(());
+        }
+        if usage == crate::keymap::HID_BROWSER_HOME {
+            if down {
+                self.check_input_ready()?;
+                self.owned_keys.insert(usage);
+            } else {
                 self.owned_keys.remove(&usage);
             }
             return Ok(());

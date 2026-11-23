@@ -161,12 +161,18 @@ fn scan(usage: u16) -> Option<u16> {
 }
 fn media_vk(usage: u16) -> Option<u16> {
     Some(match usage {
+        crate::keymap::HID_BROWSER_HOME => 0xAC,     // VK_BROWSER_HOME
         crate::keymap::HID_MUTE => 0xAD,             // VK_VOLUME_MUTE
         crate::keymap::HID_VOLUME_DOWN => 0xAE,      // VK_VOLUME_DOWN
         crate::keymap::HID_VOLUME_UP => 0xAF,        // VK_VOLUME_UP
         crate::keymap::HID_MEDIA_NEXT => 0xB0,       // VK_MEDIA_NEXT_TRACK
         crate::keymap::HID_MEDIA_PREV => 0xB1,       // VK_MEDIA_PREV_TRACK
+        crate::keymap::HID_MEDIA_STOP => 0xB2,       // VK_MEDIA_STOP
         crate::keymap::HID_MEDIA_PLAY_PAUSE => 0xB3, // VK_MEDIA_PLAY_PAUSE
+        crate::keymap::HID_LAUNCH_MAIL => 0xB4,      // VK_LAUNCH_MAIL
+        crate::keymap::HID_LAUNCH_MEDIA => 0xB5,     // VK_LAUNCH_MEDIA_SELECT
+        crate::keymap::HID_LAUNCH_APP1 => 0xB6,      // VK_LAUNCH_APP1 (Explorer)
+        crate::keymap::HID_CALCULATOR => 0xB7,       // VK_LAUNCH_APP2 (Calculator)
         _ => return None,
     })
 }

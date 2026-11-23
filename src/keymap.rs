@@ -21,6 +21,12 @@ pub const HID_VOLUME_DOWN: u16 = 0x81;
 pub const HID_MEDIA_PLAY_PAUSE: u16 = 0x9B;
 pub const HID_MEDIA_NEXT: u16 = 0x9C;
 pub const HID_MEDIA_PREV: u16 = 0x9D;
+pub const HID_MEDIA_STOP: u16 = 0x9E;
+pub const HID_LAUNCH_MAIL: u16 = 0x9F;
+pub const HID_LAUNCH_MEDIA: u16 = 0xA0;
+pub const HID_LAUNCH_APP1: u16 = 0xA1;
+pub const HID_CALCULATOR: u16 = 0xA2;
+pub const HID_BROWSER_HOME: u16 = 0xA3;
 /// Canonical usage ID used by Crossflow for the Apple Fn / Globe modifier key
 /// (fits inside `input::is_keyboard_usage` without colliding with standard keys).
 pub const HID_FN_GLOBE: u16 = 0xA4;
@@ -39,6 +45,12 @@ pub fn is_media_usage(usage: u16) -> bool {
             | HID_MEDIA_PLAY_PAUSE
             | HID_MEDIA_NEXT
             | HID_MEDIA_PREV
+            | HID_MEDIA_STOP
+            | HID_LAUNCH_MAIL
+            | HID_LAUNCH_MEDIA
+            | HID_LAUNCH_APP1
+            | HID_CALCULATOR
+            | HID_BROWSER_HOME
     )
 }
 

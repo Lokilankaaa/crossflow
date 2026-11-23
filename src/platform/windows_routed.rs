@@ -480,10 +480,12 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     const INPUT_ORIGIN_TAG: usize = 0x4352_4F53_5346_4C4F;
     if code >= 0 && lparam != 0 {
         let input = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        let is_media_or_browser_vk = matches!(input.vkCode, 0xA6 | 0xA7 | 0xAD..=0xB1 | 0xB3);
+        let is_media_or_browser_vk = matches!(input.vkCode, 0xA6..=0xB7);
         // OEM laptop Fn-key daemons, mouse vendor utilities (Logitech/Razer sending
-        // VK_BROWSER_BACK / VK_BROWSER_FORWARD), and Windows HID Input Service often
-        // deliver with LLKHF_INJECTED set. Accept unless tagged with Crossflow's own origin.
+        // VK_BROWSER_BACK / VK_BROWSER_FORWARD), and Windows HID Input Service (`hidserv`
+        // translating Calculator / Mail / Browser / Media consumer keys) deliver with
+        // LLKHF_INJECTED set. Accept unless tagged with Crossflow's own origin so they
+        // are properly suppressed locally and routed to the focused remote device.
         let accept = (input.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) == 0)
             || (is_media_or_browser_vk && input.dwExtraInfo != INPUT_ORIGIN_TAG);
         if accept {
@@ -511,12 +513,18 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     0xA3 => Some(0xE4), // VK_RCONTROL
                     0xA4 => Some(0xE2), // VK_LMENU
                     0xA5 => Some(0xE6), // VK_RMENU
+                    0xAC => Some(crate::keymap::HID_BROWSER_HOME),
                     0xAD => Some(crate::keymap::HID_MUTE),
                     0xAE => Some(crate::keymap::HID_VOLUME_DOWN),
                     0xAF => Some(crate::keymap::HID_VOLUME_UP),
                     0xB0 => Some(crate::keymap::HID_MEDIA_NEXT),
                     0xB1 => Some(crate::keymap::HID_MEDIA_PREV),
+                    0xB2 => Some(crate::keymap::HID_MEDIA_STOP),
                     0xB3 => Some(crate::keymap::HID_MEDIA_PLAY_PAUSE),
+                    0xB4 => Some(crate::keymap::HID_LAUNCH_MAIL),
+                    0xB5 => Some(crate::keymap::HID_LAUNCH_MEDIA),
+                    0xB6 => Some(crate::keymap::HID_LAUNCH_APP1),
+                    0xB7 => Some(crate::keymap::HID_CALCULATOR),
                     _ => None,
                 };
                 let resolved_usage = if let Some(u) = direct_usage {

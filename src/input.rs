@@ -86,7 +86,7 @@ pub fn is_keyboard_usage(usage: u16) -> bool {
 pub fn is_repeatable_key(usage: u16) -> bool {
     is_keyboard_usage(usage)
         && !(0xE0..=0xE7).contains(&usage)
-        && !matches!(usage, 0x39 | 0x47 | 0x53 | 0xA4 | 0x7F | 0x9B | 0x9C | 0x9D)
+        && !matches!(usage, 0x39 | 0x47 | 0x53 | 0x7F | 0x9B..=0xA4)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
