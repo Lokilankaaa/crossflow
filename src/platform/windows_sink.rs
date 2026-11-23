@@ -646,8 +646,20 @@ impl MouseSink for WindowsMouseSink {
         if !down && !self.keys.contains(&usage) {
             return Ok(());
         }
-        let packet = keyboard(usage, down);
-        let input = self.finish(packet)?;
+        let packet = match keyboard(usage, down) {
+            Ok(input) => input,
+            Err(_) if crate::input::is_keyboard_usage(usage) => {
+                // Valid HID keyboard usage with no Windows scan/VK equivalent (e.g. macOS
+                // Fn/Globe 0xA4, Keypad = 0x67, Pause 0x48): treat as a benign no-op so it
+                // never crashes the injection worker or bounces cursor focus!
+                if !down {
+                    self.keys.remove(&usage);
+                }
+                return Ok(());
+            }
+            Err(err) => return self.finish(Err(err)),
+        };
+        let input = packet;
         if down {
             self.checked()?;
             if self.keys.contains(&usage) {

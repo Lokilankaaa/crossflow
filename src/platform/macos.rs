@@ -1447,8 +1447,20 @@ impl MacMouseSink {
             }
             return Ok(());
         }
-        let keycode = mac_keycode(usage)
-            .ok_or_else(|| failure("Keyboard usage is unsupported by the ANSI Mac adapter"))?;
+        let Some(keycode) = mac_keycode(usage).or(match usage {
+            0x46 => Some(0x69), // PrintScreen -> Mac F13 (Apple standard HID mapping)
+            0x47 => Some(0x6B), // ScrollLock  -> Mac F14 (Brightness Down / Scroll Lock)
+            0x48 => Some(0x71), // Pause/Break -> Mac F15 (Brightness Up / Pause)
+            _ => None,
+        }) else {
+            // Valid HID keyboard usage with no ANSI Mac equivalent (e.g. Windows
+            // Application/Menu 0x65, F21-F24): treat as a benign no-op so pressing an
+            // unmapped key never crashes the injection worker or bounces cursor focus!
+            if !down {
+                self.owned_keys.remove(&usage);
+            }
+            return Ok(());
+        };
         let is_caps = usage == crate::keymap::HID_CAPS_LOCK;
         let is_flags_key =
             (0xE0..=0xE7).contains(&usage) || is_caps || usage == crate::keymap::HID_FN_GLOBE;
