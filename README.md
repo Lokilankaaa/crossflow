@@ -9,6 +9,15 @@
 Windows 11 ↔ macOS · N 设备全互联 Full Mesh · 纯 Rust 内核 · 原生 WinUI 3 & SwiftUI
 
 <p>
+  <a href="README.md">
+    <img src="https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-Current-5264D9?style=for-the-badge" alt="简体中文" />
+  </a>
+  <a href="README.en.md">
+    <img src="https://img.shields.io/badge/English-README.en.md-282A2E?style=for-the-badge" alt="English" />
+  </a>
+</p>
+
+<p>
   <a href="https://github.com/Lokilankaaa/crossflow/releases/latest">
     <img src="https://img.shields.io/github/v/release/Lokilankaaa/crossflow?style=flat-square&color=5264D9&label=Release" alt="Latest Release" />
   </a>
@@ -16,10 +25,6 @@ Windows 11 ↔ macOS · N 设备全互联 Full Mesh · 纯 Rust 内核 · 原生
   <img src="https://img.shields.io/badge/Core-Rust%201.85%2B-282A2E?style=flat-square&logo=rust&logoColor=white" alt="Rust Core" />
   <img src="https://img.shields.io/badge/Crypto-Noise__NNpsk0-187345?style=flat-square" alt="Noise Encryption" />
   <img src="https://img.shields.io/badge/Topology-Full%20Mesh%20P2P-2563EB?style=flat-square" alt="Full Mesh P2P" />
-</p>
-
-<p>
-  <strong>简体中文</strong> · <a href="README.en.md">English</a>
 </p>
 
 <p>
