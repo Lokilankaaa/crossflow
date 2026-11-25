@@ -232,7 +232,7 @@ internal sealed class AppUpdater
                 return;
             }
 
-            string sizeText = release.AssetSize > 0 ? $"（{release.AssetSize / (1024.0 * 1024.0):0.1} MB）" : "";
+            string sizeText = release.AssetSize > 0 ? $"（{release.AssetSize / (1024.0 * 1024.0):F1} MB）" : "";
             Publish(new UpdaterState(
                 UpdaterPhase.Available,
                 CurrentVersion,
@@ -311,8 +311,8 @@ internal sealed class AppUpdater
                     {
                         lastReportTick = now;
                         double pct = total > 0 ? Math.Clamp((double)downloaded / total, 0, 1) : 0;
-                        string mb = $"{downloaded / (1024.0 * 1024.0):0.1}";
-                        string totalMb = total > 0 ? $" / {total / (1024.0 * 1024.0):0.1} MB" : " MB";
+                        string mb = $"{downloaded / (1024.0 * 1024.0):F1}";
+                        string totalMb = total > 0 ? $" / {total / (1024.0 * 1024.0):F1} MB" : " MB";
                         Publish(new UpdaterState(
                             UpdaterPhase.Downloading,
                             CurrentVersion,
