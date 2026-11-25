@@ -47,7 +47,7 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const PEER_UI_PROTOCOL: u8 = 3;
@@ -207,6 +207,7 @@ struct PeerUiStatus {
 enum UiCommand {
     Pause,
     Resume,
+    Reconnect,
     Stop,
     ApplyLayout {
         layout: SharedLayout,
@@ -672,6 +673,42 @@ fn classify_active_channel(peer_addr: SocketAddr, local: &[LocalChannel]) -> Opt
     Some(prefix.to_string())
 }
 
+fn addr_channel_priority(addr: SocketAddr, local: &[LocalChannel]) -> u8 {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            if let Some(ch) = local.iter().find(|c| same_subnet(v4, c.ip, c.netmask)) {
+                ch.priority
+            } else if is_direct_ethernet_ipv4(v4) {
+                0
+            } else if v4.is_private() {
+                4
+            } else {
+                5
+            }
+        }
+        IpAddr::V6(_) => 6,
+    }
+}
+
+fn should_replace_peer_connection(
+    existing_addr: SocketAddr,
+    existing_initiator: bool,
+    new_addr: SocketAddr,
+    new_initiator: bool,
+    want_initiator: bool,
+    local: &[LocalChannel],
+) -> bool {
+    let old_prio = addr_channel_priority(existing_addr, local);
+    let new_prio = addr_channel_priority(new_addr, local);
+    if new_prio != old_prio {
+        // Always upgrade to a strictly faster channel (e.g. Direct Ethernet 0 over
+        // Wired LAN 1 / Wi-Fi 2 / ZeroTier 3) and never downgrade an active fast link.
+        new_prio < old_prio
+    } else {
+        new_initiator == want_initiator && existing_initiator != want_initiator
+    }
+}
+
 fn ranked_addresses(
     addresses: &[SocketAddr],
     selected_channel: &str,
@@ -710,20 +747,7 @@ fn ranked_addresses(
         })
         .collect();
 
-    ranked.sort_by_key(|addr| match addr.ip() {
-        IpAddr::V4(v4) => {
-            if let Some(ch) = local.iter().find(|c| same_subnet(v4, c.ip, c.netmask)) {
-                (ch.priority, addr.to_string())
-            } else if is_direct_ethernet_ipv4(v4) {
-                (0u8, addr.to_string())
-            } else if v4.is_private() {
-                (4u8, addr.to_string())
-            } else {
-                (5u8, addr.to_string())
-            }
-        }
-        IpAddr::V6(_) => (6u8, addr.to_string()),
-    });
+    ranked.sort_by_key(|addr| (addr_channel_priority(*addr, local), addr.to_string()));
     ranked
 }
 
@@ -1049,7 +1073,7 @@ pub fn run(
     platform: Platform,
 ) -> Result<()> {
     ensure!(
-        options.seconds.is_finite() && options.seconds > 0. && options.seconds <= 86400.,
+        options.seconds.is_finite() && options.seconds >= 0. && options.seconds <= 86400.,
         "invalid peer duration"
     );
     ensure!((60..=8000).contains(&options.max_hz), "invalid max_hz");
@@ -1126,27 +1150,31 @@ pub fn run(
 
     let rx = spawn_stdin_reader(stop.clone());
     let log = writer.log.clone();
-    let deadline = Instant::now() + Duration::from_secs_f64(options.seconds);
+    let deadline = (options.seconds > 0.0)
+        .then(|| Instant::now() + Duration::from_secs_f64(options.seconds));
     let mut user_paused = false;
     let mut screen_locked = false;
     let motion_interval = Duration::from_secs_f64(1.0 / f64::from(options.max_hz));
 
     let result = (|| -> Result<()> {
-        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        while !stop.load(Ordering::Acquire) && deadline.is_none_or(|d| Instant::now() < d) {
             let mut local_channels = enumerate_local_channels();
             let mut last_channel_refresh = Instant::now();
-            if config.channel != "auto" && !local_channels.iter().any(|c| c.id == config.channel) {
-                config.channel = default_channel();
-            }
+            // Never discard the user's pinned channel just because the interface is
+            // momentarily absent right after wake/boot; fall back to wildcard bind until
+            // the pinned NIC comes back online, then automatically rebind onto it.
+            let pinned_present = config.channel != "auto"
+                && local_channels.iter().any(|c| c.id == config.channel);
+            let bound_to_pinned = pinned_present;
 
-            let bind_ip: IpAddr = if config.channel == "auto" {
-                options.bind.ip()
-            } else {
+            let bind_ip: IpAddr = if pinned_present {
                 config
                     .channel
                     .parse::<Ipv4Addr>()
                     .map(IpAddr::V4)
                     .unwrap_or_else(|_| options.bind.ip())
+            } else {
+                options.bind.ip()
             };
             let bind_addr = SocketAddr::new(bind_ip, options.bind.port());
             let listener = TcpListener::bind(bind_addr)
@@ -1222,6 +1250,7 @@ pub fn run(
             let (hs_tx, hs_rx) = mpsc::channel::<HandshakeMsg>();
             let mut in_flight_dials: HashSet<String> = HashSet::new();
             let mut dial_backoff: HashMap<String, Instant> = HashMap::new();
+            let mut upgrade_backoff: HashMap<String, Instant> = HashMap::new();
             let mut active_peers: BTreeMap<String, ActiveMeshPeer> = BTreeMap::new();
             let mut native_io: Option<MeshNativeIo> = None;
 
@@ -1247,17 +1276,66 @@ pub fn run(
             let mut last_status_emit = Instant::now() - Duration::from_secs(1);
             let mut last_status_sig = String::new();
             let started_at = Instant::now();
+            let mut last_loop_mono = Instant::now();
+            let mut last_loop_wall = SystemTime::now();
 
             while !stop.load(Ordering::Acquire)
                 && !reconfigure_requested
-                && Instant::now() < deadline
+                && deadline.is_none_or(|d| Instant::now() < d)
             {
                 let mut did_work = false;
+
+                // Detect OS sleep/standby resume via monotonic or wall-clock jump (>= 5s).
+                // Refreshing listener + mDNS sockets immediately recovers overnight standby
+                // without requiring the user to manually click Reconnect.
+                let mono_gap = last_loop_mono.elapsed();
+                let now_wall = SystemTime::now();
+                let wall_gap = now_wall
+                    .duration_since(last_loop_wall)
+                    .unwrap_or_else(|e| e.duration());
+                last_loop_mono = Instant::now();
+                last_loop_wall = now_wall;
+                if mono_gap >= Duration::from_secs(5) || wall_gap >= Duration::from_secs(5) {
+                    log.write(
+                        "mesh_wake_detected",
+                        serde_json::json!({
+                            "mono_ms": mono_gap.as_millis() as u64,
+                            "wall_ms": wall_gap.as_millis() as u64,
+                        }),
+                    );
+                    break;
+                }
 
                 if last_channel_refresh.elapsed() >= Duration::from_secs(3) {
                     last_channel_refresh = Instant::now();
                     if let Ok(cached) = channel_cache.try_lock() {
+                        let prev_ips: HashSet<Ipv4Addr> =
+                            local_channels.iter().map(|c| c.ip).collect();
+                        let next_ips: HashSet<Ipv4Addr> = cached.iter().map(|c| c.ip).collect();
                         local_channels = cached.clone();
+                        if prev_ips != next_ips {
+                            dial_backoff.clear();
+                            upgrade_backoff.clear();
+                            last_dial_scan = Instant::now() - Duration::from_secs(2);
+                            for peer in active_peers.values_mut() {
+                                peer.active_channel_label =
+                                    classify_active_channel(peer.peer_addr, &local_channels);
+                            }
+                            let pinned_now = config.channel != "auto"
+                                && local_channels.iter().any(|c| c.id == config.channel);
+                            if (config.channel != "auto" && pinned_now != bound_to_pinned)
+                                || active_peers.is_empty()
+                            {
+                                log.write(
+                                    "mesh_network_changed",
+                                    serde_json::json!({
+                                        "pinned_now": pinned_now,
+                                        "active_peers": active_peers.len(),
+                                    }),
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
                 if last_service_check.elapsed() >= Duration::from_millis(800) {
@@ -1321,6 +1399,10 @@ pub fn run(
                             {
                                 io.enabled_attempted = true;
                             }
+                        }
+                        Ok(UiCommand::Reconnect) => {
+                            reconfigure_requested = true;
+                            break;
                         }
                         Ok(UiCommand::ApplyLayout { layout }) => {
                             let remotes = remote_display_map(&active_peers);
@@ -1553,8 +1635,103 @@ pub fn run(
                     let fallback_dial = started_at.elapsed() >= Duration::from_millis(1800);
 
                     for c in &candidates {
-                        if active_peers.keys().any(|id| ids_match(id, &c.device_id))
-                            || in_flight_dials.contains(&c.device_id)
+                        if let Some(existing) = active_peers
+                            .values()
+                            .find(|p| ids_match(&p.device_id, &c.device_id))
+                        {
+                            // Automatic channel upgrade: if this peer fell back onto Wi-Fi /
+                            // ZeroTier / slower LAN (e.g. during sleep/wake or NIC flap) and
+                            // a strictly faster channel (such as Direct Ethernet 192.168.50.x)
+                            // is available, silently probe and hot-upgrade while idle!
+                            let cur_prio =
+                                addr_channel_priority(existing.peer_addr, &local_channels);
+                            let upgrade_key = format!("upgrade:{}", c.device_id);
+                            let peer_idle = active_outbound_target.as_deref()
+                                != Some(existing.device_id.as_str())
+                                && inbound_owner.as_deref() != Some(existing.device_id.as_str());
+                            if cur_prio > 0
+                                && peer_idle
+                                && !in_flight_dials.contains(&upgrade_key)
+                                && !upgrade_backoff
+                                    .get(&c.device_id)
+                                    .is_some_and(|until| now_inst < *until)
+                            {
+                                let eff_ch = effective_channel_for_peer(&config, &c.device_id);
+                                let better_addrs: Vec<(SocketAddr, Duration)> =
+                                    ranked_addresses(&c.addresses, eff_ch, &local_channels)
+                                        .into_iter()
+                                        .filter_map(|addr| {
+                                            let p = addr_channel_priority(addr, &local_channels);
+                                            (p < cur_prio).then_some((
+                                                addr,
+                                                if p == 0 {
+                                                    Duration::from_millis(600)
+                                                } else {
+                                                    Duration::from_millis(350)
+                                                },
+                                            ))
+                                        })
+                                        .collect();
+                                if !better_addrs.is_empty() {
+                                    in_flight_dials.insert(upgrade_key.clone());
+                                    let tx = hs_tx.clone();
+                                    let dev_id = local_device_id.clone();
+                                    let dev_name = local_name.clone();
+                                    let disp = local_displays.clone();
+                                    let pass = config.passphrase.clone();
+                                    let rev = layout_book.revision();
+                                    let screens = layout_book.active_screens().to_vec();
+                                    let _ = thread::Builder::new()
+                                        .name("crossflow-mesh-upgrade".into())
+                                        .spawn(move || {
+                                            let mut last_err = None;
+                                            for (addr, timeout) in better_addrs {
+                                                match TcpStream::connect_timeout(&addr, timeout) {
+                                                    Ok(stream) => {
+                                                        match establish_mesh_peer(
+                                                            stream,
+                                                            addr,
+                                                            true,
+                                                            &dev_id,
+                                                            &dev_name,
+                                                            disp.clone(),
+                                                            pass.as_deref(),
+                                                            rev,
+                                                            screens.clone(),
+                                                        ) {
+                                                            Ok(peer) => {
+                                                                let _ = tx.send(
+                                                                    HandshakeMsg::Ready {
+                                                                        dial_key: Some(upgrade_key),
+                                                                        peer,
+                                                                    },
+                                                                );
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                last_err = Some(e);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => last_err = Some(e.into()),
+                                                }
+                                            }
+                                            let err = last_err.unwrap_or_else(|| {
+                                                anyhow::anyhow!("upgrade channel unreachable")
+                                            });
+                                            let _ = tx.send(HandshakeMsg::Failed {
+                                                dial_key: Some(upgrade_key),
+                                                is_auth_mismatch: is_passphrase_mismatch_error(
+                                                    &err,
+                                                ),
+                                                message: format!("{err:#}"),
+                                            });
+                                        });
+                                }
+                            }
+                            continue;
+                        }
+                        if in_flight_dials.contains(&c.device_id)
                             || dial_backoff
                                 .get(&c.device_id)
                                 .is_some_and(|until| now_inst < *until)
@@ -1565,7 +1742,19 @@ pub fn run(
                             continue;
                         }
                         let eff_ch = effective_channel_for_peer(&config, &c.device_id);
-                        let addrs = ranked_addresses(&c.addresses, eff_ch, &local_channels);
+                        let addrs: Vec<(SocketAddr, Duration)> =
+                            ranked_addresses(&c.addresses, eff_ch, &local_channels)
+                                .into_iter()
+                                .map(|addr| {
+                                    let timeout =
+                                        if addr_channel_priority(addr, &local_channels) == 0 {
+                                            Duration::from_millis(600)
+                                        } else {
+                                            Duration::from_millis(320)
+                                        };
+                                    (addr, timeout)
+                                })
+                                .collect();
                         if addrs.is_empty() {
                             continue;
                         }
@@ -1582,11 +1771,8 @@ pub fn run(
                             .name("crossflow-mesh-dial".into())
                             .spawn(move || {
                                 let mut last_err = None;
-                                for addr in addrs {
-                                    match TcpStream::connect_timeout(
-                                        &addr,
-                                        Duration::from_millis(280),
-                                    ) {
+                                for (addr, timeout) in addrs {
+                                    match TcpStream::connect_timeout(&addr, timeout) {
                                         Ok(stream) => {
                                             match establish_mesh_peer(
                                                 stream,
@@ -1695,16 +1881,31 @@ pub fn run(
                             is_auth_mismatch,
                             message,
                         } => {
+                            let is_upgrade = dial_key
+                                .as_deref()
+                                .is_some_and(|k| k.starts_with("upgrade:"));
                             if let Some(k) = dial_key {
                                 in_flight_dials.remove(&k);
-                                let wait = if is_auth_mismatch {
-                                    Duration::from_millis(2500)
+                                if let Some(dev_id) = k.strip_prefix("upgrade:") {
+                                    upgrade_backoff.insert(
+                                        dev_id.to_string(),
+                                        Instant::now() + Duration::from_secs(6),
+                                    );
                                 } else {
-                                    Duration::from_millis(1200)
-                                };
-                                dial_backoff.insert(k, Instant::now() + wait);
+                                    let wait = if is_auth_mismatch {
+                                        Duration::from_millis(2500)
+                                    } else {
+                                        Duration::from_millis(1200)
+                                    };
+                                    dial_backoff.insert(k, Instant::now() + wait);
+                                }
                             }
-                            log.write("mesh_handshake_failed", serde_json::json!({"auth": is_auth_mismatch, "reason": message}));
+                            if !is_upgrade {
+                                log.write(
+                                    "mesh_handshake_failed",
+                                    serde_json::json!({"auth": is_auth_mismatch, "reason": message}),
+                                );
+                            }
                             if is_auth_mismatch {
                                 last_auth_error =
                                     Some("等待密码匹配：请确认各台设备的密码配置一致。".into());
@@ -1713,19 +1914,44 @@ pub fn run(
                         HandshakeMsg::Ready { dial_key, peer } => {
                             if let Some(k) = dial_key {
                                 in_flight_dials.remove(&k);
-                                dial_backoff.remove(&k);
+                                if let Some(dev_id) = k.strip_prefix("upgrade:") {
+                                    upgrade_backoff.remove(dev_id);
+                                } else {
+                                    dial_backoff.remove(&k);
+                                }
                             }
                             last_auth_error = None;
                             let rid = peer.remote_device_id.clone();
+                            let prev_addr = active_peers.get(&rid).map(|e| e.peer_addr);
                             let keep_new = match active_peers.get(&rid) {
                                 None => true,
-                                Some(existing) => {
-                                    let want_init = preferred_initiator(&local_device_id, &rid);
-                                    peer.initiator == want_init && existing.initiator != want_init
-                                }
+                                Some(existing) => should_replace_peer_connection(
+                                    existing.peer_addr,
+                                    existing.initiator,
+                                    peer.peer_addr,
+                                    peer.initiator,
+                                    preferred_initiator(&local_device_id, &rid),
+                                    &local_channels,
+                                ),
                             };
                             if !keep_new {
                                 continue;
+                            }
+                            if let Some(old_addr) = prev_addr {
+                                log.write(
+                                    "mesh_channel_upgraded",
+                                    serde_json::json!({
+                                        "peer": &rid[..rid.len().min(8)],
+                                        "from": old_addr.to_string(),
+                                        "to": peer.peer_addr.to_string(),
+                                    }),
+                                );
+                                if inbound_owner.as_deref() == Some(rid.as_str()) {
+                                    inbound_owner = None;
+                                    if let Some(ref mut io) = native_io {
+                                        let _ = io.sink.release_owned();
+                                    }
+                                }
                             }
                             let aux_initiator = preferred_initiator(&local_device_id, &rid);
                             let aux = AuxSession::spawn_mesh_peer(
@@ -2736,5 +2962,27 @@ mod tests {
         assert!(remove_manual_peer(&mut cfg, "192.168.194.59:24800"));
         assert_eq!(cfg.manual_peers.len(), 1);
         assert_eq!(cfg.manual_peers[0].address, "10.0.0.12:25000");
+    }
+
+    #[test]
+    fn channel_priority_upgrades_to_faster_link_and_refuses_downgrade() {
+        let local = sample_channels();
+        let direct = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 2), 24800));
+        let wifi = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 188), 24800));
+        let zt = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 194, 59), 24800));
+
+        assert_eq!(addr_channel_priority(direct, &local), 0);
+        assert_eq!(addr_channel_priority(wifi, &local), 2);
+        assert_eq!(addr_channel_priority(zt, &local), 3);
+
+        // ZeroTier/Wi-Fi -> Direct Ethernet ALWAYS upgrades regardless of initiator role
+        assert!(should_replace_peer_connection(zt, true, direct, false, true, &local));
+        assert!(should_replace_peer_connection(wifi, true, direct, true, true, &local));
+        // Direct Ethernet -> Wi-Fi/ZeroTier NEVER downgrades
+        assert!(!should_replace_peer_connection(direct, false, wifi, true, true, &local));
+        assert!(!should_replace_peer_connection(direct, false, zt, true, true, &local));
+        // Equal priority falls back to deterministic preferred_initiator tie-break
+        assert!(should_replace_peer_connection(direct, false, direct, true, true, &local));
+        assert!(!should_replace_peer_connection(direct, true, direct, false, true, &local));
     }
 }

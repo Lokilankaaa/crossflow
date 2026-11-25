@@ -148,6 +148,8 @@ internal sealed class PeerMeshController
     private readonly SemaphoreSlim commands = new(1, 1);
     private Run? current;
     private long generation;
+    private string? lastDeviceName;
+    private bool userStopped;
     private PeerMeshSnapshot snapshot = PeerMeshSnapshot.Initial;
 
     internal event Action<PeerMeshSnapshot>? Changed;
@@ -168,6 +170,12 @@ internal sealed class PeerMeshController
         try
         {
             await StopLockedAsync();
+            lock (sync)
+            {
+                userStopped = false;
+                if (deviceName is not null) lastDeviceName = deviceName;
+                else deviceName = lastDeviceName;
+            }
             string logDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Crossflow", "Logs");
@@ -194,7 +202,7 @@ internal sealed class PeerMeshController
             info.ArgumentList.Add("--bind");
             info.ArgumentList.Add("0.0.0.0:24800");
             info.ArgumentList.Add("--seconds");
-            info.ArgumentList.Add("86400");
+            info.ArgumentList.Add("0");
             info.ArgumentList.Add("--max-hz");
             info.ArgumentList.Add("1000");
             info.ArgumentList.Add("--log");
@@ -259,6 +267,26 @@ internal sealed class PeerMeshController
 
     internal Task PauseAsync() => SendCommandAsync(new { op = "pause" });
     internal Task ResumeAsync() => SendCommandAsync(new { op = "resume" });
+    internal Task ReconnectAsync() => SendCommandAsync(new { op = "reconnect" });
+    internal async Task HandleSystemResumeAsync()
+    {
+        bool running;
+        bool stopped;
+        lock (sync)
+        {
+            running = current is not null && snapshot.ProcessRunning;
+            stopped = userStopped;
+        }
+        if (stopped) return;
+        if (running)
+        {
+            await ReconnectAsync();
+        }
+        else
+        {
+            try { await StartAsync(); } catch { }
+        }
+    }
     internal Task ApplyLayoutAsync(PeerSharedLayout layout) => SendCommandAsync(new { op = "apply_layout", layout });
     internal Task SetChannelAsync(string channel, string? directPeer) =>
         SendCommandAsync(new { op = "set_channel", channel, direct_peer = string.IsNullOrWhiteSpace(directPeer) ? null : directPeer.Trim() });
@@ -311,7 +339,11 @@ internal sealed class PeerMeshController
     internal async Task<bool> StopAsync()
     {
         await commands.WaitAsync();
-        try { return await StopLockedAsync(); }
+        try
+        {
+            lock (sync) userStopped = true;
+            return await StopLockedAsync();
+        }
         finally { commands.Release(); }
     }
 
@@ -410,14 +442,18 @@ internal sealed class PeerMeshController
         finally
         {
             bool stoppedByUser = Volatile.Read(ref run.StopRequested) != 0;
+            bool shouldAutoRestart = false;
+            long exitedGen = run.Generation;
             lock (sync)
             {
                 if (current == run)
                 {
                     current = null;
+                    bool rejected = snapshot.State == "startup_rejected";
+                    shouldAutoRestart = !stoppedByUser && !userStopped && !rejected;
                     snapshot = snapshot with
                     {
-                        State = stoppedByUser ? "stopped" : (snapshot.State == "error" ? "error" : "stopped"),
+                        State = shouldAutoRestart ? "starting" : (stoppedByUser ? "stopped" : (snapshot.State == "error" ? "error" : "stopped")),
                         RouteEnabled = false,
                         FocusDeviceId = null,
                         FocusScreenId = null,
@@ -427,6 +463,23 @@ internal sealed class PeerMeshController
             }
             try { run.Process.Dispose(); } catch { }
             Publish();
+
+            if (shouldAutoRestart)
+            {
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                    bool stillEligible;
+                    lock (sync)
+                    {
+                        stillEligible = !userStopped && current is null && generation == exitedGen;
+                    }
+                    if (stillEligible)
+                    {
+                        try { await StartAsync(); } catch { }
+                    }
+                });
+            }
         }
     }
 

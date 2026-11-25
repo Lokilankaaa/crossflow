@@ -1404,6 +1404,10 @@ internal sealed class MainWindow : Window
                 await peerMesh.SetPeerChannelAsync(devId, chId));
             trayIcon.SendFilesDialogRequested += targetId => DispatcherQueue.TryEnqueue(async () => await PickAndSendFilesAsync(targetId));
             trayIcon.OpenReceiveFolderRequested += () => DispatcherQueue.TryEnqueue(OpenReceiveFolder);
+            trayIcon.SystemResumed += () => DispatcherQueue.TryEnqueue(async () =>
+            {
+                if (!closing) await peerMesh.HandleSystemResumeAsync();
+            });
             trayIcon.ExitRequested += () => DispatcherQueue.TryEnqueue(async () => await ExitApplicationAsync());
         }
         catch { }

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -551,7 +552,26 @@ final class PeerMeshModel {
     @ObservationIgnored private var generation: Int = 0
     @ObservationIgnored private var shuttingDown = false
     @ObservationIgnored private var syncedDirectPeerOnce = false
+    @ObservationIgnored nonisolated(unsafe) private var wakeObserver: NSObjectProtocol?
     @ObservationIgnored var onStatusChange: (@MainActor () -> Void)?
+
+    init() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleSystemWake()
+            }
+        }
+    }
+
+    deinit {
+        if let obs = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+    }
 
     var isSharing: Bool { state == "sharing" && routeEnabled }
     var isConnected: Bool { state == "sharing" || state == "paused" }
@@ -613,7 +633,7 @@ final class PeerMeshModel {
         let args = [
             "peer",
             "--bind", "0.0.0.0:24800",
-            "--seconds", "86400",
+            "--seconds", "0",
             "--max-hz", "1000",
             "--name", Host.current().localizedName ?? "Mac",
             "--log", logURL.path
@@ -631,15 +651,33 @@ final class PeerMeshModel {
             onExit: { [weak self] _, wasStopped in
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == gen, !self.shuttingDown else { return }
-                    if !wasStopped && self.state != "startup_rejected" && self.state != "error" {
-                        self.state = "stopped"
+                    if !wasStopped && self.state != "startup_rejected" {
+                        self.state = "starting"
                         self.routeEnabled = false
                         self.focusDeviceID = nil
                         self.focusScreenID = nil
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(for: .seconds(2))
+                            guard let self, self.generation == gen, !self.shuttingDown else { return }
+                            self.start()
+                        }
                     }
                 }
             }
         )
+    }
+
+    func reconnect() {
+        runner.send(Data("{\"op\":\"reconnect\"}".utf8))
+    }
+
+    private func handleSystemWake() {
+        guard !shuttingDown, state != "startup_rejected" else { return }
+        if state == "stopped" || state == "error" {
+            start()
+        } else {
+            reconnect()
+        }
     }
 
     private func apply(_ s: PeerStatusWire) {

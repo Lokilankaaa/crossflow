@@ -28,6 +28,9 @@ internal sealed class TrayIcon : IDisposable
     private const uint WM_CONTEXTMENU = 0x007B;
     private const uint WM_NCLBUTTONDOWN = 0x00A1;
     private const uint WM_NCLBUTTONDBLCLK = 0x00A3;
+    private const uint WM_POWERBROADCAST = 0x0218;
+    private const ulong PBT_APMRESUMESUSPEND = 0x0007;
+    private const ulong PBT_APMRESUMEAUTOMATIC = 0x0012;
     private const uint HTCAPTION = 2;
     private const int GCL_STYLE = -26;
     private const long CS_DBLCLKS = 0x0008;
@@ -106,6 +109,7 @@ internal sealed class TrayIcon : IDisposable
     internal event Action<string, string>? SelectPeerChannelRequested;
     internal event Action<string?>? SendFilesDialogRequested;
     internal event Action? OpenReceiveFolderRequested;
+    internal event Action? SystemResumed;
     internal event Action? ExitRequested;
 
     internal TrayIcon(Window window, Func<bool> isWindowVisible)
@@ -243,6 +247,11 @@ internal sealed class TrayIcon : IDisposable
                 currentIcon = GetOrCreateIcon(visualState, lightTaskbar);
                 if (added) ModifyIcon();
             }
+        }
+        else if (uMsg == WM_POWERBROADCAST
+            && (wParam.ToUInt64() == PBT_APMRESUMEAUTOMATIC || wParam.ToUInt64() == PBT_APMRESUMESUSPEND))
+        {
+            SystemResumed?.Invoke();
         }
         else if (taskbarCreatedMsg != 0 && uMsg == taskbarCreatedMsg)
         {

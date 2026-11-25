@@ -37,7 +37,8 @@ enum Command {
         passphrase_env: String,
         #[arg(long)]
         log: PathBuf,
-        #[arg(long, default_value_t = 86400.0)]
+        /// Peer session lifetime in seconds (0 = unlimited, runs until stopped).
+        #[arg(long, default_value_t = 0.0)]
         seconds: f64,
         #[arg(long, default_value_t = 1000)]
         max_hz: u32,
