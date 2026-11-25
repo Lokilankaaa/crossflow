@@ -1,0 +1,27 @@
+name: Feature Request
+description: 为 Crossflow 提议新功能或体验改进
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与痛点
+      description: 这个功能想解决什么跨屏协作场景的问题？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的实现方式
+      description: 简述你希望的交互方式、配置项或默认行为。
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 期望支持平台
+      options:
+        - label: Windows
+        - label: macOS
+        - label: Linux

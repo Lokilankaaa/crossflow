@@ -1,0 +1,52 @@
+name: Bug Report
+description: 反馈 Crossflow 的异常、断连、延迟或键鼠兼容问题
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 清晰描述发生了什么，以及你期望的行为。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Crossflow 版本 / Commit
+      placeholder: "例如 v0.4.0 或 dev@3a31aa3"
+    validations:
+      required: true
+  - type: checkboxes
+    id: platforms
+    attributes:
+      label: 涉及设备与系统
+      options:
+        - label: Windows 11 / Windows 10 (x64)
+        - label: macOS Apple Silicon (macOS 14+)
+        - label: 已开启 Windows 系统服务模式（CrossflowInputService）
+  - type: dropdown
+    id: channel
+    attributes:
+      label: 当前使用的网络信道
+      options:
+        - 自动选择最优
+        - 有线直连
+        - 有线局域网
+        - Wi-Fi
+        - ZeroTier / 虚拟局域网
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 补充信息 / 日志片段（请勿包含个人密码或密钥）
+      description: 可附上复现时间点前后的 JSONL 日志关键行或外设型号（如鼠标/键盘型号）。
