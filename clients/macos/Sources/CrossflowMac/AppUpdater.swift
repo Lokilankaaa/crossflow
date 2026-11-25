@@ -55,10 +55,10 @@ private struct GitHubAssetDTO: Decodable, Sendable {
 /// rollback-safe atomic `.app` swap, and automatic relaunch.
 @MainActor @Observable
 final class AppUpdater {
-    private static let repoBaseURL = "https://github.com/Lokilankaaa/crossflow"
-    private static let latestReleaseWebURL = URL(string: "https://github.com/Lokilankaaa/crossflow/releases/latest")!
-    private static let latestReleaseAPI = URL(string: "https://api.github.com/repos/Lokilankaaa/crossflow/releases/latest")!
-    private static let allowedHosts = [
+    private nonisolated static let repoBaseURL = "https://github.com/Lokilankaaa/crossflow"
+    private nonisolated static let latestReleaseWebURL = URL(string: "https://github.com/Lokilankaaa/crossflow/releases/latest")!
+    private nonisolated static let latestReleaseAPI = URL(string: "https://api.github.com/repos/Lokilankaaa/crossflow/releases/latest")!
+    private nonisolated static let allowedHosts = [
         "api.github.com",
         "github.com",
         "objects.githubusercontent.com",
