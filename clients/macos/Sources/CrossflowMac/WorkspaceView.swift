@@ -385,6 +385,123 @@ struct WorkspaceView: View {
                                         .controlSize(.small)
                                         .frame(maxWidth: .infinity)
 
+                                        // Per-peer cursor & scroll feel controls
+                                        let isFeelModified = abs(dev.cursorSpeed - 1.0) >= 0.01
+                                            || abs(dev.scrollSpeed - 1.0) >= 0.01
+                                            || dev.invertScrollY || dev.invertScrollX
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            HStack {
+                                                Text("此设备光标与滚轮")
+                                                    .font(.system(size: 11))
+                                                    .foregroundStyle(Theme.secondary)
+                                                Spacer()
+                                                if isFeelModified {
+                                                    Button("恢复默认") {
+                                                        peer.setPeerInput(
+                                                            deviceID: dev.id,
+                                                            cursorSpeed: 1.0,
+                                                            scrollSpeed: 1.0,
+                                                            invertScrollY: false,
+                                                            invertScrollX: false
+                                                        )
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .font(.system(size: 10.5, weight: .medium))
+                                                    .foregroundStyle(Theme.accent)
+                                                }
+                                            }
+
+                                            HStack {
+                                                Text("光标速度")
+                                                    .font(.system(size: 11))
+                                                    .foregroundStyle(Theme.text)
+                                                Spacer()
+                                                Text(String(format: "%.2f×", dev.cursorSpeed))
+                                                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                                                    .foregroundStyle(Theme.accent)
+                                            }
+                                            Slider(
+                                                value: Binding(
+                                                    get: { min(max(dev.cursorSpeed, 0.25), 3.0) },
+                                                    set: { next in
+                                                        peer.setPeerInput(
+                                                            deviceID: dev.id,
+                                                            cursorSpeed: next,
+                                                            scrollSpeed: dev.scrollSpeed,
+                                                            invertScrollY: dev.invertScrollY,
+                                                            invertScrollX: dev.invertScrollX
+                                                        )
+                                                    }
+                                                ),
+                                                in: 0.25...3.0,
+                                                step: 0.05
+                                            )
+                                            .controlSize(.small)
+
+                                            HStack {
+                                                Text("滚轮速度")
+                                                    .font(.system(size: 11))
+                                                    .foregroundStyle(Theme.text)
+                                                Spacer()
+                                                Text(String(format: "%.2f×", dev.scrollSpeed))
+                                                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                                                    .foregroundStyle(Theme.accent)
+                                            }
+                                            Slider(
+                                                value: Binding(
+                                                    get: { min(max(dev.scrollSpeed, 0.25), 3.0) },
+                                                    set: { next in
+                                                        peer.setPeerInput(
+                                                            deviceID: dev.id,
+                                                            cursorSpeed: dev.cursorSpeed,
+                                                            scrollSpeed: next,
+                                                            invertScrollY: dev.invertScrollY,
+                                                            invertScrollX: dev.invertScrollX
+                                                        )
+                                                    }
+                                                ),
+                                                in: 0.25...3.0,
+                                                step: 0.05
+                                            )
+                                            .controlSize(.small)
+
+                                            HStack(spacing: 10) {
+                                                Toggle("反转上下滚轮", isOn: Binding(
+                                                    get: { dev.invertScrollY },
+                                                    set: { next in
+                                                        peer.setPeerInput(
+                                                            deviceID: dev.id,
+                                                            cursorSpeed: dev.cursorSpeed,
+                                                            scrollSpeed: dev.scrollSpeed,
+                                                            invertScrollY: next,
+                                                            invertScrollX: dev.invertScrollX
+                                                        )
+                                                    }
+                                                ))
+                                                .toggleStyle(.checkbox)
+                                                .controlSize(.small)
+                                                .font(.system(size: 11))
+                                                .help("控制此设备时反转垂直滚轮方向（适配 Mac 与 Windows 滚轮差异）")
+
+                                                Toggle("反转左右滚轮", isOn: Binding(
+                                                    get: { dev.invertScrollX },
+                                                    set: { next in
+                                                        peer.setPeerInput(
+                                                            deviceID: dev.id,
+                                                            cursorSpeed: dev.cursorSpeed,
+                                                            scrollSpeed: dev.scrollSpeed,
+                                                            invertScrollY: dev.invertScrollY,
+                                                            invertScrollX: next
+                                                        )
+                                                    }
+                                                ))
+                                                .toggleStyle(.checkbox)
+                                                .controlSize(.small)
+                                                .font(.system(size: 11))
+                                            }
+                                        }
+                                        .padding(.top, 2)
+
                                         if dev.connected {
                                             HStack(spacing: 6) {
                                                 Button("QuickJump") {

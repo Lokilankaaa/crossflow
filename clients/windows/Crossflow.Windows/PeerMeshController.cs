@@ -66,7 +66,11 @@ internal sealed record PeerInfo(
     [property: JsonPropertyName("slot")] int? Slot,
     [property: JsonPropertyName("address")] string? Address,
     [property: JsonPropertyName("active_channel_label")] string? ActiveChannelLabel,
-    [property: JsonPropertyName("preferred_channel")] string PreferredChannel);
+    [property: JsonPropertyName("preferred_channel")] string PreferredChannel,
+    [property: JsonPropertyName("cursor_speed")] double CursorSpeed = 1.0,
+    [property: JsonPropertyName("scroll_speed")] double ScrollSpeed = 1.0,
+    [property: JsonPropertyName("invert_scroll_y")] bool InvertScrollY = false,
+    [property: JsonPropertyName("invert_scroll_x")] bool InvertScrollX = false);
 
 internal sealed record NumberedScreenInfo(
     [property: JsonPropertyName("number")] int Number,
@@ -292,6 +296,16 @@ internal sealed class PeerMeshController
         SendCommandAsync(new { op = "set_channel", channel, direct_peer = string.IsNullOrWhiteSpace(directPeer) ? null : directPeer.Trim() });
     internal Task SetPeerChannelAsync(string deviceId, string channel) =>
         SendCommandAsync(new { op = "set_peer_channel", device_id = deviceId, channel });
+    internal Task SetPeerInputAsync(string deviceId, double cursorSpeed, double scrollSpeed, bool invertScrollY, bool invertScrollX) =>
+        SendCommandAsync(new
+        {
+            op = "set_peer_input",
+            device_id = deviceId,
+            cursor_speed = Math.Round(Math.Clamp(cursorSpeed, 0.25, 4.0), 2),
+            scroll_speed = Math.Round(Math.Clamp(scrollSpeed, 0.25, 4.0), 2),
+            invert_scroll_y = invertScrollY,
+            invert_scroll_x = invertScrollX
+        });
     internal Task AddManualPeerAsync(string address, string? label = null, string channel = "auto") =>
         SendCommandAsync(new { op = "add_manual_peer", address = address.Trim(), label = string.IsNullOrWhiteSpace(label) ? null : label.Trim(), channel });
     internal Task RemoveManualPeerAsync(string address) =>

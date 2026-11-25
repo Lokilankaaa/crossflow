@@ -154,6 +154,12 @@ impl SharedSource {
     pub fn is_edge_locked(&self) -> bool {
         self.lock().route.is_edge_locked()
     }
+    pub fn set_peer_profiles(
+        &self,
+        profiles: std::collections::HashMap<String, crate::routed_desktop::PeerInputProfile>,
+    ) {
+        self.lock().route.set_peer_profiles(profiles);
+    }
     pub fn has_held_physical_input(&self) -> bool {
         let state = self.lock();
         let queue = state.route.input.lock().unwrap_or_else(|e| e.into_inner());
@@ -399,6 +405,26 @@ impl SharedSource {
                 );
                 return state.route.movement(native, dx, dy, captured_at_ns);
             }
+            if let SourceEvent::Scroll {
+                horizontal,
+                vertical,
+            } = event
+            {
+                let (h, v) = state.route.transform_scroll(horizontal, vertical);
+                if h == 0 && v == 0 && (horizontal != 0 || vertical != 0) {
+                    return Ok(None);
+                }
+                let outcome = {
+                    let mut queue = state.route.input.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.scroll(h, v, captured_at_ns)
+                };
+                if let CaptureOutcome::Paused(reason) = outcome {
+                    state.fail(SourceFailure::QueuePaused(reason));
+                    anyhow::bail!("physical source queue paused");
+                }
+                state.route.outcome(outcome);
+                return Ok(None);
+            }
             let outcome = {
                 let mut queue = state.route.input.lock().unwrap_or_else(|e| e.into_inner());
                 match event {
@@ -422,11 +448,7 @@ impl SharedSource {
                         );
                         queue.key(usage, down, captured_at_ns)
                     }
-                    SourceEvent::Scroll {
-                        horizontal,
-                        vertical,
-                    } => queue.scroll(horizontal, vertical, captured_at_ns),
-                    SourceEvent::Movement { .. } => unreachable!(),
+                    SourceEvent::Scroll { .. } | SourceEvent::Movement { .. } => unreachable!(),
                 }
             };
             if let CaptureOutcome::Paused(reason) = outcome {

@@ -5,10 +5,71 @@ use crate::{
     input::{CaptureOutcome, SourceInputQueue},
     screen_runtime::{Focus, RuntimeLayout},
 };
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+
+fn default_one() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerInputProfile {
+    #[serde(default = "default_one")]
+    pub cursor_speed: f64,
+    #[serde(default = "default_one")]
+    pub scroll_speed: f64,
+    #[serde(default)]
+    pub invert_scroll_y: bool,
+    #[serde(default)]
+    pub invert_scroll_x: bool,
+}
+
+impl Default for PeerInputProfile {
+    fn default() -> Self {
+        Self {
+            cursor_speed: 1.0,
+            scroll_speed: 1.0,
+            invert_scroll_y: false,
+            invert_scroll_x: false,
+        }
+    }
+}
+
+impl PeerInputProfile {
+    pub fn sanitized(self) -> Self {
+        let clamp_speed = |v: f64| {
+            if v.is_finite() {
+                (v.clamp(0.25, 4.0) * 100.0).round() / 100.0
+            } else {
+                1.0
+            }
+        };
+        Self {
+            cursor_speed: clamp_speed(self.cursor_speed),
+            scroll_speed: clamp_speed(self.scroll_speed),
+            invert_scroll_y: self.invert_scroll_y,
+            invert_scroll_x: self.invert_scroll_x,
+        }
+    }
+
+    pub fn is_default(self) -> bool {
+        let s = self.sanitized();
+        (s.cursor_speed - 1.0).abs() < 1e-6
+            && (s.scroll_speed - 1.0).abs() < 1e-6
+            && !s.invert_scroll_y
+            && !s.invert_scroll_x
+    }
+}
+
+fn device_ids_match(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a == b || a.starts_with(b) || b.starts_with(a))
+}
 
 pub struct RoutedInput {
     pub config: RuntimeLayout,
@@ -21,6 +82,10 @@ pub struct RoutedInput {
     focus: Option<Focus>,
     last_local_native: Option<Point>,
     expected_queue_epoch: u64,
+    peer_profiles: HashMap<String, PeerInputProfile>,
+    scroll_rem_x: f64,
+    scroll_rem_y: f64,
+    scroll_rem_device: Option<String>,
 }
 impl RoutedInput {
     pub fn new(config: RuntimeLayout) -> anyhow::Result<Self> {
@@ -36,7 +101,69 @@ impl RoutedInput {
             focus: None,
             last_local_native: None,
             expected_queue_epoch: 0,
+            peer_profiles: HashMap::new(),
+            scroll_rem_x: 0.0,
+            scroll_rem_y: 0.0,
+            scroll_rem_device: None,
         })
+    }
+    pub fn set_peer_profiles(&mut self, profiles: HashMap<String, PeerInputProfile>) {
+        self.peer_profiles = profiles
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let key = k.trim().to_string();
+                let clean = v.sanitized();
+                (!key.is_empty() && !clean.is_default()).then_some((key, clean))
+            })
+            .collect();
+        self.scroll_rem_x = 0.0;
+        self.scroll_rem_y = 0.0;
+    }
+    pub fn profile_for_device(&self, device_id: &str) -> PeerInputProfile {
+        if let Some(p) = self.peer_profiles.get(device_id) {
+            return *p;
+        }
+        for (k, v) in &self.peer_profiles {
+            if device_ids_match(k, device_id) {
+                return *v;
+            }
+        }
+        PeerInputProfile::default()
+    }
+    pub fn transform_scroll(&mut self, horizontal: i32, vertical: i32) -> (i32, i32) {
+        let Some(dev_id) = self.active_remote_device_id() else {
+            self.scroll_rem_x = 0.0;
+            self.scroll_rem_y = 0.0;
+            self.scroll_rem_device = None;
+            return (horizontal, vertical);
+        };
+        if self.scroll_rem_device.as_deref() != Some(dev_id.as_str()) {
+            self.scroll_rem_x = 0.0;
+            self.scroll_rem_y = 0.0;
+            self.scroll_rem_device = Some(dev_id.clone());
+        }
+        let profile = self.profile_for_device(&dev_id);
+        if (profile.scroll_speed - 1.0).abs() < 1e-6
+            && !profile.invert_scroll_x
+            && !profile.invert_scroll_y
+        {
+            return (horizontal, vertical);
+        }
+        let mut fx = f64::from(horizontal) * profile.scroll_speed;
+        let mut fy = f64::from(vertical) * profile.scroll_speed;
+        if profile.invert_scroll_x {
+            fx = -fx;
+        }
+        if profile.invert_scroll_y {
+            fy = -fy;
+        }
+        self.scroll_rem_x += fx;
+        self.scroll_rem_y += fy;
+        let out_x = self.scroll_rem_x.trunc() as i32;
+        let out_y = self.scroll_rem_y.trunc() as i32;
+        self.scroll_rem_x -= f64::from(out_x);
+        self.scroll_rem_y -= f64::from(out_y);
+        (out_x.clamp(-30_000, 30_000), out_y.clamp(-30_000, 30_000))
     }
     pub fn set_edge_locked(&mut self, locked: bool) {
         self.edge_locked = locked;
@@ -164,17 +291,19 @@ impl RoutedInput {
             return Ok(None);
         }
         let next = if let Some(f) = &self.focus {
-            let candidate = self.config.advance(f, dx, dy)?;
+            let current_dev = self.config.screen(&f.screen_id)?.device_id.as_str();
+            let scale = self.profile_for_device(current_dev).cursor_speed;
+            let (sdx, sdy) = (dx * scale, dy * scale);
+            let candidate = self.config.advance(f, sdx, sdy)?;
             if self.edge_locked {
-                let current_dev = self.config.screen(&f.screen_id)?.device_id.as_str();
                 let next_dev = self.config.screen(&candidate.screen_id)?.device_id.as_str();
                 if current_dev != next_dev {
                     let s = self.config.screen(&f.screen_id)?;
                     Focus {
                         screen_id: f.screen_id.clone(),
                         point: Point {
-                            x: (f.point.x + dx).clamp(s.x, s.right()),
-                            y: (f.point.y + dy).clamp(s.y, s.bottom()),
+                            x: (f.point.x + sdx).clamp(s.x, s.right()),
+                            y: (f.point.y + sdy).clamp(s.y, s.bottom()),
                         },
                     }
                 } else {
@@ -649,5 +778,36 @@ mod tests {
         assert!(warp.is_some());
         assert!(!r.remote_gate.load(Ordering::Acquire));
         assert_eq!(r.focus_identity(), (Some("local".into()), Some("w".into())));
+    }
+    #[test]
+    fn per_peer_input_profile_scales_cursor_and_transforms_scroll_with_remainders() {
+        let mut r = routed();
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "peer".into(),
+            PeerInputProfile {
+                cursor_speed: 2.0,
+                scroll_speed: 1.5,
+                invert_scroll_y: true,
+                invert_scroll_x: false,
+            },
+        );
+        r.set_peer_profiles(profiles);
+
+        // Jump to remote peer center (150, 50)
+        assert!(r.quick_jump_to_device("peer", 1).unwrap().is_none());
+        let start = r.focus.as_ref().unwrap().point;
+        assert_eq!(start, Point { x: 150., y: 50. });
+
+        // Moving (5, -3) scales by 2.0 -> (10, -6) on remote
+        assert!(r.movement(Point { x: 50., y: 50. }, 5., -3., 2).unwrap().is_none());
+        assert_eq!(r.focus.as_ref().unwrap().point, Point { x: 160., y: 44. });
+
+        // Scroll vertical 120 * 1.5 inverted -> -180; horizontal 1 * 1.5 -> 1 (rem 0.5) then 2
+        assert_eq!(r.transform_scroll(1, 120), (1, -180));
+        assert_eq!(r.transform_scroll(1, 0), (2, 0));
+
+        // Large scroll clamps safely within protocol/sink bounds
+        assert_eq!(r.transform_scroll(0, -30_000), (0, 30_000));
     }
 }

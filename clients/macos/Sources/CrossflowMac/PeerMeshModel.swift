@@ -128,11 +128,66 @@ struct PeerInfo: Sendable, Equatable, Decodable, Identifiable {
     let address: String?
     let activeChannelLabel: String?
     let preferredChannel: String
+    let cursorSpeed: Double
+    let scrollSpeed: Double
+    let invertScrollY: Bool
+    let invertScrollX: Bool
 
     enum CodingKeys: String, CodingKey {
         case id, name, platform, connected, focused, slot, address
         case activeChannelLabel = "active_channel_label"
         case preferredChannel = "preferred_channel"
+        case cursorSpeed = "cursor_speed"
+        case scrollSpeed = "scroll_speed"
+        case invertScrollY = "invert_scroll_y"
+        case invertScrollX = "invert_scroll_x"
+    }
+
+    init(
+        id: String,
+        name: String,
+        platform: String,
+        connected: Bool,
+        focused: Bool,
+        slot: Int?,
+        address: String?,
+        activeChannelLabel: String?,
+        preferredChannel: String,
+        cursorSpeed: Double = 1.0,
+        scrollSpeed: Double = 1.0,
+        invertScrollY: Bool = false,
+        invertScrollX: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.platform = platform
+        self.connected = connected
+        self.focused = focused
+        self.slot = slot
+        self.address = address
+        self.activeChannelLabel = activeChannelLabel
+        self.preferredChannel = preferredChannel
+        self.cursorSpeed = cursorSpeed
+        self.scrollSpeed = scrollSpeed
+        self.invertScrollY = invertScrollY
+        self.invertScrollX = invertScrollX
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        platform = try c.decode(String.self, forKey: .platform)
+        connected = try c.decode(Bool.self, forKey: .connected)
+        focused = try c.decode(Bool.self, forKey: .focused)
+        slot = try c.decodeIfPresent(Int.self, forKey: .slot)
+        address = try c.decodeIfPresent(String.self, forKey: .address)
+        activeChannelLabel = try c.decodeIfPresent(String.self, forKey: .activeChannelLabel)
+        preferredChannel = try c.decodeIfPresent(String.self, forKey: .preferredChannel) ?? "auto"
+        cursorSpeed = try c.decodeIfPresent(Double.self, forKey: .cursorSpeed) ?? 1.0
+        scrollSpeed = try c.decodeIfPresent(Double.self, forKey: .scrollSpeed) ?? 1.0
+        invertScrollY = try c.decodeIfPresent(Bool.self, forKey: .invertScrollY) ?? false
+        invertScrollX = try c.decodeIfPresent(Bool.self, forKey: .invertScrollX) ?? false
     }
 }
 
@@ -299,6 +354,24 @@ private struct SetPeerChannelCommandWire: Encodable {
         case op
         case deviceID = "device_id"
         case channel
+    }
+}
+
+private struct SetPeerInputCommandWire: Encodable {
+    let op = "set_peer_input"
+    let deviceID: String
+    let cursorSpeed: Double
+    let scrollSpeed: Double
+    let invertScrollY: Bool
+    let invertScrollX: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case op
+        case deviceID = "device_id"
+        case cursorSpeed = "cursor_speed"
+        case scrollSpeed = "scroll_speed"
+        case invertScrollY = "invert_scroll_y"
+        case invertScrollX = "invert_scroll_x"
     }
 }
 
@@ -745,6 +818,27 @@ final class PeerMeshModel {
 
     func setPeerChannel(deviceID: String, channel: String) {
         let cmd = SetPeerChannelCommandWire(deviceID: deviceID, channel: channel)
+        if let data = try? JSONEncoder().encode(cmd) {
+            runner.send(data)
+        }
+    }
+
+    func setPeerInput(
+        deviceID: String,
+        cursorSpeed: Double,
+        scrollSpeed: Double,
+        invertScrollY: Bool,
+        invertScrollX: Bool
+    ) {
+        let cs = (min(max(cursorSpeed, 0.25), 4.0) * 100.0).rounded() / 100.0
+        let ss = (min(max(scrollSpeed, 0.25), 4.0) * 100.0).rounded() / 100.0
+        let cmd = SetPeerInputCommandWire(
+            deviceID: deviceID,
+            cursorSpeed: cs,
+            scrollSpeed: ss,
+            invertScrollY: invertScrollY,
+            invertScrollX: invertScrollX
+        )
         if let data = try? JSONEncoder().encode(cmd) {
             runner.send(data)
         }

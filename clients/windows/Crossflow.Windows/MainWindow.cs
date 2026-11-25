@@ -57,6 +57,7 @@ internal sealed class MainWindow : Window
     private string lastManualPeersSig = "";
     private string? expandedPeerId;
     private bool peerChannelDropDownOpen;
+    private bool peerInputSliderDragging;
 
     // Minimal password configuration (已配置 / 未配置)
     private readonly TextBlock passwordStateBadge = new();
@@ -1915,7 +1916,7 @@ internal sealed class MainWindow : Window
 
     private void RenderDiscoveredPeers(PeerMeshSnapshot snap)
     {
-        if (peerChannelDropDownOpen) return;
+        if (peerChannelDropDownOpen || peerInputSliderDragging) return;
 
         var items = snap.Peers.ToList();
         if (items.Count == 0 && snap.DiscoveredPeers.Count > 0)
@@ -1933,7 +1934,7 @@ internal sealed class MainWindow : Window
 
         string sig = (expandedPeerId ?? "")
             + "|" + string.Join(",", snap.NetworkChannels.Select(c => c.Id))
-            + "|" + string.Join(";", items.Select(p => $"{p.Id}:{p.Name}:{p.Connected}:{p.Focused}:{p.Slot}:{p.Address}:{p.ActiveChannelLabel}:{p.PreferredChannel}"));
+            + "|" + string.Join(";", items.Select(p => $"{p.Id}:{p.Name}:{p.Connected}:{p.Focused}:{p.Slot}:{p.Address}:{p.ActiveChannelLabel}:{p.PreferredChannel}:{p.CursorSpeed:F2}:{p.ScrollSpeed:F2}:{p.InvertScrollY}:{p.InvertScrollX}"));
         if (sig == lastPeersListSig) return;
         lastPeersListSig = sig;
 
@@ -2046,6 +2047,162 @@ internal sealed class MainWindow : Window
                     }
                 };
                 drawer.Children.Add(chBox);
+
+                // Per-peer cursor & scroll feel controls
+                double curCursor = peer.CursorSpeed > 0 ? peer.CursorSpeed : 1.0;
+                double curScroll = peer.ScrollSpeed > 0 ? peer.ScrollSpeed : 1.0;
+                bool curInvY = peer.InvertScrollY;
+                bool curInvX = peer.InvertScrollX;
+                bool isModified = Math.Abs(curCursor - 1.0) >= 0.01
+                    || Math.Abs(curScroll - 1.0) >= 0.01
+                    || curInvY || curInvX;
+
+                var feelBox = new StackPanel { Spacing = 4, Margin = new Thickness(0, 4, 0, 2) };
+                var feelHeader = new Grid();
+                feelHeader.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                feelHeader.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                feelHeader.Children.Add(new TextBlock
+                {
+                    Text = "此设备光标与滚轮",
+                    FontSize = 11,
+                    Foreground = theme.Brush("text_secondary"),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                if (isModified)
+                {
+                    var resetBtn = new Button
+                    {
+                        Content = "恢复默认",
+                        FontSize = 10.5,
+                        Padding = new Thickness(6, 2, 6, 2),
+                        MinHeight = 0,
+                        MinWidth = 0,
+                        Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                        BorderThickness = new Thickness(0),
+                        Foreground = theme.Brush("accent")
+                    };
+                    resetBtn.Click += async (_, _) => await peerMesh.SetPeerInputAsync(peerId, 1.0, 1.0, false, false);
+                    Grid.SetColumn(resetBtn, 1);
+                    feelHeader.Children.Add(resetBtn);
+                }
+                feelBox.Children.Add(feelHeader);
+
+                var cursorLabel = new TextBlock
+                {
+                    Text = $"{curCursor:0.00}×",
+                    FontSize = 11,
+                    FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                    Foreground = theme.Brush("accent")
+                };
+                var cursorHeader = new Grid();
+                cursorHeader.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                cursorHeader.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                cursorHeader.Children.Add(new TextBlock { Text = "光标速度", FontSize = 11, Foreground = theme.Brush("text") });
+                Grid.SetColumn(cursorLabel, 1);
+                cursorHeader.Children.Add(cursorLabel);
+                feelBox.Children.Add(cursorHeader);
+
+                var cursorSlider = new Slider
+                {
+                    Minimum = 0.25,
+                    Maximum = 3.0,
+                    StepFrequency = 0.05,
+                    Value = Math.Clamp(curCursor, 0.25, 3.0),
+                    IsThumbToolTipEnabled = false,
+                    Margin = new Thickness(0, -4, 0, -4)
+                };
+                cursorSlider.AddHandler(UIElement.PointerPressedEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, _) => peerInputSliderDragging = true), true);
+                cursorSlider.AddHandler(UIElement.PointerCaptureLostEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, _) =>
+                {
+                    peerInputSliderDragging = false;
+                    RenderDiscoveredPeers(currentSnap);
+                }), true);
+                cursorSlider.ValueChanged += async (_, e) =>
+                {
+                    double next = Math.Round(e.NewValue, 2);
+                    curCursor = next;
+                    cursorLabel.Text = $"{next:0.00}×";
+                    await peerMesh.SetPeerInputAsync(peerId, curCursor, curScroll, curInvY, curInvX);
+                };
+                feelBox.Children.Add(cursorSlider);
+
+                var scrollLabel = new TextBlock
+                {
+                    Text = $"{curScroll:0.00}×",
+                    FontSize = 11,
+                    FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                    Foreground = theme.Brush("accent")
+                };
+                var scrollHeader = new Grid();
+                scrollHeader.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                scrollHeader.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+                scrollHeader.Children.Add(new TextBlock { Text = "滚轮速度", FontSize = 11, Foreground = theme.Brush("text") });
+                Grid.SetColumn(scrollLabel, 1);
+                scrollHeader.Children.Add(scrollLabel);
+                feelBox.Children.Add(scrollHeader);
+
+                var scrollSlider = new Slider
+                {
+                    Minimum = 0.25,
+                    Maximum = 3.0,
+                    StepFrequency = 0.05,
+                    Value = Math.Clamp(curScroll, 0.25, 3.0),
+                    IsThumbToolTipEnabled = false,
+                    Margin = new Thickness(0, -4, 0, -4)
+                };
+                scrollSlider.AddHandler(UIElement.PointerPressedEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, _) => peerInputSliderDragging = true), true);
+                scrollSlider.AddHandler(UIElement.PointerCaptureLostEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, _) =>
+                {
+                    peerInputSliderDragging = false;
+                    RenderDiscoveredPeers(currentSnap);
+                }), true);
+                scrollSlider.ValueChanged += async (_, e) =>
+                {
+                    double next = Math.Round(e.NewValue, 2);
+                    curScroll = next;
+                    scrollLabel.Text = $"{next:0.00}×";
+                    await peerMesh.SetPeerInputAsync(peerId, curCursor, curScroll, curInvY, curInvX);
+                };
+                feelBox.Children.Add(scrollSlider);
+
+                var invRow = new Grid { ColumnSpacing = 4, Margin = new Thickness(0, 2, 0, 0) };
+                invRow.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+                invRow.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+
+                var invYCheck = new CheckBox
+                {
+                    Content = "反转上下滚轮",
+                    IsChecked = curInvY,
+                    FontSize = 11,
+                    MinWidth = 0,
+                    Padding = new Thickness(6, 0, 0, 0)
+                };
+                ToolTipService.SetToolTip(invYCheck, "控制此设备时反转垂直滚轮方向（适配 Windows 与 Mac 自然滚动差异）");
+                invYCheck.Click += async (_, _) =>
+                {
+                    curInvY = invYCheck.IsChecked == true;
+                    await peerMesh.SetPeerInputAsync(peerId, curCursor, curScroll, curInvY, curInvX);
+                };
+                invRow.Children.Add(invYCheck);
+
+                var invXCheck = new CheckBox
+                {
+                    Content = "反转左右滚轮",
+                    IsChecked = curInvX,
+                    FontSize = 11,
+                    MinWidth = 0,
+                    Padding = new Thickness(6, 0, 0, 0)
+                };
+                invXCheck.Click += async (_, _) =>
+                {
+                    curInvX = invXCheck.IsChecked == true;
+                    await peerMesh.SetPeerInputAsync(peerId, curCursor, curScroll, curInvY, curInvX);
+                };
+                Grid.SetColumn(invXCheck, 1);
+                invRow.Children.Add(invXCheck);
+                feelBox.Children.Add(invRow);
+
+                drawer.Children.Add(feelBox);
 
                 if (peer.Connected)
                 {

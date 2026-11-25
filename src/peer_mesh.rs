@@ -28,6 +28,7 @@ use crate::{
     pair_source::SharedSource,
     pair_wire::Display,
     protocol::{Frame, Kind, button_from_code},
+    routed_desktop::PeerInputProfile,
     session::{MouseSink, NativeDisplay},
     session_metadata::{SharedLayout, SharedScreen},
 };
@@ -101,6 +102,8 @@ struct PeerConfig {
     #[serde(default)]
     peer_channels: HashMap<String, String>,
     #[serde(default)]
+    peer_input: HashMap<String, PeerInputProfile>,
+    #[serde(default)]
     passphrase: Option<String>,
     #[serde(default)]
     smart_keymap: bool,
@@ -120,6 +123,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_one() -> f64 {
+    1.0
+}
+
 impl Default for PeerConfig {
     fn default() -> Self {
         Self {
@@ -127,6 +134,7 @@ impl Default for PeerConfig {
             direct_peer: None,
             manual_peers: Vec::new(),
             peer_channels: HashMap::new(),
+            peer_input: HashMap::new(),
             passphrase: None,
             smart_keymap: false,
             clipboard_sync: true,
@@ -144,7 +152,7 @@ pub struct DiscoveredPeerInfo {
     pub connected: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PeerInfo {
     pub id: String,
     pub name: String,
@@ -155,6 +163,10 @@ pub struct PeerInfo {
     pub address: Option<String>,
     pub active_channel_label: Option<String>,
     pub preferred_channel: String,
+    pub cursor_speed: f64,
+    pub scroll_speed: f64,
+    pub invert_scroll_y: bool,
+    pub invert_scroll_x: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -220,6 +232,17 @@ enum UiCommand {
     SetPeerChannel {
         device_id: String,
         channel: String,
+    },
+    SetPeerInput {
+        device_id: String,
+        #[serde(default = "default_one")]
+        cursor_speed: f64,
+        #[serde(default = "default_one")]
+        scroll_speed: f64,
+        #[serde(default)]
+        invert_scroll_y: bool,
+        #[serde(default)]
+        invert_scroll_x: bool,
     },
     AddManualPeer {
         address: String,
@@ -335,6 +358,33 @@ fn set_peer_channel(config: &mut PeerConfig, device_id: &str, channel: &str) {
     }
 }
 
+fn peer_input_profile(
+    profiles: &HashMap<String, PeerInputProfile>,
+    device_id: &str,
+) -> PeerInputProfile {
+    if let Some(p) = profiles.get(device_id) {
+        return p.sanitized();
+    }
+    for (k, v) in profiles {
+        if ids_match(k, device_id) {
+            return v.sanitized();
+        }
+    }
+    PeerInputProfile::default()
+}
+
+fn set_peer_input(config: &mut PeerConfig, device_id: &str, profile: PeerInputProfile) {
+    let key = device_id.trim();
+    if key.is_empty() {
+        return;
+    }
+    let clean = profile.sanitized();
+    config.peer_input.retain(|k, _| !ids_match(k, key));
+    if !clean.is_default() {
+        config.peer_input.insert(key.to_string(), clean);
+    }
+}
+
 fn normalize_manual_address(raw: &str) -> Option<String> {
     let sock = parse_direct_peer(Some(raw))?;
     if sock.port() == DEFAULT_PORT {
@@ -439,6 +489,15 @@ fn normalize_config(cfg: &mut PeerConfig) {
     cfg.manual_peers = cleaned;
     cfg.peer_channels
         .retain(|k, v| !k.trim().is_empty() && !v.trim().is_empty() && v.trim() != "auto");
+    let cleaned_inputs: HashMap<String, PeerInputProfile> = std::mem::take(&mut cfg.peer_input)
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let key = k.trim().to_string();
+            let clean = v.sanitized();
+            (!key.is_empty() && !clean.is_default()).then_some((key, clean))
+        })
+        .collect();
+    cfg.peer_input = cleaned_inputs;
     cfg.passphrase = cfg
         .passphrase
         .as_deref()
@@ -1469,6 +1528,26 @@ pub fn run(
                             dial_backoff.retain(|k, _| !ids_match(k, &device_id));
                             last_dial_scan = Instant::now() - Duration::from_secs(2);
                         }
+                        Ok(UiCommand::SetPeerInput {
+                            device_id,
+                            cursor_speed,
+                            scroll_speed,
+                            invert_scroll_y,
+                            invert_scroll_x,
+                        }) => {
+                            let profile = PeerInputProfile {
+                                cursor_speed,
+                                scroll_speed,
+                                invert_scroll_y,
+                                invert_scroll_x,
+                            };
+                            set_peer_input(&mut config, &device_id, profile);
+                            save_config(&config);
+                            if let Some(ref io) = native_io {
+                                io.source.set_peer_profiles(config.peer_input.clone());
+                            }
+                            last_status_sig.clear();
+                        }
                         Ok(UiCommand::AddManualPeer {
                             address,
                             label,
@@ -2198,6 +2277,7 @@ pub fn run(
                             let _ = io.source.update_runtime(rt);
                         } else if let Ok(source) = SharedSource::new(rt) {
                             source.set_edge_locked(screen_locked);
+                            source.set_peer_profiles(config.peer_input.clone());
                             hotkey_engine.reset_modifiers();
                             let _ = hotkey_engine.drain_actions();
                             if let Ok(mut sink) = prepare_worker(&local_displays, log.clone()) {
@@ -2271,6 +2351,7 @@ pub fn run(
                         let rt = io.source.runtime();
                         if let Ok(fresh_source) = SharedSource::new(rt) {
                             fresh_source.set_edge_locked(screen_locked);
+                            fresh_source.set_peer_profiles(config.peer_input.clone());
                             if let Ok(cap) = (platform.capture)(fresh_source.clone(), log.clone()) {
                                 io.last_activity = fresh_source.activity_counter();
                                 io.source = fresh_source;
@@ -2647,6 +2728,7 @@ pub fn run(
 
                 let mut peers_list: Vec<PeerInfo> = Vec::with_capacity(active_peers.len() + candidates.len());
                 for (idx, p) in active_peers.values().enumerate() {
+                    let prof = peer_input_profile(&config.peer_input, &p.device_id);
                     peers_list.push(PeerInfo {
                         id: p.device_id.clone(),
                         name: p.name.clone(),
@@ -2657,12 +2739,17 @@ pub fn run(
                         address: Some(p.peer_addr.to_string()),
                         active_channel_label: p.active_channel_label.clone(),
                         preferred_channel: peer_channel_override(&config.peer_channels, &p.device_id),
+                        cursor_speed: prof.cursor_speed,
+                        scroll_speed: prof.scroll_speed,
+                        invert_scroll_y: prof.invert_scroll_y,
+                        invert_scroll_x: prof.invert_scroll_x,
                     });
                 }
                 for c in &candidates {
                     if active_peers.keys().any(|id| ids_match(id, &c.device_id)) {
                         continue;
                     }
+                    let prof = peer_input_profile(&config.peer_input, &c.device_id);
                     peers_list.push(PeerInfo {
                         id: c.device_id.clone(),
                         name: c.friendly_name.clone(),
@@ -2673,6 +2760,10 @@ pub fn run(
                         address: None,
                         active_channel_label: None,
                         preferred_channel: peer_channel_override(&config.peer_channels, &c.device_id),
+                        cursor_speed: prof.cursor_speed,
+                        scroll_speed: prof.scroll_speed,
+                        invert_scroll_y: prof.invert_scroll_y,
+                        invert_scroll_x: prof.invert_scroll_x,
                     });
                 }
 
@@ -2984,5 +3075,36 @@ mod tests {
         // Equal priority falls back to deterministic preferred_initiator tie-break
         assert!(should_replace_peer_connection(direct, false, direct, true, true, &local));
         assert!(!should_replace_peer_connection(direct, true, direct, false, true, &local));
+    }
+
+    #[test]
+    fn peer_input_profile_clamps_persists_and_clears_on_default() {
+        let mut cfg = PeerConfig::default();
+        let full_id = "1c0e98791234567890abcdef1234567890abcdef1234567890abcdef12345678";
+        let prefix = &full_id[..32];
+
+        assert_eq!(
+            peer_input_profile(&cfg.peer_input, full_id),
+            PeerInputProfile::default()
+        );
+        set_peer_input(
+            &mut cfg,
+            prefix,
+            PeerInputProfile {
+                cursor_speed: 9.5,
+                scroll_speed: 0.1,
+                invert_scroll_y: true,
+                invert_scroll_x: false,
+            },
+        );
+        let p = peer_input_profile(&cfg.peer_input, full_id);
+        assert_eq!(p.cursor_speed, 4.0);
+        assert_eq!(p.scroll_speed, 0.25);
+        assert!(p.invert_scroll_y);
+        assert!(!p.invert_scroll_x);
+
+        // Resetting back to default removes the override cleanly
+        set_peer_input(&mut cfg, full_id, PeerInputProfile::default());
+        assert!(cfg.peer_input.is_empty());
     }
 }
