@@ -317,8 +317,8 @@ fn main() -> Result<()> {
             max_hz,
         } => {
             ensure!(
-                seconds.is_finite() && seconds > 0.0 && seconds <= 86400.0,
-                "seconds must be >0 and <=86400"
+                seconds.is_finite() && seconds >= 0.0 && seconds <= 86400.0,
+                "seconds must be >=0 and <=86400"
             );
             let passphrase = std::env::var(&passphrase_env)
                 .ok()
