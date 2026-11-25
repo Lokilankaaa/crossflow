@@ -8,13 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased] (`dev`)
 
+---
+
+## [0.4.1] - 2026-11-25
+
 ### Added
-- **每设备独立光标与滚轮手感配置**（`3a31aa3`）：支持按对端设备分别调节光标速度（`0.25×`–`3.00×`）、滚轮速度（`0.25×`–`3.00×`，带浮点残差累积防丢步）、上下/左右滚轮反转及一键恢复默认，热生效无需重连并持久化于 `peer-config.json`。
+- **双端应用内自更新（Windows + macOS）**：内置免 API 限流版本检测（优先读取 GitHub `releases/latest` + `SHA256SUMS.txt`）、启动 8 秒后静默检查、侧边栏与托盘/菜单栏快捷入口、实时进度条与取消下载、强制 **SHA-256 完整性校验**、防 Zip-Slip 解压、Windows 服务模式自动刷新以及 macOS 签名校验与失败自动回滚替换。
+- **每设备独立光标与滚轮手感配置**：支持按对端设备分别调节光标速度（`0.25×`–`3.00×`）、滚轮速度（`0.25×`–`3.00×`，带浮点残差累积防丢步）、上下/左右滚轮反转及一键恢复默认，热生效无需重连并持久化于 `peer-config.json`。
 - **规范化开发流程**：建立 `dev` 日常集成分支，新增 `CHANGELOG.md`、更新 `CONTRIBUTING.md` 及 GitHub PR / Issue 模板。
 
 ### Fixed
-- **过夜待机唤醒自动重连**（`9b97b9f`、`ce38cd5`、`e23aeb1`）：取消 `crossflow peer` 24 小时强制退出上限（启用 `--seconds 0` 常驻）；新增内核时钟跳变/网卡变动自愈、Windows `WM_POWERBROADCAST` 与 macOS `didWakeNotification` 唤醒重连、异常退出 2 秒自动拉起，以及 macOS 菜单栏启动即刻拉起内核。
-- **自动静默升级最优信道**（`9b97b9f`）：网卡短暂抖动不再清除用户固定信道偏好；当连接临时回落至 Wi-Fi / ZeroTier 时，空闲期后台自动探测并无感热升级至有线直连（`有线直连 > 有线局域网 > Wi-Fi > ZeroTier`），并拒绝慢信道反向覆盖。
+- **过夜待机唤醒自动重连**：取消 `crossflow peer` 24 小时强制退出上限（启用 `--seconds 0` 常驻）；新增内核时钟跳变/网卡变动自愈、Windows `WM_POWERBROADCAST` 与 macOS `didWakeNotification` 唤醒重连、异常退出 2 秒自动拉起，以及 macOS 菜单栏启动即刻拉起内核。
+- **自动静默升级最优信道**：网卡短暂抖动不再清除用户固定信道偏好；当连接临时回落至 Wi-Fi / ZeroTier 时，空闲期后台自动探测并无感热升级至有线直连（`有线直连 > 有线局域网 > Wi-Fi > ZeroTier`），并拒绝慢信道反向覆盖。
 
 ---
 
