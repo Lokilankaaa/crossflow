@@ -55,6 +55,8 @@ private struct GitHubAssetDTO: Decodable, Sendable {
 /// rollback-safe atomic `.app` swap, and automatic relaunch.
 @MainActor @Observable
 final class AppUpdater {
+    private static let repoBaseURL = "https://github.com/Lokilankaaa/crossflow"
+    private static let latestReleaseWebURL = URL(string: "https://github.com/Lokilankaaa/crossflow/releases/latest")!
     private static let latestReleaseAPI = URL(string: "https://api.github.com/repos/Lokilankaaa/crossflow/releases/latest")!
     private static let allowedHosts = [
         "api.github.com",
@@ -102,28 +104,35 @@ final class AppUpdater {
         }
 
         do {
-            var req = URLRequest(url: Self.latestReleaseAPI, timeoutInterval: 12)
-            req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-            req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            var resolvedTag = await fetchLatestTagFromWeb()
+            var apiDTO: GitHubReleaseDTO?
 
-            let (data, response) = try await URLSession.shared.data(for: req)
-            guard let http = response as? HTTPURLResponse else {
-                if !silent {
-                    phase = .error
-                    message = "无法获取 GitHub 响应。"
+            if resolvedTag == nil {
+                var req = URLRequest(url: Self.latestReleaseAPI, timeoutInterval: 12)
+                req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+                req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+                let (data, response) = try await URLSession.shared.data(for: req)
+                guard let http = response as? HTTPURLResponse else {
+                    if !silent {
+                        phase = .error
+                        message = "无法获取 GitHub 响应。"
+                    }
+                    return
                 }
-                return
-            }
-            guard (200...299).contains(http.statusCode) else {
-                if !silent {
-                    phase = .error
-                    message = "检查更新失败（HTTP \(http.statusCode)）"
+                guard (200...299).contains(http.statusCode) else {
+                    if !silent {
+                        phase = .error
+                        message = "检查更新失败（HTTP \(http.statusCode)）"
+                    }
+                    return
                 }
-                return
+                let dto = try JSONDecoder().decode(GitHubReleaseDTO.self, from: data)
+                apiDTO = dto
+                resolvedTag = dto.tagName?.trimmingCharacters(in: .whitespacesAndNewlines)
             }
 
-            let dto = try JSONDecoder().decode(GitHubReleaseDTO.self, from: data)
-            guard let rawTag = dto.tagName?.trimmingCharacters(in: .whitespacesAndNewlines), !rawTag.isEmpty else {
+            guard let rawTag = resolvedTag, !rawTag.isEmpty else {
                 if !silent {
                     phase = .error
                     message = "无法解析最新版本信息。"
@@ -142,13 +151,63 @@ final class AppUpdater {
                 return
             }
 
-            let assets = dto.assets ?? []
-            guard let macAsset = assets.first(where: { asset in
-                guard let name = asset.name, let url = asset.browserDownloadUrl else { return false }
-                return name.lowercased().hasSuffix("-macos-arm64.zip") && Self.isAllowedHttpsUrl(url)
-            }),
-            let assetName = macAsset.name,
-            let assetURL = macAsset.browserDownloadUrl else {
+            let info: UpdateReleaseInfo?
+            if let dto = apiDTO {
+                let assets = dto.assets ?? []
+                if let macAsset = assets.first(where: { asset in
+                    guard let name = asset.name, let url = asset.browserDownloadUrl else { return false }
+                    return name.lowercased().hasSuffix("-macos-arm64.zip") && Self.isAllowedHttpsUrl(url)
+                }),
+                let assetName = macAsset.name,
+                let assetURL = macAsset.browserDownloadUrl {
+                    let checksumsAsset = assets.first { asset in
+                        guard let name = asset.name, let url = asset.browserDownloadUrl else { return false }
+                        return name.caseInsensitiveCompare("SHA256SUMS.txt") == .orderedSame && Self.isAllowedHttpsUrl(url)
+                    }
+                    let htmlUrl = (dto.htmlUrl.flatMap { Self.isAllowedHttpsUrl($0) ? $0 : nil })
+                        ?? "\(Self.repoBaseURL)/releases/tag/\(rawTag)"
+                    info = UpdateReleaseInfo(
+                        version: latestVer,
+                        tagName: rawTag,
+                        htmlUrl: htmlUrl,
+                        notes: dto.body ?? "",
+                        assetName: assetName,
+                        downloadUrl: assetURL,
+                        assetSize: macAsset.size ?? 0,
+                        checksumsUrl: checksumsAsset?.browserDownloadUrl
+                    )
+                } else {
+                    info = nil
+                }
+            } else {
+                let checksumsUrl = "\(Self.repoBaseURL)/releases/download/\(rawTag)/SHA256SUMS.txt"
+                var assetName = "Crossflow-\(rawTag)-macos-arm64.zip"
+                if let sumURL = URL(string: checksumsUrl) {
+                    var sumReq = URLRequest(url: sumURL, timeoutInterval: 10)
+                    sumReq.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+                    if let (sumData, sumResp) = try? await URLSession.shared.data(for: sumReq),
+                       let sumHttp = sumResp as? HTTPURLResponse,
+                       (200...299).contains(sumHttp.statusCode),
+                       let sumText = String(data: sumData, encoding: .utf8),
+                       let matched = Self.findAssetNameInChecksums(sumText, suffix: "-macos-arm64.zip") {
+                        assetName = matched
+                    }
+                }
+                let downloadUrl = "\(Self.repoBaseURL)/releases/download/\(rawTag)/\(assetName)"
+                let assetSize = await probeContentLength(urlString: downloadUrl)
+                info = UpdateReleaseInfo(
+                    version: latestVer,
+                    tagName: rawTag,
+                    htmlUrl: "\(Self.repoBaseURL)/releases/tag/\(rawTag)",
+                    notes: "",
+                    assetName: assetName,
+                    downloadUrl: downloadUrl,
+                    assetSize: assetSize,
+                    checksumsUrl: checksumsUrl
+                )
+            }
+
+            guard let resolvedInfo = info, Self.isAllowedHttpsUrl(resolvedInfo.downloadUrl) else {
                 if !silent {
                     phase = .error
                     message = "发现 v\(latestVer)，但未找到 macOS 安装包。"
@@ -156,35 +215,13 @@ final class AppUpdater {
                 return
             }
 
-            let checksumsAsset = assets.first { asset in
-                guard let name = asset.name, let url = asset.browserDownloadUrl else { return false }
-                return name.caseInsensitiveCompare("SHA256SUMS.txt") == .orderedSame && Self.isAllowedHttpsUrl(url)
-            }
-
-            let htmlUrl: String
-            if let rawHtml = dto.htmlUrl, Self.isAllowedHttpsUrl(rawHtml) {
-                htmlUrl = rawHtml
-            } else {
-                htmlUrl = "https://github.com/Lokilankaaa/crossflow/releases/tag/\(rawTag)"
-            }
-
-            let info = UpdateReleaseInfo(
-                version: latestVer,
-                tagName: rawTag,
-                htmlUrl: htmlUrl,
-                notes: dto.body ?? "",
-                assetName: assetName,
-                downloadUrl: assetURL,
-                assetSize: macAsset.size ?? 0,
-                checksumsUrl: checksumsAsset?.browserDownloadUrl
-            )
-            let sizeText = info.assetSize > 0
-                ? String(format: "（%.1f MB）", Double(info.assetSize) / (1024.0 * 1024.0))
+            let sizeText = resolvedInfo.assetSize > 0
+                ? String(format: "（%.1f MB）", Double(resolvedInfo.assetSize) / (1024.0 * 1024.0))
                 : ""
-            release = info
+            release = resolvedInfo
             phase = .available
             progress = 0
-            message = "发现新版本 v\(info.version)\(sizeText)"
+            message = "发现新版本 v\(resolvedInfo.version)\(sizeText)"
         } catch is CancellationError {
             if !silent {
                 phase = .error
@@ -483,6 +520,54 @@ final class AppUpdater {
         return allowedHosts.contains { allowed in
             host == allowed || host.hasSuffix(".\(allowed)")
         }
+    }
+
+    private func fetchLatestTagFromWeb() async -> String? {
+        var req = URLRequest(url: Self.latestReleaseWebURL, timeoutInterval: 12)
+        req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else { return nil }
+
+        if let finalPath = http.url?.path,
+           let range = finalPath.range(of: "/releases/tag/", options: .caseInsensitive) {
+            let fromURL = String(finalPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if !fromURL.isEmpty {
+                return fromURL
+            }
+        }
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let tag = (json["tag_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !tag.isEmpty {
+            return tag
+        }
+        return nil
+    }
+
+    private func probeContentLength(urlString: String) async -> Int64 {
+        guard Self.isAllowedHttpsUrl(urlString), let url = URL(string: urlString) else { return 0 }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.httpMethod = "HEAD"
+        req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              http.expectedContentLength > 0 else { return 0 }
+        return http.expectedContentLength
+    }
+
+    private nonisolated static func findAssetNameInChecksums(_ text: String, suffix: String) -> String? {
+        let lowerSuffix = suffix.lowercased()
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let parts = rawLine.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard parts.count >= 2 else { continue }
+            let name = String(parts[1]).trimmingCharacters(in: CharacterSet(charactersIn: "*"))
+            if name.lowercased().hasSuffix(lowerSuffix) {
+                return name
+            }
+        }
+        return nil
     }
 
     private nonisolated static func parseExpectedSha256(_ text: String, assetName: String) -> String? {
