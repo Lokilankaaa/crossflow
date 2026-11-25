@@ -614,6 +614,11 @@ final class PeerMeshModel {
         return "正在初始化自动发现…"
     }
 
+    func startIfNeeded() {
+        guard generation == 0 else { return }
+        start()
+    }
+
     func start() {
         guard !shuttingDown else { return }
         guard let exe = crossflowExecutable() else {

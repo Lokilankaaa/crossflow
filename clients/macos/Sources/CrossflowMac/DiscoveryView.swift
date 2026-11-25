@@ -103,6 +103,7 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         peer.onStatusChange = { [weak self] in
             self?.refreshMenuBar()
         }
+        peer.startIfNeeded()
         refreshMenuBar()
     }
 

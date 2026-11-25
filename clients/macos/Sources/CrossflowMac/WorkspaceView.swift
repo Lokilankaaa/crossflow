@@ -193,7 +193,7 @@ struct WorkspaceView: View {
         .font(.system(size: Theme.bodySize))
         .task {
             await model.refreshBridge()
-            peer.start()
+            peer.startIfNeeded()
         }
         .onChange(of: peer.focusDeviceID) { _, _ in updateCursorVisibility() }
         .onChange(of: peer.state) { _, _ in updateCursorVisibility() }
