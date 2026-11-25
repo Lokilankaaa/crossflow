@@ -65,6 +65,7 @@ internal sealed class TrayIcon : IDisposable
     private const uint CMD_QJ_NEXT = 1010;
     private const uint CMD_QJ_HOME = 1011;
     private const uint CMD_SEND_FILES_ALL = 1012;
+    private const uint CMD_CHECK_UPDATES = 1013;
     private const uint CMD_CHANNEL_BASE = 2000;
     private const uint CMD_QJ_PEER_BASE = 3000;
     private const uint CMD_SEND_PEER_BASE = 4000;
@@ -109,6 +110,7 @@ internal sealed class TrayIcon : IDisposable
     internal event Action<string, string>? SelectPeerChannelRequested;
     internal event Action<string?>? SendFilesDialogRequested;
     internal event Action? OpenReceiveFolderRequested;
+    internal event Action? CheckForUpdatesRequested;
     internal event Action? SystemResumed;
     internal event Action? ExitRequested;
 
@@ -358,6 +360,7 @@ internal sealed class TrayIcon : IDisposable
             AppendMenuW(menu, MF_SEPARATOR, 0, null);
             bool autoStart = IsAutoStartEnabled();
             AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0), CMD_TOGGLE_AUTOSTART, "开机自启动");
+            AppendMenuW(menu, MF_STRING, CMD_CHECK_UPDATES, "检查更新…");
             AppendMenuW(menu, MF_STRING, CMD_EXIT, "退出 Crossflow");
 
             GetCursorPos(out var pt);
@@ -421,6 +424,9 @@ internal sealed class TrayIcon : IDisposable
                     break;
                 case CMD_TOGGLE_AUTOSTART:
                     SetAutoStartEnabled(!autoStart);
+                    break;
+                case CMD_CHECK_UPDATES:
+                    CheckForUpdatesRequested?.Invoke();
                     break;
                 case CMD_EXIT:
                     ExitRequested?.Invoke();

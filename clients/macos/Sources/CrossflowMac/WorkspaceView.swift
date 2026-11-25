@@ -136,6 +136,7 @@ private final class HotkeyKeyMonitor {
 struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
     @Bindable var peer: PeerMeshModel
+    @Bindable var updater: AppUpdater
     @ViewState private var showDetails = false
     @ViewState private var layoutNotice: String?
     @ViewState private var undoStack: [SharedLayout] = []
@@ -256,6 +257,10 @@ struct WorkspaceView: View {
                         .foregroundStyle(Theme.accent)
                     Text("Crossflow")
                         .font(.system(size: 20, weight: .semibold))
+                    Text(updater.phase == .available ? "v\(updater.currentVersion) · 有新版" : "v\(updater.currentVersion)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(updater.phase == .available ? Theme.accent : Theme.secondary)
+                        .padding(.top, 4)
                     Spacer()
                     Button { showDetails = true } label: {
                         Image(systemName: "info.circle").foregroundStyle(Theme.secondary)
@@ -737,6 +742,10 @@ struct WorkspaceView: View {
 
                 Divider().overlay(Theme.border).padding(.vertical, 2)
 
+                updateSection
+
+                Divider().overlay(Theme.border).padding(.vertical, 2)
+
                 let screenHint = peer.hotkeys.quickJumpScreenPrefix.map { "\($0)+1~9" } ?? "未设置"
                 Text("快捷键：\(screenHint) 直达屏幕 · \(peer.hotkeys.toggleSharing ?? "未设置") 暂停/恢复 · \(peer.hotkeys.lockScreen ?? "未设置") 锁屏")
                     .font(.system(size: 11))
@@ -776,6 +785,86 @@ struct WorkspaceView: View {
             }
         }
         return map
+    }
+
+    private var updateSection: some View {
+        let isBusy = updater.phase == .checking || updater.phase == .downloading || updater.phase == .verifying || updater.phase == .applying
+        let canApply = updater.release != nil && (updater.phase == .available || updater.phase == .error)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("软件更新")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.secondary)
+                Spacer()
+                if updater.phase == .available, let rel = updater.release {
+                    Text("可更新至 v\(rel.version)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.accent)
+                } else {
+                    Text("v\(updater.currentVersion)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(updater.phase == .upToDate ? Color(red: 22/255, green: 163/255, blue: 74/255) : Theme.secondary)
+                }
+            }
+
+            Text(updater.message)
+                .font(.system(size: 11))
+                .foregroundStyle(
+                    updater.phase == .error ? Color.red
+                    : (updater.phase == .available ? Theme.accent : Theme.secondary)
+                )
+                .fixedSize(horizontal: false, vertical: true)
+
+            if updater.phase == .downloading {
+                ProgressView(value: updater.progress, total: 1.0)
+                    .progressViewStyle(.linear)
+            } else if updater.phase == .verifying || updater.phase == .applying {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
+
+            HStack(spacing: 6) {
+                if canApply {
+                    Button("立即更新") {
+                        Task {
+                            let launched = await updater.downloadAndApply {
+                                _ = await peer.shutdown()
+                            }
+                            if launched {
+                                NSApp.terminate(nil)
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+
+                if updater.phase != .downloading && updater.phase != .verifying && updater.phase != .applying {
+                    Button(updater.phase == .checking ? "检查中…" : "检查更新") {
+                        Task { await updater.checkForUpdates(silent: false) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isBusy)
+                }
+
+                if updater.release != nil && !isBusy {
+                    Button("查看说明") {
+                        updater.openReleaseNotes()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if updater.phase == .downloading {
+                    Button("取消") {
+                        updater.cancelDownload()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
     }
 
     private var hotkeysSection: some View {
