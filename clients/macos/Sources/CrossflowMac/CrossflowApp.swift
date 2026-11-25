@@ -21,7 +21,7 @@ struct CrossflowApp: App {
     @ViewState private var model = WorkspaceModel()
     var body: some Scene {
         Window("Crossflow", id: "workspace") {
-            WorkspaceView(model: model, peer: appDelegate.peer)
+            WorkspaceView(model: model, peer: appDelegate.peer, updater: appDelegate.updater)
                 .background(WindowCloseHider { window in
                     appDelegate.attachMainWindow(window)
                 })

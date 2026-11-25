@@ -75,6 +75,7 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     let discovery = DiscoveryModel()
     let devices = DeviceModel()
     let peer = PeerMeshModel()
+    let updater = AppUpdater()
     private var awaitingShutdown = false
     private var statusItem: NSStatusItem?
     private var statusMenuItem: NSMenuItem?
@@ -104,6 +105,7 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             self?.refreshMenuBar()
         }
         peer.startIfNeeded()
+        updater.scheduleSilentStartupCheck()
         refreshMenuBar()
     }
 
@@ -242,6 +244,10 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         autoStartEntry.target = self
         autoStartEntry.state = isLaunchAgentEnabled() ? .on : .off
         menu.addItem(autoStartEntry)
+
+        let checkUpdateEntry = NSMenuItem(title: "检查更新…", action: #selector(checkForUpdatesFromMenu), keyEquivalent: "")
+        checkUpdateEntry.target = self
+        menu.addItem(checkUpdateEntry)
 
         let quitEntry = NSMenuItem(title: "退出 Crossflow", action: #selector(quitApp), keyEquivalent: "q")
         quitEntry.target = self
@@ -607,6 +613,11 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     @objc private func toggleAutoStart() {
         setLaunchAgentEnabled(!isLaunchAgentEnabled())
         refreshMenuBar()
+    }
+
+    @objc private func checkForUpdatesFromMenu() {
+        showMainWindow()
+        Task { await updater.checkForUpdates(silent: false) }
     }
 
     @objc private func quitApp() {

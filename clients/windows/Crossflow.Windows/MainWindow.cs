@@ -76,6 +76,15 @@ internal sealed class MainWindow : Window
     private readonly Button installServiceButton = new();
     private readonly Button uninstallServiceButton = new();
     private bool serviceBusy;
+    private readonly AppUpdater updater = new();
+    private readonly TextBlock brandVersionBadge = new();
+    private readonly TextBlock updateVersionBadge = new();
+    private readonly TextBlock updateStatusText = new() { TextWrapping = TextWrapping.Wrap };
+    private readonly ProgressBar updateProgressBar = new() { Minimum = 0, Maximum = 100, Height = 4, Visibility = Visibility.Collapsed };
+    private readonly Button checkUpdateButton = new();
+    private readonly Button applyUpdateButton = new();
+    private readonly Button releaseNotesButton = new();
+    private readonly Button cancelUpdateButton = new();
     private bool updatingClipboardUi;
     private bool updatingInputStateUi;
     private bool updatingScreenLockUi;
@@ -169,6 +178,7 @@ internal sealed class MainWindow : Window
     {
         this.theme = theme;
         peerMesh.Changed += snap => DispatcherQueue.TryEnqueue(() => OnPeerMeshUpdate(snap));
+        updater.Changed += state => DispatcherQueue.TryEnqueue(() => OnUpdaterStateChanged(state));
 
         Title = "Crossflow";
         root.RequestedTheme = ElementTheme.Light;
@@ -223,6 +233,18 @@ internal sealed class MainWindow : Window
 
         Draw();
         await RestartPeerAsync();
+        _ = RunSilentStartupUpdateCheckAsync();
+    }
+
+    private async Task RunSilentStartupUpdateCheckAsync()
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(8));
+            if (!closing)
+                await updater.CheckForUpdatesAsync(silent: true);
+        }
+        catch { }
     }
 
     private bool CanEditLayout => !closing && !busy && coreReady && activeSharedLayout is not null;
@@ -249,6 +271,12 @@ internal sealed class MainWindow : Window
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             Foreground = theme.Brush("text")
         });
+        brandVersionBadge.Text = $"v{AppUpdater.CurrentVersion}";
+        brandVersionBadge.FontSize = 11;
+        brandVersionBadge.Foreground = theme.Brush("text_secondary");
+        brandVersionBadge.VerticalAlignment = VerticalAlignment.Bottom;
+        brandVersionBadge.Margin = new Thickness(0, 0, 0, 3);
+        brand.Children.Add(brandVersionBadge);
         sidebar.Children.Add(brand);
 
         // Status Card
@@ -523,6 +551,11 @@ internal sealed class MainWindow : Window
         sidebar.Children.Add(SectionLabel("屏幕"));
         sidebar.Children.Add(screenListPanel);
 
+        sidebar.Children.Add(Divider());
+
+        // In-app Auto-Updater (GitHub Releases + SHA-256 verification)
+        BuildUpdateSection();
+
         sidebarScroll.Content = sidebar;
         var sidebarBorder = new Border
         {
@@ -615,6 +648,149 @@ internal sealed class MainWindow : Window
         Foreground = theme.Brush("text_secondary"),
         Margin = new Thickness(2, 4, 0, 2)
     };
+
+    private void BuildUpdateSection()
+    {
+        var header = new Grid { Margin = new Thickness(2, 4, 2, 2) };
+        header.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        header.Children.Add(new TextBlock
+        {
+            Text = "软件更新",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = theme.Brush("text_secondary"),
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        updateVersionBadge.Text = $"v{AppUpdater.CurrentVersion}";
+        updateVersionBadge.FontSize = 11;
+        updateVersionBadge.Foreground = theme.Brush("text_secondary");
+        updateVersionBadge.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(updateVersionBadge, 1);
+        header.Children.Add(updateVersionBadge);
+        sidebar.Children.Add(header);
+
+        updateStatusText.Text = $"当前版本 v{AppUpdater.CurrentVersion}";
+        updateStatusText.FontSize = 11;
+        updateStatusText.Foreground = theme.Brush("text_secondary");
+        updateStatusText.Margin = new Thickness(2, 0, 2, 2);
+        sidebar.Children.Add(updateStatusText);
+
+        updateProgressBar.Margin = new Thickness(2, 0, 2, 4);
+        sidebar.Children.Add(updateProgressBar);
+
+        StyleCompactButton(checkUpdateButton, "检查更新");
+        checkUpdateButton.Click += async (_, _) => await updater.CheckForUpdatesAsync(silent: false);
+
+        applyUpdateButton.Content = "立即更新";
+        applyUpdateButton.FontSize = 12;
+        applyUpdateButton.Background = theme.Brush("accent");
+        applyUpdateButton.Foreground = new SolidColorBrush(Microsoft.UI.Colors.White);
+        applyUpdateButton.BorderThickness = new Thickness(0);
+        applyUpdateButton.CornerRadius = new CornerRadius(8);
+        applyUpdateButton.Padding = new Thickness(12, 6, 12, 6);
+        applyUpdateButton.Visibility = Visibility.Collapsed;
+        applyUpdateButton.Click += async (_, _) => await ApplyUpdateAsync();
+
+        StyleCompactButton(releaseNotesButton, "查看说明");
+        releaseNotesButton.Visibility = Visibility.Collapsed;
+        releaseNotesButton.Click += (_, _) => OpenReleaseNotes();
+
+        StyleCompactButton(cancelUpdateButton, "取消");
+        cancelUpdateButton.Visibility = Visibility.Collapsed;
+        cancelUpdateButton.Click += (_, _) => updater.CancelDownload();
+
+        var actionsRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        actionsRow.Children.Add(applyUpdateButton);
+        actionsRow.Children.Add(checkUpdateButton);
+        actionsRow.Children.Add(releaseNotesButton);
+        actionsRow.Children.Add(cancelUpdateButton);
+        sidebar.Children.Add(actionsRow);
+
+        OnUpdaterStateChanged(updater.State);
+    }
+
+    private void OnUpdaterStateChanged(UpdaterState state)
+    {
+        updateStatusText.Text = state.Message;
+        bool busyUpdating = state.Phase is UpdaterPhase.Checking or UpdaterPhase.Downloading or UpdaterPhase.Verifying or UpdaterPhase.Applying;
+
+        if (state.Phase == UpdaterPhase.Available && state.Release is not null)
+        {
+            updateVersionBadge.Text = $"可更新至 v{state.Release.Version}";
+            updateVersionBadge.Foreground = theme.Brush("accent");
+            brandVersionBadge.Text = $"v{state.CurrentVersion} · 有新版";
+            brandVersionBadge.Foreground = theme.Brush("accent");
+        }
+        else
+        {
+            updateVersionBadge.Text = $"v{state.CurrentVersion}";
+            updateVersionBadge.Foreground = state.Phase == UpdaterPhase.UpToDate
+                ? new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 22, 163, 74))
+                : theme.Brush("text_secondary");
+            brandVersionBadge.Text = $"v{state.CurrentVersion}";
+            brandVersionBadge.Foreground = theme.Brush("text_secondary");
+        }
+
+        updateStatusText.Foreground = state.Phase switch
+        {
+            UpdaterPhase.Error => new SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 220, 38, 38)),
+            UpdaterPhase.Available => theme.Brush("accent"),
+            _ => theme.Brush("text_secondary")
+        };
+
+        bool showProgress = state.Phase is UpdaterPhase.Downloading or UpdaterPhase.Verifying or UpdaterPhase.Applying;
+        updateProgressBar.Visibility = showProgress ? Visibility.Visible : Visibility.Collapsed;
+        updateProgressBar.IsIndeterminate = state.Phase is UpdaterPhase.Verifying or UpdaterPhase.Applying;
+        if (state.Phase == UpdaterPhase.Downloading)
+            updateProgressBar.Value = Math.Clamp(state.Progress * 100.0, 0, 100);
+
+        checkUpdateButton.IsEnabled = !busyUpdating && !closing;
+        checkUpdateButton.Content = state.Phase == UpdaterPhase.Checking ? "检查中…" : "检查更新";
+        checkUpdateButton.Visibility = state.Phase is UpdaterPhase.Downloading or UpdaterPhase.Verifying or UpdaterPhase.Applying
+            ? Visibility.Collapsed : Visibility.Visible;
+
+        bool canApply = state.Release is not null && state.Phase is UpdaterPhase.Available or UpdaterPhase.Error;
+        applyUpdateButton.Visibility = canApply ? Visibility.Visible : Visibility.Collapsed;
+        applyUpdateButton.IsEnabled = canApply && !closing;
+
+        releaseNotesButton.Visibility = state.Release is not null && !busyUpdating ? Visibility.Visible : Visibility.Collapsed;
+        cancelUpdateButton.Visibility = state.Phase == UpdaterPhase.Downloading ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private async Task ApplyUpdateAsync()
+    {
+        if (closing) return;
+        bool launched = await updater.DownloadAndApplyAsync(async () =>
+        {
+            closing = true;
+            StopHotkeyMousePoll();
+            trayIcon?.Dispose();
+            trayIcon = null;
+            await peerMesh.StopAsync();
+        });
+        if (launched)
+        {
+            allowClose = true;
+            Close();
+        }
+        else if (closing)
+        {
+            closing = false;
+            await RestartPeerAsync();
+        }
+    }
+
+    private void OpenReleaseNotes()
+    {
+        string? url = updater.State.Release?.HtmlUrl;
+        if (string.IsNullOrWhiteSpace(url)) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch { }
+    }
 
     private void BuildHotkeysSection()
     {
@@ -1405,6 +1581,11 @@ internal sealed class MainWindow : Window
                 await peerMesh.SetPeerChannelAsync(devId, chId));
             trayIcon.SendFilesDialogRequested += targetId => DispatcherQueue.TryEnqueue(async () => await PickAndSendFilesAsync(targetId));
             trayIcon.OpenReceiveFolderRequested += () => DispatcherQueue.TryEnqueue(OpenReceiveFolder);
+            trayIcon.CheckForUpdatesRequested += () => DispatcherQueue.TryEnqueue(async () =>
+            {
+                ShowAndActivate();
+                await updater.CheckForUpdatesAsync(silent: false);
+            });
             trayIcon.SystemResumed += () => DispatcherQueue.TryEnqueue(async () =>
             {
                 if (!closing) await peerMesh.HandleSystemResumeAsync();
