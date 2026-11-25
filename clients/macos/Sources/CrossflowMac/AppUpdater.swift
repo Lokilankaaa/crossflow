@@ -325,46 +325,17 @@ final class AppUpdater {
 
             var dlReq = URLRequest(url: dlURL, timeoutInterval: 600)
             dlReq.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-            let (asyncBytes, dlResp) = try await URLSession.shared.bytes(for: dlReq)
-            guard let dlHttp = dlResp as? HTTPURLResponse, (200...299).contains(dlHttp.statusCode) else {
-                try? fm.removeItem(at: workDir)
-                phase = .error
-                message = "下载更新包失败，请稍后重试。"
-                return false
-            }
-
-            let expectedLen = dlHttp.expectedContentLength > 0 ? dlHttp.expectedContentLength : info.assetSize
-            fm.createFile(atPath: zipURL.path, contents: nil)
-            let handle = try FileHandle(forWritingTo: zipURL)
-            defer { try? handle.close() }
-
-            var buffer = Data()
-            buffer.reserveCapacity(65536)
-            var downloaded: Int64 = 0
-            var lastReport = Date.distantPast
-
-            for try await byte in asyncBytes {
-                try Task.checkCancellation()
-                buffer.append(byte)
-                if buffer.count >= 65536 {
-                    try handle.write(contentsOf: buffer)
-                    downloaded += Int64(buffer.count)
-                    buffer.removeAll(keepingCapacity: true)
-
-                    let now = Date()
-                    if now.timeIntervalSince(lastReport) >= 0.12 {
-                        lastReport = now
-                        updateDownloadProgress(downloaded: downloaded, total: expectedLen, version: info.version)
-                    }
+            let expectedLen = info.assetSize
+            let versionLabel = info.version
+            try await Self.downloadFile(
+                request: dlReq,
+                destination: zipURL,
+                fallbackTotal: expectedLen
+            ) { [weak self] downloaded, total in
+                Task { @MainActor [weak self] in
+                    self?.updateDownloadProgress(downloaded: downloaded, total: total, version: versionLabel)
                 }
             }
-            if !buffer.isEmpty {
-                try handle.write(contentsOf: buffer)
-                downloaded += Int64(buffer.count)
-                buffer.removeAll(keepingCapacity: false)
-            }
-            try handle.synchronize()
-            updateDownloadProgress(downloaded: downloaded, total: expectedLen, version: info.version)
 
             try Task.checkCancellation()
             phase = .verifying
@@ -583,6 +554,127 @@ final class AppUpdater {
             }
         }
         return nil
+    }
+
+    private nonisolated static func downloadFile(
+        request: URLRequest,
+        destination: URL,
+        fallbackTotal: Int64,
+        onProgress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws {
+        final class Delegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+            private let lock = NSLock()
+            private let destination: URL
+            private let fallbackTotal: Int64
+            private let onProgress: @Sendable (Int64, Int64) -> Void
+            private var continuation: CheckedContinuation<Void, Error>?
+            private var lastReport = Date.distantPast
+            private var finished = false
+            private var cancelled = false
+            weak var task: URLSessionDownloadTask?
+
+            init(destination: URL, fallbackTotal: Int64, onProgress: @escaping @Sendable (Int64, Int64) -> Void) {
+                self.destination = destination
+                self.fallbackTotal = fallbackTotal
+                self.onProgress = onProgress
+            }
+
+            func attach(_ cont: CheckedContinuation<Void, Error>, task: URLSessionDownloadTask) {
+                lock.lock()
+                self.continuation = cont
+                self.task = task
+                let alreadyCancelled = self.cancelled
+                lock.unlock()
+                if alreadyCancelled {
+                    task.cancel()
+                } else {
+                    task.resume()
+                }
+            }
+
+            func cancel() {
+                lock.lock()
+                self.cancelled = true
+                let t = task
+                lock.unlock()
+                t?.cancel()
+            }
+
+            private func complete(_ result: Result<Void, Error>, session: URLSession) {
+                lock.lock()
+                if finished {
+                    lock.unlock()
+                    return
+                }
+                finished = true
+                let cont = continuation
+                continuation = nil
+                lock.unlock()
+                session.finishTasksAndInvalidate()
+                cont?.resume(with: result)
+            }
+
+            func urlSession(
+                _ session: URLSession,
+                downloadTask: URLSessionDownloadTask,
+                didWriteData bytesWritten: Int64,
+                totalBytesWritten: Int64,
+                totalBytesExpectedToWrite: Int64
+            ) {
+                let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : fallbackTotal
+                lock.lock()
+                let now = Date()
+                let shouldReport = now.timeIntervalSince(lastReport) >= 0.12 || (total > 0 && totalBytesWritten >= total)
+                if shouldReport { lastReport = now }
+                lock.unlock()
+                if shouldReport {
+                    onProgress(totalBytesWritten, total)
+                }
+            }
+
+            func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+                if let http = downloadTask.response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    complete(.failure(NSError(domain: "CrossflowUpdater", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \(http.statusCode)）"])), session: session)
+                    return
+                }
+                do {
+                    let fm = FileManager.default
+                    if fm.fileExists(atPath: destination.path) {
+                        try fm.removeItem(at: destination)
+                    }
+                    try fm.moveItem(at: location, to: destination)
+                    let size = (try? fm.attributesOfItem(atPath: destination.path)[.size] as? Int64) ?? fallbackTotal
+                    onProgress(size, max(size, fallbackTotal))
+                    complete(.success(()), session: session)
+                } catch {
+                    complete(.failure(error), session: session)
+                }
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                if let error {
+                    if (error as NSError).domain == NSURLErrorDomain && (error as NSError).code == NSURLErrorCancelled {
+                        complete(.failure(CancellationError()), session: session)
+                    } else {
+                        complete(.failure(error), session: session)
+                    }
+                } else {
+                    complete(.failure(NSError(domain: "CrossflowUpdater", code: -1, userInfo: [NSLocalizedDescriptionKey: "下载意外中止。"])), session: session)
+                }
+            }
+        }
+
+        let delegate = Delegate(destination: destination, fallbackTotal: fallbackTotal, onProgress: onProgress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let downloadTask = session.downloadTask(with: request)
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                delegate.attach(cont, task: downloadTask)
+            }
+        } onCancel: {
+            delegate.cancel()
+        }
     }
 
     private nonisolated static func computeFileSha256(url: URL) throws -> String {
