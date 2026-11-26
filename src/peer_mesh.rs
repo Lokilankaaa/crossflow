@@ -2031,7 +2031,13 @@ pub fn run(
                                         let _ = io.sink.release_owned();
                                     }
                                 }
+                                // Drop the previous peer (and cleanly join/close its AuxSession)
+                                // BEFORE spawning the replacement AuxSession to avoid inbound races.
+                                if let Some(old_peer) = active_peers.remove(&rid) {
+                                    drop(old_peer);
+                                }
                             }
+                            aux_hub.clear_echo_state();
                             let aux_initiator = preferred_initiator(&local_device_id, &rid);
                             let aux = AuxSession::spawn_mesh_peer(
                                 aux_hub.clone(),
@@ -2043,6 +2049,7 @@ pub fn run(
                                 clipboard_sync_flag.clone(),
                                 input_state_sync_flag.clone(),
                                 local_has_focus.clone(),
+                                Some(log.clone()),
                             );
                             let active_ch =
                                 classify_active_channel(peer.peer_addr, &local_channels);

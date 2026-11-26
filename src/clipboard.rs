@@ -293,6 +293,21 @@ mod windows_clip {
         fn GetClipboardData(format: u32) -> *mut c_void;
         fn SetClipboardData(format: u32, mem: *mut c_void) -> *mut c_void;
         fn RegisterClipboardFormatW(name: *const u16) -> u32;
+        fn CreateWindowExW(
+            dw_ex_style: u32,
+            lp_class_name: *const u16,
+            lp_window_name: *const u16,
+            dw_style: u32,
+            x: i32,
+            y: i32,
+            n_width: i32,
+            n_height: i32,
+            h_wnd_parent: *mut c_void,
+            h_menu: *mut c_void,
+            h_instance: *mut c_void,
+            lp_param: *mut c_void,
+        ) -> *mut c_void;
+        fn DestroyWindow(hwnd: *mut c_void) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -490,14 +505,63 @@ mod windows_clip {
         })
     }
 
+    const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
+
+    struct OwnerWindow(*mut c_void);
+    impl OwnerWindow {
+        fn create() -> Self {
+            // Microsoft Win32 spec: EmptyClipboard() after OpenClipboard(NULL) sets the owner
+            // to NULL and causes SetClipboardData() to fail in headless/CreateNoWindow processes.
+            let cls: [u16; 7] = [
+                b'S' as u16, b'T' as u16, b'A' as u16, b'T' as u16, b'I' as u16, b'C' as u16, 0,
+            ];
+            let title: [u16; 1] = [0];
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    cls.as_ptr(),
+                    title.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            };
+            Self(hwnd)
+        }
+    }
+    impl Drop for OwnerWindow {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static CLIPBOARD_OWNER: OwnerWindow = OwnerWindow::create();
+    }
+
+    fn owner_hwnd() -> *mut c_void {
+        CLIPBOARD_OWNER.with(|w| w.0)
+    }
+
     struct ClipboardGuard;
     impl ClipboardGuard {
         fn open() -> Option<Self> {
-            for _ in 0..8 {
-                if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let hwnd = owner_hwnd();
+            for _ in 0..15 {
+                if unsafe { OpenClipboard(hwnd) } != 0 {
                     return Some(Self);
                 }
-                thread::sleep(Duration::from_millis(4));
+                thread::sleep(Duration::from_millis(6));
             }
             None
         }
@@ -935,7 +999,12 @@ mod macos_clip {
             let _ = msg0_isize(pb, sel_registerName(c"clearContents".as_ptr()));
             match item {
                 ClipboardItem::Text(text) => {
-                    let Ok(cstr) = std::ffi::CString::new(text.as_str()) else {
+                    let sanitized = if text.as_bytes().contains(&0) {
+                        text.replace('\0', "")
+                    } else {
+                        text.clone()
+                    };
+                    let Ok(cstr) = std::ffi::CString::new(sanitized) else {
                         return false;
                     };
                     let val = nsstring(&cstr);
