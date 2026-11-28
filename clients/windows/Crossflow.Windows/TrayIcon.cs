@@ -149,10 +149,8 @@ internal sealed class TrayIcon : IDisposable
         IReadOnlyList<NetworkChannelInfo> availableChannels)
     {
         if (disposed) return;
-        bool themeNow = IsSystemLightTaskbar();
-        bool iconChanged = state != visualState || themeNow != lightTaskbar;
+        bool iconChanged = state != visualState;
         visualState = state;
-        lightTaskbar = themeNow;
         if (iconChanged)
             currentIcon = GetOrCreateIcon(visualState, lightTaskbar);
 

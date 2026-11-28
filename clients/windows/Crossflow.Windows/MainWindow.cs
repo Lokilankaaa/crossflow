@@ -159,6 +159,9 @@ internal sealed class MainWindow : Window
 
     private readonly PeerMeshController peerMesh = new();
     private PeerMeshSnapshot currentSnap = PeerMeshSnapshot.Initial;
+    private PeerMeshSnapshot? pendingSnap;
+    private int uiUpdateQueued;
+    private bool uiDirtyWhileHidden;
     private PeerSharedLayout? activeSharedLayout;
     private bool coreReady, busy, closing, allowClose, bootstrapped;
     private string? lastShownError;
@@ -181,7 +184,7 @@ internal sealed class MainWindow : Window
     internal MainWindow(Theme theme)
     {
         this.theme = theme;
-        peerMesh.Changed += snap => DispatcherQueue.TryEnqueue(() => OnPeerMeshUpdate(snap));
+        peerMesh.Changed += EnqueuePeerMeshUpdate;
         updater.Changed += state => DispatcherQueue.TryEnqueue(() => OnUpdaterStateChanged(state));
 
         Title = "Crossflow";
@@ -223,9 +226,15 @@ internal sealed class MainWindow : Window
         InitWindowLifecycle();
     }
 
-    internal void StartInTray()
+    private void HideToTray()
     {
         AppWindow.Hide();
+        Program.DisableBackgroundPowerThrottling();
+    }
+
+    internal void StartInTray()
+    {
+        HideToTray();
         DispatcherQueue.TryEnqueue(async () => await BootstrapOnceAsync());
     }
 
@@ -1601,14 +1610,14 @@ internal sealed class MainWindow : Window
             if (allowClose) return;
             // Minimize cleanly to the system tray on X click so sharing keeps running.
             args.Cancel = true;
-            AppWindow.Hide();
+            HideToTray();
         };
 
         try
         {
             trayIcon = new TrayIcon(this, () => AppWindow.IsVisible);
             trayIcon.ShowOrRestoreRequested += () => DispatcherQueue.TryEnqueue(ShowAndActivate);
-            trayIcon.HideRequested += () => DispatcherQueue.TryEnqueue(() => AppWindow.Hide());
+            trayIcon.HideRequested += () => DispatcherQueue.TryEnqueue(HideToTray);
             trayIcon.ToggleSharingRequested += () => DispatcherQueue.TryEnqueue(async () => await OnPrimaryActionClickAsync());
             trayIcon.ToggleScreenLockRequested += locked => DispatcherQueue.TryEnqueue(async () => await peerMesh.SetScreenLockAsync(locked));
             trayIcon.QuickJumpRequested += target => DispatcherQueue.TryEnqueue(async () => await peerMesh.QuickJumpAsync(target));
@@ -1712,6 +1721,11 @@ internal sealed class MainWindow : Window
             SetForegroundWindow(hwnd);
         }
         Activate();
+        if (uiDirtyWhileHidden)
+        {
+            uiDirtyWhileHidden = false;
+            ApplySnapshotToWindow(currentSnap);
+        }
     }
 
     private async Task ExitApplicationAsync()
@@ -1812,17 +1826,34 @@ internal sealed class MainWindow : Window
         }
     }
 
-    private void OnPeerMeshUpdate(PeerMeshSnapshot snap)
+    private void EnqueuePeerMeshUpdate(PeerMeshSnapshot snap)
     {
-        currentSnap = snap;
-        if (aboutPanel?.IsOpen == true)
-            aboutPanel.RefreshDiagnostics();
+        Interlocked.Exchange(ref pendingSnap, snap);
+        if (Interlocked.Exchange(ref uiUpdateQueued, 1) == 0)
+        {
+            if (!DispatcherQueue.TryEnqueue(DrainPendingPeerMeshUpdate))
+                Interlocked.Exchange(ref uiUpdateQueued, 0);
+        }
+    }
 
-        bool isAuthMismatch = snap.Error is not null
-            && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)
-                || snap.Error.StartsWith("连接验证失败", StringComparison.Ordinal));
+    private void DrainPendingPeerMeshUpdate()
+    {
+        while (true)
+        {
+            var snap = Interlocked.Exchange(ref pendingSnap, null);
+            if (snap is not null)
+                OnPeerMeshUpdate(snap);
+            Interlocked.Exchange(ref uiUpdateQueued, 0);
+            if (Volatile.Read(ref pendingSnap) is null
+                || Interlocked.Exchange(ref uiUpdateQueued, 1) != 0)
+            {
+                break;
+            }
+        }
+    }
 
-        statusTitle.Text = isAuthMismatch ? "等待密码匹配" : snap.State switch
+    private static string ResolveStatusTitle(PeerMeshSnapshot snap, bool isAuthMismatch) =>
+        isAuthMismatch ? "等待密码匹配" : snap.State switch
         {
             "sharing" => "跨屏共享中",
             "paused" => "已连接 · 已暂停",
@@ -1832,6 +1863,100 @@ internal sealed class MainWindow : Window
             "stopped" => "已停止",
             _ => "等待中"
         };
+
+    private void UpdateTrayFromSnapshot(PeerMeshSnapshot snap, bool isAuthMismatch, string titleText)
+    {
+        bool isRemoteFocus = snap.State == "sharing"
+            && snap.FocusDeviceId is not null
+            && !string.Equals(snap.FocusDeviceId, snap.LocalDeviceId, StringComparison.Ordinal);
+        TrayVisualState trayVisual = (isAuthMismatch || snap.State is "paused" or "error" or "stopped")
+            ? TrayVisualState.Paused
+            : isRemoteFocus
+                ? TrayVisualState.ActiveRemote
+                : snap.State == "sharing"
+                    ? TrayVisualState.Connected
+                    : TrayVisualState.Searching;
+
+        string peerTag = snap.PeerName ?? "远端设备";
+        string channelSuffix = snap.ActiveChannelLabel is not null ? $" · {snap.ActiveChannelLabel}" : "";
+        string trayTip = snap.State switch
+        {
+            "sharing" => $"Crossflow · 已连接 {peerTag}{channelSuffix}",
+            "paused" => $"Crossflow · 已暂停（{peerTag}）",
+            "searching" => "Crossflow · 正在发现设备",
+            _ => "Crossflow"
+        };
+        string primaryMenuStatus = snap.State switch
+        {
+            "sharing" => $"已连接：{peerTag}{channelSuffix}",
+            "paused" => $"已暂停：{peerTag}",
+            _ => $"状态：{titleText}"
+        };
+        string? focusMenuLine = snap.State == "sharing" && snap.FocusDeviceId is not null
+            ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}{(snap.ScreenLocked ? "（已锁定）" : "")}"
+            : null;
+
+        var activePeers = snap.Peers.Where(p => p.Connected).ToList();
+        if (activePeers.Count == 0 && snap.PeerDeviceId is not null && snap.State is "sharing" or "paused")
+        {
+            activePeers.Add(new PeerInfo(
+                snap.PeerDeviceId,
+                snap.PeerName ?? "远端设备",
+                "peer",
+                true,
+                isRemoteFocus,
+                1,
+                snap.PeerAddress,
+                snap.ActiveChannelLabel,
+                "auto"));
+        }
+
+        trayIcon?.UpdateState(
+            trayVisual,
+            trayTip,
+            primaryMenuStatus,
+            focusMenuLine,
+            connected: snap.State is "sharing" or "paused",
+            canToggle: snap.State is "sharing" or "paused",
+            sharing: snap.State == "sharing",
+            locked: snap.ScreenLocked,
+            activePeers: activePeers,
+            clipboardSync: snap.ClipboardSync,
+            inputStateSync: snap.InputStateSync,
+            channelId: snap.SelectedChannel,
+            availableChannels: snap.NetworkChannels);
+    }
+
+    private void OnPeerMeshUpdate(PeerMeshSnapshot snap)
+    {
+        currentSnap = snap;
+        bool isAuthMismatch = snap.Error is not null
+            && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)
+                || snap.Error.StartsWith("连接验证失败", StringComparison.Ordinal));
+        string titleText = ResolveStatusTitle(snap, isAuthMismatch);
+        UpdateTrayFromSnapshot(snap, isAuthMismatch, titleText);
+
+        // Skip heavy XAML tree mutations and canvas redraws while hidden in the tray;
+        // ShowAndActivate() refreshes the full window instantaneously on reopen.
+        if (!AppWindow.IsVisible)
+        {
+            uiDirtyWhileHidden = true;
+            return;
+        }
+        uiDirtyWhileHidden = false;
+        ApplySnapshotToWindow(snap);
+    }
+
+    private void ApplySnapshotToWindow(PeerMeshSnapshot snap)
+    {
+        if (aboutPanel?.IsOpen == true)
+            aboutPanel.RefreshDiagnostics();
+
+        bool isAuthMismatch = snap.Error is not null
+            && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)
+                || snap.Error.StartsWith("连接验证失败", StringComparison.Ordinal));
+
+        statusTitle.Text = ResolveStatusTitle(snap, isAuthMismatch);
 
         statusDot.Fill = isAuthMismatch
             ? new SolidColorBrush(global::Windows.UI.Color.FromArgb(255, 217, 119, 6))
@@ -1925,66 +2050,6 @@ internal sealed class MainWindow : Window
         string hkScreen = snap.Hotkeys.QuickJumpScreenPrefix is { Length: > 0 } pfx ? $"{pfx}+1~9" : "未设置";
         string hkLock = snap.Hotkeys.LockScreen ?? "未设置";
         footerStatus.Text = $"快捷键：{hkScreen} 直达对应编号屏幕（手柄直通）· {hkToggle} 暂停/恢复 · {hkLock} 锁定屏幕 · 支持拖入文件跨屏直传";
-
-        bool isRemoteFocus = snap.State == "sharing"
-            && snap.FocusDeviceId is not null
-            && !string.Equals(snap.FocusDeviceId, snap.LocalDeviceId, StringComparison.Ordinal);
-        TrayVisualState trayVisual = (isAuthMismatch || snap.State is "paused" or "error" or "stopped")
-            ? TrayVisualState.Paused
-            : isRemoteFocus
-                ? TrayVisualState.ActiveRemote
-                : snap.State == "sharing"
-                    ? TrayVisualState.Connected
-                    : TrayVisualState.Searching;
-
-        string peerTag = snap.PeerName ?? "远端设备";
-        string channelSuffix = snap.ActiveChannelLabel is not null ? $" · {snap.ActiveChannelLabel}" : "";
-        string trayTip = snap.State switch
-        {
-            "sharing" => $"Crossflow · 已连接 {peerTag}{channelSuffix}",
-            "paused" => $"Crossflow · 已暂停（{peerTag}）",
-            "searching" => "Crossflow · 正在发现设备",
-            _ => "Crossflow"
-        };
-        string primaryMenuStatus = snap.State switch
-        {
-            "sharing" => $"已连接：{peerTag}{channelSuffix}",
-            "paused" => $"已暂停：{peerTag}",
-            _ => $"状态：{statusTitle.Text}"
-        };
-        string? focusMenuLine = snap.State == "sharing" && snap.FocusDeviceId is not null
-            ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}{(snap.ScreenLocked ? "（已锁定）" : "")}"
-            : null;
-
-        var activePeers = snap.Peers.Where(p => p.Connected).ToList();
-        if (activePeers.Count == 0 && snap.PeerDeviceId is not null && snap.State is "sharing" or "paused")
-        {
-            activePeers.Add(new PeerInfo(
-                snap.PeerDeviceId,
-                snap.PeerName ?? "远端设备",
-                "peer",
-                true,
-                isRemoteFocus,
-                1,
-                snap.PeerAddress,
-                snap.ActiveChannelLabel,
-                "auto"));
-        }
-
-        trayIcon?.UpdateState(
-            trayVisual,
-            trayTip,
-            primaryMenuStatus,
-            focusMenuLine,
-            connected: snap.State is "sharing" or "paused",
-            canToggle: snap.State is "sharing" or "paused",
-            sharing: snap.State == "sharing",
-            locked: snap.ScreenLocked,
-            activePeers: activePeers,
-            clipboardSync: snap.ClipboardSync,
-            inputStateSync: snap.InputStateSync,
-            channelId: snap.SelectedChannel,
-            availableChannels: snap.NetworkChannels);
 
         // Sync network channel dropdown
         SyncChannelSelector(snap);

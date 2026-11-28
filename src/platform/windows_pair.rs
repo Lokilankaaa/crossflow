@@ -139,6 +139,7 @@ impl WindowsCapture {
         let status_source = source.clone();
         let gate = source.remote_gate();
         let worker = thread::Builder::new().name("crossflow-windows-pair-capture".into()).spawn(move || {
+            crate::power::configure_realtime_thread(true);
             let event_stop = thread_stop.clone();
             let event_failure = thread_failure.clone();
             let status_stop = thread_stop.clone();

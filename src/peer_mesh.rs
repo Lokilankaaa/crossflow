@@ -43,7 +43,7 @@ use std::{
     path::PathBuf,
     process,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
@@ -864,12 +864,90 @@ fn spawn_stdin_reader(stop: Arc<AtomicBool>) -> Receiver<UiCommand> {
     rx
 }
 
-fn emit_status(stdout: &Mutex<std::io::Stdout>, status: &PeerUiStatus) {
-    if let Ok(line) = serde_json::to_string(status)
-        && let Ok(mut out) = stdout.lock()
-    {
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
+struct StatusSlot {
+    latest: Option<String>,
+    closed: bool,
+}
+
+/// Non-blocking latest-snapshot stdout status writer.
+/// Guarantees that a throttled/hidden GUI or a full 4 KB Windows pipe can NEVER
+/// stall the 1000 Hz peer_mesh network/input loop.
+struct StatusEmitter {
+    shared: Arc<(Mutex<StatusSlot>, Condvar)>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl StatusEmitter {
+    fn start() -> Self {
+        let shared = Arc::new((
+            Mutex::new(StatusSlot {
+                latest: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let bg = shared.clone();
+        let worker = thread::Builder::new()
+            .name("crossflow-status-tx".into())
+            .spawn(move || {
+                let (lock, cvar) = &*bg;
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                loop {
+                    let line = {
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.latest.is_none() && !guard.closed {
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        if let Some(line) = guard.latest.take() {
+                            line
+                        } else {
+                            break;
+                        }
+                    };
+                    if writeln!(out, "{line}").is_err() || out.flush().is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self { shared, worker }
+    }
+
+    fn emit(&self, status: &PeerUiStatus) {
+        if let Ok(line) = serde_json::to_string(status) {
+            let (lock, cvar) = &*self.shared;
+            if let Ok(mut guard) = lock.lock() {
+                guard.latest = Some(line);
+                cvar.notify_one();
+            }
+        }
+    }
+
+    fn finish(mut self, status: &PeerUiStatus) {
+        let line = serde_json::to_string(status).ok();
+        {
+            let (lock, cvar) = &*self.shared;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(line) = line {
+                guard.latest = Some(line);
+            }
+            guard.closed = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StatusEmitter {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.shared;
+        if let Ok(mut guard) = lock.lock() {
+            guard.closed = true;
+            cvar.notify_one();
+        }
     }
 }
 
@@ -1208,7 +1286,8 @@ pub fn run(
     );
     ensure!((60..=8000).contains(&options.max_hz), "invalid max_hz");
 
-    let stdout = Mutex::new(std::io::stdout());
+    crate::power::configure_realtime_thread(false);
+    let status_tx = StatusEmitter::start();
     let local_device_id = load_or_create_device_id()?;
     let local_discovery_id = local_device_id[..32].to_string();
     let local_name = options
@@ -1236,9 +1315,7 @@ pub fn run(
         if let Err(permission) = crate::platform::macos::preflight_input_permissions() {
             let local_channels = enumerate_local_channels();
             let has_pass = config.passphrase.is_some();
-            emit_status(
-                &stdout,
-                &PeerUiStatus {
+            status_tx.finish(&PeerUiStatus {
                     protocol: PEER_UI_PROTOCOL,
                     state: "startup_rejected".into(),
                     local_device_id,
@@ -1271,8 +1348,7 @@ pub fn run(
                     screen_numbers: vec![],
                     transfer: None,
                     error: Some(permission.message().to_string()),
-                },
-            );
+                });
             writer.finish()?;
             anyhow::bail!("{}", permission.message());
         }
@@ -1396,6 +1472,7 @@ pub fn run(
             let mut upgrade_backoff: HashMap<String, Instant> = HashMap::new();
             let mut active_peers: BTreeMap<String, ActiveMeshPeer> = BTreeMap::new();
             let mut native_io: Option<MeshNativeIo> = None;
+            let mut last_native_io_attempt = Instant::now() - Duration::from_secs(2);
 
             let mut active_outbound_target: Option<String> = None;
             let mut inbound_owner: Option<String> = None;
@@ -1429,9 +1506,9 @@ pub fn run(
             {
                 let mut did_work = false;
 
-                // Detect OS sleep/standby resume via monotonic or wall-clock jump (>= 5s).
+                // Detect OS sleep/standby resume via monotonic or wall-clock jump (>= 15s).
                 // Refreshing listener + mDNS sockets immediately recovers overnight standby
-                // without requiring the user to manually click Reconnect.
+                // without false-triggering on brief OS scheduling or worker-startup delays.
                 let mono_gap = last_loop_mono.elapsed();
                 let now_wall = SystemTime::now();
                 let wall_gap = now_wall
@@ -1439,7 +1516,7 @@ pub fn run(
                     .unwrap_or_else(|e| e.duration());
                 last_loop_mono = Instant::now();
                 last_loop_wall = now_wall;
-                if mono_gap >= Duration::from_secs(5) || wall_gap >= Duration::from_secs(5) {
+                if mono_gap >= Duration::from_secs(15) || wall_gap >= Duration::from_secs(15) {
                     log.write(
                         "mesh_wake_detected",
                         serde_json::json!({
@@ -2499,7 +2576,13 @@ pub fn run(
                     remote_focus_state = (None, None);
                     remote_focus_active = false;
                     last_broadcast_focus = (None, None);
-                } else if topology_changed || native_io.is_none() {
+                } else if topology_changed
+                    || (native_io.is_none()
+                        && last_native_io_attempt.elapsed() >= Duration::from_millis(400))
+                {
+                    if native_io.is_none() {
+                        last_native_io_attempt = Instant::now();
+                    }
                     let remotes = remote_display_map(&active_peers);
                     if let Ok(rt) =
                         layout_book.rebuild(&local_device_id, &local_displays, &remotes)
@@ -2548,6 +2631,8 @@ pub fn run(
                                     }
                                 }
                             }
+                            last_loop_mono = Instant::now();
+                            last_loop_wall = SystemTime::now();
                         }
                         broadcast_layout_sync(
                             &mut active_peers,
@@ -2913,6 +2998,9 @@ pub fn run(
                     if let Some(io) = native_io.take() {
                         io.shutdown();
                     }
+                    last_native_io_attempt = Instant::now() - Duration::from_secs(1);
+                    last_loop_mono = Instant::now();
+                    last_loop_wall = SystemTime::now();
                     if let Some(prev) = active_outbound_target.take()
                         && let Some(p) = active_peers.get_mut(&prev)
                     {
@@ -3002,7 +3090,7 @@ pub fn run(
 
                 // 10. Emit unified multi-device PeerUiStatus
                 let transfer = active_transfer_snapshot(&active_peers);
-                let sharing_now = !active_peers.is_empty() && !user_paused;
+                let sharing_now = !active_peers.is_empty() && !user_paused && native_io.is_some();
                 let state_str = if active_peers.is_empty() {
                     "searching"
                 } else if user_paused {
@@ -3058,7 +3146,7 @@ pub fn run(
                     .map(|io| io.sink.is_service_backed())
                     .unwrap_or(service_mode_flags.1 && service_mode_flags.2);
                 let sig = format!(
-                    "{state_str}|{:?}|{:?}|{screen_locked}|{service_mode_installed}|{service_mode_active}|{}|{}|{}|{:?}",
+                    "{state_str}|{sharing_now}|{:?}|{:?}|{screen_locked}|{service_mode_installed}|{service_mode_active}|{}|{}|{}|{:?}",
                     focus_dev,
                     focus_scr,
                     peers_list.len(),
@@ -3067,7 +3155,7 @@ pub fn run(
                     last_auth_error
                 );
                 if sig != last_status_sig
-                    || last_status_emit.elapsed() >= Duration::from_millis(250)
+                    || last_status_emit.elapsed() >= Duration::from_millis(1000)
                     || transfer.as_ref().is_some_and(|t| t.state == "active")
                 {
                     last_status_sig = sig;
@@ -3086,9 +3174,7 @@ pub fn run(
                         })
                         .collect();
                     let has_pass = config.passphrase.is_some();
-                    emit_status(
-                        &stdout,
-                        &PeerUiStatus {
+                    status_tx.emit(&PeerUiStatus {
                             protocol: PEER_UI_PROTOCOL,
                             state: state_str.into(),
                             local_device_id: local_device_id.clone(),
@@ -3126,8 +3212,7 @@ pub fn run(
                             } else {
                                 None
                             },
-                        },
-                    );
+                        });
                 }
 
                 if !did_work {
@@ -3154,9 +3239,7 @@ pub fn run(
 
     stop.store(true, Ordering::Release);
     let has_pass = config.passphrase.is_some();
-    emit_status(
-        &stdout,
-        &PeerUiStatus {
+    status_tx.finish(&PeerUiStatus {
             protocol: PEER_UI_PROTOCOL,
             state: if result.is_ok() {
                 "stopped".into()
@@ -3193,8 +3276,7 @@ pub fn run(
             screen_numbers: vec![],
             transfer: None,
             error: result.as_ref().err().map(|e| format!("{e:#}")),
-        },
-    );
+        });
     writer.finish()?;
     result
 }

@@ -16,12 +16,58 @@ internal static class Program
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetProcessInformation(
+        IntPtr hProcess,
+        int processInformationClass,
+        ref PROCESS_POWER_THROTTLING_STATE processInformation,
+        uint processInformationSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_POWER_THROTTLING_STATE
+    {
+        public uint Version;
+        public uint ControlMask;
+        public uint StateMask;
+    }
+
+    /// Opt out of Windows 11 automatic Efficiency Mode (EcoQoS) and background
+    /// timer resolution throttling when MainWindow is hidden to the system tray.
+    internal static void DisableBackgroundPowerThrottling()
+    {
+        try
+        {
+            const int ProcessPowerThrottling = 4;
+            const uint CurrentVersion = 1;
+            const uint ExecutionSpeed = 0x1;
+            const uint IgnoreTimerResolution = 0x4;
+            IntPtr proc = GetCurrentProcess();
+            uint size = (uint)Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>();
+            foreach (uint mask in new[] { ExecutionSpeed, IgnoreTimerResolution })
+            {
+                var state = new PROCESS_POWER_THROTTLING_STATE
+                {
+                    Version = CurrentVersion,
+                    ControlMask = mask,
+                    StateMask = 0
+                };
+                SetProcessInformation(proc, ProcessPowerThrottling, ref state, size);
+            }
+        }
+        catch { }
+    }
+
     private static Mutex? singleInstanceMutex;
     internal static bool StartMinimized { get; private set; }
 
     [STAThread]
     private static void Main(string[] args)
     {
+        DisableBackgroundPowerThrottling();
         StartMinimized = args.Any(a => string.Equals(a, "--minimized", StringComparison.OrdinalIgnoreCase));
         if (args.Length == 2 && args[0] == "--oneclick-fixture") { OneClickSelfTest.FixtureAsync(args[1]).GetAwaiter().GetResult(); return; }
         if (args.Length == 2 && args[0] == "--oneclick-self-test") { OneClickSelfTest.RunAsync(args[1]).GetAwaiter().GetResult(); return; }

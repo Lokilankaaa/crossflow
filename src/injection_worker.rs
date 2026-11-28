@@ -252,6 +252,7 @@ pub fn run_native(gain: f64) -> Result<()> {
 
 #[cfg(windows)]
 pub fn run_native(gain: f64) -> Result<()> {
+    crate::power::configure_realtime_thread(false);
     let (input, output) = stdio_files()?;
     let mut sink =
         crate::platform::windows::WindowsMouseSink::new(gain, Arc::new(AtomicBool::new(false)))?;

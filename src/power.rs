@@ -104,6 +104,24 @@ pub fn wake_display_throttled() {
     windows_impl::wake_display();
 }
 
+/// Prevents Windows 11 from throttling this process into EcoQoS / Efficiency Mode
+/// or ignoring `timeBeginPeriod(1)` when the GUI main window is hidden to the
+/// system tray (zero visible windows in the process tree).
+pub fn configure_realtime_process() {
+    #[cfg(windows)]
+    windows_impl::configure_realtime_process();
+}
+
+/// Exempts a latency-critical thread (such as the Windows LL-hook capture loop,
+/// mesh router, or input-worker) from Windows 11 EcoQoS thread throttling and
+/// raises its scheduling priority so low-level hooks never hit `LowLevelHooksTimeout`.
+pub fn configure_realtime_thread(high: bool) {
+    #[cfg(windows)]
+    windows_impl::configure_realtime_thread(high);
+    #[cfg(not(windows))]
+    let _ = high;
+}
+
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use std::ffi::{c_char, c_void};
@@ -208,13 +226,55 @@ mod macos_impl {
 
 #[cfg(windows)]
 mod windows_impl {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+
     const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
     const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
     const ES_CONTINUOUS: u32 = 0x8000_0000;
 
+    // ProcessPowerThrottling / ThreadPowerThrottling (Windows 10/11 EcoQoS & Timer Resolution)
+    const PROCESS_POWER_THROTTLING: i32 = 4;
+    const THREAD_POWER_THROTTLING: i32 = 4;
+    const POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x0000_0001;
+    const PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION: u32 = 0x0000_0004;
+    const THREAD_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x0000_0001;
+
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+    const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
+    const THREAD_PRIORITY_HIGHEST: i32 = 2;
+
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn SetThreadExecutionState(es_flags: u32) -> u32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetCurrentThread() -> *mut c_void;
+        fn GetPriorityClass(h_process: *mut c_void) -> u32;
+        fn SetPriorityClass(h_process: *mut c_void, dw_priority_class: u32) -> i32;
+        fn SetThreadPriority(h_thread: *mut c_void, n_priority: i32) -> i32;
+        fn SetProcessInformation(
+            h_process: *mut c_void,
+            process_information_class: i32,
+            process_information: *const c_void,
+            process_information_size: u32,
+        ) -> i32;
+        fn SetThreadInformation(
+            h_thread: *mut c_void,
+            thread_information_class: i32,
+            thread_information: *const c_void,
+            thread_information_size: u32,
+        ) -> i32;
     }
 
     pub fn set_system_required(enable: bool) {
@@ -232,5 +292,73 @@ mod windows_impl {
         unsafe {
             let _ = SetThreadExecutionState(ES_DISPLAY_REQUIRED);
         }
+    }
+
+    pub fn configure_realtime_process() {
+        unsafe {
+            let proc = GetCurrentProcess();
+            // Apply EXECUTION_SPEED and IGNORE_TIMER_RESOLUTION in separate calls so
+            // Windows 10 (which does not know bit 0x4) still disables EcoQoS cleanly,
+            // while Windows 11 disables both EcoQoS and hidden-window timer throttling.
+            for mask in [
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            ] {
+                let state = PowerThrottlingState {
+                    version: POWER_THROTTLING_CURRENT_VERSION,
+                    control_mask: mask,
+                    state_mask: 0,
+                };
+                let _ = SetProcessInformation(
+                    proc,
+                    PROCESS_POWER_THROTTLING,
+                    (&state as *const PowerThrottlingState).cast(),
+                    size_of::<PowerThrottlingState>() as u32,
+                );
+            }
+            let cur = GetPriorityClass(proc);
+            if matches!(
+                cur,
+                0 | IDLE_PRIORITY_CLASS | BELOW_NORMAL_PRIORITY_CLASS | NORMAL_PRIORITY_CLASS
+            ) {
+                let _ = SetPriorityClass(proc, ABOVE_NORMAL_PRIORITY_CLASS);
+            }
+        }
+    }
+
+    pub fn configure_realtime_thread(high: bool) {
+        unsafe {
+            let thread = GetCurrentThread();
+            let state = PowerThrottlingState {
+                version: POWER_THROTTLING_CURRENT_VERSION,
+                control_mask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+                state_mask: 0,
+            };
+            let _ = SetThreadInformation(
+                thread,
+                THREAD_POWER_THROTTLING,
+                (&state as *const PowerThrottlingState).cast(),
+                size_of::<PowerThrottlingState>() as u32,
+            );
+            let _ = SetThreadPriority(
+                thread,
+                if high {
+                    THREAD_PRIORITY_HIGHEST
+                } else {
+                    THREAD_PRIORITY_ABOVE_NORMAL
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn realtime_process_and_thread_helpers_are_safe() {
+        configure_realtime_process();
+        configure_realtime_thread(false);
     }
 }
