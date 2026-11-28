@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     mem::size_of,
     ptr::null_mut,
     sync::{
@@ -179,6 +179,32 @@ fn media_vk(usage: u16) -> Option<u16> {
     })
 }
 
+/// Editing & navigation control keys that must carry an explicit Virtual-Key (`wVk`)
+/// alongside their hardware `wScan` (without `KEYEVENTF_SCANCODE`). Windows TSF and
+/// Chinese IMEs (Microsoft Pinyin, Sogou, WeType, QQ Pinyin) often drop or mishandle
+/// `wVk = 0` scancode-only Backspace / Enter / Space / Delete events while composing
+/// or immediately after committing Chinese text.
+fn editing_control_vk(usage: u16) -> Option<(u16, u16, bool)> {
+    Some(match usage {
+        0x28 => (VK_RETURN, 0x1c, false),
+        0x29 => (VK_ESCAPE, 0x01, false),
+        0x2a => (VK_BACK, 0x0e, false),
+        0x2b => (VK_TAB, 0x0f, false),
+        0x2c => (VK_SPACE, 0x39, false),
+        0x49 => (VK_INSERT, 0x52, true),
+        0x4a => (VK_HOME, 0x47, true),
+        0x4b => (VK_PRIOR, 0x49, true),
+        0x4c => (VK_DELETE, 0x53, true),
+        0x4d => (VK_END, 0x4f, true),
+        0x4e => (VK_NEXT, 0x51, true),
+        0x4f => (VK_RIGHT, 0x4d, true),
+        0x50 => (VK_LEFT, 0x4b, true),
+        0x51 => (VK_DOWN, 0x50, true),
+        0x52 => (VK_UP, 0x48, true),
+        _ => return None,
+    })
+}
+
 fn keyboard(usage: u16, down: bool) -> Result<INPUT> {
     if let Some(vk) = media_vk(usage) {
         return Ok(INPUT {
@@ -188,6 +214,21 @@ fn keyboard(usage: u16, down: bool) -> Result<INPUT> {
                     wVk: vk,
                     wScan: 0,
                     dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                    time: 0,
+                    dwExtraInfo: INPUT_ORIGIN_TAG,
+                },
+            },
+        });
+    }
+    if let Some((vk, scan_code, extended)) = editing_control_vk(usage) {
+        return Ok(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan_code,
+                    dwFlags: if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
+                        | if down { 0 } else { KEYEVENTF_KEYUP },
                     time: 0,
                     dwExtraInfo: INPUT_ORIGIN_TAG,
                 },
@@ -562,6 +603,8 @@ impl Platform for NativeService {
     }
 }
 
+const RECENT_RELEASE_GRACE: Duration = Duration::from_millis(250);
+
 pub struct WindowsMouseSink {
     platform: Box<dyn Platform>,
     emergency: Arc<AtomicBool>,
@@ -571,6 +614,8 @@ pub struct WindowsMouseSink {
     failed: bool,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<Button>,
+    recently_released_keys: BTreeMap<u16, Instant>,
+    recently_released_buttons: BTreeMap<Button, Instant>,
 }
 impl WindowsMouseSink {
     /// `emergency` is a latched local physical-hotkey/stop signal. The caller
@@ -589,6 +634,8 @@ impl WindowsMouseSink {
             failed: true,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            recently_released_keys: BTreeMap::new(),
+            recently_released_buttons: BTreeMap::new(),
         };
         sink.reset()?;
         Ok(sink)
@@ -610,6 +657,8 @@ impl WindowsMouseSink {
             failed: true,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            recently_released_keys: BTreeMap::new(),
+            recently_released_buttons: BTreeMap::new(),
         };
         sink.reset()?;
         Ok(sink)
@@ -678,6 +727,8 @@ impl MouseSink for WindowsMouseSink {
     fn reset(&mut self) -> Result<()> {
         self.failed = true;
         self.release_owned()?;
+        self.recently_released_keys.clear();
+        self.recently_released_buttons.clear();
         self.platform.invalidate_cache();
         ensure!(
             !self.emergency_local(),
@@ -726,7 +777,12 @@ impl MouseSink for WindowsMouseSink {
         }
         if down {
             self.checked()?;
-            let valid = !self.buttons.contains(&button) && !self.platform.held(button_vk(button));
+            let own_recent_release = self
+                .recently_released_buttons
+                .get(&button)
+                .is_some_and(|t| t.elapsed() < RECENT_RELEASE_GRACE);
+            let valid = !self.buttons.contains(&button)
+                && (own_recent_release || !self.platform.held(button_vk(button)));
             self.finish(if valid {
                 Ok(())
             } else {
@@ -734,11 +790,14 @@ impl MouseSink for WindowsMouseSink {
                     "button is already held locally or remotely"
                 ))
             })?;
+            self.recently_released_buttons.remove(&button);
             self.buttons.insert(button);
         }
         self.send(button_input(button, down))?;
         if !down {
             self.buttons.remove(&button);
+            self.recently_released_buttons
+                .insert(button, Instant::now());
         }
         Ok(())
     }
@@ -776,8 +835,16 @@ impl MouseSink for WindowsMouseSink {
                 }
             } else {
                 let vk = media_vk(usage)
+                    .or_else(|| editing_control_vk(usage).map(|(vk, _, _)| vk))
                     .unwrap_or_else(|| self.platform.key_vk(scan(usage).expect("validated usage")));
-                let valid = vk != 0 && !self.platform.held(vk);
+                // Rapidly tapping Backspace / keys over Wi-Fi bursts can re-press a key
+                // milliseconds after our own SendInput(KEYUP), before Windows CSRSS / IME
+                // clears GetAsyncKeyState. Allow re-press within RECENT_RELEASE_GRACE.
+                let own_recent_release = self
+                    .recently_released_keys
+                    .get(&usage)
+                    .is_some_and(|t| t.elapsed() < RECENT_RELEASE_GRACE);
+                let valid = vk != 0 && (own_recent_release || !self.platform.held(vk));
                 self.finish(if valid {
                     Ok(())
                 } else {
@@ -785,12 +852,14 @@ impl MouseSink for WindowsMouseSink {
                         "key is unsupported or already held locally or remotely"
                     ))
                 })?;
+                self.recently_released_keys.remove(&usage);
                 self.keys.insert(usage);
             }
         }
         self.send(input)?;
         if !down {
             self.keys.remove(&usage);
+            self.recently_released_keys.insert(usage, Instant::now());
         }
         Ok(())
     }
@@ -959,9 +1028,17 @@ mod tests {
             assert_eq!(u.wScan, d.wScan);
             assert_eq!(u.dwFlags, d.dwFlags | KEYEVENTF_KEYUP);
             assert_eq!(d.dwExtraInfo, INPUT_ORIGIN_TAG);
-            assert_eq!(d.wVk, 0);
-            if capture_scan & 0xe000 != 0 && usage != 0x53 {
-                assert_ne!(d.dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+            if let Some((expected_vk, expected_scan, expected_ext)) = editing_control_vk(usage) {
+                assert_eq!(d.wVk, expected_vk);
+                assert_eq!(d.wScan, expected_scan);
+                assert_eq!(d.dwFlags & KEYEVENTF_SCANCODE, 0);
+                assert_eq!(d.dwFlags & KEYEVENTF_EXTENDEDKEY != 0, expected_ext);
+            } else {
+                assert_eq!(d.wVk, 0);
+                assert_ne!(d.dwFlags & KEYEVENTF_SCANCODE, 0);
+                if capture_scan & 0xe000 != 0 && usage != 0x53 {
+                    assert_ne!(d.dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+                }
             }
         }
         assert_eq!(scan(0x46), Some(0xe037));
@@ -1033,6 +1110,8 @@ mod tests {
             failed: true,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            recently_released_keys: BTreeMap::new(),
+            recently_released_buttons: BTreeMap::new(),
         };
         sink.reset().unwrap();
         (sink, state)
@@ -1143,5 +1222,22 @@ mod tests {
         sink.key(0xe1, true).unwrap(); // Left Shift down
         sink.key(0xe1, true).unwrap(); // Left Shift repeat -> benign no-op
         assert_eq!(state.lock().unwrap().events.len(), 4);
+    }
+    #[test]
+    fn rapid_backspace_repress_tolerates_stale_os_async_key_state_after_own_release() {
+        let (mut sink, state) = fake();
+        // Tap 1: Backspace down + up; simulate Windows CSRSS/IME leaving VK_BACK stale-held
+        sink.key(0x2a, true).unwrap();
+        sink.key(0x2a, false).unwrap();
+        state.lock().unwrap().held.insert(VK_BACK);
+        // Tap 2 immediately after our own release must succeed instead of failing the worker
+        sink.key(0x2a, true).unwrap();
+        sink.key(0x2a, false).unwrap();
+        assert_eq!(state.lock().unwrap().events.len(), 4);
+        // Verify Backspace emits explicit VK_BACK + scan 0x0e without KEYEVENTF_SCANCODE
+        let ki = unsafe { state.lock().unwrap().events[0].Anonymous.ki };
+        assert_eq!(ki.wVk, VK_BACK);
+        assert_eq!(ki.wScan, 0x0e);
+        assert_eq!(ki.dwFlags & KEYEVENTF_SCANCODE, 0);
     }
 }
