@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.3-rc.2] - 2026-11-28 (Pre-release)
+
+### Fixed
+- **修复 Windows 中文输入法下 Backspace 偶发不识别、无法删除已打文字**：
+  - Windows 接收端对 `Backspace`、`Enter`、`Space`、`Tab`、`Escape`、`Delete`、`Insert`、方向键及 `Home/End/PageUp/PageDown` 改为携带显式 `wVk` + 硬件 `wScan` 注入（不再使用易被微软拼音 / 搜狗 / 微信输入法 TSF 吞掉的 `wVk = 0` 纯扫描码模式）。
+  - 接收端增加 `250ms` 自身刚释放键位宽限窗，根治 Wi-Fi 突发包或快速连按 Backspace/鼠标键时因 Windows `GetAsyncKeyState` 异步滞后误判「本地已按住」导致的丢键与中断。
+  - 发送端底层钩子对 `VK_BACK` 等编辑控制键增加 `vkCode` 直接映射兜底，避免部分笔记本或输入法驱动出现 `scanCode == 0` 时漏发。
+
+---
+
 ## [0.4.3-rc.1] - 2026-11-28 (Pre-release)
 
 ### Fixed
