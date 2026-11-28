@@ -772,6 +772,8 @@ pub struct AuxMeshHub {
     pending_local_clips: Arc<Mutex<std::collections::VecDeque<(ClipboardItem, String)>>>,
     has_peers: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    acceptor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    poller_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl AuxMeshHub {
@@ -792,10 +794,10 @@ impl AuxMeshHub {
             Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(4)));
         let has_peers = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        if let Some(listener) = listener {
+        let acceptor_handle = if let Some(listener) = listener {
             let inbound = pending_inbound.clone();
             let stop_flag = stop.clone();
-            let _ = thread::Builder::new()
+            thread::Builder::new()
                 .name("crossflow-aux-acceptor".into())
                 .spawn(move || {
                     while !stop_flag.load(Ordering::Acquire) {
@@ -830,17 +832,20 @@ impl AuxMeshHub {
                             Err(_) => break,
                         }
                     }
-                });
-        }
+                })
+                .ok()
+        } else {
+            None
+        };
         // Poll the local OS clipboard on a dedicated background thread so image
         // decoding / OpenClipboard / NSPasteboard never stalls the 1000Hz input loop.
-        {
+        let poller_handle = {
             let echo = clip_echo.clone();
             let queue = pending_local_clips.clone();
             let clip_flag = clipboard_enabled;
             let peers_flag = has_peers.clone();
             let stop_flag = stop.clone();
-            let _ = thread::Builder::new()
+            thread::Builder::new()
                 .name("crossflow-mesh-clipboard".into())
                 .spawn(move || {
                     let mut last_poll = Instant::now();
@@ -860,14 +865,17 @@ impl AuxMeshHub {
                         }
                         thread::sleep(Duration::from_millis(25));
                     }
-                });
-        }
+                })
+                .ok()
+        };
         Self {
             pending_inbound,
             clip_echo,
             pending_local_clips,
             has_peers,
             stop,
+            acceptor_handle: Arc::new(Mutex::new(acceptor_handle)),
+            poller_handle: Arc::new(Mutex::new(poller_handle)),
         }
     }
 
@@ -884,8 +892,23 @@ impl AuxMeshHub {
         }
     }
 
+    /// Stops the acceptor & clipboard poller and waits for both threads to exit so the
+    /// listening port (`24801`) is guaranteed to be released before rebinding on wake.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.acceptor_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
+        if let Ok(mut guard) = self.poller_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
+        if let Ok(mut guard) = self.pending_inbound.lock() {
+            guard.clear();
+        }
     }
 
     fn take_inbound(&self, remote_id: &str) -> Option<(TcpStream, SecureChannel)> {
@@ -995,11 +1018,16 @@ impl AuxSession {
         let worker = thread::Builder::new()
             .name("crossflow-aux-channel".into())
             .spawn(move || {
+                let peer_aux_addr = SocketAddr::new(
+                    peer_main_addr.ip(),
+                    peer_main_addr.port().saturating_add(1),
+                );
                 while !worker_stop.load(Ordering::Acquire) {
+                    let mut was_connected = false;
                     let _ = run_aux(
                         aux_listener.clone(),
                         None,
-                        peer_main_addr,
+                        peer_aux_addr,
                         initiator,
                         &local_device_id,
                         &expected_remote_id,
@@ -1013,6 +1041,7 @@ impl AuxSession {
                         &worker_slot,
                         &worker_stop,
                         None,
+                        &mut was_connected,
                     );
                     if !sleep_unless_stopped(&worker_stop, AUX_RECONNECT_DELAY) {
                         break;
@@ -1033,7 +1062,7 @@ impl AuxSession {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_mesh_peer(
         hub: AuxMeshHub,
-        peer_main_addr: SocketAddr,
+        peer_aux_addr: SocketAddr,
         initiator: bool,
         local_device_id: String,
         expected_remote_id: String,
@@ -1059,11 +1088,13 @@ impl AuxSession {
                 // Self-healing loop: if the auxiliary TCP channel drops during sleep/wake or
                 // reconnect races while the main 24800 input channel stays up, automatically
                 // re-establish 24801 so clipboard, IME, and file sync never silently die.
+                let mut last_disc_log: Option<Instant> = None;
                 while !worker_stop.load(Ordering::Acquire) {
+                    let mut was_connected = false;
                     let res = run_aux(
                         None,
                         Some(hub.clone()),
-                        peer_main_addr,
+                        peer_aux_addr,
                         initiator,
                         &local_device_id,
                         &expected_remote_id,
@@ -1077,11 +1108,15 @@ impl AuxSession {
                         &worker_slot,
                         &worker_stop,
                         log.as_ref(),
+                        &mut was_connected,
                     );
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Some(ref log) = log {
+                    let should_log = was_connected
+                        || last_disc_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+                    if should_log && let Some(ref log) = log {
+                        last_disc_log = Some(Instant::now());
                         let peer_tag = &expected_remote_id[..expected_remote_id.len().min(8)];
                         let reason = match res {
                             Ok(()) => "closed".to_string(),
@@ -1092,6 +1127,7 @@ impl AuxSession {
                             serde_json::json!({
                                 "peer": peer_tag,
                                 "initiator": initiator,
+                                "target": peer_aux_addr.to_string(),
                                 "reason": reason,
                             }),
                         );
@@ -1167,7 +1203,7 @@ fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) -> bool {
 fn run_aux(
     aux_listener: Option<Arc<TcpListener>>,
     mesh_hub: Option<AuxMeshHub>,
-    peer_main_addr: SocketAddr,
+    peer_aux_addr: SocketAddr,
     initiator: bool,
     local_device_id: &str,
     expected_remote_id: &str,
@@ -1181,6 +1217,7 @@ fn run_aux(
     transfer_slot: &Mutex<Option<(TransferStatus, Instant)>>,
     stop: &AtomicBool,
     log: Option<&Log>,
+    was_connected: &mut bool,
 ) -> Result<()> {
     let (mut stream, mut ch) = if let Some(ref hub) = mesh_hub
         && !initiator
@@ -1200,10 +1237,7 @@ fn run_aux(
         pair
     } else {
         let mut stream = if initiator {
-            let target = SocketAddr::new(
-                peer_main_addr.ip(),
-                peer_main_addr.port().saturating_add(1),
-            );
+            let target = peer_aux_addr;
             let mut connected = None;
             for _ in 0..10 {
                 if stop.load(Ordering::Acquire) {
@@ -1227,7 +1261,7 @@ fn run_aux(
             let mut accepted = None;
             while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
                 match listener.accept() {
-                    Ok((s, addr)) if addr.ip() == peer_main_addr.ip() => {
+                    Ok((s, addr)) if addr.ip() == peer_aux_addr.ip() => {
                         accepted = Some(s);
                         break;
                     }
@@ -1250,6 +1284,7 @@ fn run_aux(
         ensure!(remote_id == expected_remote_id, "aux peer identity mismatch");
         (stream, ch)
     };
+    *was_connected = true;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -1260,7 +1295,7 @@ fn run_aux(
             serde_json::json!({
                 "peer": peer_tag,
                 "initiator": initiator,
-                "addr": peer_main_addr.to_string(),
+                "addr": peer_aux_addr.to_string(),
             }),
         );
     }

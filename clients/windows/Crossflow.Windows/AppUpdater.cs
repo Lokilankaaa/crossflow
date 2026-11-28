@@ -1,11 +1,14 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 
 namespace Crossflow.Windows;
 
@@ -17,7 +20,8 @@ internal sealed record UpdateReleaseInfo(
     string AssetName,
     string DownloadUrl,
     long AssetSize,
-    string? ChecksumsUrl);
+    string? ChecksumsUrl,
+    bool IsPrerelease);
 
 internal enum UpdaterPhase
 {
@@ -36,15 +40,35 @@ internal sealed record UpdaterState(
     string CurrentVersion,
     UpdateReleaseInfo? Release,
     double Progress,
-    string Message);
+    string Message,
+    string MirrorPrefix,
+    bool IncludePrerelease);
 
-/// GitHub Releases self-updater with mandatory SHA-256 verification, zip-slip protection,
-/// atomic robocopy staging, and automatic CrossflowInputService refresh.
+internal sealed record MirrorPreset(string Id, string Label, string Description, string? Prefix);
+
+internal sealed class UpdaterSettings
+{
+    [JsonPropertyName("mirror_prefix")] public string MirrorPrefix { get; set; } = "";
+    [JsonPropertyName("include_prerelease")] public bool IncludePrerelease { get; set; } = false;
+}
+
+/// GitHub Releases self-updater with Atom feed + web redirect + REST API fallback,
+/// optional HTTPS GitHub mirror prefix with automatic direct fallback, stable / prerelease (-rc)
+/// channel switching, mandatory SHA-256 verification, zip-slip protection, atomic robocopy
+/// staging, and automatic CrossflowInputService refresh.
 internal sealed class AppUpdater
 {
-    private const string RepoBaseUrl = "https://github.com/Lokilankaaa/crossflow";
-    private const string LatestReleaseWebUrl = RepoBaseUrl + "/releases/latest";
+    internal const string RepoBaseUrl = "https://github.com/Lokilankaaa/crossflow";
+    internal const string ReleasesAtomUrl = RepoBaseUrl + "/releases.atom";
+    internal const string LatestReleaseWebUrl = RepoBaseUrl + "/releases/latest";
+    internal const string ReleasesPageUrl = RepoBaseUrl + "/releases";
+    internal const string IssuesNewUrl = RepoBaseUrl + "/issues/new/choose";
+    internal const string AuthorGitHubUrl = "https://github.com/Lokilankaaa";
+    internal const string AuthorBilibiliUrl = "https://b23.tv/pANRtSc";
+
     private const string LatestReleaseApi = "https://api.github.com/repos/Lokilankaaa/crossflow/releases/latest";
+    private const string ReleasesListApi = "https://api.github.com/repos/Lokilankaaa/crossflow/releases?per_page=10";
+
     private static readonly string[] AllowedHosts =
     [
         "api.github.com",
@@ -53,17 +77,148 @@ internal sealed class AppUpdater
         "release-assets.githubusercontent.com"
     ];
 
+    internal static readonly IReadOnlyList<MirrorPreset> MirrorPresets =
+    [
+        new("direct", "GitHub 官方直连", "默认直连 github.com，适合海外或代理网络环境", ""),
+        new("ghproxy", "GH-Proxy · gh-proxy.com", "国内常用 GitHub Releases 加速节点，失败自动回退直连", "https://gh-proxy.com/"),
+        new("ghfast", "GHFast · ghfast.top", "国内备用 GitHub 下载加速镜像节点，失败自动回退直连", "https://ghfast.top/"),
+        new("custom", "自定义镜像前缀…", "使用自建或自定义 HTTPS 加速前缀", null)
+    ];
+
+    private static readonly Regex TagInUrlRegex = new(@"/releases/tag/(?<tag>[^/?#]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex HtmlTagRegex = new(@"<[^>]+>", RegexOptions.Compiled);
+    private static readonly Regex HtmlBreakRegex = new(@"<\s*(br|p|div|li|h[1-6]|tr)\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private static readonly HttpClient Http = CreateHttpClient();
     private CancellationTokenSource? downloadCts;
+    private UpdaterSettings settings;
     private UpdaterState state;
 
     internal event Action<UpdaterState>? Changed;
     internal UpdaterState State => state;
     internal static string CurrentVersion { get; } = ResolveCurrentVersion();
+    internal string MirrorPrefix => settings.MirrorPrefix;
+    internal bool IncludePrerelease => settings.IncludePrerelease;
+
+    internal static string UserDataDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Crossflow");
+
+    internal static string LogsDir => Path.Combine(UserDataDir, "Logs");
+    private static string SettingsPath => Path.Combine(UserDataDir, "updater-settings.json");
 
     internal AppUpdater()
     {
-        state = new UpdaterState(UpdaterPhase.Idle, CurrentVersion, null, 0, $"当前版本 v{CurrentVersion}");
+        settings = LoadSettings();
+        state = new UpdaterState(
+            UpdaterPhase.Idle,
+            CurrentVersion,
+            null,
+            0,
+            $"当前版本 v{CurrentVersion}",
+            settings.MirrorPrefix,
+            settings.IncludePrerelease);
+    }
+
+    internal static string DescribeMirror(string? prefix)
+    {
+        string clean = NormalizeMirrorPrefix(prefix);
+        if (string.IsNullOrEmpty(clean)) return "GitHub 官方直连";
+        var matched = MirrorPresets.FirstOrDefault(p =>
+            !string.IsNullOrEmpty(p.Prefix)
+            && string.Equals(p.Prefix, clean, StringComparison.OrdinalIgnoreCase));
+        return matched?.Label ?? clean.TrimEnd('/');
+    }
+
+    internal static string ResolveMirrorPresetId(string? prefix)
+    {
+        string clean = NormalizeMirrorPrefix(prefix);
+        if (string.IsNullOrEmpty(clean)) return "direct";
+        var matched = MirrorPresets.FirstOrDefault(p =>
+            !string.IsNullOrEmpty(p.Prefix)
+            && string.Equals(p.Prefix, clean, StringComparison.OrdinalIgnoreCase));
+        return matched?.Id ?? "custom";
+    }
+
+    internal static string NormalizeMirrorPrefix(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        string trimmed = raw.Trim();
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)) return "";
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return "";
+        return trimmed.EndsWith('/') ? trimmed : trimmed + "/";
+    }
+
+    internal static IReadOnlyList<string> BuildCandidateUrls(string officialUrl, string? mirrorPrefix)
+    {
+        var list = new List<string>(2);
+        string cleanMirror = NormalizeMirrorPrefix(mirrorPrefix);
+        if (!string.IsNullOrEmpty(cleanMirror) && IsAllowedHttpsUrl(officialUrl))
+        {
+            list.Add(cleanMirror + officialUrl);
+        }
+        list.Add(officialUrl);
+        return list;
+    }
+
+    internal bool SetMirrorPrefix(string? rawPrefix, out string? error)
+    {
+        error = null;
+        string trimmed = (rawPrefix ?? "").Trim();
+        if (trimmed.Length == 0)
+        {
+            settings.MirrorPrefix = "";
+        }
+        else
+        {
+            string normalized = NormalizeMirrorPrefix(trimmed);
+            if (string.IsNullOrEmpty(normalized))
+            {
+                error = "镜像前缀必须为有效的 https:// 地址，例如 https://gh-proxy.com/";
+                return false;
+            }
+            settings.MirrorPrefix = normalized;
+        }
+        SaveSettings(settings);
+        Publish(state with { MirrorPrefix = settings.MirrorPrefix });
+        return true;
+    }
+
+    internal void SetIncludePrerelease(bool includePrerelease)
+    {
+        if (settings.IncludePrerelease == includePrerelease) return;
+        settings.IncludePrerelease = includePrerelease;
+        SaveSettings(settings);
+        Publish(state with { IncludePrerelease = includePrerelease });
+    }
+
+    private static UpdaterSettings LoadSettings()
+    {
+        try
+        {
+            if (File.Exists(SettingsPath))
+            {
+                string json = File.ReadAllText(SettingsPath, Encoding.UTF8);
+                var parsed = JsonSerializer.Deserialize<UpdaterSettings>(json);
+                if (parsed is not null)
+                {
+                    parsed.MirrorPrefix = NormalizeMirrorPrefix(parsed.MirrorPrefix);
+                    return parsed;
+                }
+            }
+        }
+        catch { }
+        return new UpdaterSettings();
+    }
+
+    private static void SaveSettings(UpdaterSettings value)
+    {
+        try
+        {
+            Directory.CreateDirectory(UserDataDir);
+            string json = JsonSerializer.Serialize(value, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(SettingsPath, json, new UTF8Encoding(false));
+        }
+        catch { }
     }
 
     private static HttpClient CreateHttpClient()
@@ -82,41 +237,81 @@ internal sealed class AppUpdater
             int plus = info.IndexOf('+');
             string clean = plus >= 0 ? info[..plus] : info;
             clean = clean.Trim().TrimStart('v', 'V');
-            if (TryParseSemVer(clean, out _)) return clean;
+            if (TryParseVersion(clean, out _)) return clean;
         }
         var ver = asm.GetName().Version;
         if (ver is not null && (ver.Major > 0 || ver.Minor > 0 || ver.Build > 0))
             return $"{ver.Major}.{ver.Minor}.{Math.Max(ver.Build, 0)}";
-        return "0.4.0";
+        return "0.4.1";
     }
 
-    internal static bool TryParseSemVer(string? raw, out (int Major, int Minor, int Patch) parsed)
+    internal static bool IsPrereleaseTag(string? raw)
     {
-        parsed = (0, 0, 0);
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        return raw.Contains("-rc", StringComparison.OrdinalIgnoreCase)
+            || raw.Contains("-beta", StringComparison.OrdinalIgnoreCase)
+            || raw.Contains("-alpha", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool TryParseVersion(string? raw, out (int Major, int Minor, int Patch, string Pre) parsed)
+    {
+        parsed = (0, 0, 0, "");
         if (string.IsNullOrWhiteSpace(raw)) return false;
         string s = raw.Trim().TrimStart('v', 'V');
-        int dash = s.IndexOfAny(['-', '+']);
-        if (dash >= 0) s = s[..dash];
+        int plus = s.IndexOf('+');
+        if (plus >= 0) s = s[..plus];
+        string pre = "";
+        int dash = s.IndexOf('-');
+        if (dash >= 0)
+        {
+            pre = s[(dash + 1)..].Trim();
+            s = s[..dash];
+        }
         var parts = s.Split('.');
         if (parts.Length is < 2 or > 4) return false;
         if (!int.TryParse(parts[0], out int maj) || !int.TryParse(parts[1], out int min)) return false;
         int pat = 0;
         if (parts.Length >= 3 && !int.TryParse(parts[2], out pat)) return false;
         if (maj < 0 || min < 0 || pat < 0) return false;
-        parsed = (maj, min, pat);
+        parsed = (maj, min, pat, pre);
         return true;
     }
 
-    internal static bool IsNewerVersion(string candidate, string current)
+    internal static int CompareVersions(string candidate, string current)
     {
-        if (!TryParseSemVer(candidate, out var c) || !TryParseSemVer(current, out var cur))
-            return false;
-        return c.Major != cur.Major ? c.Major > cur.Major
-            : c.Minor != cur.Minor ? c.Minor > cur.Minor
-            : c.Patch > cur.Patch;
+        if (!TryParseVersion(candidate, out var c) || !TryParseVersion(current, out var cur))
+            return 0;
+        if (c.Major != cur.Major) return c.Major.CompareTo(cur.Major);
+        if (c.Minor != cur.Minor) return c.Minor.CompareTo(cur.Minor);
+        if (c.Patch != cur.Patch) return c.Patch.CompareTo(cur.Patch);
+
+        bool cPre = !string.IsNullOrEmpty(c.Pre);
+        bool curPre = !string.IsNullOrEmpty(cur.Pre);
+        if (!cPre && !curPre) return 0;
+        if (!cPre && curPre) return 1; // 0.4.2 > 0.4.2-rc.1
+        if (cPre && !curPre) return -1;
+
+        var aParts = c.Pre.Split('.');
+        var bParts = cur.Pre.Split('.');
+        int len = Math.Max(aParts.Length, bParts.Length);
+        for (int i = 0; i < len; i++)
+        {
+            if (i >= aParts.Length) return -1;
+            if (i >= bParts.Length) return 1;
+            bool aNum = int.TryParse(aParts[i], out int ai);
+            bool bNum = int.TryParse(bParts[i], out int bi);
+            int cmp = (aNum && bNum)
+                ? ai.CompareTo(bi)
+                : string.Compare(aParts[i], bParts[i], StringComparison.OrdinalIgnoreCase);
+            if (cmp != 0) return cmp;
+        }
+        return 0;
     }
 
-    private static bool IsAllowedHttpsUrl(string? url)
+    internal static bool IsNewerVersion(string candidate, string current) =>
+        CompareVersions(candidate, current) > 0;
+
+    internal static bool IsAllowedHttpsUrl(string? url)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return false;
         if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return false;
@@ -131,40 +326,74 @@ internal sealed class AppUpdater
         Changed?.Invoke(next);
     }
 
+    private UpdaterState MakeState(UpdaterPhase phase, UpdateReleaseInfo? rel, double progress, string message) =>
+        new(phase, CurrentVersion, rel, progress, message, settings.MirrorPrefix, settings.IncludePrerelease);
+
     internal async Task CheckForUpdatesAsync(bool silent = false)
     {
         if (state.Phase is UpdaterPhase.Checking or UpdaterPhase.Downloading or UpdaterPhase.Verifying or UpdaterPhase.Applying)
             return;
 
+        bool includePre = settings.IncludePrerelease;
+        string mirror = settings.MirrorPrefix;
+
         if (!silent)
-            Publish(new UpdaterState(UpdaterPhase.Checking, CurrentVersion, state.Release, 0, "正在检查 GitHub 最新版本…"));
+            Publish(MakeState(UpdaterPhase.Checking, state.Release, 0, "正在检查 GitHub 最新版本…"));
 
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            string? tagName = await FetchLatestTagFromWebAsync(cts.Token);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(18));
+
+            // 1. Primary: GitHub Releases Atom feed (zero API rate limit, works through mirror,
+            //    supports stable + prerelease channels, includes release notes).
+            var atomHit = await FetchLatestFromAtomAsync(includePre, mirror, cts.Token);
+
+            string? tagName = atomHit?.TagName;
+            string notes = atomHit?.Notes ?? "";
+            string? htmlUrl = atomHit?.HtmlUrl;
             GitHubReleaseDto? apiDoc = null;
 
+            // 2. Fallback (stable): GitHub /releases/latest redirect/JSON (zero API rate limit)
+            if (string.IsNullOrWhiteSpace(tagName) && !includePre)
+            {
+                tagName = await FetchLatestTagFromWebAsync(mirror, cts.Token);
+            }
+
+            // 3. Final fallback: GitHub REST API
             if (string.IsNullOrWhiteSpace(tagName))
             {
-                using var apiReq = new HttpRequestMessage(HttpMethod.Get, LatestReleaseApi);
+                string apiUrl = includePre ? ReleasesListApi : LatestReleaseApi;
+                using var apiReq = new HttpRequestMessage(HttpMethod.Get, apiUrl);
                 apiReq.Headers.Accept.ParseAdd("application/vnd.github+json");
                 using var resp = await Http.SendAsync(apiReq, cts.Token);
                 if (!resp.IsSuccessStatusCode)
                 {
                     if (!silent)
-                        Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, null, 0, $"检查更新失败（HTTP {(int)resp.StatusCode}）"));
+                        Publish(MakeState(UpdaterPhase.Error, null, 0, $"检查更新失败（HTTP {(int)resp.StatusCode}），可切换下载加速线路后重试"));
                     return;
                 }
                 await using var stream = await resp.Content.ReadAsStreamAsync(cts.Token);
-                apiDoc = await JsonSerializer.DeserializeAsync<GitHubReleaseDto>(stream, cancellationToken: cts.Token);
+                if (includePre)
+                {
+                    var list = await JsonSerializer.DeserializeAsync<List<GitHubReleaseDto>>(stream, cancellationToken: cts.Token);
+                    apiDoc = list?
+                        .Where(r => !r.Draft && !string.IsNullOrWhiteSpace(r.TagName) && r.TagName!.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+                        .OrderByDescending(r => r.TagName!, Comparer<string>.Create(CompareVersions))
+                        .FirstOrDefault();
+                }
+                else
+                {
+                    apiDoc = await JsonSerializer.DeserializeAsync<GitHubReleaseDto>(stream, cancellationToken: cts.Token);
+                }
                 tagName = apiDoc?.TagName?.Trim();
+                notes = apiDoc?.Body ?? notes;
+                htmlUrl = apiDoc?.HtmlUrl ?? htmlUrl;
             }
 
             if (string.IsNullOrWhiteSpace(tagName))
             {
                 if (!silent)
-                    Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, null, 0, "无法解析最新版本信息。"));
+                    Publish(MakeState(UpdaterPhase.Error, null, 0, "无法解析最新版本信息，请检查网络或切换镜像线路。"));
                 return;
             }
 
@@ -172,10 +401,11 @@ internal sealed class AppUpdater
             if (!IsNewerVersion(latestVer, CurrentVersion))
             {
                 if (!silent)
-                    Publish(new UpdaterState(UpdaterPhase.UpToDate, CurrentVersion, null, 0, $"已是最新版本（v{CurrentVersion}）"));
+                    Publish(MakeState(UpdaterPhase.UpToDate, null, 0, $"已是最新版本（v{CurrentVersion}）"));
                 return;
             }
 
+            bool isPre = IsPrereleaseTag(tagName);
             UpdateReleaseInfo? release = null;
             if (apiDoc is not null)
             {
@@ -191,64 +421,66 @@ internal sealed class AppUpdater
                     release = new UpdateReleaseInfo(
                         latestVer,
                         tagName,
-                        IsAllowedHttpsUrl(apiDoc.HtmlUrl) ? apiDoc.HtmlUrl! : $"{RepoBaseUrl}/releases/tag/{tagName}",
-                        apiDoc.Body ?? "",
+                        IsAllowedHttpsUrl(apiDoc.HtmlUrl) ? apiDoc.HtmlUrl! : $"{RepoBaseUrl}/releases/tag/{Uri.EscapeDataString(tagName)}",
+                        TrimNotes(notes),
                         winAsset.Name!,
                         winAsset.BrowserDownloadUrl!,
                         winAsset.Size,
-                        checksumsAsset?.BrowserDownloadUrl);
+                        checksumsAsset?.BrowserDownloadUrl,
+                        isPre);
                 }
             }
             else
             {
-                string checksumsUrl = $"{RepoBaseUrl}/releases/download/{tagName}/SHA256SUMS.txt";
+                string escapedTag = Uri.EscapeDataString(tagName);
+                string checksumsUrl = $"{RepoBaseUrl}/releases/download/{escapedTag}/SHA256SUMS.txt";
                 string assetName = $"Crossflow-{tagName}-windows-x64.zip";
-                try
+                string? sumsText = await TryGetStringWithMirrorAsync(checksumsUrl, mirror, cts.Token);
+                if (!string.IsNullOrWhiteSpace(sumsText))
                 {
-                    string sumsText = await Http.GetStringAsync(checksumsUrl, cts.Token);
                     string? matched = FindAssetNameInChecksums(sumsText, "-windows-x64.zip");
                     if (!string.IsNullOrWhiteSpace(matched))
                         assetName = matched;
                 }
-                catch { }
 
-                string downloadUrl = $"{RepoBaseUrl}/releases/download/{tagName}/{assetName}";
-                long assetSize = await ProbeContentLengthAsync(downloadUrl, cts.Token);
+                string downloadUrl = $"{RepoBaseUrl}/releases/download/{escapedTag}/{assetName}";
+                long assetSize = await ProbeContentLengthAsync(downloadUrl, mirror, cts.Token);
                 release = new UpdateReleaseInfo(
                     latestVer,
                     tagName,
-                    $"{RepoBaseUrl}/releases/tag/{tagName}",
-                    "",
+                    IsAllowedHttpsUrl(htmlUrl) ? htmlUrl! : $"{RepoBaseUrl}/releases/tag/{escapedTag}",
+                    TrimNotes(notes),
                     assetName,
                     downloadUrl,
                     assetSize,
-                    checksumsUrl);
+                    checksumsUrl,
+                    isPre);
             }
 
             if (release is null || !IsAllowedHttpsUrl(release.DownloadUrl))
             {
                 if (!silent)
-                    Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, null, 0, $"发现 v{latestVer}，但未找到 Windows x64 安装包。"));
+                    Publish(MakeState(UpdaterPhase.Error, null, 0, $"发现 v{latestVer}，但未找到 Windows x64 安装包。"));
                 return;
             }
 
+            string preBadge = release.IsPrerelease ? " RC" : "";
             string sizeText = release.AssetSize > 0 ? $"（{release.AssetSize / (1024.0 * 1024.0):F1} MB）" : "";
-            Publish(new UpdaterState(
+            Publish(MakeState(
                 UpdaterPhase.Available,
-                CurrentVersion,
                 release,
                 0,
-                $"发现新版本 v{release.Version}{sizeText}"));
+                $"发现新版本 v{release.Version}{preBadge}{sizeText}"));
         }
         catch (OperationCanceledException)
         {
             if (!silent)
-                Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, null, 0, "检查更新超时，请检查网络连接。"));
+                Publish(MakeState(UpdaterPhase.Error, null, 0, "检查更新超时，请检查网络或切换下载加速线路。"));
         }
         catch (Exception ex)
         {
             if (!silent)
-                Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, null, 0, $"检查更新失败：{ex.Message}"));
+                Publish(MakeState(UpdaterPhase.Error, null, 0, $"检查更新失败：{ex.Message}"));
         }
     }
 
@@ -268,6 +500,7 @@ internal sealed class AppUpdater
         downloadCts = new CancellationTokenSource();
         var ct = downloadCts.Token;
 
+        string mirror = settings.MirrorPrefix;
         string workDir = Path.Combine(Path.GetTempPath(), "CrossflowUpdate", $"v{release.Version}-{Guid.NewGuid():N}");
         string zipPath = Path.Combine(workDir, release.AssetName);
         string stagingDir = Path.Combine(workDir, "staging");
@@ -275,65 +508,103 @@ internal sealed class AppUpdater
         try
         {
             Directory.CreateDirectory(workDir);
-            Publish(new UpdaterState(UpdaterPhase.Downloading, CurrentVersion, release, 0, $"正在下载 v{release.Version}…"));
+            Publish(MakeState(UpdaterPhase.Downloading, release, 0, $"正在下载 v{release.Version}…"));
 
             if (string.IsNullOrWhiteSpace(release.ChecksumsUrl))
             {
                 TryDeleteDirectory(workDir);
-                Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, release, 0, "未找到 SHA256SUMS.txt 校验文件，已取消更新。"));
-                return false;
-            }
-            string sumsText = await Http.GetStringAsync(release.ChecksumsUrl, ct);
-            string? expectedSha256 = ParseExpectedSha256(sumsText, release.AssetName);
-            if (string.IsNullOrWhiteSpace(expectedSha256))
-            {
-                TryDeleteDirectory(workDir);
-                Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, release, 0, "SHA256SUMS.txt 中缺少该安装包的校验值，已取消更新。"));
+                Publish(MakeState(UpdaterPhase.Error, release, 0, "未找到 SHA256SUMS.txt 校验文件，已取消更新。"));
                 return false;
             }
 
-            using (var resp = await Http.GetAsync(release.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, ct))
+            string? sumsText = await TryGetStringWithMirrorAsync(release.ChecksumsUrl, mirror, ct);
+            string? expectedSha256 = string.IsNullOrWhiteSpace(sumsText)
+                ? null
+                : ParseExpectedSha256(sumsText, release.AssetName);
+            if (string.IsNullOrWhiteSpace(expectedSha256))
             {
-                resp.EnsureSuccessStatusCode();
-                long total = resp.Content.Headers.ContentLength ?? release.AssetSize;
-                await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
-                await using var fileStream = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true);
-                byte[] buffer = new byte[65536];
-                long downloaded = 0;
-                long lastReportTick = Environment.TickCount64;
-                int read;
-                while ((read = await netStream.ReadAsync(buffer, ct)) > 0)
+                TryDeleteDirectory(workDir);
+                Publish(MakeState(UpdaterPhase.Error, release, 0, "SHA256SUMS.txt 获取或解析失败，已取消更新。"));
+                return false;
+            }
+
+            var candidates = BuildCandidateUrls(release.DownloadUrl, mirror);
+            bool verifiedOk = false;
+            string? lastFailure = null;
+
+            for (int idx = 0; idx < candidates.Count; idx++)
+            {
+                string dlUrl = candidates[idx];
+                bool viaMirror = idx == 0 && candidates.Count > 1;
+                try
                 {
-                    await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
-                    downloaded += read;
-                    long now = Environment.TickCount64;
-                    if (now - lastReportTick >= 120 || (total > 0 && downloaded >= total))
+                    if (File.Exists(zipPath)) File.Delete(zipPath);
+                    using (var resp = await Http.GetAsync(dlUrl, HttpCompletionOption.ResponseHeadersRead, ct))
                     {
-                        lastReportTick = now;
-                        double pct = total > 0 ? Math.Clamp((double)downloaded / total, 0, 1) : 0;
-                        string mb = $"{downloaded / (1024.0 * 1024.0):F1}";
-                        string totalMb = total > 0 ? $" / {total / (1024.0 * 1024.0):F1} MB" : " MB";
-                        Publish(new UpdaterState(
-                            UpdaterPhase.Downloading,
-                            CurrentVersion,
-                            release,
-                            pct,
-                            $"正在下载 v{release.Version}… {pct * 100:0}%（{mb}{totalMb}）"));
+                        resp.EnsureSuccessStatusCode();
+                        long total = resp.Content.Headers.ContentLength ?? release.AssetSize;
+                        await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
+                        await using var fileStream = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true);
+                        byte[] buffer = new byte[65536];
+                        long downloaded = 0;
+                        long lastReportTick = Environment.TickCount64;
+                        int read;
+                        while ((read = await netStream.ReadAsync(buffer, ct)) > 0)
+                        {
+                            await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                            downloaded += read;
+                            long now = Environment.TickCount64;
+                            if (now - lastReportTick >= 120 || (total > 0 && downloaded >= total))
+                            {
+                                lastReportTick = now;
+                                double pct = total > 0 ? Math.Clamp((double)downloaded / total, 0, 1) : 0;
+                                string mb = $"{downloaded / (1024.0 * 1024.0):F1}";
+                                string totalMb = total > 0 ? $" / {total / (1024.0 * 1024.0):F1} MB" : " MB";
+                                string route = viaMirror ? "镜像" : "直连";
+                                Publish(MakeState(
+                                    UpdaterPhase.Downloading,
+                                    release,
+                                    pct,
+                                    $"正在下载 v{release.Version}（{route}）… {pct * 100:0}%（{mb}{totalMb}）"));
+                            }
+                        }
+                    }
+
+                    Publish(MakeState(UpdaterPhase.Verifying, release, 1.0, "正在校验 SHA-256 完整性…"));
+                    string actualSha256 = await ComputeFileSha256Async(zipPath, ct);
+                    if (string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        verifiedOk = true;
+                        break;
+                    }
+                    lastFailure = "安装包 SHA-256 校验不匹配";
+                    if (viaMirror)
+                    {
+                        Publish(MakeState(UpdaterPhase.Downloading, release, 0, "镜像校验异常，正在自动回退 GitHub 官方直连…"));
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastFailure = ex.Message;
+                    if (viaMirror)
+                    {
+                        Publish(MakeState(UpdaterPhase.Downloading, release, 0, "镜像线路不可用，正在自动回退 GitHub 官方直连…"));
                     }
                 }
             }
 
-            Publish(new UpdaterState(UpdaterPhase.Verifying, CurrentVersion, release, 1.0, "正在校验 SHA-256 完整性…"));
-            string actualSha256 = await ComputeFileSha256Async(zipPath, ct);
-            if (!string.IsNullOrWhiteSpace(expectedSha256)
-                && !string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
+            if (!verifiedOk)
             {
                 TryDeleteDirectory(workDir);
-                Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, release, 0, "安装包 SHA-256 校验失败，已取消更新。"));
+                Publish(MakeState(UpdaterPhase.Error, release, 0, $"更新包下载或校验失败：{lastFailure ?? "网络异常"}"));
                 return false;
             }
 
-            Publish(new UpdaterState(UpdaterPhase.Applying, CurrentVersion, release, 1.0, "正在解压并准备重启更新…"));
+            Publish(MakeState(UpdaterPhase.Applying, release, 1.0, "正在解压并准备重启更新…"));
             await Task.Run(() => ExtractZipSafely(zipPath, stagingDir), ct);
 
             string payloadDir = ResolvePayloadDir(stagingDir);
@@ -341,7 +612,7 @@ internal sealed class AppUpdater
                 || !File.Exists(Path.Combine(payloadDir, "crossflow.exe")))
             {
                 TryDeleteDirectory(workDir);
-                Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, release, 0, "更新包结构不完整，已取消更新。"));
+                Publish(MakeState(UpdaterPhase.Error, release, 0, "更新包结构不完整，已取消更新。"));
                 return false;
             }
 
@@ -385,49 +656,139 @@ internal sealed class AppUpdater
         catch (OperationCanceledException)
         {
             TryDeleteDirectory(workDir);
-            Publish(new UpdaterState(UpdaterPhase.Available, CurrentVersion, release, 0, $"已取消下载，可随时更新至 v{release.Version}"));
+            Publish(MakeState(UpdaterPhase.Available, release, 0, $"已取消下载，可随时更新至 v{release.Version}"));
             return false;
         }
         catch (Exception ex)
         {
             TryDeleteDirectory(workDir);
-            Publish(new UpdaterState(UpdaterPhase.Error, CurrentVersion, release, 0, $"更新失败：{ex.Message}"));
+            Publish(MakeState(UpdaterPhase.Error, release, 0, $"更新失败：{ex.Message}"));
             return false;
         }
     }
 
-    private static async Task<string?> FetchLatestTagFromWebAsync(CancellationToken ct)
+    private sealed record AtomEntry(string TagName, string Notes, string HtmlUrl);
+
+    private static async Task<AtomEntry?> FetchLatestFromAtomAsync(bool includePrerelease, string mirrorPrefix, CancellationToken ct)
     {
+        string? xml = await TryGetStringWithMirrorAsync(ReleasesAtomUrl, mirrorPrefix, ct);
+        if (string.IsNullOrWhiteSpace(xml)) return null;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, LatestReleaseWebUrl);
-            req.Headers.Accept.ParseAdd("application/json");
-            using var resp = await Http.SendAsync(req, ct);
-            if (!resp.IsSuccessStatusCode) return null;
-
-            string? finalPath = resp.RequestMessage?.RequestUri?.AbsolutePath;
-            if (!string.IsNullOrWhiteSpace(finalPath))
+            var doc = XDocument.Parse(xml);
+            XNamespace ns = doc.Root?.GetDefaultNamespace() ?? XNamespace.None;
+            AtomEntry? best = null;
+            foreach (var entry in doc.Descendants(ns + "entry"))
             {
-                const string marker = "/releases/tag/";
-                int idx = finalPath.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0)
+                string linkHref = entry.Elements(ns + "link")
+                    .Select(l => (string?)l.Attribute("href") ?? "")
+                    .FirstOrDefault(h => h.Contains("/releases/tag/", StringComparison.OrdinalIgnoreCase)) ?? "";
+
+                string tag = "";
+                var m = TagInUrlRegex.Match(linkHref);
+                if (m.Success)
                 {
-                    string fromUrl = Uri.UnescapeDataString(finalPath[(idx + marker.Length)..]).Trim('/');
-                    if (!string.IsNullOrWhiteSpace(fromUrl))
-                        return fromUrl;
+                    tag = Uri.UnescapeDataString(m.Groups["tag"].Value);
+                }
+                else
+                {
+                    string idVal = (string?)entry.Element(ns + "id") ?? "";
+                    int slash = idVal.LastIndexOf('/');
+                    if (slash >= 0 && slash + 1 < idVal.Length)
+                        tag = idVal[(slash + 1)..];
+                }
+
+                if (string.IsNullOrWhiteSpace(tag) || !tag.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (IsPrereleaseTag(tag) && !includePrerelease)
+                    continue;
+
+                string rawHtml = (string?)entry.Element(ns + "content") ?? "";
+                string notes = StripHtmlToPlainText(rawHtml);
+                string htmlUrl = IsAllowedHttpsUrl(linkHref)
+                    ? linkHref
+                    : $"{RepoBaseUrl}/releases/tag/{Uri.EscapeDataString(tag)}";
+
+                if (best is null || CompareVersions(tag, best.TagName) > 0)
+                    best = new AtomEntry(tag.Trim(), notes, htmlUrl);
+            }
+            return best;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task<string?> TryGetStringWithMirrorAsync(string officialUrl, string mirrorPrefix, CancellationToken ct)
+    {
+        foreach (string url in BuildCandidateUrls(officialUrl, mirrorPrefix))
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                using var resp = await Http.SendAsync(req, ct);
+                if (resp.IsSuccessStatusCode)
+                    return await resp.Content.ReadAsStringAsync(ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { }
+        }
+        return null;
+    }
+
+    private static async Task<string?> FetchLatestTagFromWebAsync(string mirrorPrefix, CancellationToken ct)
+    {
+        foreach (string url in BuildCandidateUrls(LatestReleaseWebUrl, mirrorPrefix))
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.Accept.ParseAdd("application/json");
+                using var resp = await Http.SendAsync(req, ct);
+                if (!resp.IsSuccessStatusCode) continue;
+
+                string? finalPath = resp.RequestMessage?.RequestUri?.AbsolutePath;
+                if (!string.IsNullOrWhiteSpace(finalPath))
+                {
+                    var m = TagInUrlRegex.Match(finalPath);
+                    if (m.Success)
+                    {
+                        string fromUrl = Uri.UnescapeDataString(m.Groups["tag"].Value).Trim('/');
+                        if (!string.IsNullOrWhiteSpace(fromUrl))
+                            return fromUrl;
+                    }
+                }
+
+                await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+                using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+                if (doc.RootElement.TryGetProperty("tag_name", out var tagEl) && tagEl.ValueKind == JsonValueKind.String)
+                {
+                    string? tag = tagEl.GetString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(tag)) return tag;
                 }
             }
-
-            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
-            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
-            if (doc.RootElement.TryGetProperty("tag_name", out var tagEl) && tagEl.ValueKind == JsonValueKind.String)
-            {
-                string? tag = tagEl.GetString()?.Trim();
-                if (!string.IsNullOrWhiteSpace(tag)) return tag;
-            }
+            catch (OperationCanceledException) { throw; }
+            catch { }
         }
-        catch { }
         return null;
+    }
+
+    private static string StripHtmlToPlainText(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html)) return "";
+        string s = HtmlBreakRegex.Replace(html, "\n");
+        s = HtmlTagRegex.Replace(s, "");
+        s = WebUtility.HtmlDecode(s);
+        var lines = s.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0);
+        return string.Join("\n", lines);
+    }
+
+    private static string TrimNotes(string notes)
+    {
+        string clean = (notes ?? "").Trim();
+        return clean.Length > 1600 ? clean[..1600] + "\n…" : clean;
     }
 
     private static string? FindAssetNameInChecksums(string text, string suffix)
@@ -447,16 +808,20 @@ internal sealed class AppUpdater
         return null;
     }
 
-    private static async Task<long> ProbeContentLengthAsync(string url, CancellationToken ct)
+    private static async Task<long> ProbeContentLengthAsync(string officialUrl, string mirrorPrefix, CancellationToken ct)
     {
-        try
+        foreach (string url in BuildCandidateUrls(officialUrl, mirrorPrefix))
         {
-            using var req = new HttpRequestMessage(HttpMethod.Head, url);
-            using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (resp.IsSuccessStatusCode && resp.Content.Headers.ContentLength is long len && len > 0)
-                return len;
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Head, url);
+                using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                if (resp.IsSuccessStatusCode && resp.Content.Headers.ContentLength is long len && len > 0)
+                    return len;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { }
         }
-        catch { }
         return 0;
     }
 
@@ -526,7 +891,7 @@ if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {{
     Start-Sleep -Milliseconds 300
 }}
 Get-Process -Name 'crossflow' -ErrorAction SilentlyContinue | Where-Object {{
-    try {{ $_.Path -and $_.Path.StartsWith($install, [StringComparison]::OrdinalIgnoreCase) }} catch {{ $false }}
+    try {{ $_.Path -and $_.Path.StartsWith($install, [StringComparison.OrdinalIgnoreCase]) }} catch {{ $false }}
 }} | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 
@@ -585,6 +950,7 @@ Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
         [JsonPropertyName("tag_name")] public string? TagName { get; set; }
         [JsonPropertyName("html_url")] public string? HtmlUrl { get; set; }
         [JsonPropertyName("body")] public string? Body { get; set; }
+        [JsonPropertyName("draft")] public bool Draft { get; set; }
         [JsonPropertyName("assets")] public List<GitHubAssetDto>? Assets { get; set; }
     }
 

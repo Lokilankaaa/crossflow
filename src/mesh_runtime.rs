@@ -43,6 +43,8 @@ pub enum MeshControl {
         layout_revision: u64,
         #[serde(default)]
         layout_screens: Vec<SharedScreen>,
+        #[serde(default)]
+        aux_port: Option<u16>,
     },
     LayoutSync {
         revision: u64,
@@ -72,6 +74,7 @@ pub struct HandshakedMeshPeer {
     pub displays: Vec<Display>,
     pub layout_revision: u64,
     pub layout_screens: Vec<SharedScreen>,
+    pub aux_port: Option<u16>,
 }
 
 /// Returns true ONLY for real Noise AEAD decryption / passphrase mismatch errors,
@@ -170,6 +173,7 @@ pub fn establish_mesh_peer(
     passphrase: Option<&str>,
     layout_revision: u64,
     layout_screens: Vec<SharedScreen>,
+    local_aux_port: Option<u16>,
 ) -> Result<HandshakedMeshPeer> {
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
@@ -189,6 +193,7 @@ pub fn establish_mesh_peer(
         displays: local_displays,
         layout_revision,
         layout_screens,
+        aux_port: local_aux_port,
     })?;
 
     let peer_plain = if initiator {
@@ -206,6 +211,7 @@ pub fn establish_mesh_peer(
         displays,
         layout_revision: peer_rev,
         layout_screens: peer_screens,
+        aux_port: peer_aux_port,
     }) = decode_packet(&peer_plain)?
     else {
         bail!("expected MeshControl::Hello after handshake");
@@ -228,6 +234,7 @@ pub fn establish_mesh_peer(
         displays,
         layout_revision: peer_rev,
         layout_screens: peer_screens,
+        aux_port: peer_aux_port,
     })
 }
 
@@ -853,6 +860,7 @@ mod tests {
                     pass,
                     1,
                     vec![],
+                    Some(24801),
                 )
                 .unwrap();
                 peers.push(p);
@@ -871,6 +879,7 @@ mod tests {
             pass,
             1,
             vec![],
+            Some(24801),
         )
         .unwrap();
 
@@ -885,13 +894,16 @@ mod tests {
             pass,
             1,
             vec![],
+            Some(24801),
         )
         .unwrap();
 
         let mut a_peers = server.join().unwrap();
         assert_eq!(a_peers.len(), 2);
         assert_eq!(peer_b.remote_device_id, id_a);
+        assert_eq!(peer_b.aux_port, Some(24801));
         assert_eq!(peer_c.remote_device_id, id_a);
+        assert_eq!(a_peers[0].aux_port, Some(24801));
 
         // Node B pushes a LayoutSync revision=5 to Node A; Node A gossips to Node C!
         let updated_screens = vec![
@@ -982,7 +994,7 @@ mod tests {
         let a_disp2 = disp_a.clone();
         let srv2 = thread::spawn(move || {
             let (s, a) = listener_bad.accept().unwrap();
-            establish_mesh_peer(s, a, false, &a_id2, "Node-A", a_disp2, Some("right-pass"), 1, vec![])
+            establish_mesh_peer(s, a, false, &a_id2, "Node-A", a_disp2, Some("right-pass"), 1, vec![], None)
         });
         let s_bad = TcpStream::connect(addr_bad).unwrap();
         let err_client = establish_mesh_peer(
@@ -995,6 +1007,7 @@ mod tests {
             Some("wrong-pass"),
             1,
             vec![],
+            None,
         )
         .err();
         let err_server = srv2.join().unwrap().err();
