@@ -143,6 +143,38 @@ internal sealed class MainWindow : Window
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct OPENFILENAMEW
+    {
+        public int lStructSize;
+        public IntPtr hwndOwner;
+        public IntPtr hInstance;
+        public string? lpstrFilter;
+        public string? lpstrCustomFilter;
+        public int nMaxCustFilter;
+        public int nFilterIndex;
+        public IntPtr lpstrFile;
+        public int nMaxFile;
+        public IntPtr lpstrFileTitle;
+        public int nMaxFileTitle;
+        public string? lpstrInitialDir;
+        public string? lpstrTitle;
+        public uint Flags;
+        public short nFileOffset;
+        public short nFileExtension;
+        public string? lpstrDefExt;
+        public IntPtr lCustData;
+        public IntPtr lpfnHook;
+        public string? lpTemplateName;
+        public IntPtr pvReserved;
+        public int dwReserved;
+        public int FlagsEx;
+    }
+
+    [DllImport("comdlg32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetOpenFileNameW(ref OPENFILENAMEW lpofn);
+
     private readonly StackPanel screenListPanel = new() { Spacing = 6 };
 
     private readonly InfoBar notice = new() { IsOpen = false, IsClosable = true };
@@ -152,6 +184,7 @@ internal sealed class MainWindow : Window
     private readonly ProgressBar transferProgress = new() { Minimum = 0, Maximum = 100, Height = 4 };
     private readonly Button transferActionButton = new();
     private string? transferSavedDir;
+    private string? lastNotifiedTransferKey;
     private readonly Canvas canvas = new();
     private readonly TextBlock footerStatus = new();
 
@@ -1670,21 +1703,89 @@ internal sealed class MainWindow : Window
         return null;
     }
 
+    private Task<List<string>> PickFilesNativeAsync(IntPtr ownerHwnd)
+    {
+        var tcs = new TaskCompletionSource<List<string>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            const int maxChars = 65536;
+            const uint OFN_NOCHANGEDIR = 0x00000008;
+            const uint OFN_ALLOWMULTISELECT = 0x00000200;
+            const uint OFN_PATHMUSTEXIST = 0x00000800;
+            const uint OFN_FILEMUSTEXIST = 0x00001000;
+            const uint OFN_EXPLORER = 0x00080000;
+            IntPtr buffer = Marshal.AllocHGlobal(maxChars * 2);
+            try
+            {
+                // Zero-initialize first 2 bytes (empty initial filename)
+                Marshal.WriteInt16(buffer, 0);
+                var ofn = new OPENFILENAMEW
+                {
+                    lStructSize = Marshal.SizeOf<OPENFILENAMEW>(),
+                    hwndOwner = ownerHwnd,
+                    lpstrFilter = "所有文件 (*.*)\0*.*\0\0",
+                    nFilterIndex = 1,
+                    lpstrFile = buffer,
+                    nMaxFile = maxChars,
+                    lpstrTitle = "选择要发送到对端的文件",
+                    Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+                };
+                var result = new List<string>();
+                if (GetOpenFileNameW(ref ofn))
+                {
+                    var parts = new List<string>();
+                    int offset = 0;
+                    while (offset < maxChars)
+                    {
+                        string s = Marshal.PtrToStringUni(buffer + offset * 2) ?? "";
+                        if (s.Length == 0) break;
+                        parts.Add(s);
+                        offset += s.Length + 1;
+                    }
+                    if (parts.Count == 1)
+                    {
+                        result.Add(parts[0]);
+                    }
+                    else if (parts.Count > 1)
+                    {
+                        string dir = parts[0];
+                        for (int i = 1; i < parts.Count; i++)
+                            result.Add(System.IO.Path.Combine(dir, parts[i]));
+                    }
+                }
+                tcs.TrySetResult(result);
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return tcs.Task;
+    }
+
     private async Task PickAndSendFilesAsync(string? targetDeviceId = null)
     {
         if (currentSnap.Peers.All(p => !p.Connected) && currentSnap.PeerDeviceId is null) return;
         try
         {
-            var picker = new FileOpenPicker();
-            picker.FileTypeFilter.Add("*");
-            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
-            var files = await picker.PickMultipleFilesAsync();
-            if (files is null || files.Count == 0) return;
-            var paths = files.Select(f => f.Path).Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
+            // Native Win32 GetOpenFileNameW works reliably whether MainWindow is hidden in
+            // the tray, visible, or running elevated (unlike WinRT FileOpenPicker).
+            IntPtr owner = AppWindow.IsVisible ? WindowNative.GetWindowHandle(this) : IntPtr.Zero;
+            var paths = await PickFilesNativeAsync(owner);
             if (paths.Count > 0)
                 await peerMesh.SendFilesAsync(paths, targetDeviceId);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            ShowNotice($"打开文件选择器失败：{ex.Message}", isError: true);
+        }
     }
 
     private static void OpenReceiveFolder()
@@ -1886,6 +1987,14 @@ internal sealed class MainWindow : Window
             "searching" => "Crossflow · 正在发现设备",
             _ => "Crossflow"
         };
+        if (snap.Transfer is { State: "active" } activeXfer)
+        {
+            double pct = activeXfer.BytesTotal > 0
+                ? Math.Min(100.0, activeXfer.BytesDone * 100.0 / activeXfer.BytesTotal)
+                : 0.0;
+            string dir = activeXfer.Direction == "sending" ? "正在发送" : "正在接收";
+            trayTip = $"Crossflow · {dir} {activeXfer.Name} ({pct:0}%)";
+        }
         string primaryMenuStatus = snap.State switch
         {
             "sharing" => $"已连接：{peerTag}{channelSuffix}",
@@ -1895,6 +2004,16 @@ internal sealed class MainWindow : Window
         string? focusMenuLine = snap.State == "sharing" && snap.FocusDeviceId is not null
             ? $"当前焦点：{(isRemoteFocus ? peerTag : "这台电脑")}{(snap.ScreenLocked ? "（已锁定）" : "")}"
             : null;
+        if (snap.Transfer is { State: "active" } activeMenuXfer)
+        {
+            double pct = activeMenuXfer.BytesTotal > 0
+                ? Math.Min(100.0, activeMenuXfer.BytesDone * 100.0 / activeMenuXfer.BytesTotal)
+                : 0.0;
+            string dir = activeMenuXfer.Direction == "sending" ? "正在发送" : "正在接收";
+            focusMenuLine = $"{dir}：{activeMenuXfer.Name} ({pct:0}%)";
+        }
+
+        NotifyTransferCompletionIfNeeded(snap.Transfer);
 
         var activePeers = snap.Peers.Where(p => p.Connected).ToList();
         if (activePeers.Count == 0 && snap.PeerDeviceId is not null && snap.State is "sharing" or "paused")
@@ -1925,6 +2044,42 @@ internal sealed class MainWindow : Window
             inputStateSync: snap.InputStateSync,
             channelId: snap.SelectedChannel,
             availableChannels: snap.NetworkChannels);
+    }
+
+    private void NotifyTransferCompletionIfNeeded(TransferStatusInfo? xfer)
+    {
+        if (xfer is null || xfer.State == "active")
+        {
+            if (xfer is null) lastNotifiedTransferKey = null;
+            return;
+        }
+        string key = $"{xfer.Direction}|{xfer.State}|{xfer.Name}|{xfer.FilesTotal}|{xfer.BytesTotal}|{xfer.Error}";
+        if (key == lastNotifiedTransferKey) return;
+        lastNotifiedTransferKey = key;
+
+        if (xfer.State == "completed")
+        {
+            if (xfer.Direction == "receiving")
+            {
+                string saveHint = string.IsNullOrWhiteSpace(xfer.SavedDir) ? "" : $"\n已保存至 {xfer.SavedDir}";
+                trayIcon?.ShowNotification(
+                    "Crossflow · 文件已接收",
+                    $"{xfer.Name} 已就绪，可直接按 Ctrl+V 粘贴到任意文件夹或聊天框{saveHint}");
+            }
+            else if (!AppWindow.IsVisible)
+            {
+                trayIcon?.ShowNotification(
+                    "Crossflow · 文件已发送",
+                    $"{xfer.Name}（{FormatBytes(xfer.BytesTotal)}）已发送到对端设备");
+            }
+        }
+        else if (xfer.State == "failed")
+        {
+            trayIcon?.ShowNotification(
+                "Crossflow · 文件传输失败",
+                $"{xfer.Name}：{xfer.Error ?? "请检查网络连接后重试"}",
+                isError: true);
+        }
     }
 
     private void OnPeerMeshUpdate(PeerMeshSnapshot snap)

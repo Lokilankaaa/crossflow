@@ -12,7 +12,7 @@ use super::{CaptureEvent, CaptureStatus, STOP, TOGGLE, scan_to_hid, win_error};
 use crate::input::Button;
 use serde::Serialize;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     mem::size_of,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -21,7 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -336,9 +336,14 @@ struct HookState {
     wake_posted: bool,
     failed: bool,
     requested_stop: bool,
+    raw_moves_since_mouse_hook: u32,
+    raw_move_burst_start: Option<Instant>,
 }
 pub(super) const WM_ROUTED_INPUT: u32 = WM_APP + 0x41;
 const EVENT_CAPACITY: usize = 256;
+const STALE_HOOK_MIN_RAW_MOVES: u32 = 24;
+const STALE_HOOK_BURST_AGE: Duration = Duration::from_millis(1500);
+const HOOK_REINSTALL_COOLDOWN: Duration = Duration::from_secs(5);
 
 pub(super) fn abort_input() {
     HOOK_STATE.with(|slot| {
@@ -411,6 +416,11 @@ thread_local! { static HOOK_STATE: RefCell<Option<HookState>> = const { RefCell:
 pub(super) fn enqueue_raw_move(dx: i32, dy: i32, captured_at: Instant) {
     HOOK_STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
+            state.raw_moves_since_mouse_hook =
+                state.raw_moves_since_mouse_hook.saturating_add(1);
+            if state.raw_move_burst_start.is_none() {
+                state.raw_move_burst_start = Some(captured_at);
+            }
             state.enqueue(CaptureEvent::Delta {
                 dx,
                 dy,
@@ -418,6 +428,24 @@ pub(super) fn enqueue_raw_move(dx: i32, dy: i32, captured_at: Instant) {
             });
         }
     });
+}
+
+fn mark_mouse_hook_alive() {
+    HOOK_STATE.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut()
+            && let Some(state) = guard.as_mut()
+        {
+            state.raw_moves_since_mouse_hook = 0;
+            state.raw_move_burst_start = None;
+        }
+    });
+}
+
+fn mouse_hook_looks_unhooked(state: &HookState, now: Instant) -> bool {
+    state.raw_moves_since_mouse_hook >= STALE_HOOK_MIN_RAW_MOVES
+        && state
+            .raw_move_burst_start
+            .is_some_and(|start| now.saturating_duration_since(start) >= STALE_HOOK_BURST_AGE)
 }
 
 pub(super) fn drain_events() -> Result<Vec<CaptureEvent>, String> {
@@ -665,6 +693,7 @@ fn mouse_button(message: u32, data: u32) -> Option<(usize, bool)> {
 
 unsafe extern "system" fn mouse(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && lparam != 0 {
+        mark_mouse_hook_alive();
         let input = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
         let msg = wparam as u32;
         let is_aux_mouse = matches!(
@@ -773,6 +802,7 @@ pub(super) struct RoutedHooks {
     focus: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     notified_window: HWND,
+    last_reinstall: Cell<Option<Instant>>,
 }
 impl RoutedHooks {
     pub(super) fn install(
@@ -796,6 +826,8 @@ impl RoutedHooks {
                 wake_posted: false,
                 failed: false,
                 requested_stop: false,
+                raw_moves_since_mouse_hook: 0,
+                raw_move_burst_start: None,
             });
             Ok(())
         })?;
@@ -805,6 +837,7 @@ impl RoutedHooks {
             focus,
             stop,
             notified_window: null_mut(),
+            last_reinstall: Cell::new(None),
         };
         let instance = unsafe { GetModuleHandleW(null()) };
         if instance.is_null() {
@@ -828,6 +861,61 @@ impl RoutedHooks {
         if status != CaptureStatus::Active || self.stop.load(Ordering::Acquire) {
             self.focus.store(false, Ordering::Release);
         }
+    }
+    /// Self-healing watchdog for Windows `LowLevelHooksTimeout` or game anti-cheat
+    /// drivers (e.g. WeGame / ACE / TenProtect) that silently unhook `WH_MOUSE_LL`
+    /// or `WH_KEYBOARD_LL` without returning an error. Because Raw Input (`WM_INPUT`)
+    /// is never unhooked, sustained physical mouse moves with zero `WH_MOUSE_LL`
+    /// callbacks deterministically indicate hook removal; re-installing both hooks
+    /// in-place restores full control within ~0.1 ms without dropping connections.
+    pub(super) fn heal_if_stale(&mut self, now: Instant) -> bool {
+        if self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        if self
+            .last_reinstall
+            .get()
+            .is_some_and(|t| now.saturating_duration_since(t) < HOOK_REINSTALL_COOLDOWN)
+        {
+            return false;
+        }
+        let stale = HOOK_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|state| mouse_hook_looks_unhooked(state, now))
+        });
+        if !stale {
+            return false;
+        }
+        self.last_reinstall.set(Some(now));
+        HOOK_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.raw_moves_since_mouse_hook = 0;
+                state.raw_move_burst_start = None;
+                if !state.focus.load(Ordering::Acquire) {
+                    state.policy = Policy::new(|vk| unsafe { GetAsyncKeyState(vk as i32) < 0 });
+                }
+            }
+        });
+        let instance = unsafe { GetModuleHandleW(null()) };
+        if instance.is_null() {
+            return false;
+        }
+        let new_mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), instance, 0) };
+        if !new_mouse.is_null() {
+            if !self.mouse.is_null() {
+                unsafe { UnhookWindowsHookEx(self.mouse) };
+            }
+            self.mouse = new_mouse;
+        }
+        let new_keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), instance, 0) };
+        if !new_keyboard.is_null() {
+            if !self.keyboard.is_null() {
+                unsafe { UnhookWindowsHookEx(self.keyboard) };
+            }
+            self.keyboard = new_keyboard;
+        }
+        !new_mouse.is_null() || !new_keyboard.is_null()
     }
     pub(super) fn snapshot(&self) -> (Vec<Button>, Vec<u16>) {
         let held: [bool; 256] =
@@ -1008,6 +1096,8 @@ mod tests {
             wake_posted: true,
             failed: false,
             requested_stop: false,
+            raw_moves_since_mouse_hook: 0,
+            raw_move_burst_start: None,
         };
         for _ in 0..EVENT_CAPACITY {
             state.enqueue(CaptureEvent::Key {
@@ -1040,6 +1130,7 @@ mod tests {
             focus: focus.clone(),
             stop: stop.clone(),
             notified_window: null_mut(),
+            last_reinstall: Cell::new(None),
         };
         for status in [
             CaptureStatus::Ready,
@@ -1073,6 +1164,8 @@ mod tests {
             wake_posted: true,
             failed: false,
             requested_stop: false,
+            raw_moves_since_mouse_hook: 0,
+            raw_move_burst_start: None,
         };
         let t1 = Instant::now();
         state.enqueue(CaptureEvent::Delta {
@@ -1110,5 +1203,31 @@ mod tests {
             captured_at: Instant::now(),
         });
         assert_eq!(state.events.len(), 4);
+    }
+    #[test]
+    fn stale_mouse_hook_detection_requires_sustained_raw_moves_and_clears_on_callback() {
+        let focus = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let mut state = HookState {
+            policy: Policy::new(|_| false),
+            hwnd: null_mut(),
+            focus,
+            stop,
+            events: VecDeque::with_capacity(EVENT_CAPACITY),
+            wake_posted: true,
+            failed: false,
+            requested_stop: false,
+            raw_moves_since_mouse_hook: STALE_HOOK_MIN_RAW_MOVES - 1,
+            raw_move_burst_start: Some(start),
+        };
+        assert!(!mouse_hook_looks_unhooked(&state, start + Duration::from_secs(2)));
+        state.raw_moves_since_mouse_hook = STALE_HOOK_MIN_RAW_MOVES;
+        assert!(!mouse_hook_looks_unhooked(&state, start + Duration::from_millis(500)));
+        assert!(mouse_hook_looks_unhooked(&state, start + STALE_HOOK_BURST_AGE));
+        // Clearing on any WH_MOUSE_LL callback resets detection immediately
+        state.raw_moves_since_mouse_hook = 0;
+        state.raw_move_burst_start = None;
+        assert!(!mouse_hook_looks_unhooked(&state, start + Duration::from_secs(10)));
     }
 }
