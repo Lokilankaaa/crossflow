@@ -122,6 +122,25 @@ pub fn configure_realtime_thread(high: bool) {
     let _ = high;
 }
 
+/// Immediately locks the local workstation / user session screen.
+/// - Windows: calls Win32 `LockWorkStation()` in the active user session.
+/// - macOS: invokes `SACLockScreenImmediate()` from `login.framework` (dynamically
+///   resolved via `dlopen`/`dlsym`, with `pmset displaysleepnow` fallback).
+pub fn lock_workstation() -> bool {
+    #[cfg(windows)]
+    {
+        windows_impl::lock_workstation()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_impl::lock_workstation()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use std::ffi::{c_char, c_void};
@@ -222,6 +241,36 @@ mod macos_impl {
             CFRelease(reason);
         }
     }
+
+    pub fn lock_workstation() -> bool {
+        const RTLD_LAZY: i32 = 1;
+        unsafe extern "C" {
+            fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> i32;
+        }
+        unsafe {
+            let handle = dlopen(
+                c"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login"
+                    .as_ptr(),
+                RTLD_LAZY,
+            );
+            if !handle.is_null() {
+                let sym = dlsym(handle, c"SACLockScreenImmediate".as_ptr());
+                if !sym.is_null() {
+                    let lock_fn: extern "C" fn() = std::mem::transmute(sym);
+                    lock_fn();
+                    let _ = dlclose(handle);
+                    return true;
+                }
+                let _ = dlclose(handle);
+            }
+        }
+        std::process::Command::new("/usr/bin/pmset")
+            .arg("displaysleepnow")
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 }
 
 #[cfg(windows)]
@@ -275,6 +324,15 @@ mod windows_impl {
             thread_information: *const c_void,
             thread_information_size: u32,
         ) -> i32;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn LockWorkStation() -> i32;
+    }
+
+    pub fn lock_workstation() -> bool {
+        unsafe { LockWorkStation() != 0 }
     }
 
     pub fn set_system_required(enable: bool) {

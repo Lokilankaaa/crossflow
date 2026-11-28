@@ -65,6 +65,7 @@ impl HotkeyPrefix {
 pub enum HotkeyAction {
     ToggleSharing,
     ToggleLockScreen,
+    LockFocusedDevice,
     QuickJumpNext,
     QuickJumpPrevScreen,
     QuickJumpNextScreen,
@@ -83,6 +84,8 @@ pub struct HotkeyConfig {
     pub toggle_sharing: Option<String>,
     #[serde(default = "default_lock_screen")]
     pub lock_screen: Option<String>,
+    #[serde(default = "default_lock_device")]
+    pub lock_device: Option<String>,
     #[serde(default = "default_quick_jump_next")]
     pub quick_jump_next: Option<String>,
     #[serde(default)]
@@ -107,6 +110,9 @@ fn default_toggle_sharing() -> Option<String> {
 fn default_lock_screen() -> Option<String> {
     Some("Ctrl+Alt+L".into())
 }
+fn default_lock_device() -> Option<String> {
+    Some("Ctrl+Alt+Shift+L".into())
+}
 fn default_quick_jump_next() -> Option<String> {
     Some("Ctrl+Alt+Tab".into())
 }
@@ -125,6 +131,7 @@ impl Default for HotkeyConfig {
         Self {
             toggle_sharing: default_toggle_sharing(),
             lock_screen: default_lock_screen(),
+            lock_device: default_lock_device(),
             quick_jump_next: default_quick_jump_next(),
             quick_jump_prev_screen: None,
             quick_jump_next_screen: None,
@@ -152,6 +159,7 @@ impl HotkeyConfig {
         Self {
             toggle_sharing: norm(&self.toggle_sharing),
             lock_screen: norm(&self.lock_screen),
+            lock_device: norm(&self.lock_device),
             quick_jump_next: norm(&self.quick_jump_next),
             quick_jump_prev_screen: norm(&self.quick_jump_prev_screen),
             quick_jump_next_screen: norm(&self.quick_jump_next_screen),
@@ -171,10 +179,11 @@ impl HotkeyConfig {
 
     pub fn compiled(&self) -> Vec<(HotkeyBinding, HotkeyAction)> {
         let mut out = Vec::new();
-        let pairs: [(&Option<String>, HotkeyAction); 9] = [
+        let pairs: [(&Option<String>, HotkeyAction); 10] = [
             (&self.emergency_stop, HotkeyAction::EmergencyStop),
             (&self.toggle_sharing, HotkeyAction::ToggleSharing),
             (&self.lock_screen, HotkeyAction::ToggleLockScreen),
+            (&self.lock_device, HotkeyAction::LockFocusedDevice),
             (&self.quick_jump_prev_screen, HotkeyAction::QuickJumpPrevScreen),
             (&self.quick_jump_next_screen, HotkeyAction::QuickJumpNextScreen),
             (&self.quick_jump_next, HotkeyAction::QuickJumpNext),
@@ -773,6 +782,7 @@ mod tests {
         let json = r#"{
             "toggle_sharing": null,
             "lock_screen": null,
+            "lock_device": null,
             "quick_jump_next": "Ctrl+Alt+Tab",
             "quick_jump_prev_screen": "Alt+Mouse4",
             "quick_jump_next_screen": "Q+Mouse5",
@@ -786,12 +796,17 @@ mod tests {
         let norm = cfg.normalized();
         assert_eq!(norm.toggle_sharing, None);
         assert_eq!(norm.lock_screen, None);
+        assert_eq!(norm.lock_device, None);
         assert_eq!(norm.quick_jump_next.as_deref(), Some("Ctrl+Alt+Tab"));
         assert_eq!(norm.quick_jump_prev_screen.as_deref(), Some("Alt+Mouse4"));
         assert_eq!(norm.quick_jump_next_screen.as_deref(), Some("Q+Mouse5"));
         assert_eq!(norm.quick_jump_screen_prefix, None);
         assert_eq!(norm.emergency_stop, None);
         assert_eq!(norm.compiled().len(), 3);
+        assert_eq!(
+            HotkeyConfig::default().lock_device.as_deref(),
+            Some("Ctrl+Alt+Shift+L")
+        );
     }
 
     #[test]

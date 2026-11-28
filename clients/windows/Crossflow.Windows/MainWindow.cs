@@ -902,6 +902,7 @@ internal sealed class MainWindow : Window
             ("quick_jump_home", "QuickJump 回本机"),
             ("toggle_sharing", "暂停 / 恢复共享"),
             ("lock_screen", "锁定当前屏幕"),
+            ("lock_device", "锁屏（焦点设备）"),
             ("emergency_stop", "紧急停止"),
         };
 
@@ -1178,6 +1179,7 @@ internal sealed class MainWindow : Window
             "quick_jump_next_screen" => h with { QuickJumpNextScreen = newValue },
             "toggle_sharing" => h with { ToggleSharing = newValue },
             "lock_screen" => h with { LockScreen = newValue },
+            "lock_device" => h with { LockDevice = newValue },
             "quick_jump_next" => h with { QuickJumpNext = newValue },
             "quick_jump_home" => h with { QuickJumpHome = newValue },
             "emergency_stop" => h with { EmergencyStop = newValue },
@@ -1406,6 +1408,7 @@ internal sealed class MainWindow : Window
             "quick_jump_next_screen" => h with { QuickJumpNextScreen = null },
             "toggle_sharing" => h with { ToggleSharing = null },
             "lock_screen" => h with { LockScreen = null },
+            "lock_device" => h with { LockDevice = null },
             "quick_jump_next" => h with { QuickJumpNext = null },
             "quick_jump_home" => h with { QuickJumpHome = null },
             "emergency_stop" => h with { EmergencyStop = null },
@@ -1424,6 +1427,7 @@ internal sealed class MainWindow : Window
             "quick_jump_next_screen" => h.QuickJumpNextScreen,
             "toggle_sharing" => h.ToggleSharing,
             "lock_screen" => h.LockScreen,
+            "lock_device" => h.LockDevice,
             "quick_jump_next" => h.QuickJumpNext,
             "quick_jump_home" => h.QuickJumpHome,
             "emergency_stop" => h.EmergencyStop,

@@ -211,6 +211,7 @@ struct NumberedScreenInfo: Sendable, Equatable, Decodable, Identifiable {
 struct HotkeyConfigInfo: Sendable, Equatable, Codable {
     var toggleSharing: String?
     var lockScreen: String?
+    var lockDevice: String?
     var quickJumpNext: String?
     var quickJumpPrevScreen: String?
     var quickJumpNextScreen: String?
@@ -223,6 +224,7 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case toggleSharing = "toggle_sharing"
         case lockScreen = "lock_screen"
+        case lockDevice = "lock_device"
         case quickJumpNext = "quick_jump_next"
         case quickJumpPrevScreen = "quick_jump_prev_screen"
         case quickJumpNextScreen = "quick_jump_next_screen"
@@ -239,6 +241,7 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(toggleSharing, forKey: .toggleSharing)
         try c.encode(lockScreen, forKey: .lockScreen)
+        try c.encode(lockDevice, forKey: .lockDevice)
         try c.encode(quickJumpNext, forKey: .quickJumpNext)
         try c.encode(quickJumpPrevScreen, forKey: .quickJumpPrevScreen)
         try c.encode(quickJumpNextScreen, forKey: .quickJumpNextScreen)
@@ -252,6 +255,7 @@ struct HotkeyConfigInfo: Sendable, Equatable, Codable {
     static let defaults = HotkeyConfigInfo(
         toggleSharing: "Ctrl+Alt+S",
         lockScreen: "Ctrl+Alt+L",
+        lockDevice: "Ctrl+Alt+Shift+L",
         quickJumpNext: "Ctrl+Alt+Tab",
         quickJumpPrevScreen: nil,
         quickJumpNextScreen: nil,

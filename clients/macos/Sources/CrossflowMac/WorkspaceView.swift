@@ -879,6 +879,7 @@ struct WorkspaceView: View {
                 hotkeyRow(field: "quick_jump_home", label: "QuickJump 回本机", value: peer.hotkeys.quickJumpHome)
                 hotkeyRow(field: "toggle_sharing", label: "暂停 / 恢复共享", value: peer.hotkeys.toggleSharing)
                 hotkeyRow(field: "lock_screen", label: "锁定当前屏幕", value: peer.hotkeys.lockScreen)
+                hotkeyRow(field: "lock_device", label: "锁屏（焦点设备）", value: peer.hotkeys.lockDevice)
                 hotkeyRow(field: "emergency_stop", label: "紧急停止", value: peer.hotkeys.emergencyStop)
 
                 HStack {
@@ -996,6 +997,7 @@ struct WorkspaceView: View {
         case "quick_jump_next_screen": updated.quickJumpNextScreen = value
         case "toggle_sharing": updated.toggleSharing = value
         case "lock_screen": updated.lockScreen = value
+        case "lock_device": updated.lockDevice = value
         case "quick_jump_next": updated.quickJumpNext = value
         case "quick_jump_home": updated.quickJumpHome = value
         case "emergency_stop": updated.emergencyStop = value

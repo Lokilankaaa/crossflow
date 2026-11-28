@@ -82,6 +82,7 @@ internal sealed record NumberedScreenInfo(
 internal sealed record HotkeyConfigInfo(
     [property: JsonPropertyName("toggle_sharing")] string? ToggleSharing,
     [property: JsonPropertyName("lock_screen")] string? LockScreen,
+    [property: JsonPropertyName("lock_device")] string? LockDevice,
     [property: JsonPropertyName("quick_jump_next")] string? QuickJumpNext,
     [property: JsonPropertyName("quick_jump_prev_screen")] string? QuickJumpPrevScreen,
     [property: JsonPropertyName("quick_jump_next_screen")] string? QuickJumpNextScreen,
@@ -94,6 +95,7 @@ internal sealed record HotkeyConfigInfo(
     internal static HotkeyConfigInfo Defaults => new(
         "Ctrl+Alt+S",
         "Ctrl+Alt+L",
+        "Ctrl+Alt+Shift+L",
         "Ctrl+Alt+Tab",
         null,
         null,

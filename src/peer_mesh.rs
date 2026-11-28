@@ -1036,6 +1036,49 @@ struct ActiveMeshPeer {
     displays: Vec<Display>,
     conn: MeshPeerConn,
     aux: AuxSession,
+    supports_lock_control: bool,
+}
+
+/// Returns true when the remote sender presses `L` (`HID 0x0F`) while holding ONLY
+/// Left/Right Win (`0xE3`/`0xE7`) with no Ctrl/Alt/Shift modifiers. Windows ignores
+/// injected `SendInput(Win+L)` for security reasons, so the Windows receiver invokes
+/// `LockWorkStation()` directly when this chord arrives from a remote peer.
+fn is_remote_win_lock_chord(
+    held_keys: &std::collections::BTreeSet<u16>,
+    code: u16,
+    down: bool,
+) -> bool {
+    if !down || code != 0x0F {
+        return false;
+    }
+    let has_meta = held_keys.contains(&0xE3) || held_keys.contains(&0xE7);
+    let has_other_mod = held_keys.contains(&0xE0)
+        || held_keys.contains(&0xE4)
+        || held_keys.contains(&0xE1)
+        || held_keys.contains(&0xE5)
+        || held_keys.contains(&0xE2)
+        || held_keys.contains(&0xE6);
+    has_meta && !has_other_mod
+}
+
+fn queue_legacy_mac_lock_chord(conn: &mut MeshPeerConn, now_ns: u64) {
+    // Graceful fallback when locking an older macOS peer that predates
+    // `MeshControl::LockWorkstation`: send native macOS Control + Command + Q.
+    for (code, down) in [
+        (0xE0u16, true),
+        (0xE3, true),
+        (0x14, true),
+        (0x14, false),
+        (0xE3, false),
+        (0xE0, false),
+    ] {
+        let mut f = Frame::new(Kind::Key);
+        f.code = code;
+        f.down = down;
+        f.t0_ns = now_ns;
+        let _ = conn.queue_frame(&f);
+    }
+    let _ = conn.flush();
 }
 
 struct MeshNativeIo {
@@ -1487,6 +1530,8 @@ pub fn run(
 
             let mut active_outbound_target: Option<String> = None;
             let mut inbound_owner: Option<String> = None;
+            let mut inbound_held_keys: std::collections::BTreeSet<u16> =
+                std::collections::BTreeSet::new();
             let mut remote_focus_state: (Option<String>, Option<String>) = (None, None);
             let mut remote_focus_active = false;
             let mut last_broadcast_focus: (Option<String>, Option<String>) = (None, None);
@@ -2282,6 +2327,7 @@ pub fn run(
                                     displays: peer.displays,
                                     conn: peer.conn,
                                     aux,
+                                    supports_lock_control: peer.supports_lock_control,
                                 },
                             );
                             let remotes = remote_display_map(&active_peers);
@@ -2353,6 +2399,7 @@ pub fn run(
                                                     {
                                                         revoke_outbound_from.push(old_owner);
                                                     }
+                                                    inbound_held_keys.clear();
                                                     if let Err(err) = io.sink.reset() {
                                                         log.write(
                                                             "mesh_inbound_arm_err",
@@ -2386,6 +2433,7 @@ pub fn run(
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
                                                     {
                                                         let _ = io.sink.release_owned();
+                                                        inbound_held_keys.clear();
                                                         inbound_owner = None;
                                                     }
                                                 }
@@ -2404,6 +2452,33 @@ pub fn run(
                                                                 )),
                                                             );
                                                         }
+                                                        if frame.kind == Kind::Key {
+                                                            #[cfg(windows)]
+                                                            if is_remote_win_lock_chord(
+                                                                &inbound_held_keys,
+                                                                frame.code,
+                                                                frame.down,
+                                                            ) {
+                                                                let _ = io.sink.release_owned();
+                                                                inbound_held_keys.clear();
+                                                                log.write(
+                                                                    "mesh_remote_lock_workstation",
+                                                                    serde_json::json!({
+                                                                        "source": "win_l",
+                                                                        "peer": &pid[..pid.len().min(8)],
+                                                                    }),
+                                                                );
+                                                                crate::power::lock_workstation();
+                                                                continue;
+                                                            }
+                                                            if frame.down {
+                                                                inbound_held_keys
+                                                                    .insert(frame.code);
+                                                            } else {
+                                                                inbound_held_keys
+                                                                    .remove(&frame.code);
+                                                            }
+                                                        }
                                                         if let Err(err) =
                                                             apply_inbound_frame(&mut io.sink, &frame)
                                                         {
@@ -2415,6 +2490,7 @@ pub fn run(
                                                                 }),
                                                             );
                                                             let _ = io.sink.release_owned();
+                                                            inbound_held_keys.clear();
                                                             inbound_owner = None;
                                                             revoke_outbound_from.push(pid.clone());
                                                         }
@@ -2489,7 +2565,23 @@ pub fn run(
                                                 active_outbound_target = None;
                                             }
                                         }
-                                        MeshControl::KeepAlive | MeshControl::Hello { .. } => {}
+                                        MeshControl::LockWorkstation => {
+                                            if let Some(ref mut io) = native_io {
+                                                let _ = io.sink.release_owned();
+                                            }
+                                            inbound_held_keys.clear();
+                                            log.write(
+                                                "mesh_remote_lock_workstation",
+                                                serde_json::json!({
+                                                    "source": "control",
+                                                    "peer": &pid[..pid.len().min(8)],
+                                                }),
+                                            );
+                                            crate::power::lock_workstation();
+                                        }
+                                        MeshControl::KeepAlive
+                                        | MeshControl::Hello { .. }
+                                        | MeshControl::Unknown => {}
                                     },
                                 }
                             }
@@ -2826,6 +2918,31 @@ pub fn run(
                                 HotkeyAction::ToggleLockScreen => {
                                     screen_locked = !screen_locked;
                                     io.source.set_edge_locked(screen_locked);
+                                }
+                                HotkeyAction::LockFocusedDevice => {
+                                    if let Some(target_id) = active_outbound_target.as_deref()
+                                        && let Some(peer) = active_peers.get_mut(target_id)
+                                    {
+                                        log.write(
+                                            "mesh_lock_device_tx",
+                                            serde_json::json!({
+                                                "peer": &target_id[..target_id.len().min(8)],
+                                                "native_control": peer.supports_lock_control,
+                                            }),
+                                        );
+                                        if peer.supports_lock_control {
+                                            let _ = peer
+                                                .conn
+                                                .queue_control(&MeshControl::LockWorkstation);
+                                            let _ = peer.conn.flush();
+                                        } else if peer.platform == "macos" {
+                                            queue_legacy_mac_lock_chord(&mut peer.conn, log.ns());
+                                        }
+                                    } else {
+                                        let _ = io.sink.release_owned();
+                                        inbound_held_keys.clear();
+                                        crate::power::lock_workstation();
+                                    }
                                 }
                                 HotkeyAction::QuickJumpNext => {
                                     if !user_paused
@@ -3597,5 +3714,20 @@ mod tests {
         }
         assert!(matches!(&out[4], MeshPacket::Control(MeshControl::KeepAlive)));
         assert!(matches!(&out[5], MeshPacket::Input(f) if f.kind == Kind::Move && f.x == 1.0));
+    }
+
+    #[test]
+    fn remote_win_lock_chord_matches_only_pure_win_plus_l() {
+        let mut held = std::collections::BTreeSet::new();
+        assert!(!is_remote_win_lock_chord(&held, 0x0F, true));
+        held.insert(0xE3); // Left Win / Cmd
+        assert!(is_remote_win_lock_chord(&held, 0x0F, true));
+        assert!(!is_remote_win_lock_chord(&held, 0x0F, false));
+        assert!(!is_remote_win_lock_chord(&held, 0x04, true)); // Win + A
+        held.insert(0xE0); // Ctrl + Win + L must NOT trigger lock
+        assert!(!is_remote_win_lock_chord(&held, 0x0F, true));
+        held.clear();
+        held.insert(0xE7); // Right Win / Cmd
+        assert!(is_remote_win_lock_chord(&held, 0x0F, true));
     }
 }
