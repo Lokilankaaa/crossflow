@@ -51,6 +51,9 @@ pub enum MeshControl {
         revision: u64,
         screens: Vec<SharedScreen>,
     },
+    DisplaysUpdate {
+        displays: Vec<Display>,
+    },
     FocusState {
         focus_device_id: Option<String>,
         focus_screen_id: Option<String>,
@@ -471,6 +474,39 @@ pub fn ordered_screens(screens: &[SharedScreen]) -> Vec<SharedScreen> {
     sorted
 }
 
+fn screens_touch(a: &SharedScreen, b: &SharedScreen) -> bool {
+    const EPS: f64 = 1e-3;
+    let a_r = a.x + a.width;
+    let a_b = a.y + a.height;
+    let b_r = b.x + b.width;
+    let b_b = b.y + b.height;
+    let horiz_touch = ((a_r - b.x).abs() <= EPS || (b_r - a.x).abs() <= EPS)
+        && a.y.max(b.y) + EPS < a_b.min(b_b);
+    let vert_touch = ((a_b - b.y).abs() <= EPS || (b_b - a.y).abs() <= EPS)
+        && a.x.max(b.x) + EPS < a_r.min(b_r);
+    horiz_touch || vert_touch
+}
+
+fn all_screens_connected(screens: &[SharedScreen]) -> bool {
+    if screens.len() <= 1 {
+        return true;
+    }
+    let mut visited = vec![false; screens.len()];
+    let mut stack = vec![0usize];
+    visited[0] = true;
+    let mut count = 1usize;
+    while let Some(i) = stack.pop() {
+        for j in 0..screens.len() {
+            if !visited[j] && screens_touch(&screens[i], &screens[j]) {
+                visited[j] = true;
+                count += 1;
+                stack.push(j);
+            }
+        }
+    }
+    count == screens.len()
+}
+
 pub struct MeshLayoutBook {
     revision: u64,
     saved_positions: HashMap<String, (f64, f64)>,
@@ -541,7 +577,7 @@ impl MeshLayoutBook {
         let mut placed: Vec<SharedScreen> = Vec::new();
         let mut bindings: Vec<Binding> = Vec::new();
 
-        for (dev_id, displays) in device_groups {
+        for &(dev_id, displays) in &device_groups {
             if displays.is_empty() {
                 continue;
             }
@@ -625,6 +661,56 @@ impl MeshLayoutBook {
             }
             placed.extend(candidate_screens);
             bindings.extend(candidate_bindings);
+        }
+
+        // If a display rotated or changed resolution (e.g. 1920x1080 -> 1080x1920),
+        // saved positions may remain non-overlapping yet leave a dead gap between
+        // devices so the cursor can no longer cross. Detect disconnected islands
+        // and re-snap them cleanly edge-to-edge while preserving valid cycles.
+        if !all_screens_connected(&placed) {
+            let mut resnapped: Vec<SharedScreen> = Vec::with_capacity(placed.len());
+            let mut resnapped_bindings: Vec<Binding> = Vec::with_capacity(bindings.len());
+            for (dev_id, displays) in &device_groups {
+                if displays.is_empty() {
+                    continue;
+                }
+                let min_x = displays.iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
+                let min_y = displays.iter().map(|d| d.y).fold(f64::INFINITY, f64::min);
+                let anchor_x = resnapped
+                    .iter()
+                    .map(|s| s.x + s.width)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let base_x = if anchor_x.is_finite() { anchor_x } else { 0.0 };
+                let base_y = 0.0;
+                for d in *displays {
+                    let sid = canonical_screen_id(dev_id, d.wire_id);
+                    let sx = base_x + (d.x - min_x);
+                    let sy = base_y + (d.y - min_y);
+                    self.saved_positions
+                        .insert(pos_key(dev_id, &d.native_id), (sx, sy));
+                    resnapped.push(SharedScreen {
+                        id: sid.clone(),
+                        device_id: (*dev_id).to_string(),
+                        native_id: d.native_id.clone(),
+                        x: sx,
+                        y: sy,
+                        width: d.width,
+                        height: d.height,
+                    });
+                    resnapped_bindings.push(Binding {
+                        screen_id: sid,
+                        native_id: d.wire_id.to_string(),
+                        native: NativeRect {
+                            x: d.x,
+                            y: d.y,
+                            width: d.width,
+                            height: d.height,
+                        },
+                    });
+                }
+            }
+            placed = resnapped;
+            bindings = resnapped_bindings;
         }
 
         validate_mesh_screens(&placed)?;
@@ -1128,5 +1214,46 @@ mod tests {
         assert_eq!(routed.active_remote_device_id(), None);
         assert!((warp_local1.x - 720.).abs() < 1.0);
         assert!((warp_local1.y - 1280.).abs() < 1.0);
+    }
+
+    #[test]
+    fn display_rotation_resnaps_gap_and_keeps_screens_edge_connected() {
+        let win1 = "a".repeat(64);
+        let win2 = "b".repeat(64);
+        let mut book = MeshLayoutBook {
+            revision: 1,
+            saved_positions: HashMap::new(),
+            active_screens: Vec::new(),
+        };
+
+        // Initially two landscape 1920x1080 monitors side by side: [0..1920][1920..3840]
+        let local_land = vec![disp("WIN1-1", 1, 0., 0., 1920., 1080.)];
+        let mut remotes = BTreeMap::new();
+        remotes.insert(win2.clone(), vec![disp("WIN2-1", 2, 0., 0., 1920., 1080.)]);
+        book.rebuild(&win1, &local_land, &remotes).unwrap();
+        assert_eq!(book.active_screens()[0].x, 0.0);
+        assert_eq!(book.active_screens()[1].x, 1920.0);
+
+        // Now Win1 rotates to portrait 1080x1920! Saved Win2 at x=1920 would leave an 840px dead gap.
+        let local_port = vec![disp("WIN1-1", 1, 0., 0., 1080., 1920.)];
+        let rt = book.rebuild(&win1, &local_port, &remotes).unwrap();
+        assert_eq!(book.active_screens()[0].width, 1080.0);
+        assert_eq!(book.active_screens()[0].height, 1920.0);
+        // Must auto-resnap Win2 right against x=1080 so edge crossing works immediately!
+        assert_eq!(book.active_screens()[1].x, 1080.0);
+        assert!(all_screens_connected(book.active_screens()));
+        assert!(rt.validate().is_ok());
+
+        // Also test DisplayUpdate serialization roundtrip
+        let ctrl = MeshControl::DisplaysUpdate {
+            displays: local_port.clone(),
+        };
+        let encoded = encode_control_plaintext(&ctrl).unwrap();
+        match decode_packet(&encoded).unwrap() {
+            MeshPacket::Control(MeshControl::DisplaysUpdate { displays }) => {
+                assert_eq!(displays, local_port);
+            }
+            other => panic!("expected DisplaysUpdate, got {other:?}"),
+        }
     }
 }

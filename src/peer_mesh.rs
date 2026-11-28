@@ -1017,6 +1017,16 @@ fn broadcast_layout_sync(
     }
 }
 
+fn broadcast_displays_update(peers: &mut BTreeMap<String, ActiveMeshPeer>, displays: &[Display]) {
+    let ctrl = MeshControl::DisplaysUpdate {
+        displays: displays.to_vec(),
+    };
+    for peer in peers.values_mut() {
+        let _ = peer.conn.queue_control(&ctrl);
+        let _ = peer.conn.flush();
+    }
+}
+
 fn resolve_mesh_quick_jump_target(
     target: Option<&str>,
     local_device_id: &str,
@@ -1493,14 +1503,37 @@ pub fn run(
                         }
                     }
                 }
-                if active_peers.is_empty() && last_display_refresh.elapsed() >= Duration::from_secs(2)
-                {
+                let mut local_displays_changed = false;
+                if last_display_refresh.elapsed() >= Duration::from_millis(1500) {
                     last_display_refresh = Instant::now();
                     if let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
+                        && inv != local_displays
                     {
+                        log.write(
+                            "mesh_local_displays_changed",
+                            serde_json::json!({
+                                "count": inv.len(),
+                                "peers": active_peers.len(),
+                            }),
+                        );
                         local_displays = inv;
+                        local_displays_changed = true;
                         screen_numbers_dirty = true;
+                        last_status_sig.clear();
+                        if !active_peers.is_empty() {
+                            broadcast_displays_update(&mut active_peers, &local_displays);
+                            if let Some(io) = native_io.take() {
+                                io.shutdown();
+                            }
+                            if let Some(prev) = active_outbound_target.take()
+                                && let Some(p) = active_peers.get_mut(&prev)
+                            {
+                                let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                                let _ = p.conn.flush();
+                            }
+                            inbound_owner = None;
+                        }
                     }
                 }
 
@@ -2029,7 +2062,7 @@ pub fn run(
                 }
 
                 // 4. Integrate newly handshaked peers
-                let mut topology_changed = false;
+                let mut topology_changed = local_displays_changed;
                 while let Ok(msg) = hs_rx.try_recv() {
                     did_work = true;
                     match msg {
@@ -2186,6 +2219,7 @@ pub fn run(
                 let mut dead_peers: Vec<(String, &'static str)> = Vec::new();
                 let peer_ids: Vec<String> = active_peers.keys().cloned().collect();
                 let mut inbound_layout_updates: Vec<(String, u64, Vec<crate::session_metadata::SharedScreen>)> = Vec::new();
+                let mut inbound_display_updates: Vec<(String, Vec<Display>)> = Vec::new();
                 let mut revoke_outbound_from: Vec<String> = Vec::new();
 
                 for pid in peer_ids {
@@ -2252,6 +2286,9 @@ pub fn run(
                                             inbound_layout_updates
                                                 .push((pid.clone(), revision, screens));
                                         }
+                                        MeshControl::DisplaysUpdate { displays } => {
+                                            inbound_display_updates.push((pid.clone(), displays));
+                                        }
                                         MeshControl::FocusState {
                                             focus_device_id,
                                             focus_screen_id,
@@ -2298,6 +2335,36 @@ pub fn run(
                     if let Some(p) = active_peers.get_mut(&old_id) {
                         let _ = p.conn.queue_control(&MeshControl::RevokeControl);
                         let _ = p.conn.flush();
+                    }
+                }
+
+                // Apply any received remote DisplaysUpdate (orientation / resolution / hotplug)
+                for (from_id, displays) in inbound_display_updates {
+                    if crate::pair_wire::validate_inventory(&displays).is_ok()
+                        && let Some(peer) = active_peers.get_mut(&from_id)
+                        && peer.displays != displays
+                    {
+                        peer.displays = displays;
+                        if active_outbound_target.as_deref() == Some(from_id.as_str()) {
+                            active_outbound_target = None;
+                            if let Some(ref mut io) = native_io
+                                && let Ok(Some(pt)) =
+                                    io.source.force_return_local_with_clock(|| log.ns())
+                                && let Some(ref mut cap) = io.capture
+                            {
+                                let _ = cap.warp_local(pt);
+                            }
+                        }
+                        log.write(
+                            "mesh_peer_displays_updated",
+                            serde_json::json!({
+                                "peer": &from_id[..from_id.len().min(8)],
+                                "count": peer.displays.len(),
+                            }),
+                        );
+                        topology_changed = true;
+                        screen_numbers_dirty = true;
+                        last_status_sig.clear();
                     }
                 }
 
@@ -2782,8 +2849,20 @@ pub fn run(
                     inbound_owner = None;
                     if let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
+                        && inv != local_displays
                     {
+                        log.write(
+                            "mesh_local_displays_changed",
+                            serde_json::json!({
+                                "count": inv.len(),
+                                "peers": active_peers.len(),
+                                "via": "restart_native",
+                            }),
+                        );
                         local_displays = inv;
+                        screen_numbers_dirty = true;
+                        last_status_sig.clear();
+                        broadcast_displays_update(&mut active_peers, &local_displays);
                     }
                 }
 
