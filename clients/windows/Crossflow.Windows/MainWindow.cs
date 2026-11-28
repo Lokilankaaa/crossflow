@@ -172,6 +172,7 @@ internal sealed class MainWindow : Window
     private double scale = 1, offsetX, offsetY;
     private string? lastDrawnFocus;
     private string? lastLayoutSignature;
+    private DateTimeOffset ignoreStaleLayoutUntil = DateTimeOffset.MinValue;
     private ScreenLayout? dragOriginal, dragPreview;
     private Point dragStart;
     private Border? dragVisual;
@@ -2479,6 +2480,13 @@ internal sealed class MainWindow : Window
             string sig = string.Join("|", shared.Screens.Select(s => $"{s.Id}:{s.X:R},{s.Y:R},{s.Width:R},{s.Height:R}")) + "#" + numbersSig;
             if (sig != lastLayoutSignature)
             {
+                if (DateTimeOffset.UtcNow < ignoreStaleLayoutUntil
+                    && activeSharedLayout is not null
+                    && shared.Screens.Count == activeSharedLayout.Screens.Count
+                    && shared.Screens.All(s => activeSharedLayout.Screens.Any(cur => cur.Id == s.Id && cur.Width == s.Width && cur.Height == s.Height)))
+                {
+                    return;
+                }
                 lastLayoutSignature = sig;
                 activeSharedLayout = shared;
                 layout = new LayoutDocument(shared.Screens.Select(s => new ScreenLayout(s.Id, s.DeviceId, s.X, s.Y, s.Width, s.Height)).ToList());
@@ -2715,7 +2723,9 @@ internal sealed class MainWindow : Window
             if (recordHistory) layoutHistory.Record(layout);
             activeSharedLayout = updatedShared;
             layout = candidate;
-            lastLayoutSignature = string.Join("|", updatedShared.Screens.Select(s => $"{s.Id}:{s.X:R},{s.Y:R},{s.Width:R},{s.Height:R}"));
+            string numbersSig = string.Join(",", currentSnap.ScreenNumbers.Select(n => $"{n.Number}:{n.ScreenId}"));
+            lastLayoutSignature = string.Join("|", updatedShared.Screens.Select(s => $"{s.Id}:{s.X:R},{s.Y:R},{s.Width:R},{s.Height:R}")) + "#" + numbersSig;
+            ignoreStaleLayoutUntil = DateTimeOffset.UtcNow.AddMilliseconds(700);
             ClearNotice();
             await peerMesh.ApplyLayoutAsync(updatedShared);
             return true;
@@ -2791,7 +2801,7 @@ internal sealed class MainWindow : Window
                 ? ScreenName(screen.Id)
                 : DeviceName(screen.DeviceId);
             string displayTitle = globalNum > 0 ? $"#{globalNum}  {baseTitle}" : baseTitle;
-            var label = new StackPanel { Spacing = smallTile ? 3 : 5, VerticalAlignment = VerticalAlignment.Center };
+            var label = new StackPanel { Spacing = smallTile ? 3 : 5, VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false };
             var screenLabel = Text(displayTitle, "section");
             screenLabel.FontSize = smallTile ? 13 : 15;
             screenLabel.MaxWidth = textWidth;
@@ -2824,11 +2834,14 @@ internal sealed class MainWindow : Window
                 VerticalAlignment = VerticalAlignment.Stretch,
                 HorizontalContentAlignment = HorizontalAlignment.Center,
                 VerticalContentAlignment = VerticalAlignment.Center,
-                Background = tint,
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
                 CornerRadius = new CornerRadius(9)
             };
             AutomationProperties.SetAutomationId(button, "screen-" + screen.Id);
-            var tileContent = new Grid();
+            var tileContent = new Grid
+            {
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent)
+            };
             tileContent.Children.Add(button);
             if (globalNum > 0)
             {
@@ -2858,10 +2871,14 @@ internal sealed class MainWindow : Window
                 };
                 tileContent.Children.Add(badge);
             }
+            // Put the tinted fill directly on the outer Border (`tile`) so WinUI 3 renders
+            // and hit-tests 100% of the screen rectangle (WinUI 3's default ContentControl
+            // template only contains a ContentPresenter and ignores Background for hit-testing).
             var tile = new Border
             {
                 Width = screen.Width * scale,
                 Height = screen.Height * scale,
+                Background = tint,
                 Child = tileContent,
                 CornerRadius = new CornerRadius(10),
                 BorderThickness = new Thickness(isFocused ? 3 : selectedScreenId == screen.Id ? 2 : 1),
@@ -2871,17 +2888,19 @@ internal sealed class MainWindow : Window
             Canvas.SetTop(tile, screen.Y * scale + offsetY);
             canvas.Children.Add(tile);
 
-            button.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
+            tile.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
             {
                 selectedScreenId = screen.Id;
                 RefreshScreenList();
                 if (!CanEditLayout || !e.GetCurrentPoint(canvas).Properties.IsLeftButtonPressed) return;
+                // Focus BEFORE capturing pointer on canvas so focus transition never drops capture.
+                button.Focus(FocusState.Pointer);
                 if (!canvas.CapturePointer(e.Pointer)) return;
                 dragCapture.Begin(e.Pointer.PointerId);
-                button.Focus(FocusState.Pointer);
                 dragOriginal = screen;
                 dragPreview = screen;
                 dragVisual = tile;
+                Canvas.SetZIndex(tile, 100);
                 dragStart = e.GetCurrentPoint(canvas).Position;
                 e.Handled = true;
             }), true);
@@ -2924,7 +2943,7 @@ internal sealed class MainWindow : Window
         double x = original.X + (point.X - dragStart.X) / scale;
         double y = original.Y + (point.Y - dragStart.Y) / scale;
         if (!double.IsFinite(x) || !double.IsFinite(y)) return;
-        double snap = 10 / scale;
+        double snap = 24 / scale;
         foreach (var other in layout.Screens.Where(s => s.Id != original.Id))
         {
             foreach (double edge in new[] { other.X - original.Width, other.X, other.X + other.Width, other.X + other.Width - original.Width })
@@ -2937,18 +2956,59 @@ internal sealed class MainWindow : Window
         Canvas.SetTop(dragVisual, dragPreview.Y * scale + offsetY);
     }
 
+    private static bool Overlaps(ScreenLayout a, ScreenLayout b) =>
+        a.X < b.X + b.Width && a.X + a.Width > b.X && a.Y < b.Y + b.Height && a.Y + a.Height > b.Y;
+
+    private ScreenLayout ResolveNonOverlappingDrop(ScreenLayout candidate)
+    {
+        var others = layout.Screens.Where(s => s.Id != candidate.Id).ToList();
+        if (!others.Any(o => Overlaps(candidate, o))) return candidate;
+
+        ScreenLayout? best = null;
+        double bestDistSq = double.PositiveInfinity;
+        foreach (var o in others)
+        {
+            var options = new[]
+            {
+                candidate with { X = Math.Round(o.X - candidate.Width) },
+                candidate with { X = Math.Round(o.X + o.Width) },
+                candidate with { Y = Math.Round(o.Y - candidate.Height) },
+                candidate with { Y = Math.Round(o.Y + o.Height) },
+            };
+            foreach (var opt in options)
+            {
+                if (others.Any(other => Overlaps(opt, other))) continue;
+                double dx = opt.X - candidate.X, dy = opt.Y - candidate.Y;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < bestDistSq)
+                {
+                    bestDistSq = d2;
+                    best = opt;
+                }
+            }
+        }
+        return best ?? candidate;
+    }
+
     private async void DragEnd(object sender, PointerRoutedEventArgs e)
     {
         if (!dragCapture.Matches(e.Pointer.PointerId)) return;
         dragCapture.End();
         var next = dragPreview;
         var orig = dragOriginal;
+        if (dragVisual is not null) Canvas.SetZIndex(dragVisual, 0);
         dragOriginal = null;
         dragPreview = null;
         dragVisual = null;
         canvas.ReleasePointerCaptures();
-        if (next is not null && orig is not null && (next.X != orig.X || next.Y != orig.Y))
-            await Commit(Replace(next));
+        if (next is not null && orig is not null)
+        {
+            var resolved = ResolveNonOverlappingDrop(next);
+            if (resolved.X != orig.X || resolved.Y != orig.Y)
+                await Commit(Replace(resolved));
+            else
+                Draw();
+        }
         else
             Draw();
     }
@@ -2956,6 +3016,7 @@ internal sealed class MainWindow : Window
     private void CancelDrag()
     {
         dragCapture.End();
+        if (dragVisual is not null) Canvas.SetZIndex(dragVisual, 0);
         dragOriginal = null;
         dragPreview = null;
         dragVisual = null;

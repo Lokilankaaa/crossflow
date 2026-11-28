@@ -18,7 +18,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const OWNER_LEASE_NS: u64 = 100_000_000;
+const OWNER_LEASE_NS: u64 = 1_500_000_000;
+
+fn is_uipi_access_denied(error: &str) -> bool {
+    error.contains("(Win32 5)")
+}
 
 pub fn inventory() -> Result<Vec<crate::pair_wire::Display>> {
     windows::displays()
@@ -181,14 +185,20 @@ impl WindowsCapture {
                             None => event_source.observe(event, at),
                         }?;
                         if let Some(point) = warp {
-                            windows::warp_cursor(point.x, point.y).map_err(anyhow::Error::msg)?;
+                            if let Err(err) = windows::warp_cursor(point.x, point.y) {
+                                // Windows UIPI blocks Medium-IL SetPhysicalCursorPos when an
+                                // elevated window (e.g. Task Manager / Admin console) has focus.
+                                // Ignore Win32 ERROR_ACCESS_DENIED (5) so sharing stays alive.
+                                if !is_uipi_access_denied(&err) {
+                                    return Err(anyhow::Error::msg(err));
+                                }
+                            }
                         }
                         Ok(())
                     })();
                     if let Err(error) = handled {
                         event_source.capture_stopped();
                         record_failure(&event_failure, &event_stop, format!("{error:#}"));
-                        physical_stop.store(true, Ordering::Release);
                     }
                 },
                 move || {

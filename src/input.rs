@@ -9,7 +9,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 pub const INPUT_QUEUE_CAPACITY: usize = 256;
-pub const INPUT_MAX_AGE_NS: u64 = 30_000_000;
+pub const INPUT_MAX_AGE_NS: u64 = 250_000_000;
 const MAX_COORDINATE: f64 = (1u64 << 48) as f64;
 const MAX_RELATIVE_MOVE: f64 = 20_000.0;
 

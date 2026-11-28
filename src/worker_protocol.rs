@@ -10,9 +10,9 @@ use anyhow::{Result, bail, ensure};
 
 pub const FRAME_LEN: usize = 80;
 pub const VERSION: u8 = 3;
-pub const ACTIVE_LEASE_NS: u64 = 150_000_000;
+pub const ACTIVE_LEASE_NS: u64 = 600_000_000;
 pub const IDLE_LEASE_NS: u64 = 10_000_000_000;
-pub const MAX_REQUEST_AGE_NS: u64 = 30_000_000;
+pub const MAX_REQUEST_AGE_NS: u64 = 250_000_000;
 const MAGIC: [u8; 4] = *b"CFIW";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

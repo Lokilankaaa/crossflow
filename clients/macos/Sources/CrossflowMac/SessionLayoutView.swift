@@ -124,6 +124,11 @@ struct SessionLayoutView: View {
                                         Image(systemName: local ? "laptopcomputer" : "display")
                                             .foregroundStyle(accentColor)
                                         Text(globalNum > 0 ? "#\(globalNum)" : "屏 \(ordinal)").font(.caption2.weight(.semibold))
+                                        if focused {
+                                            Text("焦点")
+                                                .font(.system(size: 10, weight: .semibold))
+                                                .foregroundStyle(accentColor)
+                                        }
                                     }
                                     Image(systemName: local ? "laptopcomputer" : "display")
                                 }

@@ -502,11 +502,19 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     0xA7 => Some(Button::Forward),
                     _ => None,
                 };
-                // Map multimedia virtual keys and sided modifiers directly so Right Shift
-                // (which Windows WH_KEYBOARD_LL often flags with LLKHF_EXTENDED -> 0xE036)
-                // and OEM media keys with scanCode == 0 never get dropped.
+                // Map editing/control keys, multimedia virtual keys, and sided modifiers
+                // directly so Backspace/Enter/Tab/Escape/Delete (even if a laptop driver or
+                // IME filter emits scanCode == 0 or unexpected extended flags), Right Shift
+                // (often flagged with LLKHF_EXTENDED -> 0xE036), and OEM media keys never drop.
                 let direct_usage = match input.vkCode {
+                    0x08 => Some(0x2A), // VK_BACK (Backspace)
+                    0x09 => Some(0x2B), // VK_TAB
+                    0x0D if input.flags & LLKHF_EXTENDED != 0 => Some(0x58), // Numpad Enter
+                    0x0D => Some(0x28), // VK_RETURN (Main Enter)
                     0x14 => Some(crate::keymap::HID_CAPS_LOCK),
+                    0x1B => Some(0x29), // VK_ESCAPE
+                    0x20 => Some(0x2C), // VK_SPACE
+                    0x2E if input.flags & LLKHF_EXTENDED != 0 => Some(0x4C), // VK_DELETE
                     0x5B => Some(0xE3), // VK_LWIN
                     0x5C => Some(0xE7), // VK_RWIN
                     0x7C..=0x87 => Some(0x68 + (input.vkCode - 0x7C) as u16), // VK_F13..VK_F24

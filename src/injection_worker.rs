@@ -25,8 +25,8 @@ use std::{
 #[path = "injection_worker_tests.rs"]
 mod tests;
 
-const RPC_TIMEOUT: Duration = Duration::from_millis(30);
-const HEARTBEAT: Duration = Duration::from_millis(25);
+const RPC_TIMEOUT: Duration = Duration::from_millis(250);
+const HEARTBEAT: Duration = Duration::from_millis(50);
 
 fn timing_for_ack(
     request: &Message,

@@ -10,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.3] - 2026-11-28
+
+### Fixed
+- **双 Windows Wi-Fi 连接、老款 CPU 与任务管理器专项优化**：
+  - 修复普通权限模式下打开任务管理器 / 管理员窗口触发 Windows UIPI（`Win32 5 / ERROR_ACCESS_DENIED`）时错误触发 `physical_stop` 锁死暂停或反复重启 `input-worker` 的问题（如需远程直接操作管理员窗口内部，可开启内置「Windows 服务模式」）。
+  - Windows 接收端对桌面就绪与显示器拓扑增加 `100ms` 缓存并消除 `move_by` 重复校验，单帧系统调用开销降低 **50 倍以上**。
+  - 有线直连 / 有线局域网保持完整 **1000 Hz**；Wi-Fi / ZeroTier 通道自适应 **125 Hz（8ms）** 平滑合并发送并引入 TCP 队列背压（阈值 8，无损累加位移，点击/按键/切边 0ms 即时转发）与批处理 `flush()`，队列上限提至 `1024`。
+  - 接收端新增 `coalesce_inbound_packets` 无损合并 Wi-Fi 突发鼠标移动帧（严格保留按键/滚轮/切屏顺序屏障），单帧异常时主动回发 `RevokeControl`。
+  - 放宽老款 CPU 与 Wi-Fi 弱网超时：Worker RPC / 输入老化 `30ms → 250ms`、租约 `150ms → 600ms`、采集租约 `100ms → 1500ms`、Wi-Fi 建连 `300~350ms → 1200ms`、握手 `2s → 4s`、静默断连 `9s → 18s`。
+- **彻底根治 Windows 中文输入法与本机微信打字异常（候选框悬空 / 文字不上屏 / Backspace 失灵）**：
+  - 彻底删除 `read_caps_lock()` 中每 `350ms` 对前台应用调用的 `AttachThreadInput`，改为零副作用直接读取 `GetKeyState(VK_CAPITAL)`；本机打字期间不再每 `350ms` 向微信 IME 窗口发送同步 `WM_IME_CONTROL`（仅在跨屏切换瞬间同步一次输入法状态）。
+  - Windows 接收端对 `Backspace`、`Enter`、`Space`、`Tab`、`Escape`、`Delete`、`Insert`、方向键及 `Home/End/PageUp/PageDown` 改为携带显式 `wVk` + 硬件 `wScan` 注入，彻底解决微软拼音 / 搜狗 / 微信输入法吞掉 `wVk = 0` 退格键的问题。
+  - 接收端新增 `250ms` 自身刚释放键位宽限窗，避免快速连按 Backspace / 鼠标键被 `GetAsyncKeyState` 异步滞后误杀；发送端钩子补充 `VK_BACK` 等编辑键 `vkCode` 直接映射兜底。
+- **彻底修复 Windows 屏幕排列画布「拖不动 / 拖一下又拖不动」**：
+  - 将屏幕块底色与点击事件从 WinUI 3 `ContentControl` 移至外层 `Border`，整块屏幕任意位置 100% 可抓住拖动，拖动时自动置顶层级。
+  - 调整 `Focus` 与 `CapturePointer` 顺序防止焦点切换误丢捕获；扩大边缘磁吸半径至 `24px`，松手轻微重叠时自动吸附至最近无重叠贴边位置；补齐 `lastLayoutSignature` 并增加 `700ms` 过期快照防弹回保护。
+- **连接中改变屏幕朝向 / 分辨率 / 插拔显示器实时热同步**：
+  - 修复 Windows `WM_DISPLAYCHANGE` 错误触发紧急暂停锁死 `user_paused` 的问题，改为无感自动重启采集与注入。
+  - 新增 `MeshControl::DisplaysUpdate` 加密控制帧，连接状态下实时同步显示器几何变化并刷新双端画布与路由表；若横竖屏切换导致两屏间出现空隙或重叠，自动重新边缘吸合连通。
+- **修复 macOS 锁屏黑屏后移动鼠标过去未自动点亮屏幕**：
+  - 移除 `CGDisplayIsAsleep(CGMainDisplayID())` 误判跳过逻辑，改为复用 `IOPMAssertionID` 无条件调用 `IOPMAssertionDeclareUserActivity(kIOPMUserActiveLocal)`，收到 `Kind::Arm` / `FocusState` / 远端输入时立即点亮黑屏并在唤醒重建后自动承接控制权。
+- **修复 Win 控制 Mac 时 Mac 端不显示焦点屏幕高亮**：
+  - 节点重连时重置 `last_broadcast_focus`，新增 `remote_focus_active` 区分最近活跃操作方并禁止被动接收端反向覆盖广播；收到 `Kind::Arm` / `Kind::Position(display_id)` 直接推导目标屏高亮；为 macOS 紧凑尺寸屏幕块补齐「焦点」提示。
+
+---
+
 ## [0.4.2] - 2026-11-28
 
 ### Added

@@ -9,15 +9,17 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     mem::size_of,
     ptr::null_mut,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
+    Foundation::{ERROR_ACCESS_DENIED, GetLastError},
     System::{
         RemoteDesktop::{
             WTS_CURRENT_SESSION, WTSActive, WTSConnectState, WTSFreeMemory,
@@ -177,6 +179,32 @@ fn media_vk(usage: u16) -> Option<u16> {
     })
 }
 
+/// Editing & navigation control keys that must carry an explicit Virtual-Key (`wVk`)
+/// alongside their hardware `wScan` (without `KEYEVENTF_SCANCODE`). Windows TSF and
+/// Chinese IMEs (Microsoft Pinyin, Sogou, WeType, QQ Pinyin) often drop or mishandle
+/// `wVk = 0` scancode-only Backspace / Enter / Space / Delete events while composing
+/// or immediately after committing Chinese text.
+fn editing_control_vk(usage: u16) -> Option<(u16, u16, bool)> {
+    Some(match usage {
+        0x28 => (VK_RETURN, 0x1c, false),
+        0x29 => (VK_ESCAPE, 0x01, false),
+        0x2a => (VK_BACK, 0x0e, false),
+        0x2b => (VK_TAB, 0x0f, false),
+        0x2c => (VK_SPACE, 0x39, false),
+        0x49 => (VK_INSERT, 0x52, true),
+        0x4a => (VK_HOME, 0x47, true),
+        0x4b => (VK_PRIOR, 0x49, true),
+        0x4c => (VK_DELETE, 0x53, true),
+        0x4d => (VK_END, 0x4f, true),
+        0x4e => (VK_NEXT, 0x51, true),
+        0x4f => (VK_RIGHT, 0x4d, true),
+        0x50 => (VK_LEFT, 0x4b, true),
+        0x51 => (VK_DOWN, 0x50, true),
+        0x52 => (VK_UP, 0x48, true),
+        _ => return None,
+    })
+}
+
 fn keyboard(usage: u16, down: bool) -> Result<INPUT> {
     if let Some(vk) = media_vk(usage) {
         return Ok(INPUT {
@@ -186,6 +214,21 @@ fn keyboard(usage: u16, down: bool) -> Result<INPUT> {
                     wVk: vk,
                     wScan: 0,
                     dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                    time: 0,
+                    dwExtraInfo: INPUT_ORIGIN_TAG,
+                },
+            },
+        });
+    }
+    if let Some((vk, scan_code, extended)) = editing_control_vk(usage) {
+        return Ok(INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan_code,
+                    dwFlags: if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
+                        | if down { 0 } else { KEYEVENTF_KEYUP },
                     time: 0,
                     dwExtraInfo: INPUT_ORIGIN_TAG,
                 },
@@ -317,7 +360,10 @@ fn desktop_ready() -> Result<()> {
     Ok(())
 }
 
+const PLATFORM_CACHE_TTL: Duration = Duration::from_millis(100);
+
 trait Platform: Send {
+    fn invalidate_cache(&self) {}
     fn ready(&self) -> Result<()>;
     fn displays(&self) -> Result<Vec<NativeDisplay>>;
     fn cursor(&self) -> Result<(f64, f64)>;
@@ -325,13 +371,55 @@ trait Platform: Send {
     fn key_vk(&self, scan: u16) -> u16;
     fn post(&mut self, input: INPUT) -> Result<()>;
 }
-struct Native;
+struct Native {
+    last_ready: Mutex<Option<Instant>>,
+    cached_displays: Mutex<Option<(Instant, Vec<NativeDisplay>)>>,
+}
+impl Native {
+    fn new() -> Self {
+        Self {
+            last_ready: Mutex::new(None),
+            cached_displays: Mutex::new(None),
+        }
+    }
+}
 impl Platform for Native {
+    fn invalidate_cache(&self) {
+        *self.last_ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
     fn ready(&self) -> Result<()> {
-        desktop_ready()
+        if self
+            .last_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| t.elapsed() < PLATFORM_CACHE_TTL)
+        {
+            return Ok(());
+        }
+        desktop_ready()?;
+        *self.last_ready.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Ok(())
     }
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
-        receiver_displays()
+        if let Some((t, cached)) = self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && t.elapsed() < PLATFORM_CACHE_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let fresh = receiver_displays()?;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
         super::cursor_position().map_err(anyhow::Error::msg)
@@ -347,10 +435,18 @@ impl Platform for Native {
         let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
         // One event per call avoids ambiguous partial batches. Even a successful
         // insertion does not establish foreground-app acceptance or visibility.
-        ensure!(
-            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-            "Windows input insertion failed; elevated apps and secure desktops are unsupported"
-        );
+        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } != 1 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_ACCESS_DENIED {
+                // Windows UIPI blocks Medium-IL SendInput when an elevated window
+                // (e.g. Task Manager or Admin console) has focus. Treat as a benign
+                // UIPI drop rather than crashing input-worker and tearing down sharing.
+                return Ok(());
+            }
+            bail!(
+                "Windows input insertion failed (Win32 {err}); elevated apps and secure desktops require Service Mode"
+            );
+        }
         Ok(())
     }
 }
@@ -361,15 +457,34 @@ impl Platform for Native {
 /// `SetThreadDesktop` so remote mouse and keyboard control work across UAC prompts, elevated
 /// Administrator applications, and the Windows lock screen.
 struct NativeService {
-    attached: std::sync::Mutex<Option<(String, isize)>>,
+    attached: Mutex<Option<(String, isize)>>,
+    last_sync: Mutex<Option<Instant>>,
+    cached_displays: Mutex<Option<(Instant, Vec<NativeDisplay>)>>,
 }
 unsafe impl Send for NativeService {}
 
 impl NativeService {
     fn new() -> Self {
         Self {
-            attached: std::sync::Mutex::new(None),
+            attached: Mutex::new(None),
+            last_sync: Mutex::new(None),
+            cached_displays: Mutex::new(None),
         }
+    }
+
+    fn sync_input_desktop_throttled(&self, force: bool) -> Result<()> {
+        if !force
+            && self
+                .last_sync
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|t| t.elapsed() < PLATFORM_CACHE_TTL)
+        {
+            return Ok(());
+        }
+        self.sync_input_desktop()?;
+        *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Ok(())
     }
 
     fn sync_input_desktop(&self) -> Result<()> {
@@ -433,15 +548,36 @@ impl Drop for NativeService {
 }
 
 impl Platform for NativeService {
+    fn invalidate_cache(&self) {
+        *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
     fn ready(&self) -> Result<()> {
-        self.sync_input_desktop()
+        self.sync_input_desktop_throttled(false)
     }
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
-        let _ = self.sync_input_desktop();
-        receiver_displays()
+        if let Some((t, cached)) = self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && t.elapsed() < PLATFORM_CACHE_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let _ = self.sync_input_desktop_throttled(false);
+        let fresh = receiver_displays()?;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
-        let _ = self.sync_input_desktop();
+        let _ = self.sync_input_desktop_throttled(false);
         super::cursor_position().map_err(anyhow::Error::msg)
     }
     fn held(&self, vk: u16) -> bool {
@@ -451,9 +587,14 @@ impl Platform for NativeService {
         unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
-        let _ = self.sync_input_desktop();
+        let _ = self.sync_input_desktop_throttled(false);
         crate::power::wake_display_throttled();
         let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
+        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1 {
+            return Ok(());
+        }
+        // Desktop may have just transitioned (Default <-> Winlogon): resync and retry once.
+        let _ = self.sync_input_desktop_throttled(true);
         ensure!(
             unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
             "Windows service input insertion failed"
@@ -461,6 +602,8 @@ impl Platform for NativeService {
         Ok(())
     }
 }
+
+const RECENT_RELEASE_GRACE: Duration = Duration::from_millis(250);
 
 pub struct WindowsMouseSink {
     platform: Box<dyn Platform>,
@@ -471,6 +614,8 @@ pub struct WindowsMouseSink {
     failed: bool,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<Button>,
+    recently_released_keys: BTreeMap<u16, Instant>,
+    recently_released_buttons: BTreeMap<Button, Instant>,
 }
 impl WindowsMouseSink {
     /// `emergency` is a latched local physical-hotkey/stop signal. The caller
@@ -481,7 +626,7 @@ impl WindowsMouseSink {
             "mouse gain must be finite and positive"
         );
         let mut sink = Self {
-            platform: Box::new(Native),
+            platform: Box::new(Native::new()),
             emergency,
             gain,
             displays: Vec::new(),
@@ -489,6 +634,8 @@ impl WindowsMouseSink {
             failed: true,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            recently_released_keys: BTreeMap::new(),
+            recently_released_buttons: BTreeMap::new(),
         };
         sink.reset()?;
         Ok(sink)
@@ -510,6 +657,8 @@ impl WindowsMouseSink {
             failed: true,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            recently_released_keys: BTreeMap::new(),
+            recently_released_buttons: BTreeMap::new(),
         };
         sink.reset()?;
         Ok(sink)
@@ -559,17 +708,28 @@ impl WindowsMouseSink {
         let result = self.platform.post(input);
         self.finish(result)
     }
+    fn position_checked(&mut self, x: f64, y: f64, id: u32) -> Result<(f64, f64)> {
+        let packet = absolute(&self.displays, x, y, id);
+        let (input, point) = self.finish(packet)?;
+        self.send(input)?;
+        self.position = point;
+        Ok(point)
+    }
 }
 impl MouseSink for WindowsMouseSink {
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
         self.platform.displays()
     }
     fn maintain(&mut self) -> Result<()> {
+        self.platform.invalidate_cache();
         self.checked()
     }
     fn reset(&mut self) -> Result<()> {
         self.failed = true;
         self.release_owned()?;
+        self.recently_released_keys.clear();
+        self.recently_released_buttons.clear();
+        self.platform.invalidate_cache();
         ensure!(
             !self.emergency_local(),
             "local emergency requested input stop"
@@ -601,7 +761,7 @@ impl MouseSink for WindowsMouseSink {
                 "relative input leaves active display geometry"
             )));
         };
-        let result = self.position(x, y, id)?;
+        let result = self.position_checked(x, y, id)?;
         // Preserve fractional gain between relative packets even though the
         // native event targets one integral pixel.
         self.position = (x, y);
@@ -609,11 +769,7 @@ impl MouseSink for WindowsMouseSink {
     }
     fn position(&mut self, x: f64, y: f64, id: u32) -> Result<(f64, f64)> {
         self.checked()?;
-        let packet = absolute(&self.displays, x, y, id);
-        let (input, point) = self.finish(packet)?;
-        self.send(input)?;
-        self.position = point;
-        Ok(point)
+        self.position_checked(x, y, id)
     }
     fn button(&mut self, button: Button, down: bool) -> Result<()> {
         if !down && !self.buttons.contains(&button) {
@@ -621,7 +777,12 @@ impl MouseSink for WindowsMouseSink {
         }
         if down {
             self.checked()?;
-            let valid = !self.buttons.contains(&button) && !self.platform.held(button_vk(button));
+            let own_recent_release = self
+                .recently_released_buttons
+                .get(&button)
+                .is_some_and(|t| t.elapsed() < RECENT_RELEASE_GRACE);
+            let valid = !self.buttons.contains(&button)
+                && (own_recent_release || !self.platform.held(button_vk(button)));
             self.finish(if valid {
                 Ok(())
             } else {
@@ -629,11 +790,14 @@ impl MouseSink for WindowsMouseSink {
                     "button is already held locally or remotely"
                 ))
             })?;
+            self.recently_released_buttons.remove(&button);
             self.buttons.insert(button);
         }
         self.send(button_input(button, down))?;
         if !down {
             self.buttons.remove(&button);
+            self.recently_released_buttons
+                .insert(button, Instant::now());
         }
         Ok(())
     }
@@ -671,8 +835,16 @@ impl MouseSink for WindowsMouseSink {
                 }
             } else {
                 let vk = media_vk(usage)
+                    .or_else(|| editing_control_vk(usage).map(|(vk, _, _)| vk))
                     .unwrap_or_else(|| self.platform.key_vk(scan(usage).expect("validated usage")));
-                let valid = vk != 0 && !self.platform.held(vk);
+                // Rapidly tapping Backspace / keys over Wi-Fi bursts can re-press a key
+                // milliseconds after our own SendInput(KEYUP), before Windows CSRSS / IME
+                // clears GetAsyncKeyState. Allow re-press within RECENT_RELEASE_GRACE.
+                let own_recent_release = self
+                    .recently_released_keys
+                    .get(&usage)
+                    .is_some_and(|t| t.elapsed() < RECENT_RELEASE_GRACE);
+                let valid = vk != 0 && (own_recent_release || !self.platform.held(vk));
                 self.finish(if valid {
                     Ok(())
                 } else {
@@ -680,12 +852,14 @@ impl MouseSink for WindowsMouseSink {
                         "key is unsupported or already held locally or remotely"
                     ))
                 })?;
+                self.recently_released_keys.remove(&usage);
                 self.keys.insert(usage);
             }
         }
         self.send(input)?;
         if !down {
             self.keys.remove(&usage);
+            self.recently_released_keys.insert(usage, Instant::now());
         }
         Ok(())
     }
@@ -854,9 +1028,17 @@ mod tests {
             assert_eq!(u.wScan, d.wScan);
             assert_eq!(u.dwFlags, d.dwFlags | KEYEVENTF_KEYUP);
             assert_eq!(d.dwExtraInfo, INPUT_ORIGIN_TAG);
-            assert_eq!(d.wVk, 0);
-            if capture_scan & 0xe000 != 0 && usage != 0x53 {
-                assert_ne!(d.dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+            if let Some((expected_vk, expected_scan, expected_ext)) = editing_control_vk(usage) {
+                assert_eq!(d.wVk, expected_vk);
+                assert_eq!(d.wScan, expected_scan);
+                assert_eq!(d.dwFlags & KEYEVENTF_SCANCODE, 0);
+                assert_eq!(d.dwFlags & KEYEVENTF_EXTENDEDKEY != 0, expected_ext);
+            } else {
+                assert_eq!(d.wVk, 0);
+                assert_ne!(d.dwFlags & KEYEVENTF_SCANCODE, 0);
+                if capture_scan & 0xe000 != 0 && usage != 0x53 {
+                    assert_ne!(d.dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+                }
             }
         }
         assert_eq!(scan(0x46), Some(0xe037));
@@ -928,6 +1110,8 @@ mod tests {
             failed: true,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            recently_released_keys: BTreeMap::new(),
+            recently_released_buttons: BTreeMap::new(),
         };
         sink.reset().unwrap();
         (sink, state)
@@ -1038,5 +1222,22 @@ mod tests {
         sink.key(0xe1, true).unwrap(); // Left Shift down
         sink.key(0xe1, true).unwrap(); // Left Shift repeat -> benign no-op
         assert_eq!(state.lock().unwrap().events.len(), 4);
+    }
+    #[test]
+    fn rapid_backspace_repress_tolerates_stale_os_async_key_state_after_own_release() {
+        let (mut sink, state) = fake();
+        // Tap 1: Backspace down + up; simulate Windows CSRSS/IME leaving VK_BACK stale-held
+        sink.key(0x2a, true).unwrap();
+        sink.key(0x2a, false).unwrap();
+        state.lock().unwrap().held.insert(VK_BACK);
+        // Tap 2 immediately after our own release must succeed instead of failing the worker
+        sink.key(0x2a, true).unwrap();
+        sink.key(0x2a, false).unwrap();
+        assert_eq!(state.lock().unwrap().events.len(), 4);
+        // Verify Backspace emits explicit VK_BACK + scan 0x0e without KEYEVENTF_SCANCODE
+        let ki = unsafe { state.lock().unwrap().events[0].Anonymous.ki };
+        assert_eq!(ki.wVk, VK_BACK);
+        assert_eq!(ki.wScan, 0x0e);
+        assert_eq!(ki.dwFlags & KEYEVENTF_SCANCODE, 0);
     }
 }

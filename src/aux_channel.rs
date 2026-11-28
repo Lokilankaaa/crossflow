@@ -1440,8 +1440,25 @@ fn run_aux(
             } else if local_has_focus.load(Ordering::Acquire)
                 && Instant::now() >= suppress_input_sync_until
             {
-                let st = crate::input_state::read_state();
-                let changed = last_local_input_state.is_some_and(|prev| prev != st);
+                let st = if cfg!(windows) {
+                    // On Windows, never send synchronous WM_IME_CONTROL messages to foreground
+                    // apps (such as WeChat) on a 350ms timer while the user is typing locally.
+                    // Full IME state is still synced on screen crossing (`force_state_push`);
+                    // background polling on Windows only observes lock-free Caps Lock state.
+                    crate::input_state::InputLockState {
+                        caps_lock: crate::input_state::read_caps_lock(),
+                        ime_chinese: None,
+                    }
+                } else {
+                    crate::input_state::read_state()
+                };
+                let changed = last_local_input_state.is_some_and(|prev| {
+                    if cfg!(windows) {
+                        prev.caps_lock != st.caps_lock
+                    } else {
+                        prev != st
+                    }
+                });
                 last_local_input_state = Some(st);
                 if changed {
                     let msg = serde_json::to_vec(&AuxHeader::InputState {
@@ -1481,7 +1498,14 @@ fn run_aux(
                             true,
                         );
                         suppress_input_sync_until = Instant::now() + INPUT_STATE_ECHO_COOLDOWN;
-                        last_local_input_state = Some(crate::input_state::read_state());
+                        last_local_input_state = Some(if cfg!(windows) && ime_chinese.is_none() {
+                            crate::input_state::InputLockState {
+                                caps_lock: crate::input_state::read_caps_lock(),
+                                ime_chinese: None,
+                            }
+                        } else {
+                            crate::input_state::read_state()
+                        });
                     }
                 }
                 Ok(AuxHeader::Clipboard { format, hash, len }) => {

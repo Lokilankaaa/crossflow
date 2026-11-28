@@ -1017,6 +1017,16 @@ fn broadcast_layout_sync(
     }
 }
 
+fn broadcast_displays_update(peers: &mut BTreeMap<String, ActiveMeshPeer>, displays: &[Display]) {
+    let ctrl = MeshControl::DisplaysUpdate {
+        displays: displays.to_vec(),
+    };
+    for peer in peers.values_mut() {
+        let _ = peer.conn.queue_control(&ctrl);
+        let _ = peer.conn.flush();
+    }
+}
+
 fn resolve_mesh_quick_jump_target(
     target: Option<&str>,
     local_device_id: &str,
@@ -1123,6 +1133,67 @@ fn active_transfer_snapshot(
         }
     }
     fallback
+}
+
+/// Keep full wired/direct-Ethernet motion rate (up to 1000 Hz), while pacing
+/// Wi-Fi / ZeroTier links to 125 Hz (8 ms) so high-polling gaming mice do not
+/// flood wireless airtime or overwhelm slower CPUs. Clicks, keys, scrolls, and
+/// edge crossings are never rate-limited.
+fn effective_motion_interval(
+    base: Duration,
+    peer_addr: SocketAddr,
+    local_channels: &[LocalChannel],
+) -> Duration {
+    if addr_channel_priority(peer_addr, local_channels) >= 2 {
+        base.max(Duration::from_millis(8))
+    } else {
+        base
+    }
+}
+
+/// Losslessly coalesce bursts of inbound cursor motion (common over Wi-Fi TCP
+/// aggregation) before invoking synchronous `input-worker` IPC, while preserving
+/// strict ordering across every discrete barrier (`Button`, `Key`, `Scroll`,
+/// `Arm`, `Pause`, display switches, and control packets).
+fn coalesce_inbound_packets(packets: Vec<MeshPacket>) -> Vec<MeshPacket> {
+    let mut out: Vec<MeshPacket> = Vec::with_capacity(packets.len());
+    for pkt in packets {
+        let merged = match (out.last_mut(), &pkt) {
+            (Some(MeshPacket::Input(prev)), MeshPacket::Input(curr))
+                if prev.kind == Kind::Move && curr.kind == Kind::Move =>
+            {
+                let nx = prev.x + curr.x;
+                let ny = prev.y + curr.y;
+                if nx.is_finite()
+                    && ny.is_finite()
+                    && nx.abs() <= 20_000.0
+                    && ny.abs() <= 20_000.0
+                {
+                    prev.x = nx;
+                    prev.y = ny;
+                    prev.t1_ns = curr.t1_ns;
+                    true
+                } else {
+                    false
+                }
+            }
+            (Some(MeshPacket::Input(prev)), MeshPacket::Input(curr))
+                if prev.kind == Kind::Position
+                    && curr.kind == Kind::Position
+                    && prev.display_id == curr.display_id =>
+            {
+                prev.x = curr.x;
+                prev.y = curr.y;
+                prev.t1_ns = curr.t1_ns;
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            out.push(pkt);
+        }
+    }
+    out
 }
 
 pub fn run(
@@ -1329,6 +1400,7 @@ pub fn run(
             let mut active_outbound_target: Option<String> = None;
             let mut inbound_owner: Option<String> = None;
             let mut remote_focus_state: (Option<String>, Option<String>) = (None, None);
+            let mut remote_focus_active = false;
             let mut last_broadcast_focus: (Option<String>, Option<String>) = (None, None);
             let mut pending_quick_jump: Option<(QuickJumpTarget, Instant)> = None;
             let mut numbered_screens: Vec<NumberedScreenInfo> = build_numbered_screens(
@@ -1432,14 +1504,37 @@ pub fn run(
                         }
                     }
                 }
-                if active_peers.is_empty() && last_display_refresh.elapsed() >= Duration::from_secs(2)
-                {
+                let mut local_displays_changed = false;
+                if last_display_refresh.elapsed() >= Duration::from_millis(1500) {
                     last_display_refresh = Instant::now();
                     if let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
+                        && inv != local_displays
                     {
+                        log.write(
+                            "mesh_local_displays_changed",
+                            serde_json::json!({
+                                "count": inv.len(),
+                                "peers": active_peers.len(),
+                            }),
+                        );
                         local_displays = inv;
+                        local_displays_changed = true;
                         screen_numbers_dirty = true;
+                        last_status_sig.clear();
+                        if !active_peers.is_empty() {
+                            broadcast_displays_update(&mut active_peers, &local_displays);
+                            if let Some(io) = native_io.take() {
+                                io.shutdown();
+                            }
+                            if let Some(prev) = active_outbound_target.take()
+                                && let Some(p) = active_peers.get_mut(&prev)
+                            {
+                                let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
+                                let _ = p.conn.flush();
+                            }
+                            inbound_owner = None;
+                        }
                     }
                 }
 
@@ -1760,7 +1855,7 @@ pub fn run(
                                                 if p == 0 {
                                                     Duration::from_millis(600)
                                                 } else {
-                                                    Duration::from_millis(350)
+                                                    Duration::from_millis(1200)
                                                 },
                                             ))
                                         })
@@ -1844,7 +1939,7 @@ pub fn run(
                                         if addr_channel_priority(addr, &local_channels) == 0 {
                                             Duration::from_millis(600)
                                         } else {
-                                            Duration::from_millis(320)
+                                            Duration::from_millis(1200)
                                         };
                                     (addr, timeout)
                                 })
@@ -1932,7 +2027,7 @@ pub fn run(
                             .spawn(move || {
                                 match TcpStream::connect_timeout(
                                     &target,
-                                    Duration::from_millis(300),
+                                    Duration::from_millis(1200),
                                 )
                                 .map_err(anyhow::Error::from)
                                 .and_then(|stream| {
@@ -1968,7 +2063,7 @@ pub fn run(
                 }
 
                 // 4. Integrate newly handshaked peers
-                let mut topology_changed = false;
+                let mut topology_changed = local_displays_changed;
                 while let Ok(msg) = hs_rx.try_recv() {
                     did_work = true;
                     match msg {
@@ -2116,6 +2211,7 @@ pub fn run(
                                     layout_book.active_screens(),
                                 );
                             }
+                            last_broadcast_focus = (None, None);
                             topology_changed = true;
                         }
                     }
@@ -2125,6 +2221,7 @@ pub fn run(
                 let mut dead_peers: Vec<(String, &'static str)> = Vec::new();
                 let peer_ids: Vec<String> = active_peers.keys().cloned().collect();
                 let mut inbound_layout_updates: Vec<(String, u64, Vec<crate::session_metadata::SharedScreen>)> = Vec::new();
+                let mut inbound_display_updates: Vec<(String, Vec<Display>)> = Vec::new();
                 let mut revoke_outbound_from: Vec<String> = Vec::new();
 
                 for pid in peer_ids {
@@ -2143,9 +2240,17 @@ pub fn run(
                             if !packets.is_empty() {
                                 did_work = true;
                             }
-                            for pkt in packets {
+                            for pkt in coalesce_inbound_packets(packets) {
                                 match pkt {
                                     MeshPacket::Input(frame) => {
+                                        // Always wake a sleeping/black display immediately on remote
+                                        // cursor entry or input — even when `native_io` is temporarily
+                                        // down because macOS turned off its display during lock/sleep!
+                                        match frame.kind {
+                                            Kind::Arm => crate::power::wake_display_now(),
+                                            Kind::Pause => {}
+                                            _ => crate::power::wake_display_throttled(),
+                                        }
                                         if let Some(ref mut io) = native_io {
                                             match frame.kind {
                                                 Kind::Arm => {
@@ -2156,6 +2261,23 @@ pub fn run(
                                                     }
                                                     let _ = io.sink.reset();
                                                     inbound_owner = Some(pid.clone());
+                                                    remote_focus_active = true;
+                                                    if remote_focus_state.0.as_deref()
+                                                        != Some(local_device_id.as_str())
+                                                    {
+                                                        let fallback_scr = local_displays
+                                                            .first()
+                                                            .map(|d| {
+                                                                canonical_screen_id(
+                                                                    &local_device_id,
+                                                                    d.wire_id,
+                                                                )
+                                                            });
+                                                        remote_focus_state = (
+                                                            Some(local_device_id.clone()),
+                                                            fallback_scr,
+                                                        );
+                                                    }
                                                 }
                                                 Kind::Pause => {
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
@@ -2167,6 +2289,18 @@ pub fn run(
                                                 _ => {
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
                                                     {
+                                                        if frame.kind == Kind::Position
+                                                            && frame.display_id != 0
+                                                        {
+                                                            remote_focus_active = true;
+                                                            remote_focus_state = (
+                                                                Some(local_device_id.clone()),
+                                                                Some(canonical_screen_id(
+                                                                    &local_device_id,
+                                                                    frame.display_id,
+                                                                )),
+                                                            );
+                                                        }
                                                         if let Err(err) =
                                                             apply_inbound_frame(&mut io.sink, &frame)
                                                         {
@@ -2179,9 +2313,30 @@ pub fn run(
                                                             );
                                                             let _ = io.sink.release_owned();
                                                             inbound_owner = None;
+                                                            revoke_outbound_from.push(pid.clone());
                                                         }
                                                     }
                                                 }
+                                            }
+                                        } else {
+                                            // Preserve pending inbound ownership while display wakes up
+                                            // so the newly started sink accepts motion seamlessly.
+                                            match frame.kind {
+                                                Kind::Arm => {
+                                                    if let Some(old_owner) = inbound_owner.take()
+                                                        && old_owner != pid
+                                                    {
+                                                        revoke_outbound_from.push(old_owner);
+                                                    }
+                                                    inbound_owner = Some(pid.clone());
+                                                }
+                                                Kind::Pause => {
+                                                    if inbound_owner.as_deref() == Some(pid.as_str())
+                                                    {
+                                                        inbound_owner = None;
+                                                    }
+                                                }
+                                                _ => {}
                                             }
                                         }
                                     }
@@ -2190,11 +2345,22 @@ pub fn run(
                                             inbound_layout_updates
                                                 .push((pid.clone(), revision, screens));
                                         }
+                                        MeshControl::DisplaysUpdate { displays } => {
+                                            inbound_display_updates.push((pid.clone(), displays));
+                                        }
                                         MeshControl::FocusState {
                                             focus_device_id,
                                             focus_screen_id,
                                         } => {
-                                            if active_outbound_target.is_none() {
+                                            if focus_device_id.as_deref()
+                                                == Some(local_device_id.as_str())
+                                            {
+                                                crate::power::wake_display_now();
+                                            }
+                                            if active_outbound_target.is_none()
+                                                && focus_device_id.is_some()
+                                            {
+                                                remote_focus_active = true;
                                                 remote_focus_state =
                                                     (focus_device_id, focus_screen_id);
                                             }
@@ -2236,6 +2402,36 @@ pub fn run(
                     if let Some(p) = active_peers.get_mut(&old_id) {
                         let _ = p.conn.queue_control(&MeshControl::RevokeControl);
                         let _ = p.conn.flush();
+                    }
+                }
+
+                // Apply any received remote DisplaysUpdate (orientation / resolution / hotplug)
+                for (from_id, displays) in inbound_display_updates {
+                    if crate::pair_wire::validate_inventory(&displays).is_ok()
+                        && let Some(peer) = active_peers.get_mut(&from_id)
+                        && peer.displays != displays
+                    {
+                        peer.displays = displays;
+                        if active_outbound_target.as_deref() == Some(from_id.as_str()) {
+                            active_outbound_target = None;
+                            if let Some(ref mut io) = native_io
+                                && let Ok(Some(pt)) =
+                                    io.source.force_return_local_with_clock(|| log.ns())
+                                && let Some(ref mut cap) = io.capture
+                            {
+                                let _ = cap.warp_local(pt);
+                            }
+                        }
+                        log.write(
+                            "mesh_peer_displays_updated",
+                            serde_json::json!({
+                                "peer": &from_id[..from_id.len().min(8)],
+                                "count": peer.displays.len(),
+                            }),
+                        );
+                        topology_changed = true;
+                        screen_numbers_dirty = true;
+                        last_status_sig.clear();
                     }
                 }
 
@@ -2301,6 +2497,8 @@ pub fn run(
                     active_outbound_target = None;
                     inbound_owner = None;
                     remote_focus_state = (None, None);
+                    remote_focus_active = false;
+                    last_broadcast_focus = (None, None);
                 } else if topology_changed || native_io.is_none() {
                     let remotes = remote_display_map(&active_peers);
                     if let Ok(rt) =
@@ -2315,6 +2513,9 @@ pub fn run(
                             hotkey_engine.reset_modifiers();
                             let _ = hotkey_engine.drain_actions();
                             if let Ok(mut sink) = prepare_worker(&local_displays, log.clone()) {
+                                if inbound_owner.is_some() {
+                                    let _ = sink.reset();
+                                }
                                 match (platform.capture)(source.clone(), log.clone()) {
                                     Ok(capture) => {
                                         let last_activity = source.activity_counter();
@@ -2599,6 +2800,7 @@ pub fn run(
                         let act = io.source.activity_counter();
                         if act != io.last_activity {
                             io.last_activity = act;
+                            remote_focus_active = false;
                             if let Some(owner_id) = inbound_owner.take() {
                                 log.write(
                                     "mesh_revoke_control",
@@ -2616,9 +2818,26 @@ pub fn run(
                         }
 
                         // Drain outbound frames and route directly 1-hop to target peer!
+                        // Use full 1000 Hz on Wired/Direct Ethernet, adaptive 125 Hz + TCP
+                        // backpressure on Wi-Fi/ZeroTier, and batch socket flush per tick.
+                        let mut dirty_peers: Vec<String> = Vec::new();
                         let mut drained = 0usize;
                         while drained < 32 {
-                            let allow_motion = last_motion_send.elapsed() >= motion_interval;
+                            let motion_peer = active_outbound_target
+                                .as_deref()
+                                .and_then(|tid| active_peers.get(tid));
+                            let eff_interval = motion_peer
+                                .map(|p| {
+                                    effective_motion_interval(
+                                        motion_interval,
+                                        p.peer_addr,
+                                        &local_channels,
+                                    )
+                                })
+                                .unwrap_or(motion_interval);
+                            let tcp_ready = motion_peer.is_none_or(|p| p.conn.can_queue_motion());
+                            let allow_motion =
+                                tcp_ready && last_motion_send.elapsed() >= eff_interval;
                             let next = match io
                                 .source
                                 .next_mesh_frame_with_clock(|| log.ns(), allow_motion)
@@ -2647,7 +2866,9 @@ pub fn run(
                                     && let Some(old_peer) = active_peers.get_mut(&old_id)
                                 {
                                     let _ = old_peer.conn.queue_frame(&Frame::new(Kind::Pause));
-                                    let _ = old_peer.conn.flush();
+                                    if !dirty_peers.iter().any(|id| id == &old_id) {
+                                        dirty_peers.push(old_id);
+                                    }
                                 }
                                 if let Some(ref new_id) = target
                                     && let Some(new_peer) = active_peers.get(new_id)
@@ -2661,6 +2882,13 @@ pub fn run(
                                 && let Some(peer) = active_peers.get_mut(tid)
                             {
                                 let _ = peer.conn.queue_frame(&frame);
+                                if !dirty_peers.iter().any(|id| id == tid) {
+                                    dirty_peers.push(tid.clone());
+                                }
+                            }
+                        }
+                        for tid in dirty_peers {
+                            if let Some(peer) = active_peers.get_mut(&tid) {
                                 let _ = peer.conn.flush();
                             }
                         }
@@ -2668,7 +2896,7 @@ pub fn run(
 
                     // Keep input-worker heartbeat healthy (even when capture is paused on lock screen!)
                     if restart_native.is_none()
-                        && io.last_sink_maintain.elapsed() >= Duration::from_millis(15)
+                        && io.last_sink_maintain.elapsed() >= Duration::from_millis(25)
                     {
                         io.last_sink_maintain = Instant::now();
                         if let Err(err) = io.sink.maintain() {
@@ -2694,8 +2922,20 @@ pub fn run(
                     inbound_owner = None;
                     if let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
+                        && inv != local_displays
                     {
+                        log.write(
+                            "mesh_local_displays_changed",
+                            serde_json::json!({
+                                "count": inv.len(),
+                                "peers": active_peers.len(),
+                                "via": "restart_native",
+                            }),
+                        );
                         local_displays = inv;
+                        screen_numbers_dirty = true;
+                        last_status_sig.clear();
+                        broadcast_displays_update(&mut active_peers, &local_displays);
                     }
                 }
 
@@ -2710,21 +2950,27 @@ pub fn run(
                 }
 
                 // 9. Track local_has_focus & broadcast FocusState changes
-                let (focus_dev, focus_scr) = if let Some(ref io) = native_io
-                    && !user_paused
-                    && io.source.status().enabled
-                {
+                let (focus_dev, focus_scr) = if !user_paused && !active_peers.is_empty() {
                     if active_outbound_target.is_some() {
-                        io.source.focus_identity()
-                    } else if inbound_owner.is_some() {
+                        remote_focus_active = false;
+                        native_io
+                            .as_ref()
+                            .filter(|io| io.source.status().enabled)
+                            .map(|io| io.source.focus_identity())
+                            .unwrap_or((None, None))
+                    } else if inbound_owner.is_some() || remote_focus_active {
                         remote_focus_state.clone()
-                    } else {
+                    } else if let Some(ref io) = native_io
+                        && io.source.status().enabled
+                    {
                         let local_f = io.source.focus_identity();
                         if local_f.0.is_some() {
                             local_f
                         } else {
                             remote_focus_state.clone()
                         }
+                    } else {
+                        remote_focus_state.clone()
                     }
                 } else {
                     (None, None)
@@ -2733,9 +2979,14 @@ pub fn run(
                     || (active_outbound_target.is_none() && inbound_owner.is_none());
                 local_has_focus.store(is_local_focus_now, Ordering::Release);
 
+                // Only the device actively driving cursor focus broadcasts FocusState so
+                // passive receivers never echo stale focus back over the active sender.
+                let owns_focus_broadcast = active_outbound_target.is_some()
+                    || (!remote_focus_active
+                        && inbound_owner.is_none()
+                        && focus_dev.as_deref() == Some(local_device_id.as_str()));
                 if !active_peers.is_empty()
-                    && (focus_dev.as_deref() == Some(local_device_id.as_str())
-                        || active_outbound_target.is_some())
+                    && owns_focus_broadcast
                     && (focus_dev.clone(), focus_scr.clone()) != last_broadcast_focus
                 {
                     last_broadcast_focus = (focus_dev.clone(), focus_scr.clone());
@@ -3142,5 +3393,79 @@ mod tests {
         // Resetting back to default removes the override cleanly
         set_peer_input(&mut cfg, full_id, PeerInputProfile::default());
         assert!(cfg.peer_input.is_empty());
+    }
+
+    #[test]
+    fn effective_motion_interval_keeps_wired_1000hz_and_paces_wifi_125hz() {
+        let local = sample_channels();
+        let wired = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 2), 24800));
+        let wifi = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 188), 24800));
+        let zt = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 194, 59), 24800));
+        let base = Duration::from_millis(1);
+
+        assert_eq!(effective_motion_interval(base, wired, &local), base);
+        assert_eq!(
+            effective_motion_interval(base, wifi, &local),
+            Duration::from_millis(8)
+        );
+        assert_eq!(
+            effective_motion_interval(base, zt, &local),
+            Duration::from_millis(8)
+        );
+    }
+
+    #[test]
+    fn coalesce_inbound_packets_merges_motion_bursts_and_preserves_barriers() {
+        let mv = |x: f64, y: f64| {
+            let mut f = Frame::new(Kind::Move);
+            f.x = x;
+            f.y = y;
+            MeshPacket::Input(f)
+        };
+        let pos = |x: f64, y: f64, d: u32| {
+            let mut f = Frame::new(Kind::Position);
+            f.x = x;
+            f.y = y;
+            f.display_id = d;
+            MeshPacket::Input(f)
+        };
+        let btn = MeshPacket::Input(Frame::new(Kind::Button));
+        let ctrl = MeshPacket::Control(MeshControl::KeepAlive);
+
+        let out = coalesce_inbound_packets(vec![
+            mv(3.0, -2.0),
+            mv(7.0, 5.0),
+            btn,
+            pos(10.0, 20.0, 1),
+            pos(42.0, 84.0, 1),
+            pos(5.0, 6.0, 2),
+            ctrl,
+            mv(1.0, 1.0),
+        ]);
+        assert_eq!(out.len(), 6);
+        match &out[0] {
+            MeshPacket::Input(f) => {
+                assert_eq!(f.kind, Kind::Move);
+                assert_eq!((f.x, f.y), (10.0, 3.0));
+            }
+            _ => panic!("expected coalesced move"),
+        }
+        assert!(matches!(&out[1], MeshPacket::Input(f) if f.kind == Kind::Button));
+        match &out[2] {
+            MeshPacket::Input(f) => {
+                assert_eq!(f.kind, Kind::Position);
+                assert_eq!((f.x, f.y, f.display_id), (42.0, 84.0, 1));
+            }
+            _ => panic!("expected coalesced position on display 1"),
+        }
+        match &out[3] {
+            MeshPacket::Input(f) => {
+                assert_eq!(f.kind, Kind::Position);
+                assert_eq!((f.x, f.y, f.display_id), (5.0, 6.0, 2));
+            }
+            _ => panic!("expected separate position on display 2"),
+        }
+        assert!(matches!(&out[4], MeshPacket::Control(MeshControl::KeepAlive)));
+        assert!(matches!(&out[5], MeshPacket::Input(f) if f.kind == Kind::Move && f.x == 1.0));
     }
 }

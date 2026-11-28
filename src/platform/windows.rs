@@ -810,8 +810,11 @@ unsafe extern "system" fn window_proc<F: FnMut(CaptureEvent), S: FnMut() -> Capt
         if state.routed_input && routed_context_invalidated(message, wparam) {
             routed::abort_input();
             state.error =
-                Some("Windows display or session changed; reconnect before sharing".into());
-            state.command(STOP);
+                Some("Windows display or session changed; restarting capture".into());
+            // Stop the capture loop with an error instead of emitting CaptureEvent::Stop
+            // (which is reserved for the user's physical Ctrl+Alt+Esc emergency chord and
+            // would permanently latch user_paused = true on display rotation/hotplug).
+            state.stop.store(true, Ordering::Release);
             // Never veto Windows logoff/shutdown after relinquishing input.
             return if message == WM_QUERYENDSESSION || message == WM_POWERBROADCAST {
                 1

@@ -108,14 +108,13 @@ mod platform {
     use std::ptr::null_mut;
     use std::thread;
     use std::time::Duration;
-    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, INPUT, INPUT_0, INPUT_KEYBOARD,
         KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CAPITAL,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, MSG, PM_NOREMOVE, PeekMessageW,
-        PostMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+        GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, SMTO_ABORTIFHUNG,
+        SendMessageTimeoutW,
     };
 
     const WM_INPUTLANGCHANGEREQUEST: u32 = 0x0050;
@@ -136,26 +135,11 @@ mod platform {
     }
 
     pub fn read_caps_lock() -> bool {
-        unsafe {
-            // Pump message queue state and attach briefly to foreground thread so
-            // GetKeyState(VK_CAPITAL) returns the true live global Caps Lock toggle
-            // rather than a stale background-thread snapshot.
-            let mut msg: MSG = std::mem::zeroed();
-            let _ = PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
-            let cur_tid = GetCurrentThreadId();
-            let hwnd = GetForegroundWindow();
-            let fg_tid = if !hwnd.is_null() {
-                GetWindowThreadProcessId(hwnd, null_mut())
-            } else {
-                0
-            };
-            let attached = fg_tid != 0 && fg_tid != cur_tid && AttachThreadInput(cur_tid, fg_tid, 1) != 0;
-            let state = (GetKeyState(VK_CAPITAL as i32) & 1) != 0;
-            if attached {
-                let _ = AttachThreadInput(cur_tid, fg_tid, 0);
-            }
-            state
-        }
+        // NEVER call AttachThreadInput on another process's foreground UI thread!
+        // Repeatedly attaching/detaching input queues resets keyboard state and
+        // detaches Windows TSF/IME focus in WeChat, Chromium, and Electron apps,
+        // stranding the floating candidate bar while blocking text commit / Backspace.
+        unsafe { (GetKeyState(VK_CAPITAL as i32) & 1) != 0 }
     }
 
     pub fn set_caps_lock(desired: bool) -> bool {
