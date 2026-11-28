@@ -10,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.3-rc.1] - 2026-11-28 (Pre-release)
+
+### Fixed
+- **彻底修复 Windows 下打开任务管理器 / 管理员窗口导致卡死或无法来回切屏**：
+  - 修复普通权限模式下 Windows UIPI 拦截 `SetPhysicalCursorPos` / `SendInput`（`Win32 5 / ERROR_ACCESS_DENIED`）时错误触发 `physical_stop` 并永久锁死 `user_paused` 或反复杀掉 `input-worker` 的问题；打开任务管理器等高权限窗口不再中断跨屏控制。
+- **大幅优化双 Windows Wi-Fi 连接及老旧 CPU（如六七年前 i7 笔记本）流畅度与稳定性**：
+  - 在 `WindowsMouseSink`（普通与服务模式）内对桌面状态与显示器列表增加 `100ms` 缓存并消除 `move_by` 重复校验，将每帧鼠标移动的系统调用开销降低 50 倍以上。
+  - 有线直连 / 有线局域网保持完整 `1000 Hz`，Wi-Fi / ZeroTier 通道自动自适应 `125 Hz (8ms)` 平滑合并发送并加入 TCP 队列背压（阈值 8，无损累加位移，点击/按键/切边 0ms 即时转发），队列上限提至 `1024` 并批处理 `flush()`。
+  - 接收端新增 `coalesce_inbound_packets` 无损合并 Wi-Fi 突发鼠标移动帧（严格保留按键/滚轮/切屏顺序屏障），异常时主动向对端回发 `RevokeControl`。
+  - 放宽旧款 CPU 与 Wi-Fi 弱网场景下的超时阈值：`MAX_REQUEST_AGE_NS` / `RPC_TIMEOUT` / `INPUT_MAX_AGE_NS` `30ms → 250ms`、`ACTIVE_LEASE_NS` `150ms → 600ms`、`OWNER_LEASE_NS` `100ms → 1500ms`、Wi-Fi 建连超时 `300~350ms → 1200ms`、握手超时 `2s → 4s`、静默断连 `9s → 18s`。
+
+---
+
 ## [0.4.2] - 2026-11-28
 
 ### Added
