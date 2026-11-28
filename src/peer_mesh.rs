@@ -1400,6 +1400,7 @@ pub fn run(
             let mut active_outbound_target: Option<String> = None;
             let mut inbound_owner: Option<String> = None;
             let mut remote_focus_state: (Option<String>, Option<String>) = (None, None);
+            let mut remote_focus_active = false;
             let mut last_broadcast_focus: (Option<String>, Option<String>) = (None, None);
             let mut pending_quick_jump: Option<(QuickJumpTarget, Instant)> = None;
             let mut numbered_screens: Vec<NumberedScreenInfo> = build_numbered_screens(
@@ -2210,6 +2211,7 @@ pub fn run(
                                     layout_book.active_screens(),
                                 );
                             }
+                            last_broadcast_focus = (None, None);
                             topology_changed = true;
                         }
                     }
@@ -2259,6 +2261,23 @@ pub fn run(
                                                     }
                                                     let _ = io.sink.reset();
                                                     inbound_owner = Some(pid.clone());
+                                                    remote_focus_active = true;
+                                                    if remote_focus_state.0.as_deref()
+                                                        != Some(local_device_id.as_str())
+                                                    {
+                                                        let fallback_scr = local_displays
+                                                            .first()
+                                                            .map(|d| {
+                                                                canonical_screen_id(
+                                                                    &local_device_id,
+                                                                    d.wire_id,
+                                                                )
+                                                            });
+                                                        remote_focus_state = (
+                                                            Some(local_device_id.clone()),
+                                                            fallback_scr,
+                                                        );
+                                                    }
                                                 }
                                                 Kind::Pause => {
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
@@ -2270,6 +2289,18 @@ pub fn run(
                                                 _ => {
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
                                                     {
+                                                        if frame.kind == Kind::Position
+                                                            && frame.display_id != 0
+                                                        {
+                                                            remote_focus_active = true;
+                                                            remote_focus_state = (
+                                                                Some(local_device_id.clone()),
+                                                                Some(canonical_screen_id(
+                                                                    &local_device_id,
+                                                                    frame.display_id,
+                                                                )),
+                                                            );
+                                                        }
                                                         if let Err(err) =
                                                             apply_inbound_frame(&mut io.sink, &frame)
                                                         {
@@ -2326,7 +2357,10 @@ pub fn run(
                                             {
                                                 crate::power::wake_display_now();
                                             }
-                                            if active_outbound_target.is_none() {
+                                            if active_outbound_target.is_none()
+                                                && focus_device_id.is_some()
+                                            {
+                                                remote_focus_active = true;
                                                 remote_focus_state =
                                                     (focus_device_id, focus_screen_id);
                                             }
@@ -2463,6 +2497,8 @@ pub fn run(
                     active_outbound_target = None;
                     inbound_owner = None;
                     remote_focus_state = (None, None);
+                    remote_focus_active = false;
+                    last_broadcast_focus = (None, None);
                 } else if topology_changed || native_io.is_none() {
                     let remotes = remote_display_map(&active_peers);
                     if let Ok(rt) =
@@ -2764,6 +2800,7 @@ pub fn run(
                         let act = io.source.activity_counter();
                         if act != io.last_activity {
                             io.last_activity = act;
+                            remote_focus_active = false;
                             if let Some(owner_id) = inbound_owner.take() {
                                 log.write(
                                     "mesh_revoke_control",
@@ -2913,21 +2950,27 @@ pub fn run(
                 }
 
                 // 9. Track local_has_focus & broadcast FocusState changes
-                let (focus_dev, focus_scr) = if let Some(ref io) = native_io
-                    && !user_paused
-                    && io.source.status().enabled
-                {
+                let (focus_dev, focus_scr) = if !user_paused && !active_peers.is_empty() {
                     if active_outbound_target.is_some() {
-                        io.source.focus_identity()
-                    } else if inbound_owner.is_some() {
+                        remote_focus_active = false;
+                        native_io
+                            .as_ref()
+                            .filter(|io| io.source.status().enabled)
+                            .map(|io| io.source.focus_identity())
+                            .unwrap_or((None, None))
+                    } else if inbound_owner.is_some() || remote_focus_active {
                         remote_focus_state.clone()
-                    } else {
+                    } else if let Some(ref io) = native_io
+                        && io.source.status().enabled
+                    {
                         let local_f = io.source.focus_identity();
                         if local_f.0.is_some() {
                             local_f
                         } else {
                             remote_focus_state.clone()
                         }
+                    } else {
+                        remote_focus_state.clone()
                     }
                 } else {
                     (None, None)
@@ -2936,9 +2979,14 @@ pub fn run(
                     || (active_outbound_target.is_none() && inbound_owner.is_none());
                 local_has_focus.store(is_local_focus_now, Ordering::Release);
 
+                // Only the device actively driving cursor focus broadcasts FocusState so
+                // passive receivers never echo stale focus back over the active sender.
+                let owns_focus_broadcast = active_outbound_target.is_some()
+                    || (!remote_focus_active
+                        && inbound_owner.is_none()
+                        && focus_dev.as_deref() == Some(local_device_id.as_str()));
                 if !active_peers.is_empty()
-                    && (focus_dev.as_deref() == Some(local_device_id.as_str())
-                        || active_outbound_target.is_some())
+                    && owns_focus_broadcast
                     && (focus_dev.clone(), focus_scr.clone()) != last_broadcast_focus
                 {
                     last_broadcast_focus = (focus_dev.clone(), focus_scr.clone());
