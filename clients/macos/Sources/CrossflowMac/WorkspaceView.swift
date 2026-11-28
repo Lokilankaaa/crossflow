@@ -137,7 +137,6 @@ struct WorkspaceView: View {
     @Bindable var model: WorkspaceModel
     @Bindable var peer: PeerMeshModel
     @Bindable var updater: AppUpdater
-    @ViewState private var showDetails = false
     @ViewState private var layoutNotice: String?
     @ViewState private var undoStack: [SharedLayout] = []
     @ViewState private var editingPassword = false
@@ -203,27 +202,8 @@ struct WorkspaceView: View {
             cancelHotkeyRecording()
             RemoteCursorHider.shared.setHidden(false)
         }
-        .sheet(isPresented: $showDetails) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("内核信息").font(.title2.bold())
-                Text(model.bridgeMessage).foregroundStyle(Theme.secondary)
-                if let ep = peer.listenEndpoint {
-                    Text("监听地址：\(ep)").font(.caption).foregroundStyle(Theme.secondary)
-                }
-                ScrollView {
-                    Text(model.environmentJSON.isEmpty ? "暂无环境信息。" : model.environmentJSON)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                HStack {
-                    Button("重新检查") { Task { await model.refreshBridge() } }
-                    Spacer()
-                    Button("完成") { showDetails = false }
-                }
-            }
-            .padding(24)
-            .frame(width: 540, height: 380)
+        .sheet(isPresented: $updater.showAboutSheet) {
+            AboutCommunityView(model: model, peer: peer, updater: updater)
         }
     }
 
@@ -262,11 +242,13 @@ struct WorkspaceView: View {
                         .foregroundStyle(updater.phase == .available ? Theme.accent : Theme.secondary)
                         .padding(.top, 4)
                     Spacer()
-                    Button { showDetails = true } label: {
-                        Image(systemName: "info.circle").foregroundStyle(Theme.secondary)
+                    Button { updater.openAbout(tab: "updates") } label: {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(updater.phase == .available ? Theme.accent : Theme.secondary)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("内核信息")
+                    .help("关于、更新与社区支持")
+                    .accessibilityLabel("关于与社区支持")
                 }
                 .padding(.bottom, 4)
 
@@ -863,6 +845,12 @@ struct WorkspaceView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
+
+                Button("关于与社区") {
+                    updater.openAbout(tab: "community")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
     }

@@ -12,6 +12,7 @@ struct UpdateReleaseInfo: Equatable, Sendable {
     let downloadUrl: String
     let assetSize: Int64
     let checksumsUrl: String?
+    let isPrerelease: Bool
 }
 
 enum UpdaterPhase: Equatable, Sendable {
@@ -25,16 +26,35 @@ enum UpdaterPhase: Equatable, Sendable {
     case error
 }
 
+struct MirrorPreset: Identifiable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let desc: String
+    let prefix: String?
+}
+
+private struct UpdaterSettingsFile: Codable, Sendable {
+    var mirrorPrefix: String = ""
+    var includePrerelease: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case mirrorPrefix = "mirror_prefix"
+        case includePrerelease = "include_prerelease"
+    }
+}
+
 private struct GitHubReleaseDTO: Decodable, Sendable {
     let tagName: String?
     let htmlUrl: String?
     let body: String?
+    let draft: Bool?
     let assets: [GitHubAssetDTO]?
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
         case htmlUrl = "html_url"
         case body
+        case draft
         case assets
     }
 }
@@ -51,13 +71,27 @@ private struct GitHubAssetDTO: Decodable, Sendable {
     }
 }
 
-/// GitHub Releases self-updater with mandatory SHA-256 verification, codesign verification,
-/// rollback-safe atomic `.app` swap, and automatic relaunch.
+private struct AtomReleaseEntry: Sendable {
+    let tagName: String
+    let notes: String
+    let htmlUrl: String
+}
+
+/// GitHub Releases self-updater with Atom feed + web redirect + REST API fallback,
+/// optional HTTPS GitHub mirror prefix with automatic direct fallback, stable / prerelease (-rc)
+/// channel switching, mandatory SHA-256 verification, codesign verification, and rollback-safe swap.
 @MainActor @Observable
 final class AppUpdater {
-    private nonisolated static let repoBaseURL = "https://github.com/Lokilankaaa/crossflow"
-    private nonisolated static let latestReleaseWebURL = URL(string: "https://github.com/Lokilankaaa/crossflow/releases/latest")!
+    nonisolated static let repoBaseURL = "https://github.com/Lokilankaaa/crossflow"
+    nonisolated static let releasesAtomURL = "https://github.com/Lokilankaaa/crossflow/releases.atom"
+    nonisolated static let latestReleaseWebURL = "https://github.com/Lokilankaaa/crossflow/releases/latest"
+    nonisolated static let releasesPageURL = "https://github.com/Lokilankaaa/crossflow/releases"
+    nonisolated static let issuesNewURL = "https://github.com/Lokilankaaa/crossflow/issues/new/choose"
+    nonisolated static let authorGitHubURL = "https://github.com/Lokilankaaa"
+    nonisolated static let authorBilibiliURL = "https://b23.tv/pANRtSc"
+
     private nonisolated static let latestReleaseAPI = URL(string: "https://api.github.com/repos/Lokilankaaa/crossflow/releases/latest")!
+    private nonisolated static let releasesListAPI = URL(string: "https://api.github.com/repos/Lokilankaaa/crossflow/releases?per_page=10")!
     private nonisolated static let allowedHosts = [
         "api.github.com",
         "github.com",
@@ -65,19 +99,134 @@ final class AppUpdater {
         "release-assets.githubusercontent.com"
     ]
 
+    nonisolated static let mirrorPresets: [MirrorPreset] = [
+        MirrorPreset(id: "direct", label: "GitHub 官方直连", desc: "默认直连 github.com，适合海外或代理网络环境", prefix: ""),
+        MirrorPreset(id: "ghproxy", label: "GH-Proxy · gh-proxy.com", desc: "国内常用 GitHub Releases 加速节点，失败自动回退直连", prefix: "https://gh-proxy.com/"),
+        MirrorPreset(id: "ghfast", label: "GHFast · ghfast.top", desc: "国内备用 GitHub 下载加速镜像节点，失败自动回退直连", prefix: "https://ghfast.top/"),
+        MirrorPreset(id: "custom", label: "自定义镜像前缀…", desc: "使用自建或自定义 HTTPS 加速前缀", prefix: nil)
+    ]
+
     let currentVersion: String
     var phase: UpdaterPhase = .idle
     var release: UpdateReleaseInfo?
     var progress: Double = 0
     var message: String
+    var mirrorPrefix: String
+    var includePrerelease: Bool
+    var showAboutSheet: Bool = false
+    var activeAboutTab: String = "updates"
 
     @ObservationIgnored private var downloadTask: Task<Bool, Never>?
     @ObservationIgnored private var startupChecked = false
 
+    nonisolated static var userDataDirURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Crossflow", isDirectory: true)
+    }
+
+    nonisolated static var logsDirURL: URL {
+        userDataDirURL.appendingPathComponent("Logs", isDirectory: true)
+    }
+
+    private nonisolated static var settingsURL: URL {
+        userDataDirURL.appendingPathComponent("updater-settings.json")
+    }
+
     init() {
         let ver = Self.resolveCurrentVersion()
+        let saved = Self.loadSettings()
         self.currentVersion = ver
+        self.mirrorPrefix = saved.mirrorPrefix
+        self.includePrerelease = saved.includePrerelease
         self.message = "当前版本 v\(ver)"
+    }
+
+    func openAbout(tab: String = "updates") {
+        activeAboutTab = tab
+        showAboutSheet = true
+    }
+
+    func describeMirror() -> String {
+        Self.describeMirror(mirrorPrefix)
+    }
+
+    nonisolated static func describeMirror(_ rawPrefix: String) -> String {
+        let clean = normalizeMirrorPrefix(rawPrefix)
+        if clean.isEmpty { return "GitHub 官方直连" }
+        if let match = mirrorPresets.first(where: { ($0.prefix ?? "").caseInsensitiveCompare(clean) == .orderedSame }) {
+            return match.label
+        }
+        return clean.hasSuffix("/") ? String(clean.dropLast()) : clean
+    }
+
+    nonisolated static func resolveMirrorPresetID(_ rawPrefix: String) -> String {
+        let clean = normalizeMirrorPrefix(rawPrefix)
+        if clean.isEmpty { return "direct" }
+        if let match = mirrorPresets.first(where: { ($0.prefix ?? "").caseInsensitiveCompare(clean) == .orderedSame }) {
+            return match.id
+        }
+        return "custom"
+    }
+
+    nonisolated static func normalizeMirrorPrefix(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              url.scheme?.lowercased() == "https",
+              let host = url.host, !host.isEmpty else { return "" }
+        return trimmed.hasSuffix("/") ? trimmed : trimmed + "/"
+    }
+
+    nonisolated static func buildCandidateURLs(officialURL: String, mirrorPrefix: String) -> [String] {
+        var result: [String] = []
+        let cleanMirror = normalizeMirrorPrefix(mirrorPrefix)
+        if !cleanMirror.isEmpty && isAllowedHttpsUrl(officialURL) {
+            result.append(cleanMirror + officialURL)
+        }
+        result.append(officialURL)
+        return result
+    }
+
+    func setMirrorPrefix(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            mirrorPrefix = ""
+        } else {
+            let normalized = Self.normalizeMirrorPrefix(trimmed)
+            if normalized.isEmpty {
+                return "镜像前缀必须为有效的 https:// 地址，例如 https://gh-proxy.com/"
+            }
+            mirrorPrefix = normalized
+        }
+        saveSettings()
+        return nil
+    }
+
+    func setIncludePrerelease(_ enabled: Bool) {
+        guard includePrerelease != enabled else { return }
+        includePrerelease = enabled
+        saveSettings()
+    }
+
+    private func saveSettings() {
+        let cfg = UpdaterSettingsFile(mirrorPrefix: mirrorPrefix, includePrerelease: includePrerelease)
+        let url = Self.settingsURL
+        do {
+            try FileManager.default.createDirectory(at: Self.userDataDirURL, withIntermediateDirectories: true)
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try enc.encode(cfg)
+            try data.write(to: url, options: .atomic)
+        } catch {}
+    }
+
+    private nonisolated static func loadSettings() -> UpdaterSettingsFile {
+        guard let data = try? Data(contentsOf: settingsURL),
+              var cfg = try? JSONDecoder().decode(UpdaterSettingsFile.self, from: data) else {
+            return UpdaterSettingsFile()
+        }
+        cfg.mirrorPrefix = normalizeMirrorPrefix(cfg.mirrorPrefix)
+        return cfg
     }
 
     func scheduleSilentStartupCheck() {
@@ -97,6 +246,9 @@ final class AppUpdater {
             break
         }
 
+        let includePre = includePrerelease
+        let mirror = mirrorPrefix
+
         if !silent {
             phase = .checking
             progress = 0
@@ -104,11 +256,23 @@ final class AppUpdater {
         }
 
         do {
-            var resolvedTag = await fetchLatestTagFromWeb()
+            // 1. Primary: GitHub Releases Atom feed (zero API rate limit, works via mirror,
+            //    supports stable + prerelease channels + release notes)
+            let atomHit = await fetchLatestFromAtom(includePrerelease: includePre, mirrorPrefix: mirror)
+
+            var resolvedTag = atomHit?.tagName
+            var notes = atomHit?.notes ?? ""
+            var htmlUrl = atomHit?.htmlUrl
             var apiDTO: GitHubReleaseDTO?
 
+            // 2. Fallback (stable): GitHub /releases/latest web redirect/JSON
+            if resolvedTag == nil && !includePre {
+                resolvedTag = await fetchLatestTagFromWeb(mirrorPrefix: mirror)
+            }
+
+            // 3. Final fallback: GitHub REST API
             if resolvedTag == nil {
-                var req = URLRequest(url: Self.latestReleaseAPI, timeoutInterval: 12)
+                var req = URLRequest(url: includePre ? Self.releasesListAPI : Self.latestReleaseAPI, timeoutInterval: 15)
                 req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
                 req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
 
@@ -123,19 +287,28 @@ final class AppUpdater {
                 guard (200...299).contains(http.statusCode) else {
                     if !silent {
                         phase = .error
-                        message = "检查更新失败（HTTP \(http.statusCode)）"
+                        message = "检查更新失败（HTTP \(http.statusCode)），可切换下载加速线路后重试"
                     }
                     return
                 }
-                let dto = try JSONDecoder().decode(GitHubReleaseDTO.self, from: data)
-                apiDTO = dto
-                resolvedTag = dto.tagName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if includePre {
+                    let list = try JSONDecoder().decode([GitHubReleaseDTO].self, from: data)
+                    let valid = list.filter { ($0.draft ?? false) == false && ($0.tagName?.lowercased().hasPrefix("v") ?? false) }
+                    apiDTO = valid.max { a, b in
+                        Self.compareVersions(a.tagName ?? "", b.tagName ?? "") < 0
+                    }
+                } else {
+                    apiDTO = try JSONDecoder().decode(GitHubReleaseDTO.self, from: data)
+                }
+                resolvedTag = apiDTO?.tagName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                notes = apiDTO?.body ?? notes
+                htmlUrl = apiDTO?.htmlUrl ?? htmlUrl
             }
 
             guard let rawTag = resolvedTag, !rawTag.isEmpty else {
                 if !silent {
                     phase = .error
-                    message = "无法解析最新版本信息。"
+                    message = "无法解析最新版本信息，请检查网络或切换镜像线路。"
                 }
                 return
             }
@@ -151,6 +324,7 @@ final class AppUpdater {
                 return
             }
 
+            let isPre = Self.isPrereleaseTag(rawTag)
             let info: UpdateReleaseInfo?
             if let dto = apiDTO {
                 let assets = dto.assets ?? []
@@ -164,46 +338,44 @@ final class AppUpdater {
                         guard let name = asset.name, let url = asset.browserDownloadUrl else { return false }
                         return name.caseInsensitiveCompare("SHA256SUMS.txt") == .orderedSame && Self.isAllowedHttpsUrl(url)
                     }
-                    let htmlUrl = (dto.htmlUrl.flatMap { Self.isAllowedHttpsUrl($0) ? $0 : nil })
+                    let safeHtml = (dto.htmlUrl.flatMap { Self.isAllowedHttpsUrl($0) ? $0 : nil })
                         ?? "\(Self.repoBaseURL)/releases/tag/\(rawTag)"
                     info = UpdateReleaseInfo(
                         version: latestVer,
                         tagName: rawTag,
-                        htmlUrl: htmlUrl,
-                        notes: dto.body ?? "",
+                        htmlUrl: safeHtml,
+                        notes: Self.trimNotes(notes),
                         assetName: assetName,
                         downloadUrl: assetURL,
                         assetSize: macAsset.size ?? 0,
-                        checksumsUrl: checksumsAsset?.browserDownloadUrl
+                        checksumsUrl: checksumsAsset?.browserDownloadUrl,
+                        isPrerelease: isPre
                     )
                 } else {
                     info = nil
                 }
             } else {
-                let checksumsUrl = "\(Self.repoBaseURL)/releases/download/\(rawTag)/SHA256SUMS.txt"
+                let escapedTag = rawTag.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? rawTag
+                let checksumsUrl = "\(Self.repoBaseURL)/releases/download/\(escapedTag)/SHA256SUMS.txt"
                 var assetName = "Crossflow-\(rawTag)-macos-arm64.zip"
-                if let sumURL = URL(string: checksumsUrl) {
-                    var sumReq = URLRequest(url: sumURL, timeoutInterval: 10)
-                    sumReq.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-                    if let (sumData, sumResp) = try? await URLSession.shared.data(for: sumReq),
-                       let sumHttp = sumResp as? HTTPURLResponse,
-                       (200...299).contains(sumHttp.statusCode),
-                       let sumText = String(data: sumData, encoding: .utf8),
-                       let matched = Self.findAssetNameInChecksums(sumText, suffix: "-macos-arm64.zip") {
-                        assetName = matched
-                    }
+                if let sumText = await fetchStringWithMirror(officialURL: checksumsUrl, mirrorPrefix: mirror),
+                   let matched = Self.findAssetNameInChecksums(sumText, suffix: "-macos-arm64.zip") {
+                    assetName = matched
                 }
-                let downloadUrl = "\(Self.repoBaseURL)/releases/download/\(rawTag)/\(assetName)"
-                let assetSize = await probeContentLength(urlString: downloadUrl)
+                let downloadUrl = "\(Self.repoBaseURL)/releases/download/\(escapedTag)/\(assetName)"
+                let assetSize = await probeContentLength(officialURL: downloadUrl, mirrorPrefix: mirror)
+                let safeHtml = (htmlUrl.flatMap { Self.isAllowedHttpsUrl($0) ? $0 : nil })
+                    ?? "\(Self.repoBaseURL)/releases/tag/\(escapedTag)"
                 info = UpdateReleaseInfo(
                     version: latestVer,
                     tagName: rawTag,
-                    htmlUrl: "\(Self.repoBaseURL)/releases/tag/\(rawTag)",
-                    notes: "",
+                    htmlUrl: safeHtml,
+                    notes: Self.trimNotes(notes),
                     assetName: assetName,
                     downloadUrl: downloadUrl,
                     assetSize: assetSize,
-                    checksumsUrl: checksumsUrl
+                    checksumsUrl: checksumsUrl,
+                    isPrerelease: isPre
                 )
             }
 
@@ -215,13 +387,14 @@ final class AppUpdater {
                 return
             }
 
+            let preBadge = resolvedInfo.isPrerelease ? " RC" : ""
             let sizeText = resolvedInfo.assetSize > 0
                 ? String(format: "（%.1f MB）", Double(resolvedInfo.assetSize) / (1024.0 * 1024.0))
                 : ""
             release = resolvedInfo
             phase = .available
             progress = 0
-            message = "发现新版本 v\(resolvedInfo.version)\(sizeText)"
+            message = "发现新版本 v\(resolvedInfo.version)\(preBadge)\(sizeText)"
         } catch is CancellationError {
             if !silent {
                 phase = .error
@@ -240,9 +413,18 @@ final class AppUpdater {
     }
 
     func openReleaseNotes() {
-        guard let urlStr = release?.htmlUrl,
-              Self.isAllowedHttpsUrl(urlStr),
-              let url = URL(string: urlStr) else { return }
+        let urlStr = release?.htmlUrl ?? Self.releasesPageURL
+        openExternalURL(urlStr)
+    }
+
+    func openExternalURL(_ raw: String) {
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https" else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func openFolder(_ url: URL) {
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         NSWorkspace.shared.open(url)
     }
 
@@ -264,7 +446,7 @@ final class AppUpdater {
         let parentDir = targetAppURL.deletingLastPathComponent()
         guard Self.canWriteDirectory(parentDir) else {
             phase = .error
-            message = "当前应用目录不可写，请将 Crossflow.app 移至“应用程序”后再更新，或点击“查看说明”手动下载。"
+            message = "当前应用目录不可写，请将 Crossflow.app 移至“应用程序”后再更新，或点击“更新日志”手动下载。"
             return false
         }
 
@@ -283,6 +465,7 @@ final class AppUpdater {
         stopBeforeReplace: @escaping @MainActor () async -> Void
     ) async -> Bool {
         let fm = FileManager.default
+        let mirror = mirrorPrefix
         let workDir = fm.temporaryDirectory
             .appendingPathComponent("CrossflowUpdate", isDirectory: true)
             .appendingPathComponent("v\(info.version)-\(UUID().uuidString)", isDirectory: true)
@@ -297,59 +480,84 @@ final class AppUpdater {
 
             guard let checksumsStr = info.checksumsUrl,
                   Self.isAllowedHttpsUrl(checksumsStr),
-                  let checksumsURL = URL(string: checksumsStr) else {
-                try? fm.removeItem(at: workDir)
-                phase = .error
-                message = "未找到 SHA256SUMS.txt 校验文件，已取消更新。"
-                return false
-            }
-
-            var sumReq = URLRequest(url: checksumsURL, timeoutInterval: 20)
-            sumReq.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-            let (sumData, sumResp) = try await URLSession.shared.data(for: sumReq)
-            guard let sumHttp = sumResp as? HTTPURLResponse, (200...299).contains(sumHttp.statusCode),
-                  let sumsText = String(data: sumData, encoding: .utf8),
+                  let sumsText = await fetchStringWithMirror(officialURL: checksumsStr, mirrorPrefix: mirror),
                   let expectedSha = Self.parseExpectedSha256(sumsText, assetName: info.assetName) else {
                 try? fm.removeItem(at: workDir)
                 phase = .error
-                message = "SHA256SUMS.txt 中缺少该安装包的校验值，已取消更新。"
+                message = "SHA256SUMS.txt 获取或解析失败，已取消更新。"
                 return false
             }
 
-            guard Self.isAllowedHttpsUrl(info.downloadUrl), let dlURL = URL(string: info.downloadUrl) else {
+            guard Self.isAllowedHttpsUrl(info.downloadUrl) else {
                 try? fm.removeItem(at: workDir)
                 phase = .error
                 message = "更新包下载地址不受信任，已取消更新。"
                 return false
             }
 
-            var dlReq = URLRequest(url: dlURL, timeoutInterval: 600)
-            dlReq.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-            let expectedLen = info.assetSize
-            let versionLabel = info.version
-            try await Self.downloadFile(
-                request: dlReq,
-                destination: zipURL,
-                fallbackTotal: expectedLen
-            ) { [weak self] downloaded, total in
-                Task { @MainActor [weak self] in
-                    self?.updateDownloadProgress(downloaded: downloaded, total: total, version: versionLabel)
+            let candidates = Self.buildCandidateURLs(officialURL: info.downloadUrl, mirrorPrefix: mirror)
+            var verifiedOk = false
+            var lastErrMsg: String?
+
+            for (idx, candidateStr) in candidates.enumerated() {
+                try Task.checkCancellation()
+                guard let dlURL = URL(string: candidateStr) else { continue }
+                let viaMirror = idx == 0 && candidates.count > 1
+                let route = viaMirror ? "镜像" : "直连"
+
+                do {
+                    if fm.fileExists(atPath: zipURL.path) {
+                        try? fm.removeItem(at: zipURL)
+                    }
+                    var dlReq = URLRequest(url: dlURL, timeoutInterval: 600)
+                    dlReq.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+                    let expectedLen = info.assetSize
+                    let versionLabel = info.version
+                    try await Self.downloadFile(
+                        request: dlReq,
+                        destination: zipURL,
+                        fallbackTotal: expectedLen
+                    ) { [weak self] downloaded, total in
+                        Task { @MainActor [weak self] in
+                            self?.updateDownloadProgress(downloaded: downloaded, total: total, version: versionLabel, route: route)
+                        }
+                    }
+
+                    try Task.checkCancellation()
+                    phase = .verifying
+                    progress = 1.0
+                    message = "正在校验 SHA-256 完整性…"
+
+                    let actualSha = try await Task.detached(priority: .userInitiated) {
+                        try Self.computeFileSha256(url: zipURL)
+                    }.value
+
+                    if actualSha.caseInsensitiveCompare(expectedSha) == .orderedSame {
+                        verifiedOk = true
+                        break
+                    }
+                    lastErrMsg = "安装包 SHA-256 校验失败"
+                    if viaMirror {
+                        phase = .downloading
+                        progress = 0
+                        message = "镜像校验异常，正在自动回退 GitHub 官方直连…"
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    lastErrMsg = error.localizedDescription
+                    if viaMirror {
+                        phase = .downloading
+                        progress = 0
+                        message = "镜像线路不可用，正在自动回退 GitHub 官方直连…"
+                    }
                 }
             }
 
-            try Task.checkCancellation()
-            phase = .verifying
-            progress = 1.0
-            message = "正在校验 SHA-256 完整性…"
-
-            let actualSha = try await Task.detached(priority: .userInitiated) {
-                try Self.computeFileSha256(url: zipURL)
-            }.value
-
-            guard actualSha.caseInsensitiveCompare(expectedSha) == .orderedSame else {
+            guard verifiedOk else {
                 try? fm.removeItem(at: workDir)
                 phase = .error
-                message = "安装包 SHA-256 校验失败，已取消更新。"
+                message = "更新包下载或校验失败：\(lastErrMsg ?? "网络异常")"
                 return false
             }
 
@@ -434,34 +642,199 @@ final class AppUpdater {
         }
     }
 
-    private func updateDownloadProgress(downloaded: Int64, total: Int64, version: String) {
+    private func updateDownloadProgress(downloaded: Int64, total: Int64, version: String, route: String) {
         let pct = total > 0 ? min(max(Double(downloaded) / Double(total), 0), 1) : 0
         progress = pct
         let mb = String(format: "%.1f", Double(downloaded) / (1024.0 * 1024.0))
         if total > 0 {
             let totalMb = String(format: "%.1f", Double(total) / (1024.0 * 1024.0))
-            message = String(format: "正在下载 v%@… %.0f%%（%@ / %@ MB）", version, pct * 100.0, mb, totalMb)
+            message = String(format: "正在下载 v%@（%@）… %.0f%%（%@ / %@ MB）", version, route, pct * 100.0, mb, totalMb)
         } else {
-            message = "正在下载 v\(version)…（\(mb) MB）"
+            message = "正在下载 v\(version)（\(route)）…（\(mb) MB）"
         }
+    }
+
+    private func fetchStringWithMirror(officialURL: String, mirrorPrefix: String) async -> String? {
+        for candidate in Self.buildCandidateURLs(officialURL: officialURL, mirrorPrefix: mirrorPrefix) {
+            guard let url = URL(string: candidate) else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 15)
+            req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+            if let (data, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let text = String(data: data, encoding: .utf8) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    private func fetchLatestFromAtom(includePrerelease: Bool, mirrorPrefix: String) async -> AtomReleaseEntry? {
+        guard let xml = await fetchStringWithMirror(officialURL: Self.releasesAtomURL, mirrorPrefix: mirrorPrefix),
+              let data = xml.data(using: .utf8) else { return nil }
+        return Self.parseReleasesAtom(data: data, includePrerelease: includePrerelease)
+    }
+
+    private nonisolated static func parseReleasesAtom(data: Data, includePrerelease: Bool) -> AtomReleaseEntry? {
+        final class ParserDelegate: NSObject, XMLParserDelegate {
+            var entries: [(id: String, link: String, content: String)] = []
+            private var inEntry = false
+            private var currentTag = ""
+            private var curId = ""
+            private var curLink = ""
+            private var curContent = ""
+
+            func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
+                if elementName == "entry" {
+                    inEntry = true
+                    curId = ""
+                    curLink = ""
+                    curContent = ""
+                } else if inEntry {
+                    currentTag = elementName
+                    if elementName == "link", let href = attributeDict["href"], href.lowercased().contains("/releases/tag/") {
+                        curLink = href
+                    }
+                }
+            }
+
+            func parser(_ parser: XMLParser, foundCharacters string: String) {
+                guard inEntry else { return }
+                if currentTag == "id" { curId += string }
+                else if currentTag == "content" { curContent += string }
+            }
+
+            func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+                if elementName == "entry" {
+                    entries.append((curId.trimmingCharacters(in: .whitespacesAndNewlines), curLink, curContent))
+                    inEntry = false
+                }
+                if elementName == currentTag { currentTag = "" }
+            }
+        }
+
+        let delegate = ParserDelegate()
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        guard parser.parse() else { return nil }
+
+        var best: AtomReleaseEntry?
+        for item in delegate.entries {
+            var tag = ""
+            if let range = item.link.range(of: "/releases/tag/", options: .caseInsensitive) {
+                let raw = String(item.link[range.upperBound...])
+                    .split(whereSeparator: { $0 == "?" || $0 == "#" || $0 == "/" })
+                    .first.map(String.init) ?? ""
+                tag = raw.removingPercentEncoding ?? raw
+            } else if let lastSlash = item.id.lastIndex(of: "/") {
+                tag = String(item.id[item.id.index(after: lastSlash)...])
+            }
+            guard !tag.isEmpty, tag.lowercased().hasPrefix("v") else { continue }
+            if isPrereleaseTag(tag) && !includePrerelease { continue }
+            let notes = stripHtmlToPlainText(item.content)
+            let htmlUrl = isAllowedHttpsUrl(item.link) ? item.link : "\(repoBaseURL)/releases/tag/\(tag)"
+            if best == nil || compareVersions(tag, best!.tagName) > 0 {
+                best = AtomReleaseEntry(tagName: tag, notes: notes, htmlUrl: htmlUrl)
+            }
+        }
+        return best
+    }
+
+    private nonisolated static func stripHtmlToPlainText(_ html: String) -> String {
+        guard !html.isEmpty else { return "" }
+        var s = html
+        if let brRe = try? NSRegularExpression(pattern: "<\\s*(br|p|div|li|h[1-6]|tr)\\b[^>]*>", options: .caseInsensitive) {
+            s = brRe.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "\n")
+        }
+        if let tagRe = try? NSRegularExpression(pattern: "<[^>]+>") {
+            s = tagRe.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        s = s.replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+        let lines = s.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return lines.joined(separator: "\n")
+    }
+
+    private nonisolated static func trimNotes(_ notes: String) -> String {
+        let clean = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.count > 1600 {
+            return String(clean.prefix(1600)) + "\n…"
+        }
+        return clean
+    }
+
+    private func fetchLatestTagFromWeb(mirrorPrefix: String) async -> String? {
+        for candidate in Self.buildCandidateURLs(officialURL: Self.latestReleaseWebURL, mirrorPrefix: mirrorPrefix) {
+            guard let url = URL(string: candidate) else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 12)
+            req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            guard let (data, response) = try? await URLSession.shared.data(for: req),
+                  let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else { continue }
+
+            if let finalPath = http.url?.path,
+               let range = finalPath.range(of: "/releases/tag/", options: .caseInsensitive) {
+                let fromURL = String(finalPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                if !fromURL.isEmpty { return fromURL }
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tag = (json["tag_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !tag.isEmpty {
+                return tag
+            }
+        }
+        return nil
+    }
+
+    private func probeContentLength(officialURL: String, mirrorPrefix: String) async -> Int64 {
+        for candidate in Self.buildCandidateURLs(officialURL: officialURL, mirrorPrefix: mirrorPrefix) {
+            guard let url = URL(string: candidate) else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 10)
+            req.httpMethod = "HEAD"
+            req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+            if let (_, resp) = try? await URLSession.shared.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               http.expectedContentLength > 0 {
+                return http.expectedContentLength
+            }
+        }
+        return 0
     }
 
     private nonisolated static func resolveCurrentVersion() -> String {
         if let raw = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
             let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-            if parseSemVer(clean) != nil {
+            if parseVersion(clean) != nil {
                 return clean
             }
         }
-        return "0.4.0"
+        return "0.4.1"
     }
 
-    nonisolated static func parseSemVer(_ raw: String) -> (Int, Int, Int)? {
+    nonisolated static func isPrereleaseTag(_ raw: String) -> Bool {
+        let lower = raw.lowercased()
+        return lower.contains("-rc") || lower.contains("-beta") || lower.contains("-alpha")
+    }
+
+    nonisolated static func parseVersion(_ raw: String) -> (Int, Int, Int, String)? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-        if let idx = s.firstIndex(where: { $0 == "-" || $0 == "+" }) {
-            s = String(s[..<idx])
+        if let plus = s.firstIndex(of: "+") {
+            s = String(s[..<plus])
+        }
+        var pre = ""
+        if let dash = s.firstIndex(of: "-") {
+            pre = String(s[s.index(after: dash)...]).trimmingCharacters(in: .whitespaces)
+            s = String(s[..<dash])
         }
         let parts = s.split(separator: ".")
         guard parts.count >= 2 && parts.count <= 4,
@@ -474,14 +847,39 @@ final class AppUpdater {
         } else {
             pat = 0
         }
-        return (maj, min, pat)
+        return (maj, min, pat, pre)
+    }
+
+    nonisolated static func compareVersions(_ candidate: String, _ current: String) -> Int {
+        guard let c = parseVersion(candidate), let cur = parseVersion(current) else { return 0 }
+        if c.0 != cur.0 { return c.0 < cur.0 ? -1 : 1 }
+        if c.1 != cur.1 { return c.1 < cur.1 ? -1 : 1 }
+        if c.2 != cur.2 { return c.2 < cur.2 ? -1 : 1 }
+
+        let cPre = !c.3.isEmpty
+        let curPre = !cur.3.isEmpty
+        if !cPre && !curPre { return 0 }
+        if !cPre && curPre { return 1 }
+        if cPre && !curPre { return -1 }
+
+        let aParts = c.3.split(separator: ".").map(String.init)
+        let bParts = cur.3.split(separator: ".").map(String.init)
+        let count = max(aParts.count, bParts.count)
+        for i in 0..<count {
+            if i >= aParts.count { return -1 }
+            if i >= bParts.count { return 1 }
+            if let ai = Int(aParts[i]), let bi = Int(bParts[i]) {
+                if ai != bi { return ai < bi ? -1 : 1 }
+            } else {
+                let cmp = aParts[i].caseInsensitiveCompare(bParts[i])
+                if cmp != .orderedSame { return cmp == .orderedAscending ? -1 : 1 }
+            }
+        }
+        return 0
     }
 
     nonisolated static func isNewerVersion(_ candidate: String, than current: String) -> Bool {
-        guard let c = parseSemVer(candidate), let cur = parseSemVer(current) else { return false }
-        if c.0 != cur.0 { return c.0 > cur.0 }
-        if c.1 != cur.1 { return c.1 > cur.1 }
-        return c.2 > cur.2
+        compareVersions(candidate, current) > 0
     }
 
     private nonisolated static func isAllowedHttpsUrl(_ raw: String) -> Bool {
@@ -491,41 +889,6 @@ final class AppUpdater {
         return allowedHosts.contains { allowed in
             host == allowed || host.hasSuffix(".\(allowed)")
         }
-    }
-
-    private func fetchLatestTagFromWeb() async -> String? {
-        var req = URLRequest(url: Self.latestReleaseWebURL, timeoutInterval: 12)
-        req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let (data, response) = try? await URLSession.shared.data(for: req),
-              let http = response as? HTTPURLResponse,
-              (200...299).contains(http.statusCode) else { return nil }
-
-        if let finalPath = http.url?.path,
-           let range = finalPath.range(of: "/releases/tag/", options: .caseInsensitive) {
-            let fromURL = String(finalPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            if !fromURL.isEmpty {
-                return fromURL
-            }
-        }
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let tag = (json["tag_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !tag.isEmpty {
-            return tag
-        }
-        return nil
-    }
-
-    private func probeContentLength(urlString: String) async -> Int64 {
-        guard Self.isAllowedHttpsUrl(urlString), let url = URL(string: urlString) else { return 0 }
-        var req = URLRequest(url: url, timeoutInterval: 10)
-        req.httpMethod = "HEAD"
-        req.setValue("Crossflow-Updater/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-        guard let (_, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse,
-              (200...299).contains(http.statusCode),
-              http.expectedContentLength > 0 else { return 0 }
-        return http.expectedContentLength
     }
 
     private nonisolated static func findAssetNameInChecksums(_ text: String, suffix: String) -> String? {

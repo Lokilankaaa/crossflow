@@ -1242,15 +1242,28 @@ pub fn run(
             listener.set_nonblocking(true)?;
             let bound = listener.local_addr()?;
             let listen_endpoint = Some(bound.to_string());
-            let aux_listener = TcpListener::bind(SocketAddr::new(
-                bound.ip(),
-                bound.port().saturating_add(1),
-            ))
-            .ok()
-            .and_then(|l| {
-                l.set_nonblocking(true).ok()?;
-                Some(Arc::new(l))
-            });
+            let preferred_aux_addr = SocketAddr::new(bound.ip(), bound.port().saturating_add(1));
+            let mut bound_aux = None;
+            for attempt in 0..10 {
+                if let Ok(l) = TcpListener::bind(preferred_aux_addr) {
+                    bound_aux = Some(l);
+                    break;
+                }
+                if attempt < 9 {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            let aux_listener = bound_aux
+                .or_else(|| TcpListener::bind(SocketAddr::new(bound.ip(), 0)).ok())
+                .or_else(|| TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).ok())
+                .and_then(|l| {
+                    l.set_nonblocking(true).ok()?;
+                    Some(Arc::new(l))
+                });
+            let local_aux_port = aux_listener
+                .as_ref()
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port());
             let aux_hub = AuxMeshHub::start(
                 aux_listener,
                 local_device_id.clone(),
@@ -1680,6 +1693,7 @@ pub fn run(
                                         pass.as_deref(),
                                         rev,
                                         screens,
+                                        local_aux_port,
                                     ) {
                                         Ok(peer) => {
                                             let _ = tx.send(HandshakeMsg::Ready {
@@ -1777,6 +1791,7 @@ pub fn run(
                                                             pass.as_deref(),
                                                             rev,
                                                             screens.clone(),
+                                                            local_aux_port,
                                                         ) {
                                                             Ok(peer) => {
                                                                 let _ = tx.send(
@@ -1863,6 +1878,7 @@ pub fn run(
                                                 pass.as_deref(),
                                                 rev,
                                                 screens.clone(),
+                                                local_aux_port,
                                             ) {
                                                 Ok(peer) => {
                                                     let _ = tx.send(HandshakeMsg::Ready {
@@ -1930,6 +1946,7 @@ pub fn run(
                                         pass.as_deref(),
                                         rev,
                                         screens,
+                                        local_aux_port,
                                     )
                                 }) {
                                     Ok(peer) => {
@@ -2031,11 +2048,27 @@ pub fn run(
                                         let _ = io.sink.release_owned();
                                     }
                                 }
+                                // Drop the previous peer (and cleanly join/close its AuxSession)
+                                // BEFORE spawning the replacement AuxSession to avoid inbound races.
+                                if let Some(old_peer) = active_peers.remove(&rid) {
+                                    drop(old_peer);
+                                }
                             }
+                            aux_hub.clear_echo_state();
                             let aux_initiator = preferred_initiator(&local_device_id, &rid);
+                            let remote_aux_port = peer.aux_port.unwrap_or_else(|| {
+                                if peer.initiator {
+                                    // Outbound main connection: peer_addr.port() is their real listening port.
+                                    peer.peer_addr.port().saturating_add(1)
+                                } else {
+                                    // Inbound main connection: peer_addr.port() is a random ephemeral source port!
+                                    DEFAULT_PORT.saturating_add(1)
+                                }
+                            });
+                            let peer_aux_addr = SocketAddr::new(peer.peer_addr.ip(), remote_aux_port);
                             let aux = AuxSession::spawn_mesh_peer(
                                 aux_hub.clone(),
-                                peer.peer_addr,
+                                peer_aux_addr,
                                 aux_initiator,
                                 local_device_id.clone(),
                                 rid.clone(),
@@ -2043,6 +2076,7 @@ pub fn run(
                                 clipboard_sync_flag.clone(),
                                 input_state_sync_flag.clone(),
                                 local_has_focus.clone(),
+                                Some(log.clone()),
                             );
                             let active_ch =
                                 classify_active_channel(peer.peer_addr, &local_channels);
@@ -2854,11 +2888,13 @@ pub fn run(
                 }
             }
 
+            active_peers.clear();
             if let Some(io) = native_io.take() {
                 io.shutdown();
             }
             channel_watch_stop.store(true, Ordering::Release);
             aux_hub.stop();
+            drop(listener);
             discovery.stop();
             let _ = discovery.wait_stopped(Duration::from_secs(2));
         }

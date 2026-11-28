@@ -77,7 +77,9 @@ internal sealed class MainWindow : Window
     private readonly Button uninstallServiceButton = new();
     private bool serviceBusy;
     private readonly AppUpdater updater = new();
+    private AboutCommunityPanel? aboutPanel;
     private readonly TextBlock brandVersionBadge = new();
+    private readonly Button brandAboutButton = new();
     private readonly TextBlock updateVersionBadge = new();
     private readonly TextBlock updateStatusText = new() { TextWrapping = TextWrapping.Wrap };
     private readonly ProgressBar updateProgressBar = new() { Minimum = 0, Maximum = 100, Height = 4, Visibility = Visibility.Collapsed };
@@ -85,6 +87,7 @@ internal sealed class MainWindow : Window
     private readonly Button applyUpdateButton = new();
     private readonly Button releaseNotesButton = new();
     private readonly Button cancelUpdateButton = new();
+    private readonly Button openAboutButton = new();
     private bool updatingClipboardUi;
     private bool updatingInputStateUi;
     private bool updatingScreenLockUi;
@@ -198,6 +201,15 @@ internal sealed class MainWindow : Window
         BuildSidebarSplitter();
         BuildWorkspace();
 
+        aboutPanel = new AboutCommunityPanel(
+            theme,
+            updater,
+            () => currentSnap,
+            ApplyUpdateAsync,
+            (msg, isErr) => ShowNotice(msg, isErr));
+        Grid.SetColumnSpan(aboutPanel.OverlayRoot, 3);
+        root.Children.Add(aboutPanel.OverlayRoot);
+
         Content = root;
         AppWindow.Resize(new global::Windows.Graphics.SizeInt32(
             (int)theme.Number("window", "width"),
@@ -255,14 +267,21 @@ internal sealed class MainWindow : Window
         sidebar.Background = theme.Brush("surface");
 
         // Brand (double-click top bar maximizes/restores cleanly)
-        var brand = new StackPanel
+        var brandRow = new Grid
         {
-            Orientation = Orientation.Horizontal,
-            Spacing = 10,
             Margin = new Thickness(2, 0, 0, 12),
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent)
         };
-        brand.DoubleTapped += (_, _) => ToggleMaximize();
+        brandRow.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        brandRow.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        brandRow.DoubleTapped += (_, _) => ToggleMaximize();
+
+        var brand = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            VerticalAlignment = VerticalAlignment.Center
+        };
         brand.Children.Add(new FontIcon { Glyph = "\uE71B", FontSize = 22, Foreground = theme.Brush("accent") });
         brand.Children.Add(new TextBlock
         {
@@ -277,7 +296,20 @@ internal sealed class MainWindow : Window
         brandVersionBadge.VerticalAlignment = VerticalAlignment.Bottom;
         brandVersionBadge.Margin = new Thickness(0, 0, 0, 3);
         brand.Children.Add(brandVersionBadge);
-        sidebar.Children.Add(brand);
+        brandRow.Children.Add(brand);
+
+        brandAboutButton.Content = new FontIcon { Glyph = "\uE946", FontSize = 14 };
+        brandAboutButton.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        brandAboutButton.Foreground = theme.Brush("text_secondary");
+        brandAboutButton.BorderThickness = new Thickness(0);
+        brandAboutButton.CornerRadius = new CornerRadius(7);
+        brandAboutButton.Padding = new Thickness(6, 5, 6, 5);
+        brandAboutButton.VerticalAlignment = VerticalAlignment.Center;
+        ToolTipService.SetToolTip(brandAboutButton, "关于、更新与社区支持");
+        brandAboutButton.Click += (_, _) => aboutPanel?.Open("updates");
+        Grid.SetColumn(brandAboutButton, 1);
+        brandRow.Children.Add(brandAboutButton);
+        sidebar.Children.Add(brandRow);
 
         // Status Card
         var statusHeader = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
@@ -700,11 +732,15 @@ internal sealed class MainWindow : Window
         cancelUpdateButton.Visibility = Visibility.Collapsed;
         cancelUpdateButton.Click += (_, _) => updater.CancelDownload();
 
+        StyleCompactButton(openAboutButton, "关于与社区");
+        openAboutButton.Click += (_, _) => aboutPanel?.Open("community");
+
         var actionsRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
         actionsRow.Children.Add(applyUpdateButton);
         actionsRow.Children.Add(checkUpdateButton);
         actionsRow.Children.Add(releaseNotesButton);
         actionsRow.Children.Add(cancelUpdateButton);
+        actionsRow.Children.Add(openAboutButton);
         sidebar.Children.Add(actionsRow);
 
         OnUpdaterStateChanged(updater.State);
@@ -756,6 +792,8 @@ internal sealed class MainWindow : Window
 
         releaseNotesButton.Visibility = state.Release is not null && !busyUpdating ? Visibility.Visible : Visibility.Collapsed;
         cancelUpdateButton.Visibility = state.Phase == UpdaterPhase.Downloading ? Visibility.Visible : Visibility.Collapsed;
+        brandAboutButton.Foreground = state.Phase == UpdaterPhase.Available ? theme.Brush("accent") : theme.Brush("text_secondary");
+        aboutPanel?.RefreshUpdaterState(state);
     }
 
     private async Task ApplyUpdateAsync()
@@ -1584,7 +1622,13 @@ internal sealed class MainWindow : Window
             trayIcon.CheckForUpdatesRequested += () => DispatcherQueue.TryEnqueue(async () =>
             {
                 ShowAndActivate();
+                aboutPanel?.Open("updates");
                 await updater.CheckForUpdatesAsync(silent: false);
+            });
+            trayIcon.OpenAboutRequested += () => DispatcherQueue.TryEnqueue(() =>
+            {
+                ShowAndActivate();
+                aboutPanel?.Open("community");
             });
             trayIcon.SystemResumed += () => DispatcherQueue.TryEnqueue(async () =>
             {
@@ -1770,6 +1814,8 @@ internal sealed class MainWindow : Window
     private void OnPeerMeshUpdate(PeerMeshSnapshot snap)
     {
         currentSnap = snap;
+        if (aboutPanel?.IsOpen == true)
+            aboutPanel.RefreshDiagnostics();
 
         bool isAuthMismatch = snap.Error is not null
             && (snap.Error.StartsWith("等待密码匹配", StringComparison.Ordinal)

@@ -249,6 +249,10 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         checkUpdateEntry.target = self
         menu.addItem(checkUpdateEntry)
 
+        let aboutEntry = NSMenuItem(title: "关于与社区支持…", action: #selector(openAboutFromMenu), keyEquivalent: "")
+        aboutEntry.target = self
+        menu.addItem(aboutEntry)
+
         let quitEntry = NSMenuItem(title: "退出 Crossflow", action: #selector(quitApp), keyEquivalent: "q")
         quitEntry.target = self
         menu.addItem(quitEntry)
@@ -617,7 +621,13 @@ final class DiscoveryAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
     @objc private func checkForUpdatesFromMenu() {
         showMainWindow()
+        updater.openAbout(tab: "updates")
         Task { await updater.checkForUpdates(silent: false) }
+    }
+
+    @objc private func openAboutFromMenu() {
+        showMainWindow()
+        updater.openAbout(tab: "community")
     }
 
     @objc private func quitApp() {
