@@ -442,7 +442,12 @@ impl Platform for Native {
         unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
     }
     fn key_vk(&self, scan: u16) -> u16 {
-        unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
+        let vk = unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) } as u16;
+        if vk != 0 {
+            vk
+        } else {
+            unsafe { MapVirtualKeyW(u32::from(scan & 0x00ff), MAPVK_VSC_TO_VK) as u16 }
+        }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
         crate::power::wake_display_throttled();
@@ -463,6 +468,62 @@ impl Platform for Native {
         }
         Ok(())
     }
+}
+
+/// Map non-extended numpad scan codes (`0x47..=0x53`) to `VK_NUMPAD*` / `VK_DECIMAL`
+/// when NumLock is active, because `MapVirtualKeyW(MAPVK_VSC_TO_VK_EX)` always returns
+/// the navigation VK (`VK_HOME`/`VK_END`/etc.) regardless of NumLock state.
+fn numpad_vk_when_numlock_on(scan: u16) -> Option<u16> {
+    Some(match scan {
+        0x47 => VK_NUMPAD7,
+        0x48 => VK_NUMPAD8,
+        0x49 => VK_NUMPAD9,
+        0x4b => VK_NUMPAD4,
+        0x4c => VK_NUMPAD5,
+        0x4d => VK_NUMPAD6,
+        0x4f => VK_NUMPAD1,
+        0x50 => VK_NUMPAD2,
+        0x51 => VK_NUMPAD3,
+        0x52 => VK_NUMPAD0,
+        0x53 => VK_DECIMAL,
+        _ => return None,
+    })
+}
+
+/// On Windows 11's secure desktop (`WinSta0\Winlogon` / `LogonUI.exe` PIN & password box),
+/// `SendInput` keyboard events with `wVk = 0 | KEYEVENTF_SCANCODE` are dropped/ignored.
+/// Populate explicit `wVk` alongside hardware `wScan` (clearing `KEYEVENTF_SCANCODE`) so
+/// digits, letters, numpad PINs, modifiers, and symbols type cleanly into `LogonUI.exe`.
+fn normalize_winlogon_keyboard_input_with_numlock(mut input: INPUT, numlock_on: bool) -> INPUT {
+    if input.r#type != INPUT_KEYBOARD {
+        return input;
+    }
+    let ki = unsafe { &mut input.Anonymous.ki };
+    if ki.wVk == 0 && (ki.dwFlags & KEYEVENTF_SCANCODE) != 0 && ki.wScan != 0 {
+        let extended = (ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0;
+        let mut vk = if !extended && numlock_on {
+            numpad_vk_when_numlock_on(ki.wScan).unwrap_or(0)
+        } else {
+            0
+        };
+        if vk == 0 {
+            let full_scan = u32::from(ki.wScan) | if extended { 0xe000 } else { 0 };
+            vk = unsafe { MapVirtualKeyW(full_scan, MAPVK_VSC_TO_VK_EX) } as u16;
+        }
+        if vk == 0 {
+            vk = unsafe { MapVirtualKeyW(u32::from(ki.wScan), MAPVK_VSC_TO_VK) } as u16;
+        }
+        if vk != 0 {
+            ki.wVk = vk;
+            ki.dwFlags &= !KEYEVENTF_SCANCODE;
+        }
+    }
+    input
+}
+
+fn normalize_winlogon_keyboard_input(input: INPUT) -> INPUT {
+    let numlock_on = (unsafe { GetKeyState(i32::from(VK_NUMLOCK)) } & 1) != 0;
+    normalize_winlogon_keyboard_input_with_numlock(input, numlock_on)
 }
 
 enum DesktopCmd {
@@ -547,7 +608,13 @@ impl DesktopActor {
                         }
                         DesktopCmd::Post { input, tx } => {
                             crate::power::wake_display_throttled();
-                            let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+                            let effective = if is_winlogon {
+                                normalize_winlogon_keyboard_input(input)
+                            } else {
+                                input
+                            };
+                            let sent =
+                                unsafe { SendInput(1, &effective, size_of::<INPUT>() as i32) };
                             let res = if sent == 1 {
                                 Ok(())
                             } else {
@@ -745,7 +812,12 @@ impl Platform for NativeService {
             .unwrap_or(false)
     }
     fn key_vk(&self, scan: u16) -> u16 {
-        unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
+        let vk = unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) } as u16;
+        if vk != 0 {
+            vk
+        } else {
+            unsafe { MapVirtualKeyW(u32::from(scan & 0x00ff), MAPVK_VSC_TO_VK) as u16 }
+        }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
         self.sync_input_desktop_throttled(false)?;
@@ -1396,5 +1468,51 @@ mod tests {
         assert_eq!(ki.wVk, VK_BACK);
         assert_eq!(ki.wScan, 0x0e);
         assert_eq!(ki.dwFlags & KEYEVENTF_SCANCODE, 0);
+    }
+    #[test]
+    fn winlogon_keyboard_input_populates_virtual_key_and_clears_scancode_flag() {
+        // Letters ('A' = HID 0x04), top-row digits ('1' = HID 0x1e, '0' = HID 0x27),
+        // and Left Shift (HID 0xe1) must receive explicit wVk with KEYEVENTF_SCANCODE cleared.
+        for (usage, expected_vk) in [
+            (0x04u16, 0x41u16), // 'A'
+            (0x1e, 0x31),       // '1'
+            (0x27, 0x30),       // '0'
+            (0xe1, VK_LSHIFT),  // Left Shift
+        ] {
+            let raw = keyboard(usage, true).unwrap();
+            let norm = normalize_winlogon_keyboard_input_with_numlock(raw, true);
+            let ki = unsafe { norm.Anonymous.ki };
+            assert_eq!(ki.wVk, expected_vk, "usage 0x{usage:02x}");
+            assert_ne!(ki.wScan, 0, "usage 0x{usage:02x} must keep hardware scan");
+            assert_eq!(ki.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(ki.dwFlags & KEYEVENTF_KEYUP, 0);
+            assert_eq!(ki.dwExtraInfo, INPUT_ORIGIN_TAG);
+
+            let raw_up = keyboard(usage, false).unwrap();
+            let norm_up = normalize_winlogon_keyboard_input_with_numlock(raw_up, true);
+            let ki_up = unsafe { norm_up.Anonymous.ki };
+            assert_eq!(ki_up.wVk, expected_vk);
+            assert_eq!(ki_up.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_ne!(ki_up.dwFlags & KEYEVENTF_KEYUP, 0);
+        }
+
+        // Numpad '1' (HID 0x59 -> scan 0x4f): VK_NUMPAD1 when NumLock is ON, VK_END when OFF.
+        let kp1 = keyboard(0x59, true).unwrap();
+        let kp1_on = unsafe {
+            normalize_winlogon_keyboard_input_with_numlock(kp1, true)
+                .Anonymous
+                .ki
+        };
+        assert_eq!(kp1_on.wVk, VK_NUMPAD1);
+        assert_eq!(kp1_on.wScan, 0x4f);
+        assert_eq!(kp1_on.dwFlags & KEYEVENTF_SCANCODE, 0);
+
+        let kp1_off = unsafe {
+            normalize_winlogon_keyboard_input_with_numlock(kp1, false)
+                .Anonymous
+                .ki
+        };
+        assert_eq!(kp1_off.wVk, VK_END);
+        assert_eq!(kp1_off.dwFlags & KEYEVENTF_SCANCODE, 0);
     }
 }
