@@ -8,12 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased] (`dev`)
 
+_暂无未发布变更。_
+
+---
+
+## [0.4.4] - 2026-11-28
+
+### Added
+- **远端 `Win + L` / `Cmd + L` 锁定 Windows 与「锁屏（焦点设备）」快捷键（Windows + macOS）**：
+  - Windows 接收端识别远端发来的纯 `Win + L`（含 Mac 端 `Cmd + L`），自动释放修饰键后调用 Win32 `LockWorkStation()`，彻底解决 Windows 忽略 `SendInput` 注入 `Win + L` 的限制。
+  - 新增可自定义全局快捷键「锁屏（焦点设备）」（`lock_device`，默认 `Ctrl + Alt + Shift + L`，双端侧边栏可自由录制或清空）与 `MeshControl::LockWorkstation` 加密控制帧：焦点在远端时直接锁定远端系统（Windows 调 `LockWorkStation()`、macOS 调 `SACLockScreenImmediate()`，并兼容旧版 macOS 回退 `Ctrl + Cmd + Q`），焦点在本机时锁定本机。
+- **文件传输接收通知、进度展示与原生文件选择器（Windows）**：
+  - 新增 Windows 原生 `NIF_INFO` 托盘气泡通知（文件接收成功/发送完成/传输失败提示保存路径）与托盘悬停/右键菜单实时传输进度显示。
+  - 将托盘「发送文件」从隐藏窗口/高权限下易静默失效的 WinRT `FileOpenPicker` 替换为原生 Win32 STA `GetOpenFileNameW`。
+
 ### Fixed
+- **彻底打通 Windows 锁屏界面（`WinSta0\Winlogon`）远程键鼠控制与密码/PIN 输入**：
+  - Windows 服务模式（`CrossflowInputService`）改为按桌面生命周期动态创建干净的独立 `DesktopActor` 线程执行 `SetThreadDesktop`，根治反复在 `Default <-> Winlogon` 切换时触发 `ERROR_BUSY (170)` 的问题；锁屏期间保留服务注入连接并暂停用户态低级钩子采集。
+  - `Winlogon` 安全桌面上为字母、数字、小键盘（区分 `NumLock`）和修饰键自动补齐显式 `wVk` 并清除 `KEYEVENTF_SCANCODE`，解决 Windows 11 锁屏 `LogonUI.exe` 忽略纯扫描码键盘事件导致“鼠标能动但敲 PIN/密码无反应”的问题。
+  - 为 `SharedPipeHandle` 引入显式 `close_event` + `PipeCloser::close()` 与 `WaitForMultipleObjects` + `CancelIoEx`，并移除重叠管道上的阻塞式 `FlushFileBuffers`，根治客户端断开/重连时双向 `PipeReader` 线程泄露导致 `CrossflowInputService` 命名管道永久 `ERROR_PIPE_BUSY (231)` 死锁的问题。
 - **彻底修复 Windows 关闭主界面到后台托盘后频繁断链/失灵（且托盘仍显示已连接）**：
   - 对 `Crossflow.Windows.exe`、`crossflow.exe peer` 与 `input-worker` 调用 `SetProcessInformation(ProcessPowerThrottling)` 关闭 Windows 11 自动 EcoQoS（效率模式）及隐藏窗口定时器降频（`IGNORE_TIMER_RESOLUTION`），并在隐藏到托盘后重新声明，兼容 Win10/Win11。
   - `peer` / `input-worker` 进程提升至 `ABOVE_NORMAL_PRIORITY_CLASS`（保留系统服务模式 `HIGH_PRIORITY_CLASS`），`WH_MOUSE_LL` / `WH_KEYBOARD_LL` 捕获线程提升至 `THREAD_PRIORITY_HIGHEST` 并关闭线程节流，杜绝隐藏后台后触发 `LowLevelHooksTimeout` 被系统静默摘钩。
   - 将 `peer_mesh` 对 UI 的 `stdout` 状态推送拆至独立后台 `StatusEmitter`（单槽最新快照合并），即使 UI 进程暂时卡顿也绝不阻塞 1000 Hz 键鼠与 KeepAlive 主循环；空闲状态心跳降至 1000 ms，`mesh_wake_detected` 阈值放宽至 15 s 并在 `native_io` 重建时重置时钟，`native_io` 启动失败增加 400 ms 退避，`route_enabled` 精确反映采集/注入存活状态。
   - Windows 主窗口隐藏至托盘时合并状态派发，仅即时更新托盘图标与右键菜单，跳过后台 XAML 重绘与重复读注册表，重新打开主界面时瞬间补刷；日志新增 2 秒空闲自动落盘，便于实时诊断。
+- **WeGame / 反作弊游戏退出后低级钩子自愈 & 文件跨屏粘贴体验优化**：
+  - 新增 `RoutedHooks::heal_if_stale()` 看门狗：交叉比对 `WM_INPUT` 原始鼠标流与 `WH_MOUSE_LL` 回调计数，当反作弊或系统超时静默摘除低级钩子时在 ~0.1 ms 内原地无感重装键鼠钩子，无需重启或断连。
+  - Windows 文件剪贴板同步同时写入 `CF_HDROP` 与 `Preferred DropEffect = DROPEFFECT_COPY`，确保接收后在资源管理器、桌面、微信/QQ 中直接按 `Ctrl + V` 即可粘贴落盘；消除剪贴板写入回环竞态、兼容 OneDrive 占位文件并新增 Windows Defender `rename` 重试与 30 s 读写超时。
 
 ---
 
