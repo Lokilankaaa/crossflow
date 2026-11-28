@@ -8,11 +8,11 @@ struct AboutCommunityView: View {
     @Bindable var peer: PeerMeshModel
     @Bindable var updater: AppUpdater
 
-    @SwiftUI.State private var mirrorPresetID: String = "direct"
-    @SwiftUI.State private var customMirrorInput: String = ""
-    @SwiftUI.State private var customMirrorError: String?
-    @SwiftUI.State private var toastNotice: String?
-    @SwiftUI.State private var showKernelJSON = false
+    @ViewState private var mirrorPresetID: String = "direct"
+    @ViewState private var customMirrorInput: String = ""
+    @ViewState private var customMirrorError: String?
+    @ViewState private var toastNotice: String?
+    @ViewState private var showKernelJSON = false
 
     var body: some View {
         VStack(spacing: 0) {
