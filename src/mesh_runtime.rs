@@ -46,6 +46,8 @@ pub enum MeshControl {
         layout_screens: Vec<SharedScreen>,
         #[serde(default)]
         aux_port: Option<u16>,
+        #[serde(default)]
+        supports_lock_control: bool,
     },
     LayoutSync {
         revision: u64,
@@ -60,6 +62,9 @@ pub enum MeshControl {
     },
     RevokeControl,
     KeepAlive,
+    LockWorkstation,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -79,6 +84,7 @@ pub struct HandshakedMeshPeer {
     pub layout_revision: u64,
     pub layout_screens: Vec<SharedScreen>,
     pub aux_port: Option<u16>,
+    pub supports_lock_control: bool,
 }
 
 /// Returns true ONLY for real Noise AEAD decryption / passphrase mismatch errors,
@@ -198,6 +204,7 @@ pub fn establish_mesh_peer(
         layout_revision,
         layout_screens,
         aux_port: local_aux_port,
+        supports_lock_control: true,
     })?;
 
     let peer_plain = if initiator {
@@ -216,6 +223,7 @@ pub fn establish_mesh_peer(
         layout_revision: peer_rev,
         layout_screens: peer_screens,
         aux_port: peer_aux_port,
+        supports_lock_control: peer_supports_lock,
     }) = decode_packet(&peer_plain)?
     else {
         bail!("expected MeshControl::Hello after handshake");
@@ -239,6 +247,7 @@ pub fn establish_mesh_peer(
         layout_revision: peer_rev,
         layout_screens: peer_screens,
         aux_port: peer_aux_port,
+        supports_lock_control: peer_supports_lock,
     })
 }
 

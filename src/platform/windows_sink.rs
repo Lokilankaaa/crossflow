@@ -15,6 +15,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -307,6 +308,19 @@ fn desktop_name(handle: HDESK) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("invalid local desktop name"))?;
     String::from_utf16(&name[..end]).map_err(|_| anyhow::anyhow!("invalid local desktop name"))
 }
+/// Returns true when the current interactive input desktop is the normal user desktop
+/// (`WinSta0\Default`). Returns false when Windows is locked (`WinSta0\Winlogon`),
+/// showing a UAC secure desktop, or disconnected.
+pub fn is_input_desktop_default() -> bool {
+    let input = Desktop(unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) });
+    if input.0.is_null() {
+        return false;
+    }
+    desktop_name(input.0)
+        .map(|name| name.eq_ignore_ascii_case("Default"))
+        .unwrap_or(false)
+}
+
 fn desktop_ready() -> Result<()> {
     // Never switch desktops or grant access to Winlogon/UAC. Same-name Default
     // desktops are compared inside this process's window station.
@@ -428,7 +442,12 @@ impl Platform for Native {
         unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
     }
     fn key_vk(&self, scan: u16) -> u16 {
-        unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
+        let vk = unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) } as u16;
+        if vk != 0 {
+            vk
+        } else {
+            unsafe { MapVirtualKeyW(u32::from(scan & 0x00ff), MAPVK_VSC_TO_VK) as u16 }
+        }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
         crate::power::wake_display_throttled();
@@ -451,13 +470,257 @@ impl Platform for Native {
     }
 }
 
+/// Map non-extended numpad scan codes (`0x47..=0x53`) to `VK_NUMPAD*` / `VK_DECIMAL`
+/// when NumLock is active, because `MapVirtualKeyW(MAPVK_VSC_TO_VK_EX)` always returns
+/// the navigation VK (`VK_HOME`/`VK_END`/etc.) regardless of NumLock state.
+fn numpad_vk_when_numlock_on(scan: u16) -> Option<u16> {
+    Some(match scan {
+        0x47 => VK_NUMPAD7,
+        0x48 => VK_NUMPAD8,
+        0x49 => VK_NUMPAD9,
+        0x4b => VK_NUMPAD4,
+        0x4c => VK_NUMPAD5,
+        0x4d => VK_NUMPAD6,
+        0x4f => VK_NUMPAD1,
+        0x50 => VK_NUMPAD2,
+        0x51 => VK_NUMPAD3,
+        0x52 => VK_NUMPAD0,
+        0x53 => VK_DECIMAL,
+        _ => return None,
+    })
+}
+
+/// On Windows 11's secure desktop (`WinSta0\Winlogon` / `LogonUI.exe` PIN & password box),
+/// `SendInput` keyboard events with `wVk = 0 | KEYEVENTF_SCANCODE` are dropped/ignored.
+/// Populate explicit `wVk` alongside hardware `wScan` (clearing `KEYEVENTF_SCANCODE`) so
+/// digits, letters, numpad PINs, modifiers, and symbols type cleanly into `LogonUI.exe`.
+fn normalize_winlogon_keyboard_input_with_numlock(mut input: INPUT, numlock_on: bool) -> INPUT {
+    if input.r#type != INPUT_KEYBOARD {
+        return input;
+    }
+    let ki = unsafe { &mut input.Anonymous.ki };
+    if ki.wVk == 0 && (ki.dwFlags & KEYEVENTF_SCANCODE) != 0 && ki.wScan != 0 {
+        let extended = (ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0;
+        let mut vk = if !extended && numlock_on {
+            numpad_vk_when_numlock_on(ki.wScan).unwrap_or(0)
+        } else {
+            0
+        };
+        if vk == 0 {
+            let full_scan = u32::from(ki.wScan) | if extended { 0xe000 } else { 0 };
+            vk = unsafe { MapVirtualKeyW(full_scan, MAPVK_VSC_TO_VK_EX) } as u16;
+        }
+        if vk == 0 {
+            vk = unsafe { MapVirtualKeyW(u32::from(ki.wScan), MAPVK_VSC_TO_VK) } as u16;
+        }
+        if vk != 0 {
+            ki.wVk = vk;
+            ki.dwFlags &= !KEYEVENTF_SCANCODE;
+        }
+    }
+    input
+}
+
+fn normalize_winlogon_keyboard_input(input: INPUT) -> INPUT {
+    let numlock_on = (unsafe { GetKeyState(i32::from(VK_NUMLOCK)) } & 1) != 0;
+    normalize_winlogon_keyboard_input_with_numlock(input, numlock_on)
+}
+
+enum DesktopCmd {
+    Displays(mpsc::SyncSender<Result<Vec<NativeDisplay>>>),
+    Cursor(mpsc::SyncSender<Result<(f64, f64)>>),
+    Held {
+        vk: u16,
+        tx: mpsc::SyncSender<bool>,
+    },
+    Post {
+        input: INPUT,
+        tx: mpsc::SyncSender<Result<()>>,
+    },
+}
+
+struct DesktopActor {
+    name: String,
+    tx: Option<mpsc::SyncSender<DesktopCmd>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DesktopActor {
+    fn spawn(name: String, hdesk: HDESK) -> Result<Self> {
+        let raw_desk = hdesk as usize;
+        let is_winlogon = name.eq_ignore_ascii_case("Winlogon");
+        let (tx, rx) = mpsc::sync_channel::<DesktopCmd>(4);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<()>>(1);
+        let thread_name = format!("crossflow-svc-{}", name.to_ascii_lowercase());
+        let handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                crate::power::configure_realtime_thread(true);
+                let hdesk = raw_desk as HDESK;
+                // SetThreadDesktop MUST be the very first Win32 USER/GDI call on a clean
+                // thread so Windows never rejects it with ERROR_BUSY (170).
+                if unsafe { SetThreadDesktop(hdesk) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    unsafe { CloseDesktop(hdesk) };
+                    let _ = ready_tx.send(Err(anyhow::anyhow!(
+                        "SetThreadDesktop failed (Win32 {err})"
+                    )));
+                    return;
+                }
+                let _dpi = DpiScope::physical().ok();
+                let _ = ready_tx.send(Ok(()));
+
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        DesktopCmd::Displays(reply) => {
+                            let _ = reply.send(receiver_displays());
+                        }
+                        DesktopCmd::Cursor(reply) => {
+                            let res = super::cursor_position()
+                                .map_err(anyhow::Error::msg)
+                                .or_else(|err| {
+                                    // Fallback to logical GetCursorPos or primary display center
+                                    // while Winlogon's lock-screen curtain / sleeping display
+                                    // temporarily refuses GetPhysicalCursorPos.
+                                    let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+                                    if unsafe {
+                                        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(
+                                            &mut pt,
+                                        )
+                                    } != 0
+                                    {
+                                        Ok((f64::from(pt.x), f64::from(pt.y)))
+                                    } else if is_winlogon {
+                                        receiver_displays().map(|ds| {
+                                            ds.first()
+                                                .map(|d| (d.x + d.width * 0.5, d.y + d.height * 0.5))
+                                                .unwrap_or((0.0, 0.0))
+                                        })
+                                    } else {
+                                        Err(err)
+                                    }
+                                })
+                                .map(|pt| {
+                                    if is_winlogon
+                                        && let Ok(ds) = receiver_displays()
+                                        && !ds.iter().any(|d| contains(d, pt.0, pt.1))
+                                        && let Some(first) = ds.first()
+                                    {
+                                        return (
+                                            first.x + first.width * 0.5,
+                                            first.y + first.height * 0.5,
+                                        );
+                                    }
+                                    pt
+                                });
+                            let _ = reply.send(res);
+                        }
+                        DesktopCmd::Held { vk, tx } => {
+                            let held = unsafe { GetAsyncKeyState(i32::from(vk)) < 0 };
+                            let _ = tx.send(held);
+                        }
+                        DesktopCmd::Post { input, tx } => {
+                            crate::power::wake_display_throttled();
+                            let effective = if is_winlogon {
+                                normalize_winlogon_keyboard_input(input)
+                            } else {
+                                input
+                            };
+                            let sent =
+                                unsafe { SendInput(1, &effective, size_of::<INPUT>() as i32) };
+                            let res = if sent == 1 {
+                                Ok(())
+                            } else {
+                                let err = unsafe { GetLastError() };
+                                Err(anyhow::anyhow!(
+                                    "Windows service SendInput failed (Win32 {err})"
+                                ))
+                            };
+                            let _ = tx.send(res);
+                        }
+                    }
+                }
+                unsafe { CloseDesktop(hdesk) };
+            })?;
+        match ready_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(())) => Ok(Self {
+                name,
+                tx: Some(tx),
+                handle: Some(handle),
+            }),
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(e)
+            }
+            Err(_) => {
+                drop(tx);
+                let _ = handle.join();
+                bail!("service desktop worker thread startup timed out")
+            }
+        }
+    }
+
+    fn send(&self, cmd: DesktopCmd) -> Result<()> {
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("service desktop worker closed"))?
+            .send(cmd)
+            .map_err(|_| anyhow::anyhow!("service desktop worker stopped"))
+    }
+}
+
+impl Drop for DesktopActor {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn open_active_input_desktop() -> Result<(String, HDESK)> {
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const MIN_RIGHTS: u32 = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP;
+    let mut hdesk: HDESK = null_mut();
+    for attempt in 0..5 {
+        hdesk = unsafe { OpenInputDesktop(0, 0, MAXIMUM_ALLOWED) };
+        if hdesk.is_null() {
+            hdesk = unsafe { OpenInputDesktop(0, 0, MIN_RIGHTS) };
+        }
+        if !hdesk.is_null() {
+            break;
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    ensure!(
+        !hdesk.is_null(),
+        "OpenInputDesktop failed in service worker (Win32 {})",
+        unsafe { GetLastError() }
+    );
+    let name = match desktop_name(hdesk) {
+        Ok(n) => n,
+        Err(e) => {
+            unsafe { CloseDesktop(hdesk) };
+            return Err(e);
+        }
+    };
+    let allowed = name.eq_ignore_ascii_case("Default") || name.eq_ignore_ascii_case("Winlogon");
+    if !allowed {
+        unsafe { CloseDesktop(hdesk) };
+        bail!("unsupported interactive desktop for service input: {name}");
+    }
+    Ok((name, hdesk))
+}
+
 /// Elevated `LocalSystem` platform backend used exclusively inside `CrossflowInputService`'s
-/// interactive session worker (`crossflow.exe service-worker`). Dynamically follows the active
-/// Windows input desktop (`WinSta0\Default` <-> `WinSta0\Winlogon`) via `OpenInputDesktop` +
-/// `SetThreadDesktop` so remote mouse and keyboard control work across UAC prompts, elevated
-/// Administrator applications, and the Windows lock screen.
+/// interactive session worker (`crossflow.exe service-worker`). Spawns a clean per-desktop
+/// thread whenever the active input desktop transitions (`WinSta0\Default` <-> `WinSta0\Winlogon`)
+/// so `SetThreadDesktop` never hits `ERROR_BUSY (170)` and remote mouse/keyboard control work
+/// seamlessly across UAC prompts, elevated Administrator applications, and the Windows lock screen.
 struct NativeService {
-    attached: Mutex<Option<(String, isize)>>,
+    actor: Mutex<Option<DesktopActor>>,
     last_sync: Mutex<Option<Instant>>,
     cached_displays: Mutex<Option<(Instant, Vec<NativeDisplay>)>>,
 }
@@ -466,7 +729,7 @@ unsafe impl Send for NativeService {}
 impl NativeService {
     fn new() -> Self {
         Self {
-            attached: Mutex::new(None),
+            actor: Mutex::new(None),
             last_sync: Mutex::new(None),
             cached_displays: Mutex::new(None),
         }
@@ -479,71 +742,49 @@ impl NativeService {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some_and(|t| t.elapsed() < PLATFORM_CACHE_TTL)
+            && self
+                .actor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
         {
             return Ok(());
         }
-        self.sync_input_desktop()?;
+        let (name, hdesk) = open_active_input_desktop()?;
+        let mut guard = self.actor.lock().unwrap_or_else(|e| e.into_inner());
+        let same = guard
+            .as_ref()
+            .is_some_and(|cur| cur.name.eq_ignore_ascii_case(&name));
+        if same {
+            unsafe { CloseDesktop(hdesk) };
+            *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            return Ok(());
+        }
+        // Drop the old desktop actor first so its handle closes cleanly, then attach a
+        // brand-new thread to the new input desktop (Default <-> Winlogon).
+        let prev = guard.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+        *guard = None;
+        let fresh = DesktopActor::spawn(name.clone(), hdesk)?;
+        super::service::append_service_log(&format!(
+            "desktop actor switched: '{prev}' -> '{name}'"
+        ));
+        *guard = Some(fresh);
         *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         Ok(())
     }
 
-    fn sync_input_desktop(&self) -> Result<()> {
-        const RIGHTS: u32 = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP | 0x01FF;
-        let mut hdesk: HDESK = null_mut();
-        for _ in 0..3 {
-            hdesk = unsafe { OpenInputDesktop(0, 0, RIGHTS) };
-            if !hdesk.is_null() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        ensure!(
-            !hdesk.is_null(),
-            "OpenInputDesktop failed in service worker"
-        );
-        let name = match desktop_name(hdesk) {
-            Ok(n) => n,
-            Err(e) => {
-                unsafe { CloseDesktop(hdesk) };
-                return Err(e);
-            }
-        };
-        let allowed =
-            name.eq_ignore_ascii_case("Default") || name.eq_ignore_ascii_case("Winlogon");
-        if !allowed {
-            unsafe { CloseDesktop(hdesk) };
-            bail!("unsupported interactive desktop for service input");
-        }
-        let mut guard = self.attached.lock().unwrap_or_else(|e| e.into_inner());
-        let same = guard
-            .as_ref()
-            .is_some_and(|(cur, _)| cur.eq_ignore_ascii_case(&name));
-        if same {
-            unsafe { CloseDesktop(hdesk) };
-            return Ok(());
-        }
-        let ok = unsafe { SetThreadDesktop(hdesk) };
-        if ok == 0 {
-            unsafe { CloseDesktop(hdesk) };
-            bail!("SetThreadDesktop failed while switching to {name}");
-        }
-        if let Some((_, old_raw)) = guard.replace((name, hdesk as isize))
-            && old_raw != 0
+    fn call_actor<T>(&self, build: impl FnOnce(mpsc::SyncSender<T>) -> DesktopCmd) -> Result<T> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         {
-            unsafe { CloseDesktop(old_raw as HDESK) };
+            let guard = self.actor.lock().unwrap_or_else(|e| e.into_inner());
+            let actor = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("service desktop actor unavailable"))?;
+            actor.send(build(reply_tx))?;
         }
-        Ok(())
-    }
-}
-
-impl Drop for NativeService {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.attached.lock()
-            && let Some((_, raw)) = guard.take()
-            && raw != 0
-        {
-            unsafe { CloseDesktop(raw as HDESK) };
-        }
+        reply_rx
+            .recv_timeout(Duration::from_millis(200))
+            .map_err(|_| anyhow::anyhow!("service desktop actor timed out"))
     }
 }
 
@@ -559,47 +800,72 @@ impl Platform for NativeService {
         self.sync_input_desktop_throttled(false)
     }
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
-        if let Some((t, cached)) = self
-            .cached_displays
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            && t.elapsed() < PLATFORM_CACHE_TTL
-        {
-            return Ok(cached.clone());
+        let cached_snapshot = {
+            let guard = self
+                .cached_displays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((t, cached)) = guard.as_ref() {
+                if t.elapsed() < PLATFORM_CACHE_TTL {
+                    return Ok(cached.clone());
+                }
+                Some(cached.clone())
+            } else {
+                None
+            }
+        };
+        self.sync_input_desktop_throttled(false)?;
+        match self.call_actor(DesktopCmd::Displays) {
+            Ok(Ok(fresh)) => {
+                *self
+                    .cached_displays
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+                Ok(fresh)
+            }
+            Err(err) | Ok(Err(err)) => {
+                let on_winlogon = self
+                    .actor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|a| a.name.eq_ignore_ascii_case("Winlogon"));
+                if on_winlogon && let Some(prev) = cached_snapshot {
+                    return Ok(prev);
+                }
+                Err(err)
+            }
         }
-        let _ = self.sync_input_desktop_throttled(false);
-        let fresh = receiver_displays()?;
-        *self
-            .cached_displays
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
-        Ok(fresh)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
-        let _ = self.sync_input_desktop_throttled(false);
-        super::cursor_position().map_err(anyhow::Error::msg)
+        self.sync_input_desktop_throttled(false)?;
+        self.call_actor(DesktopCmd::Cursor)?
     }
     fn held(&self, vk: u16) -> bool {
-        unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
+        if self.sync_input_desktop_throttled(false).is_err() {
+            return false;
+        }
+        self.call_actor(|tx| DesktopCmd::Held { vk, tx })
+            .unwrap_or(false)
     }
     fn key_vk(&self, scan: u16) -> u16 {
-        unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
+        let vk = unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) } as u16;
+        if vk != 0 {
+            vk
+        } else {
+            unsafe { MapVirtualKeyW(u32::from(scan & 0x00ff), MAPVK_VSC_TO_VK) as u16 }
+        }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
-        let _ = self.sync_input_desktop_throttled(false);
-        crate::power::wake_display_throttled();
-        let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
-        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1 {
+        self.sync_input_desktop_throttled(false)?;
+        if self.call_actor(|tx| DesktopCmd::Post { input, tx })?.is_ok() {
             return Ok(());
         }
-        // Desktop may have just transitioned (Default <-> Winlogon): resync and retry once.
-        let _ = self.sync_input_desktop_throttled(true);
-        ensure!(
-            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-            "Windows service input insertion failed"
-        );
-        Ok(())
+        // Desktop may have just transitioned (Default <-> Winlogon): resync onto a fresh
+        // desktop actor, wake the display, and retry once.
+        crate::power::wake_display_now();
+        self.sync_input_desktop_throttled(true)?;
+        self.call_actor(|tx| DesktopCmd::Post { input, tx })?
     }
 }
 
@@ -1239,5 +1505,51 @@ mod tests {
         assert_eq!(ki.wVk, VK_BACK);
         assert_eq!(ki.wScan, 0x0e);
         assert_eq!(ki.dwFlags & KEYEVENTF_SCANCODE, 0);
+    }
+    #[test]
+    fn winlogon_keyboard_input_populates_virtual_key_and_clears_scancode_flag() {
+        // Letters ('A' = HID 0x04), top-row digits ('1' = HID 0x1e, '0' = HID 0x27),
+        // and Left Shift (HID 0xe1) must receive explicit wVk with KEYEVENTF_SCANCODE cleared.
+        for (usage, expected_vk) in [
+            (0x04u16, 0x41u16), // 'A'
+            (0x1e, 0x31),       // '1'
+            (0x27, 0x30),       // '0'
+            (0xe1, VK_LSHIFT),  // Left Shift
+        ] {
+            let raw = keyboard(usage, true).unwrap();
+            let norm = normalize_winlogon_keyboard_input_with_numlock(raw, true);
+            let ki = unsafe { norm.Anonymous.ki };
+            assert_eq!(ki.wVk, expected_vk, "usage 0x{usage:02x}");
+            assert_ne!(ki.wScan, 0, "usage 0x{usage:02x} must keep hardware scan");
+            assert_eq!(ki.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(ki.dwFlags & KEYEVENTF_KEYUP, 0);
+            assert_eq!(ki.dwExtraInfo, INPUT_ORIGIN_TAG);
+
+            let raw_up = keyboard(usage, false).unwrap();
+            let norm_up = normalize_winlogon_keyboard_input_with_numlock(raw_up, true);
+            let ki_up = unsafe { norm_up.Anonymous.ki };
+            assert_eq!(ki_up.wVk, expected_vk);
+            assert_eq!(ki_up.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_ne!(ki_up.dwFlags & KEYEVENTF_KEYUP, 0);
+        }
+
+        // Numpad '1' (HID 0x59 -> scan 0x4f): VK_NUMPAD1 when NumLock is ON, VK_END when OFF.
+        let kp1 = keyboard(0x59, true).unwrap();
+        let kp1_on = unsafe {
+            normalize_winlogon_keyboard_input_with_numlock(kp1, true)
+                .Anonymous
+                .ki
+        };
+        assert_eq!(kp1_on.wVk, VK_NUMPAD1);
+        assert_eq!(kp1_on.wScan, 0x4f);
+        assert_eq!(kp1_on.dwFlags & KEYEVENTF_SCANCODE, 0);
+
+        let kp1_off = unsafe {
+            normalize_winlogon_keyboard_input_with_numlock(kp1, false)
+                .Anonymous
+                .ki
+        };
+        assert_eq!(kp1_off.wVk, VK_END);
+        assert_eq!(kp1_off.dwFlags & KEYEVENTF_SCANCODE, 0);
     }
 }

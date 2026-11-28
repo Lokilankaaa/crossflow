@@ -43,6 +43,9 @@ internal sealed class TrayIcon : IDisposable
     private const uint NIF_MESSAGE = 0x00000001;
     private const uint NIF_ICON = 0x00000002;
     private const uint NIF_TIP = 0x00000004;
+    private const uint NIF_INFO = 0x00000010;
+    private const uint NIIF_INFO = 0x00000001;
+    private const uint NIIF_ERROR = 0x00000003;
 
     private const uint MF_STRING = 0x00000000;
     private const uint MF_GRAYED = 0x00000001;
@@ -149,10 +152,8 @@ internal sealed class TrayIcon : IDisposable
         IReadOnlyList<NetworkChannelInfo> availableChannels)
     {
         if (disposed) return;
-        bool themeNow = IsSystemLightTaskbar();
-        bool iconChanged = state != visualState || themeNow != lightTaskbar;
+        bool iconChanged = state != visualState;
         visualState = state;
-        lightTaskbar = themeNow;
         if (iconChanged)
             currentIcon = GetOrCreateIcon(visualState, lightTaskbar);
 
@@ -173,6 +174,21 @@ internal sealed class TrayIcon : IDisposable
 
         if (!added) AddIcon();
         else if (iconChanged || tipChanged) ModifyIcon();
+    }
+
+    internal void ShowNotification(string title, string message, bool isError = false)
+    {
+        if (disposed) return;
+        if (!added) AddIcon();
+        if (!added) return;
+        string safeTitle = title.Length > 60 ? title[..60] : title;
+        string safeBody = message.Length > 240 ? message[..240] : message;
+        var nid = BuildData();
+        nid.uFlags |= NIF_INFO;
+        nid.szInfoTitle = safeTitle;
+        nid.szInfo = safeBody;
+        nid.dwInfoFlags = isError ? NIIF_ERROR : NIIF_INFO;
+        Shell_NotifyIconW(NIM_MODIFY, ref nid);
     }
 
     private void AddIcon()

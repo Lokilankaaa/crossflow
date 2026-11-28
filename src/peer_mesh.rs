@@ -43,7 +43,7 @@ use std::{
     path::PathBuf,
     process,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
@@ -864,15 +864,104 @@ fn spawn_stdin_reader(stop: Arc<AtomicBool>) -> Receiver<UiCommand> {
     rx
 }
 
-fn emit_status(stdout: &Mutex<std::io::Stdout>, status: &PeerUiStatus) {
-    if let Ok(line) = serde_json::to_string(status)
-        && let Ok(mut out) = stdout.lock()
-    {
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
+struct StatusSlot {
+    latest: Option<String>,
+    closed: bool,
+}
+
+/// Non-blocking latest-snapshot stdout status writer.
+/// Guarantees that a throttled/hidden GUI or a full 4 KB Windows pipe can NEVER
+/// stall the 1000 Hz peer_mesh network/input loop.
+struct StatusEmitter {
+    shared: Arc<(Mutex<StatusSlot>, Condvar)>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl StatusEmitter {
+    fn start() -> Self {
+        let shared = Arc::new((
+            Mutex::new(StatusSlot {
+                latest: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let bg = shared.clone();
+        let worker = thread::Builder::new()
+            .name("crossflow-status-tx".into())
+            .spawn(move || {
+                let (lock, cvar) = &*bg;
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                loop {
+                    let line = {
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.latest.is_none() && !guard.closed {
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        if let Some(line) = guard.latest.take() {
+                            line
+                        } else {
+                            break;
+                        }
+                    };
+                    if writeln!(out, "{line}").is_err() || out.flush().is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self { shared, worker }
+    }
+
+    fn emit(&self, status: &PeerUiStatus) {
+        if let Ok(line) = serde_json::to_string(status) {
+            let (lock, cvar) = &*self.shared;
+            if let Ok(mut guard) = lock.lock() {
+                guard.latest = Some(line);
+                cvar.notify_one();
+            }
+        }
+    }
+
+    fn finish(mut self, status: &PeerUiStatus) {
+        let line = serde_json::to_string(status).ok();
+        {
+            let (lock, cvar) = &*self.shared;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(line) = line {
+                guard.latest = Some(line);
+            }
+            guard.closed = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 
+impl Drop for StatusEmitter {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.shared;
+        if let Ok(mut guard) = lock.lock() {
+            guard.closed = true;
+            cvar.notify_one();
+        }
+    }
+}
+
+
+fn local_desktop_accepts_user_capture() -> bool {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::is_input_desktop_default()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 fn query_windows_service_flags() -> (bool, bool, bool) {
     #[cfg(windows)]
@@ -947,6 +1036,49 @@ struct ActiveMeshPeer {
     displays: Vec<Display>,
     conn: MeshPeerConn,
     aux: AuxSession,
+    supports_lock_control: bool,
+}
+
+/// Returns true when the remote sender presses `L` (`HID 0x0F`) while holding ONLY
+/// Left/Right Win (`0xE3`/`0xE7`) with no Ctrl/Alt/Shift modifiers. Windows ignores
+/// injected `SendInput(Win+L)` for security reasons, so the Windows receiver invokes
+/// `LockWorkStation()` directly when this chord arrives from a remote peer.
+fn is_remote_win_lock_chord(
+    held_keys: &std::collections::BTreeSet<u16>,
+    code: u16,
+    down: bool,
+) -> bool {
+    if !down || code != 0x0F {
+        return false;
+    }
+    let has_meta = held_keys.contains(&0xE3) || held_keys.contains(&0xE7);
+    let has_other_mod = held_keys.contains(&0xE0)
+        || held_keys.contains(&0xE4)
+        || held_keys.contains(&0xE1)
+        || held_keys.contains(&0xE5)
+        || held_keys.contains(&0xE2)
+        || held_keys.contains(&0xE6);
+    has_meta && !has_other_mod
+}
+
+fn queue_legacy_mac_lock_chord(conn: &mut MeshPeerConn, now_ns: u64) {
+    // Graceful fallback when locking an older macOS peer that predates
+    // `MeshControl::LockWorkstation`: send native macOS Control + Command + Q.
+    for (code, down) in [
+        (0xE0u16, true),
+        (0xE3, true),
+        (0x14, true),
+        (0x14, false),
+        (0xE3, false),
+        (0xE0, false),
+    ] {
+        let mut f = Frame::new(Kind::Key);
+        f.code = code;
+        f.down = down;
+        f.t0_ns = now_ns;
+        let _ = conn.queue_frame(&f);
+    }
+    let _ = conn.flush();
 }
 
 struct MeshNativeIo {
@@ -1208,7 +1340,8 @@ pub fn run(
     );
     ensure!((60..=8000).contains(&options.max_hz), "invalid max_hz");
 
-    let stdout = Mutex::new(std::io::stdout());
+    crate::power::configure_realtime_thread(false);
+    let status_tx = StatusEmitter::start();
     let local_device_id = load_or_create_device_id()?;
     let local_discovery_id = local_device_id[..32].to_string();
     let local_name = options
@@ -1236,9 +1369,7 @@ pub fn run(
         if let Err(permission) = crate::platform::macos::preflight_input_permissions() {
             let local_channels = enumerate_local_channels();
             let has_pass = config.passphrase.is_some();
-            emit_status(
-                &stdout,
-                &PeerUiStatus {
+            status_tx.finish(&PeerUiStatus {
                     protocol: PEER_UI_PROTOCOL,
                     state: "startup_rejected".into(),
                     local_device_id,
@@ -1271,8 +1402,7 @@ pub fn run(
                     screen_numbers: vec![],
                     transfer: None,
                     error: Some(permission.message().to_string()),
-                },
-            );
+                });
             writer.finish()?;
             anyhow::bail!("{}", permission.message());
         }
@@ -1396,9 +1526,12 @@ pub fn run(
             let mut upgrade_backoff: HashMap<String, Instant> = HashMap::new();
             let mut active_peers: BTreeMap<String, ActiveMeshPeer> = BTreeMap::new();
             let mut native_io: Option<MeshNativeIo> = None;
+            let mut last_native_io_attempt = Instant::now() - Duration::from_secs(2);
 
             let mut active_outbound_target: Option<String> = None;
             let mut inbound_owner: Option<String> = None;
+            let mut inbound_held_keys: std::collections::BTreeSet<u16> =
+                std::collections::BTreeSet::new();
             let mut remote_focus_state: (Option<String>, Option<String>) = (None, None);
             let mut remote_focus_active = false;
             let mut last_broadcast_focus: (Option<String>, Option<String>) = (None, None);
@@ -1429,9 +1562,9 @@ pub fn run(
             {
                 let mut did_work = false;
 
-                // Detect OS sleep/standby resume via monotonic or wall-clock jump (>= 5s).
+                // Detect OS sleep/standby resume via monotonic or wall-clock jump (>= 15s).
                 // Refreshing listener + mDNS sockets immediately recovers overnight standby
-                // without requiring the user to manually click Reconnect.
+                // without false-triggering on brief OS scheduling or worker-startup delays.
                 let mono_gap = last_loop_mono.elapsed();
                 let now_wall = SystemTime::now();
                 let wall_gap = now_wall
@@ -1439,7 +1572,7 @@ pub fn run(
                     .unwrap_or_else(|e| e.duration());
                 last_loop_mono = Instant::now();
                 last_loop_wall = now_wall;
-                if mono_gap >= Duration::from_secs(5) || wall_gap >= Duration::from_secs(5) {
+                if mono_gap >= Duration::from_secs(15) || wall_gap >= Duration::from_secs(15) {
                     log.write(
                         "mesh_wake_detected",
                         serde_json::json!({
@@ -1507,7 +1640,12 @@ pub fn run(
                 let mut local_displays_changed = false;
                 if last_display_refresh.elapsed() >= Duration::from_millis(1500) {
                     last_display_refresh = Instant::now();
-                    if let Ok(inv) = (platform.inventory)()
+                    let service_locked_desktop = native_io
+                        .as_ref()
+                        .is_some_and(|io| io.sink.is_service_backed())
+                        && !local_desktop_accepts_user_capture();
+                    if !service_locked_desktop
+                        && let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
                         && inv != local_displays
                     {
@@ -2189,6 +2327,7 @@ pub fn run(
                                     displays: peer.displays,
                                     conn: peer.conn,
                                     aux,
+                                    supports_lock_control: peer.supports_lock_control,
                                 },
                             );
                             let remotes = remote_display_map(&active_peers);
@@ -2223,6 +2362,7 @@ pub fn run(
                 let mut inbound_layout_updates: Vec<(String, u64, Vec<crate::session_metadata::SharedScreen>)> = Vec::new();
                 let mut inbound_display_updates: Vec<(String, Vec<Display>)> = Vec::new();
                 let mut revoke_outbound_from: Vec<String> = Vec::new();
+                let mut inbound_arm_failed = false;
 
                 for pid in peer_ids {
                     let Some(peer) = active_peers.get_mut(&pid) else {
@@ -2259,7 +2399,17 @@ pub fn run(
                                                     {
                                                         revoke_outbound_from.push(old_owner);
                                                     }
-                                                    let _ = io.sink.reset();
+                                                    inbound_held_keys.clear();
+                                                    if let Err(err) = io.sink.reset() {
+                                                        log.write(
+                                                            "mesh_inbound_arm_err",
+                                                            serde_json::json!({
+                                                                "peer": &pid[..pid.len().min(8)],
+                                                                "reason": format!("{err:#}"),
+                                                            }),
+                                                        );
+                                                        inbound_arm_failed = true;
+                                                    }
                                                     inbound_owner = Some(pid.clone());
                                                     remote_focus_active = true;
                                                     if remote_focus_state.0.as_deref()
@@ -2283,6 +2433,7 @@ pub fn run(
                                                     if inbound_owner.as_deref() == Some(pid.as_str())
                                                     {
                                                         let _ = io.sink.release_owned();
+                                                        inbound_held_keys.clear();
                                                         inbound_owner = None;
                                                     }
                                                 }
@@ -2301,6 +2452,33 @@ pub fn run(
                                                                 )),
                                                             );
                                                         }
+                                                        if frame.kind == Kind::Key {
+                                                            #[cfg(windows)]
+                                                            if is_remote_win_lock_chord(
+                                                                &inbound_held_keys,
+                                                                frame.code,
+                                                                frame.down,
+                                                            ) {
+                                                                let _ = io.sink.release_owned();
+                                                                inbound_held_keys.clear();
+                                                                log.write(
+                                                                    "mesh_remote_lock_workstation",
+                                                                    serde_json::json!({
+                                                                        "source": "win_l",
+                                                                        "peer": &pid[..pid.len().min(8)],
+                                                                    }),
+                                                                );
+                                                                crate::power::lock_workstation();
+                                                                continue;
+                                                            }
+                                                            if frame.down {
+                                                                inbound_held_keys
+                                                                    .insert(frame.code);
+                                                            } else {
+                                                                inbound_held_keys
+                                                                    .remove(&frame.code);
+                                                            }
+                                                        }
                                                         if let Err(err) =
                                                             apply_inbound_frame(&mut io.sink, &frame)
                                                         {
@@ -2312,6 +2490,7 @@ pub fn run(
                                                                 }),
                                                             );
                                                             let _ = io.sink.release_owned();
+                                                            inbound_held_keys.clear();
                                                             inbound_owner = None;
                                                             revoke_outbound_from.push(pid.clone());
                                                         }
@@ -2386,7 +2565,23 @@ pub fn run(
                                                 active_outbound_target = None;
                                             }
                                         }
-                                        MeshControl::KeepAlive | MeshControl::Hello { .. } => {}
+                                        MeshControl::LockWorkstation => {
+                                            if let Some(ref mut io) = native_io {
+                                                let _ = io.sink.release_owned();
+                                            }
+                                            inbound_held_keys.clear();
+                                            log.write(
+                                                "mesh_remote_lock_workstation",
+                                                serde_json::json!({
+                                                    "source": "control",
+                                                    "peer": &pid[..pid.len().min(8)],
+                                                }),
+                                            );
+                                            crate::power::lock_workstation();
+                                        }
+                                        MeshControl::KeepAlive
+                                        | MeshControl::Hello { .. }
+                                        | MeshControl::Unknown => {}
                                     },
                                 }
                             }
@@ -2499,7 +2694,13 @@ pub fn run(
                     remote_focus_state = (None, None);
                     remote_focus_active = false;
                     last_broadcast_focus = (None, None);
-                } else if topology_changed || native_io.is_none() {
+                } else if topology_changed
+                    || (native_io.is_none()
+                        && last_native_io_attempt.elapsed() >= Duration::from_millis(400))
+                {
+                    if native_io.is_none() {
+                        last_native_io_attempt = Instant::now();
+                    }
                     let remotes = remote_display_map(&active_peers);
                     if let Ok(rt) =
                         layout_book.rebuild(&local_device_id, &local_displays, &remotes)
@@ -2516,38 +2717,55 @@ pub fn run(
                                 if inbound_owner.is_some() {
                                     let _ = sink.reset();
                                 }
-                                match (platform.capture)(source.clone(), log.clone()) {
-                                    Ok(capture) => {
-                                        let last_activity = source.activity_counter();
-                                        native_io = Some(MeshNativeIo {
-                                            source,
-                                            capture: Some(capture),
-                                            sink,
-                                            last_activity,
-                                            last_sink_maintain: Instant::now(),
-                                            last_capture_retry: Instant::now(),
-                                            enabled_attempted: false,
-                                        });
-                                    }
-                                    Err(_) if sink.is_service_backed() => {
-                                        // Lock screen / secure desktop: keep elevated service sink
-                                        // alive so remote peers can still control and unlock!
-                                        let last_activity = source.activity_counter();
-                                        native_io = Some(MeshNativeIo {
-                                            source,
-                                            capture: None,
-                                            sink,
-                                            last_activity,
-                                            last_sink_maintain: Instant::now(),
-                                            last_capture_retry: Instant::now(),
-                                            enabled_attempted: false,
-                                        });
-                                    }
-                                    Err(_) => {
-                                        let _ = sink.shutdown();
+                                if sink.is_service_backed() && !local_desktop_accepts_user_capture() {
+                                    // Lock screen / secure desktop: keep elevated service sink
+                                    // active in receive-only mode until the user unlocks.
+                                    let last_activity = source.activity_counter();
+                                    native_io = Some(MeshNativeIo {
+                                        source,
+                                        capture: None,
+                                        sink,
+                                        last_activity,
+                                        last_sink_maintain: Instant::now(),
+                                        last_capture_retry: Instant::now(),
+                                        enabled_attempted: false,
+                                    });
+                                } else {
+                                    match (platform.capture)(source.clone(), log.clone()) {
+                                        Ok(capture) => {
+                                            let last_activity = source.activity_counter();
+                                            native_io = Some(MeshNativeIo {
+                                                source,
+                                                capture: Some(capture),
+                                                sink,
+                                                last_activity,
+                                                last_sink_maintain: Instant::now(),
+                                                last_capture_retry: Instant::now(),
+                                                enabled_attempted: false,
+                                            });
+                                        }
+                                        Err(_) if sink.is_service_backed() => {
+                                            // Lock screen / secure desktop: keep elevated service sink
+                                            // alive so remote peers can still control and unlock!
+                                            let last_activity = source.activity_counter();
+                                            native_io = Some(MeshNativeIo {
+                                                source,
+                                                capture: None,
+                                                sink,
+                                                last_activity,
+                                                last_sink_maintain: Instant::now(),
+                                                last_capture_retry: Instant::now(),
+                                                enabled_attempted: false,
+                                            });
+                                        }
+                                        Err(_) => {
+                                            let _ = sink.shutdown();
+                                        }
                                     }
                                 }
                             }
+                            last_loop_mono = Instant::now();
+                            last_loop_wall = SystemTime::now();
                         }
                         broadcast_layout_sync(
                             &mut active_peers,
@@ -2576,11 +2794,16 @@ pub fn run(
                 }
 
                 // 7. Poll native capture, process custom hotkeys / QuickJump, route 1-hop frames!
-                let mut restart_native: Option<&'static str> = None;
+                let mut restart_native: Option<&'static str> = if inbound_arm_failed {
+                    Some("arm_reset_err")
+                } else {
+                    None
+                };
                 if let Some(ref mut io) = native_io {
                     // Retry starting capture if we are currently in receive-only service mode (e.g. after unlock)
                     if io.capture.is_none()
                         && io.last_capture_retry.elapsed() >= Duration::from_millis(1200)
+                        && local_desktop_accepts_user_capture()
                     {
                         io.last_capture_retry = Instant::now();
                         let rt = io.source.runtime();
@@ -2695,6 +2918,31 @@ pub fn run(
                                 HotkeyAction::ToggleLockScreen => {
                                     screen_locked = !screen_locked;
                                     io.source.set_edge_locked(screen_locked);
+                                }
+                                HotkeyAction::LockFocusedDevice => {
+                                    if let Some(target_id) = active_outbound_target.as_deref()
+                                        && let Some(peer) = active_peers.get_mut(target_id)
+                                    {
+                                        log.write(
+                                            "mesh_lock_device_tx",
+                                            serde_json::json!({
+                                                "peer": &target_id[..target_id.len().min(8)],
+                                                "native_control": peer.supports_lock_control,
+                                            }),
+                                        );
+                                        if peer.supports_lock_control {
+                                            let _ = peer
+                                                .conn
+                                                .queue_control(&MeshControl::LockWorkstation);
+                                            let _ = peer.conn.flush();
+                                        } else if peer.platform == "macos" {
+                                            queue_legacy_mac_lock_chord(&mut peer.conn, log.ns());
+                                        }
+                                    } else {
+                                        let _ = io.sink.release_owned();
+                                        inbound_held_keys.clear();
+                                        crate::power::lock_workstation();
+                                    }
                                 }
                                 HotkeyAction::QuickJumpNext => {
                                     if !user_paused
@@ -2913,13 +3161,18 @@ pub fn run(
                     if let Some(io) = native_io.take() {
                         io.shutdown();
                     }
+                    last_native_io_attempt = Instant::now() - Duration::from_secs(1);
+                    last_loop_mono = Instant::now();
+                    last_loop_wall = SystemTime::now();
                     if let Some(prev) = active_outbound_target.take()
                         && let Some(p) = active_peers.get_mut(&prev)
                     {
                         let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
                         let _ = p.conn.flush();
                     }
-                    inbound_owner = None;
+                    if restart_native != Some("arm_reset_err") {
+                        inbound_owner = None;
+                    }
                     if let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
                         && inv != local_displays
@@ -3002,7 +3255,7 @@ pub fn run(
 
                 // 10. Emit unified multi-device PeerUiStatus
                 let transfer = active_transfer_snapshot(&active_peers);
-                let sharing_now = !active_peers.is_empty() && !user_paused;
+                let sharing_now = !active_peers.is_empty() && !user_paused && native_io.is_some();
                 let state_str = if active_peers.is_empty() {
                     "searching"
                 } else if user_paused {
@@ -3058,7 +3311,7 @@ pub fn run(
                     .map(|io| io.sink.is_service_backed())
                     .unwrap_or(service_mode_flags.1 && service_mode_flags.2);
                 let sig = format!(
-                    "{state_str}|{:?}|{:?}|{screen_locked}|{service_mode_installed}|{service_mode_active}|{}|{}|{}|{:?}",
+                    "{state_str}|{sharing_now}|{:?}|{:?}|{screen_locked}|{service_mode_installed}|{service_mode_active}|{}|{}|{}|{:?}",
                     focus_dev,
                     focus_scr,
                     peers_list.len(),
@@ -3067,7 +3320,7 @@ pub fn run(
                     last_auth_error
                 );
                 if sig != last_status_sig
-                    || last_status_emit.elapsed() >= Duration::from_millis(250)
+                    || last_status_emit.elapsed() >= Duration::from_millis(1000)
                     || transfer.as_ref().is_some_and(|t| t.state == "active")
                 {
                     last_status_sig = sig;
@@ -3086,9 +3339,7 @@ pub fn run(
                         })
                         .collect();
                     let has_pass = config.passphrase.is_some();
-                    emit_status(
-                        &stdout,
-                        &PeerUiStatus {
+                    status_tx.emit(&PeerUiStatus {
                             protocol: PEER_UI_PROTOCOL,
                             state: state_str.into(),
                             local_device_id: local_device_id.clone(),
@@ -3126,8 +3377,7 @@ pub fn run(
                             } else {
                                 None
                             },
-                        },
-                    );
+                        });
                 }
 
                 if !did_work {
@@ -3154,9 +3404,7 @@ pub fn run(
 
     stop.store(true, Ordering::Release);
     let has_pass = config.passphrase.is_some();
-    emit_status(
-        &stdout,
-        &PeerUiStatus {
+    status_tx.finish(&PeerUiStatus {
             protocol: PEER_UI_PROTOCOL,
             state: if result.is_ok() {
                 "stopped".into()
@@ -3193,8 +3441,7 @@ pub fn run(
             screen_numbers: vec![],
             transfer: None,
             error: result.as_ref().err().map(|e| format!("{e:#}")),
-        },
-    );
+        });
     writer.finish()?;
     result
 }
@@ -3467,5 +3714,20 @@ mod tests {
         }
         assert!(matches!(&out[4], MeshPacket::Control(MeshControl::KeepAlive)));
         assert!(matches!(&out[5], MeshPacket::Input(f) if f.kind == Kind::Move && f.x == 1.0));
+    }
+
+    #[test]
+    fn remote_win_lock_chord_matches_only_pure_win_plus_l() {
+        let mut held = std::collections::BTreeSet::new();
+        assert!(!is_remote_win_lock_chord(&held, 0x0F, true));
+        held.insert(0xE3); // Left Win / Cmd
+        assert!(is_remote_win_lock_chord(&held, 0x0F, true));
+        assert!(!is_remote_win_lock_chord(&held, 0x0F, false));
+        assert!(!is_remote_win_lock_chord(&held, 0x04, true)); // Win + A
+        held.insert(0xE0); // Ctrl + Win + L must NOT trigger lock
+        assert!(!is_remote_win_lock_chord(&held, 0x0F, true));
+        held.clear();
+        held.insert(0xE7); // Right Win / Cmd
+        assert!(is_remote_win_lock_chord(&held, 0x0F, true));
     }
 }

@@ -13,7 +13,7 @@ pub use routed::{
     CaptureCoordinateDiagnostics, NativeDisplay, capture_coordinate_diagnostics, cursor_position,
     displays, warp_cursor,
 };
-pub use sink::{WindowsMouseSink, receiver_display_id, receiver_displays};
+pub use sink::{WindowsMouseSink, is_input_desktop_default, receiver_display_id, receiver_displays};
 
 use crate::input::Button;
 use std::{
@@ -1345,7 +1345,7 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     if resources.timer == 0 {
         return Err(win_error("SetTimer"));
     }
-    let routed = remote_focus
+    let mut routed = remote_focus
         .map(|focus| routed::RoutedHooks::install(resources.hwnd, focus, state.stop.clone()))
         .transpose()?;
     if full_input {
@@ -1376,8 +1376,9 @@ fn run_capture_mode<F: FnMut(CaptureEvent), S: FnMut() -> CaptureStatus>(
     let started = Instant::now();
     let mut message = MaybeUninit::<MSG>::zeroed();
     while !state.stop.load(Ordering::Acquire) && !duration.is_some_and(|d| started.elapsed() >= d) {
-        if let Some(hooks) = &routed {
+        if let Some(hooks) = &mut routed {
             hooks.maintain(state.data.borrow_mut().status());
+            hooks.heal_if_stale(Instant::now());
         }
         let result = unsafe { GetMessageW(message.as_mut_ptr(), null_mut(), 0, 0) };
         if result == -1 {

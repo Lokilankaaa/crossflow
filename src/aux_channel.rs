@@ -175,12 +175,9 @@ fn collect_transfer_entries(roots: &[PathBuf]) -> Result<(Vec<FileEntrySpec>, u6
     let mut used_roots: HashSet<String> = HashSet::new();
 
     for root in roots {
-        let Ok(meta) = fs::symlink_metadata(root) else {
+        let Ok(meta) = fs::metadata(root) else {
             continue;
         };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
         let base_name = root
             .file_name()
             .and_then(|n| n.to_str())
@@ -399,53 +396,23 @@ fn send_file_batch(
         },
     );
 
-    let start_hdr = serde_json::to_vec(&AuxHeader::FileBatchStart {
-        batch_id,
-        total_files,
-        total_bytes,
-        display_name: display_name.clone(),
-    })?;
-    write_encrypted(stream, ch, &start_hdr)?;
-    stream.flush()?;
-
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let mut bytes_done: u64 = 0;
     let mut files_done: usize = 0;
     let mut last_ui = Instant::now();
     let mut buf = vec![0u8; CHUNK_SIZE];
 
-    for entry in &entries {
-        if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
-            let hdr = serde_json::to_vec(&AuxHeader::FileCancel { batch_id })?;
-            let _ = write_encrypted(stream, ch, &hdr);
-            let _ = stream.flush();
-            publish_transfer(
-                status_slot,
-                TransferStatus {
-                    direction: "sending".into(),
-                    state: "cancelled".into(),
-                    name: display_name,
-                    bytes_done,
-                    bytes_total: total_bytes,
-                    files_done,
-                    files_total: total_files,
-                    saved_dir: None,
-                    error: None,
-                },
-            );
-            return Ok(());
-        }
-
-        let mut file = File::open(&entry.source_path)?;
-        let entry_hdr = serde_json::to_vec(&AuxHeader::FileEntryStart {
+    let send_res = (|| -> Result<bool> {
+        let start_hdr = serde_json::to_vec(&AuxHeader::FileBatchStart {
             batch_id,
-            rel_path: entry.rel_path.clone(),
-            size: entry.size,
+            total_files,
+            total_bytes,
+            display_name: display_name.clone(),
         })?;
-        write_encrypted(stream, ch, &entry_hdr)?;
+        write_encrypted(stream, ch, &start_hdr)?;
+        stream.flush()?;
 
-        let mut hasher = new_blake2s();
-        let mut remaining = entry.size;
-        while remaining > 0 {
+        for entry in &entries {
             if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
                 let hdr = serde_json::to_vec(&AuxHeader::FileCancel { batch_id })?;
                 let _ = write_encrypted(stream, ch, &hdr);
@@ -455,31 +422,6 @@ fn send_file_batch(
                     TransferStatus {
                         direction: "sending".into(),
                         state: "cancelled".into(),
-                        name: display_name,
-                        bytes_done,
-                        bytes_total: total_bytes,
-                        files_done,
-                        files_total: total_files,
-                        saved_dir: None,
-                        error: None,
-                    },
-                );
-                return Ok(());
-            }
-            let to_read = (remaining as usize).min(CHUNK_SIZE);
-            let n = file.read(&mut buf[..to_read])?;
-            ensure!(n > 0, "unexpected EOF while reading file");
-            hasher.input(&buf[..n]);
-            write_encrypted(stream, ch, &buf[..n])?;
-            remaining -= n as u64;
-            bytes_done += n as u64;
-            if last_ui.elapsed() >= Duration::from_millis(90) {
-                last_ui = Instant::now();
-                publish_transfer(
-                    status_slot,
-                    TransferStatus {
-                        direction: "sending".into(),
-                        state: "active".into(),
                         name: display_name.clone(),
                         bytes_done,
                         bytes_total: total_bytes,
@@ -489,36 +431,118 @@ fn send_file_batch(
                         error: None,
                     },
                 );
+                return Ok(false);
             }
+
+            let mut file = File::open(&entry.source_path)?;
+            let entry_hdr = serde_json::to_vec(&AuxHeader::FileEntryStart {
+                batch_id,
+                rel_path: entry.rel_path.clone(),
+                size: entry.size,
+            })?;
+            write_encrypted(stream, ch, &entry_hdr)?;
+
+            let mut hasher = new_blake2s();
+            let mut remaining = entry.size;
+            while remaining > 0 {
+                if cancel.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
+                    let hdr = serde_json::to_vec(&AuxHeader::FileCancel { batch_id })?;
+                    let _ = write_encrypted(stream, ch, &hdr);
+                    let _ = stream.flush();
+                    publish_transfer(
+                        status_slot,
+                        TransferStatus {
+                            direction: "sending".into(),
+                            state: "cancelled".into(),
+                            name: display_name.clone(),
+                            bytes_done,
+                            bytes_total: total_bytes,
+                            files_done,
+                            files_total: total_files,
+                            saved_dir: None,
+                            error: None,
+                        },
+                    );
+                    return Ok(false);
+                }
+                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let n = file.read(&mut buf[..to_read])?;
+                ensure!(n > 0, "unexpected EOF while reading file");
+                hasher.input(&buf[..n]);
+                write_encrypted(stream, ch, &buf[..n])?;
+                remaining -= n as u64;
+                bytes_done += n as u64;
+                if last_ui.elapsed() >= Duration::from_millis(90) {
+                    last_ui = Instant::now();
+                    publish_transfer(
+                        status_slot,
+                        TransferStatus {
+                            direction: "sending".into(),
+                            state: "active".into(),
+                            name: display_name.clone(),
+                            bytes_done,
+                            bytes_total: total_bytes,
+                            files_done,
+                            files_total: total_files,
+                            saved_dir: None,
+                            error: None,
+                        },
+                    );
+                }
+            }
+            let digest = finish_blake2s_hex(hasher.as_mut());
+            let end_hdr = serde_json::to_vec(&AuxHeader::FileEntryEnd {
+                batch_id,
+                blake2s: digest,
+            })?;
+            write_encrypted(stream, ch, &end_hdr)?;
+            files_done += 1;
         }
-        let digest = finish_blake2s_hex(hasher.as_mut());
-        let end_hdr = serde_json::to_vec(&AuxHeader::FileEntryEnd {
-            batch_id,
-            blake2s: digest,
-        })?;
-        write_encrypted(stream, ch, &end_hdr)?;
-        files_done += 1;
+
+        let batch_end = serde_json::to_vec(&AuxHeader::FileBatchEnd { batch_id })?;
+        write_encrypted(stream, ch, &batch_end)?;
+        stream.flush()?;
+        Ok(true)
+    })();
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    match send_res {
+        Ok(true) => {
+            publish_transfer(
+                status_slot,
+                TransferStatus {
+                    direction: "sending".into(),
+                    state: "completed".into(),
+                    name: display_name,
+                    bytes_done: total_bytes,
+                    bytes_total: total_bytes,
+                    files_done: total_files,
+                    files_total: total_files,
+                    saved_dir: None,
+                    error: None,
+                },
+            );
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(e) => {
+            publish_transfer(
+                status_slot,
+                TransferStatus {
+                    direction: "sending".into(),
+                    state: "failed".into(),
+                    name: display_name,
+                    bytes_done,
+                    bytes_total: total_bytes,
+                    files_done,
+                    files_total: total_files,
+                    saved_dir: None,
+                    error: Some(format!("{e:#}")),
+                },
+            );
+            Err(e)
+        }
     }
-
-    let batch_end = serde_json::to_vec(&AuxHeader::FileBatchEnd { batch_id })?;
-    write_encrypted(stream, ch, &batch_end)?;
-    stream.flush()?;
-
-    publish_transfer(
-        status_slot,
-        TransferStatus {
-            direction: "sending".into(),
-            state: "completed".into(),
-            name: display_name,
-            bytes_done: total_bytes,
-            bytes_total: total_bytes,
-            files_done: total_files,
-            files_total: total_files,
-            saved_dir: None,
-            error: None,
-        },
-    );
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -556,7 +580,7 @@ fn recv_file_batch(
         },
     );
 
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut root_remap: HashMap<String, String> = HashMap::new();
     let mut top_paths: Vec<PathBuf> = Vec::new();
     let mut top_seen: HashSet<PathBuf> = HashSet::new();
@@ -679,7 +703,27 @@ fn recv_file_batch(
                         let _ = fs::remove_file(&part_path);
                         bail!("file checksum mismatch");
                     }
-                    fs::rename(&part_path, &final_path)?;
+                    // Retry briefly on Windows where Defender real-time scanning can
+                    // hold a freshly closed `.part` file for 20-200ms before rename.
+                    let mut rename_err = None;
+                    for attempt in 0..10 {
+                        match fs::rename(&part_path, &final_path) {
+                            Ok(()) => {
+                                rename_err = None;
+                                break;
+                            }
+                            Err(e) => {
+                                rename_err = Some(e);
+                                if attempt < 9 {
+                                    thread::sleep(Duration::from_millis(30));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(e) = rename_err {
+                        let _ = fs::remove_file(&part_path);
+                        return Err(e.into());
+                    }
                     if top_seen.insert(top_path.clone()) {
                         top_paths.push(top_path);
                     }
@@ -927,7 +971,14 @@ impl AuxMeshHub {
         poll_local_clipboard_inner(&self.clip_echo)
     }
 
-    fn record_remote_clipboard_write(&self, hash: String) {
+    fn begin_remote_clipboard_write(&self, hash: String) {
+        if let Ok(mut st) = self.clip_echo.lock() {
+            st.last_remote_write = Some((hash, Instant::now()));
+            st.pending_empty_token = None;
+        }
+    }
+
+    fn finish_remote_clipboard_write(&self, hash: String) {
         if let Ok(mut st) = self.clip_echo.lock() {
             st.last_remote_write = Some((hash, Instant::now()));
             st.last_token = clipboard::change_token();
@@ -1315,6 +1366,7 @@ fn run_aux(
         // 1. Explicit drag-and-drop / send_files / mesh-broadcast clipboard requests
         match send_rx.try_recv() {
             Ok(AuxOutbound::Files(paths)) => {
+                let count = paths.len();
                 let batch_id = next_batch_id;
                 next_batch_id += 1;
                 send_file_batch(
@@ -1326,6 +1378,16 @@ fn run_aux(
                     stop,
                     transfer_slot,
                 )?;
+                if let Some(log) = log {
+                    log.write(
+                        "aux_file_sent",
+                        serde_json::json!({
+                            "peer": peer_tag,
+                            "roots": count,
+                            "via": "explicit",
+                        }),
+                    );
+                }
                 last_ping = Instant::now();
             }
             Ok(AuxOutbound::Clipboard { item, hash }) => {
@@ -1513,11 +1575,14 @@ fn run_aux(
                     let mut write_ok = false;
                     if clipboard_enabled.load(Ordering::Relaxed) {
                         last_remote_write = Some((hash.clone(), Instant::now()));
+                        if let Some(ref hub) = mesh_hub {
+                            hub.begin_remote_clipboard_write(hash.clone());
+                        }
                         write_ok = clipboard::write(&item);
                         if write_ok {
                             last_token = clipboard::change_token();
                             if let Some(ref hub) = mesh_hub {
-                                hub.record_remote_clipboard_write(hash);
+                                hub.finish_remote_clipboard_write(hash);
                             }
                         }
                     }
@@ -1552,14 +1617,30 @@ fn run_aux(
                         transfer_slot,
                     )? && !saved_paths.is_empty()
                     {
+                        let saved_count = saved_paths.len();
                         let clip_item = ClipboardItem::Files(saved_paths);
                         let hash = clip_item.hash_hex();
                         last_remote_write = Some((hash.clone(), Instant::now()));
-                        if clipboard::write(&clip_item) {
+                        if let Some(ref hub) = mesh_hub {
+                            hub.begin_remote_clipboard_write(hash.clone());
+                        }
+                        let write_ok = clipboard::write(&clip_item);
+                        if write_ok {
                             last_token = clipboard::change_token();
                             if let Some(ref hub) = mesh_hub {
-                                hub.record_remote_clipboard_write(hash);
+                                hub.finish_remote_clipboard_write(hash);
                             }
+                        }
+                        if let Some(log) = log {
+                            log.write(
+                                "aux_file_recv",
+                                serde_json::json!({
+                                    "peer": peer_tag,
+                                    "files": saved_count,
+                                    "bytes": total_bytes,
+                                    "clipboard_ok": write_ok,
+                                }),
+                            );
                         }
                     }
                 }

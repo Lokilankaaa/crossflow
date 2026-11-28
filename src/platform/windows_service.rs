@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread,
@@ -33,6 +33,7 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED,
         ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE,
         GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        WAIT_OBJECT_0,
     },
     Security::{
         Authorization::{
@@ -44,8 +45,7 @@ use windows_sys::Win32::{
         SetTokenInformation,
     },
     Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_OVERLAPPED, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-        ReadFile, WriteFile,
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     },
     System::{
         IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
@@ -71,8 +71,9 @@ use windows_sys::Win32::{
         },
         Threading::{
             CREATE_NO_WINDOW, CreateEventW, CreateProcessAsUserW, GetCurrentProcess,
-            GetCurrentProcessId, GetExitCodeProcess, HIGH_PRIORITY_CLASS, OpenProcessToken,
-            PROCESS_INFORMATION, ResetEvent, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            GetCurrentProcessId, GetExitCodeProcess, HIGH_PRIORITY_CLASS, INFINITE,
+            OpenProcessToken, PROCESS_INFORMATION, ResetEvent, STARTUPINFOW, SetEvent,
+            TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
         },
     },
 };
@@ -377,22 +378,78 @@ impl Drop for ScHandleGuard {
 // Overlapped Full-Duplex Named Pipe (Zero Read/Write Deadlock!)
 // ============================================================================
 
+pub(crate) fn append_service_log(msg: &str) {
+    let dir = installed_binary_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\Crossflow"));
+    let _ = fs::create_dir_all(&dir);
+    let log_path = dir.join("service-worker.log");
+    if let Ok(meta) = fs::metadata(&log_path)
+        && meta.len() > 64 * 1024
+    {
+        let _ = fs::write(&log_path, b"");
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{ts}] {msg}");
+    }
+}
+
 struct SharedPipeHandle {
     handle: HANDLE,
     is_server: bool,
+    close_event: EventGuard,
+    closed: AtomicBool,
 }
 unsafe impl Send for SharedPipeHandle {}
 unsafe impl Sync for SharedPipeHandle {}
 
+impl SharedPipeHandle {
+    fn new(handle: HANDLE, is_server: bool) -> io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            handle,
+            is_server,
+            close_event: EventGuard::new_manual()?,
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            unsafe {
+                SetEvent(self.close_event.0);
+                CancelIoEx(self.handle, null());
+                if self.is_server {
+                    DisconnectNamedPipe(self.handle);
+                }
+            }
+        }
+    }
+}
+
 impl Drop for SharedPipeHandle {
     fn drop(&mut self) {
+        self.close();
         unsafe {
-            CancelIoEx(self.handle, null());
-            if self.is_server {
-                DisconnectNamedPipe(self.handle);
-            }
             CloseHandle(self.handle);
         }
+    }
+}
+
+/// Explicitly cancels blocked overlapped I/O on a service pipe and disconnects it so
+/// detached reader/writer threads exit immediately instead of leaking the pipe handle.
+pub struct PipeCloser(Arc<SharedPipeHandle>);
+impl PipeCloser {
+    pub fn close(&self) {
+        self.0.close();
     }
 }
 
@@ -414,6 +471,28 @@ impl Drop for EventGuard {
     }
 }
 
+fn wait_overlapped_or_close(
+    pipe: &SharedPipeHandle,
+    ov: &mut OVERLAPPED,
+    bytes: &mut u32,
+) -> Result<(), u32> {
+    let handles = [ov.hEvent, pipe.close_event.0];
+    let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+    if waited == WAIT_OBJECT_0 {
+        if unsafe { GetOverlappedResult(pipe.handle, ov, bytes, 1) } != 0 {
+            return Ok(());
+        }
+        return Err(unsafe { GetLastError() });
+    }
+    // Close signaled (or unexpected wait failure): cancel this specific overlapped I/O
+    // and wait for the kernel to finish referencing `ov` before returning.
+    unsafe {
+        CancelIoEx(pipe.handle, ov);
+        let _ = GetOverlappedResult(pipe.handle, ov, bytes, 1);
+    }
+    Err(ERROR_BROKEN_PIPE)
+}
+
 pub struct PipeReader {
     pipe: Arc<SharedPipeHandle>,
     event: EventGuard,
@@ -423,6 +502,9 @@ unsafe impl Send for PipeReader {}
 impl Read for PipeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pipe.closed.load(Ordering::Acquire) {
             return Ok(0);
         }
         unsafe {
@@ -453,18 +535,12 @@ impl Read for PipeReader {
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));
         }
-        let waited = unsafe { GetOverlappedResult(self.pipe.handle, &ov, &mut read_bytes, 1) };
-        if waited != 0 {
-            return Ok(read_bytes as usize);
+        match wait_overlapped_or_close(&self.pipe, &mut ov, &mut read_bytes) {
+            Ok(()) => Ok(read_bytes as usize),
+            Err(e) if e == ERROR_BROKEN_PIPE => Ok(0),
+            Err(e) if e == ERROR_MORE_DATA => Ok(read_bytes as usize),
+            Err(e) => Err(io::Error::from_raw_os_error(e as i32)),
         }
-        let err2 = unsafe { GetLastError() };
-        if err2 == ERROR_BROKEN_PIPE {
-            return Ok(0);
-        }
-        if err2 == ERROR_MORE_DATA {
-            return Ok(read_bytes as usize);
-        }
-        Err(io::Error::from_raw_os_error(err2 as i32))
     }
 }
 
@@ -478,6 +554,12 @@ impl Write for PipeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.pipe.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "service pipe closed",
+            ));
         }
         unsafe {
             ResetEvent(self.event.0);
@@ -501,56 +583,79 @@ impl Write for PipeWriter {
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));
         }
-        let waited = unsafe { GetOverlappedResult(self.pipe.handle, &ov, &mut written, 1) };
-        if waited != 0 {
-            return Ok(written as usize);
+        match wait_overlapped_or_close(&self.pipe, &mut ov, &mut written) {
+            Ok(()) => Ok(written as usize),
+            Err(e) if e == ERROR_BROKEN_PIPE => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "service pipe closed",
+            )),
+            Err(e) => Err(io::Error::from_raw_os_error(e as i32)),
         }
-        Err(io::Error::last_os_error())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let _ = unsafe { FlushFileBuffers(self.pipe.handle) };
+        // Windows overlapped named pipes deliver WriteFile bytes directly to the kernel
+        // buffer. Never call FlushFileBuffers here, which blocks until the peer drains.
         Ok(())
     }
 }
 
 /// Client-side connection from user-session `crossflow.exe peer` to the active
 /// `LocalSystem` `service-worker` named pipe in this interactive session.
-pub fn connect_service_pipe() -> Result<(PipeReader, PipeWriter)> {
+pub fn connect_service_pipe() -> Result<(PipeReader, PipeWriter, PipeCloser)> {
     let pipe_name = pipe_name_for_session(current_session_id());
-    let pipe_w = wide(&pipe_name);
-    if unsafe { WaitNamedPipeW(pipe_w.as_ptr(), 40) } == 0 {
-        bail!("CrossflowInputService pipe unavailable");
+    connect_named_pipe(&pipe_name)
+}
+
+fn connect_named_pipe(pipe_name: &str) -> Result<(PipeReader, PipeWriter, PipeCloser)> {
+    const ERROR_PIPE_BUSY: u32 = 231;
+    let pipe_w = wide(pipe_name);
+    let mut handle: HANDLE = INVALID_HANDLE_VALUE;
+    let mut last_err: u32 = 0;
+    for attempt in 0..4 {
+        let _ = unsafe { WaitNamedPipeW(pipe_w.as_ptr(), 120) };
+        handle = unsafe {
+            CreateFileW(
+                pipe_w.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+            break;
+        }
+        last_err = unsafe { GetLastError() };
+        if attempt < 3 && (last_err == ERROR_PIPE_BUSY || last_err == 2) {
+            thread::sleep(Duration::from_millis(60));
+            continue;
+        }
+        break;
     }
-    let handle = unsafe {
-        CreateFileW(
-            pipe_w.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            null_mut(),
-        )
-    };
     ensure!(
         handle != INVALID_HANDLE_VALUE && !handle.is_null(),
-        "connect to CrossflowInputService pipe failed (Win32 {})",
-        unsafe { GetLastError() }
+        "connect to CrossflowInputService pipe failed (Win32 {last_err})"
     );
-    let shared = Arc::new(SharedPipeHandle {
-        handle,
-        is_server: false,
-    });
+    let shared = match SharedPipeHandle::new(handle, false) {
+        Ok(s) => s,
+        Err(err) => {
+            unsafe { CloseHandle(handle) };
+            return Err(err.into());
+        }
+    };
     let reader = PipeReader {
         pipe: shared.clone(),
         event: EventGuard::new_manual()?,
     };
     let writer = PipeWriter {
-        pipe: shared,
+        pipe: shared.clone(),
         event: EventGuard::new_manual()?,
     };
-    Ok((reader, writer))
+    let closer = PipeCloser(shared);
+    Ok((reader, writer, closer))
 }
 
 // ============================================================================
@@ -643,7 +748,7 @@ fn create_acl_pipe_server(pipe_name: &str, sddl: &str) -> Result<HANDLE> {
             pipe_w.as_ptr(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
+            4,
             4096,
             4096,
             0,
@@ -688,19 +793,87 @@ fn wait_pipe_client(handle: HANDLE, stop: &AtomicBool) -> Result<bool> {
     }
 }
 
+fn serve_one_pipe_client(
+    handle: HANDLE,
+    mut build_sink: impl FnMut() -> Result<Box<dyn crate::session::MouseSink>>,
+) {
+    let shared = match SharedPipeHandle::new(handle, true) {
+        Ok(s) => s,
+        Err(err) => {
+            append_service_log(&format!("pipe handle init failed: {err}"));
+            unsafe {
+                DisconnectNamedPipe(handle);
+                CloseHandle(handle);
+            }
+            return;
+        }
+    };
+    let reader = match EventGuard::new_manual() {
+        Ok(event) => PipeReader {
+            pipe: shared.clone(),
+            event,
+        },
+        Err(err) => {
+            append_service_log(&format!("pipe reader event failed: {err}"));
+            shared.close();
+            return;
+        }
+    };
+    let writer = match EventGuard::new_manual() {
+        Ok(event) => PipeWriter {
+            pipe: shared.clone(),
+            event,
+        },
+        Err(err) => {
+            append_service_log(&format!("pipe writer event failed: {err}"));
+            shared.close();
+            return;
+        }
+    };
+
+    match build_sink() {
+        Ok(mut sink) => {
+            let worker_res = crate::injection_worker::run_worker(reader, writer, sink.as_mut());
+            let _ = sink.release_owned();
+            if let Err(err) = worker_res {
+                append_service_log(&format!("run_worker ended with error: {err:#}"));
+            }
+        }
+        Err(err) => {
+            append_service_log(&format!("new_service sink init failed: {err:#}"));
+            drop(reader);
+            drop(writer);
+        }
+    }
+
+    // Explicitly wake and cancel the detached reader/writer threads spawned inside
+    // `run_worker` so they drop their `Arc<SharedPipeHandle>` and release the pipe
+    // handle immediately instead of deadlocking future clients with ERROR_PIPE_BUSY.
+    shared.close();
+    let weak: Weak<SharedPipeHandle> = Arc::downgrade(&shared);
+    drop(shared);
+    let wait_until = Instant::now() + Duration::from_millis(250);
+    while weak.upgrade().is_some() && Instant::now() < wait_until {
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Runs inside the active interactive session as `NT AUTHORITY\SYSTEM`.
 /// Accepts one authenticated local client at a time over the session's ACL-locked pipe,
 /// injects input across both `WinSta0\Default` and `WinSta0\Winlogon` (UAC & Lock Screen),
 /// and guarantees full `release_owned()` cleanup whenever a client disconnects.
 pub fn run_service_worker(session_id: u32) -> Result<()> {
+    crate::power::configure_realtime_thread(true);
     let stop = Arc::new(AtomicBool::new(false));
     let pipe_name = pipe_name_for_session(session_id);
+    append_service_log(&format!("service-worker started for session {session_id}"));
 
     while !stop.load(Ordering::Acquire) {
         let sddl = pipe_sddl_for_session(session_id);
         let handle = match create_acl_pipe_server(&pipe_name, &sddl) {
             Ok(h) => h,
-            Err(_) => {
+            Err(err) => {
+                append_service_log(&format!("create_acl_pipe_server failed: {err:#}"));
                 thread::sleep(Duration::from_millis(300));
                 continue;
             }
@@ -711,7 +884,8 @@ pub fn run_service_worker(session_id: u32) -> Result<()> {
                 unsafe { CloseHandle(handle) };
                 break;
             }
-            Err(_) => {
+            Err(err) => {
+                append_service_log(&format!("wait_pipe_client failed: {err:#}"));
                 unsafe { CloseHandle(handle) };
                 thread::sleep(Duration::from_millis(200));
                 continue;
@@ -721,34 +895,11 @@ pub fn run_service_worker(session_id: u32) -> Result<()> {
             unsafe { CloseHandle(handle) };
             continue;
         }
-        let shared = Arc::new(SharedPipeHandle {
-            handle,
-            is_server: true,
+        serve_one_pipe_client(handle, || {
+            let emergency = Arc::new(AtomicBool::new(false));
+            let sink = crate::platform::windows::WindowsMouseSink::new_service(1.0, emergency)?;
+            Ok(Box::new(sink))
         });
-        let reader = match EventGuard::new_manual() {
-            Ok(event) => PipeReader {
-                pipe: shared.clone(),
-                event,
-            },
-            Err(_) => continue,
-        };
-        let writer = match EventGuard::new_manual() {
-            Ok(event) => PipeWriter {
-                pipe: shared.clone(),
-                event,
-            },
-            Err(_) => continue,
-        };
-        // Drop our extra ref so closing reader+writer closes & disconnects the pipe cleanly.
-        drop(shared);
-
-        let emergency = Arc::new(AtomicBool::new(false));
-        if let Ok(mut sink) =
-            crate::platform::windows::WindowsMouseSink::new_service(1.0, emergency)
-        {
-            let _ = crate::injection_worker::run_worker(reader, writer, &mut sink);
-            let _ = crate::session::MouseSink::release_owned(&mut sink);
-        }
     }
     Ok(())
 }
@@ -1020,5 +1171,111 @@ mod tests {
         if !st.installed {
             assert!(!st.running);
         }
+    }
+
+    #[test]
+    fn service_pipe_reconnects_cleanly_after_shutdown_without_busy_deadlock() {
+        use crate::input::Button;
+        use crate::session::{MouseSink, NativeDisplay};
+
+        struct DummySink;
+        impl MouseSink for DummySink {
+            fn displays(&self) -> Result<Vec<NativeDisplay>> {
+                Ok(vec![NativeDisplay {
+                    id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                }])
+            }
+            fn reset(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn move_by(&mut self, x: f64, y: f64) -> Result<(f64, f64)> {
+                Ok((x, y))
+            }
+            fn position(&mut self, x: f64, y: f64, _display_id: u32) -> Result<(f64, f64)> {
+                Ok((x, y))
+            }
+            fn button(&mut self, _button: Button, _down: bool) -> Result<()> {
+                Ok(())
+            }
+            fn key(&mut self, _usage: u16, _down: bool) -> Result<()> {
+                Ok(())
+            }
+            fn scroll(&mut self, _horizontal: i32, _vertical: i32) -> Result<()> {
+                Ok(())
+            }
+            fn release_owned(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn emergency_pressed(&self) -> bool {
+                false
+            }
+        }
+
+        let pipe_name = format!(
+            r"\\.\pipe\CrossflowTestPipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let server_pipe = pipe_name.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+
+        let server = thread::spawn(move || {
+            let pipe_w = wide(&server_pipe);
+            for _ in 0..3 {
+                let handle = unsafe {
+                    CreateNamedPipeW(
+                        pipe_w.as_ptr(),
+                        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                        1,
+                        4096,
+                        4096,
+                        0,
+                        null(),
+                    )
+                };
+                assert!(
+                    handle != INVALID_HANDLE_VALUE && !handle.is_null(),
+                    "CreateNamedPipeW failed with Win32 {}",
+                    unsafe { GetLastError() }
+                );
+                let connected = wait_pipe_client(handle, &server_stop).unwrap();
+                assert!(connected);
+                serve_one_pipe_client(handle, || Ok(Box::new(DummySink)));
+            }
+        });
+
+        // Give server thread a brief moment to create the first pipe instance.
+        thread::sleep(Duration::from_millis(20));
+
+        // Connect -> reset -> key -> shutdown -> reconnect 3 consecutive times on a
+        // nMaxInstances=1 pipe. Before the PipeCloser fix, iteration 2 deadlocked forever
+        // with ERROR_PIPE_BUSY (231).
+        for round in 0..3 {
+            let (reader, writer, closer) = connect_named_pipe(&pipe_name)
+                .unwrap_or_else(|e| panic!("round {round} connect failed: {e:#}"));
+            let mut proxy = crate::injection_worker::WorkerProxy::from_test_pipe(
+                reader, writer, closer,
+            )
+            .unwrap_or_else(|e| panic!("round {round} ready failed: {e:#}"));
+            proxy.reset().unwrap();
+            proxy.position(100.0, 200.0, 1).unwrap();
+            proxy.key(0x04, true).unwrap();
+            proxy.key(0x04, false).unwrap();
+            proxy.shutdown().unwrap();
+            drop(proxy);
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
     }
 }

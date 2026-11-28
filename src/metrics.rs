@@ -76,12 +76,15 @@ fn write_log(
 ) -> Result<()> {
     writeln!(output, "{}", json!({"event":"metadata","data":metadata}))
         .context("Cannot write performance log metadata")?;
-    for event in events {
-        match event {
-            Message::Event(value) => {
+    let _ = output.flush();
+    let mut dirty = false;
+    loop {
+        match events.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Message::Event(value)) => {
                 writeln!(output, "{value}").context("Cannot write performance log event")?;
+                dirty = true;
             }
-            Message::Close => {
+            Ok(Message::Close) => {
                 writeln!(
                     output,
                     "{}",
@@ -91,6 +94,13 @@ fn write_log(
                 output.flush().context("Cannot flush performance log")?;
                 return Ok(());
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if dirty {
+                    let _ = output.flush();
+                    dirty = false;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     bail!("Performance log was not explicitly finalized")

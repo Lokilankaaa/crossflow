@@ -307,6 +307,19 @@ fn main() -> Result<()> {
     };
     #[cfg(windows)]
     let _timer = TimerPeriod::start();
+    if matches!(
+        &args.command,
+        Command::Peer { .. }
+            | Command::InputWorker { .. }
+            | Command::ServiceWorker { .. }
+            | Command::Receive { .. }
+            | Command::PairReceive { .. }
+            | Command::Send { .. }
+            | Command::DesktopSend { .. }
+            | Command::DesktopPair { .. }
+    ) {
+        crossflow::power::configure_realtime_process();
+    }
     match args.command {
         Command::Peer {
             bind,

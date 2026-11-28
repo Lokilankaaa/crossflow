@@ -505,6 +505,14 @@ mod windows_clip {
         })
     }
 
+    fn preferred_drop_effect_format() -> u32 {
+        static FMT: OnceLock<u32> = OnceLock::new();
+        *FMT.get_or_init(|| {
+            let wide: Vec<u16> = "Preferred DropEffect\0".encode_utf16().collect();
+            unsafe { RegisterClipboardFormatW(wide.as_ptr()) }
+        })
+    }
+
     const HWND_MESSAGE: *mut c_void = (-3isize) as *mut c_void;
 
     struct OwnerWindow(*mut c_void);
@@ -736,7 +744,16 @@ mod windows_clip {
                     buf.extend_from_slice(&0u16.to_le_bytes());
                 }
                 buf.extend_from_slice(&0u16.to_le_bytes());
-                set_global_bytes(CF_HDROP, &buf)
+                if !set_global_bytes(CF_HDROP, &buf) {
+                    return false;
+                }
+                // Advertise DROPEFFECT_COPY (1) so Windows 11 Explorer, Desktop,
+                // WeChat, QQ, and Office all enable Ctrl+V paste cleanly.
+                let effect_fmt = preferred_drop_effect_format();
+                if effect_fmt != 0 {
+                    let _ = set_global_bytes(effect_fmt, &1u32.to_le_bytes());
+                }
+                true
             }
         }
     }
