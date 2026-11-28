@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased] (`dev`)
 
+### Fixed
+- **彻底修复 Windows 关闭主界面到后台托盘后频繁断链/失灵（且托盘仍显示已连接）**：
+  - 对 `Crossflow.Windows.exe`、`crossflow.exe peer` 与 `input-worker` 调用 `SetProcessInformation(ProcessPowerThrottling)` 关闭 Windows 11 自动 EcoQoS（效率模式）及隐藏窗口定时器降频（`IGNORE_TIMER_RESOLUTION`），并在隐藏到托盘后重新声明，兼容 Win10/Win11。
+  - `peer` / `input-worker` 进程提升至 `ABOVE_NORMAL_PRIORITY_CLASS`（保留系统服务模式 `HIGH_PRIORITY_CLASS`），`WH_MOUSE_LL` / `WH_KEYBOARD_LL` 捕获线程提升至 `THREAD_PRIORITY_HIGHEST` 并关闭线程节流，杜绝隐藏后台后触发 `LowLevelHooksTimeout` 被系统静默摘钩。
+  - 将 `peer_mesh` 对 UI 的 `stdout` 状态推送拆至独立后台 `StatusEmitter`（单槽最新快照合并），即使 UI 进程暂时卡顿也绝不阻塞 1000 Hz 键鼠与 KeepAlive 主循环；空闲状态心跳降至 1000 ms，`mesh_wake_detected` 阈值放宽至 15 s 并在 `native_io` 重建时重置时钟，`native_io` 启动失败增加 400 ms 退避，`route_enabled` 精确反映采集/注入存活状态。
+  - Windows 主窗口隐藏至托盘时合并状态派发，仅即时更新托盘图标与右键菜单，跳过后台 XAML 重绘与重复读注册表，重新打开主界面时瞬间补刷；日志新增 2 秒空闲自动落盘，便于实时诊断。
+
 ---
 
 ## [0.4.3] - 2026-11-28
