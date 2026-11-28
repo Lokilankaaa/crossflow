@@ -13,7 +13,7 @@ pub use routed::{
     CaptureCoordinateDiagnostics, NativeDisplay, capture_coordinate_diagnostics, cursor_position,
     displays, warp_cursor,
 };
-pub use sink::{WindowsMouseSink, receiver_display_id, receiver_displays};
+pub use sink::{WindowsMouseSink, is_input_desktop_default, receiver_display_id, receiver_displays};
 
 use crate::input::Button;
 use std::{

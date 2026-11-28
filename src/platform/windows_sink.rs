@@ -15,6 +15,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -307,6 +308,19 @@ fn desktop_name(handle: HDESK) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("invalid local desktop name"))?;
     String::from_utf16(&name[..end]).map_err(|_| anyhow::anyhow!("invalid local desktop name"))
 }
+/// Returns true when the current interactive input desktop is the normal user desktop
+/// (`WinSta0\Default`). Returns false when Windows is locked (`WinSta0\Winlogon`),
+/// showing a UAC secure desktop, or disconnected.
+pub fn is_input_desktop_default() -> bool {
+    let input = Desktop(unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) });
+    if input.0.is_null() {
+        return false;
+    }
+    desktop_name(input.0)
+        .map(|name| name.eq_ignore_ascii_case("Default"))
+        .unwrap_or(false)
+}
+
 fn desktop_ready() -> Result<()> {
     // Never switch desktops or grant access to Winlogon/UAC. Same-name Default
     // desktops are compared inside this process's window station.
@@ -451,13 +465,182 @@ impl Platform for Native {
     }
 }
 
+enum DesktopCmd {
+    Displays(mpsc::SyncSender<Result<Vec<NativeDisplay>>>),
+    Cursor(mpsc::SyncSender<Result<(f64, f64)>>),
+    Held {
+        vk: u16,
+        tx: mpsc::SyncSender<bool>,
+    },
+    Post {
+        input: INPUT,
+        tx: mpsc::SyncSender<Result<()>>,
+    },
+}
+
+struct DesktopActor {
+    name: String,
+    tx: Option<mpsc::SyncSender<DesktopCmd>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DesktopActor {
+    fn spawn(name: String, hdesk: HDESK) -> Result<Self> {
+        let raw_desk = hdesk as usize;
+        let is_winlogon = name.eq_ignore_ascii_case("Winlogon");
+        let (tx, rx) = mpsc::sync_channel::<DesktopCmd>(4);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<()>>(1);
+        let thread_name = format!("crossflow-svc-{}", name.to_ascii_lowercase());
+        let handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                crate::power::configure_realtime_thread(true);
+                let hdesk = raw_desk as HDESK;
+                // SetThreadDesktop MUST be the very first Win32 USER/GDI call on a clean
+                // thread so Windows never rejects it with ERROR_BUSY (170).
+                if unsafe { SetThreadDesktop(hdesk) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    unsafe { CloseDesktop(hdesk) };
+                    let _ = ready_tx.send(Err(anyhow::anyhow!(
+                        "SetThreadDesktop failed (Win32 {err})"
+                    )));
+                    return;
+                }
+                let _dpi = DpiScope::physical().ok();
+                let _ = ready_tx.send(Ok(()));
+
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        DesktopCmd::Displays(reply) => {
+                            let _ = reply.send(receiver_displays());
+                        }
+                        DesktopCmd::Cursor(reply) => {
+                            let res = super::cursor_position()
+                                .map_err(anyhow::Error::msg)
+                                .or_else(|err| {
+                                    // Fallback to logical GetCursorPos or primary display center
+                                    // while Winlogon's lock-screen curtain / sleeping display
+                                    // temporarily refuses GetPhysicalCursorPos.
+                                    let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+                                    if unsafe {
+                                        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(
+                                            &mut pt,
+                                        )
+                                    } != 0
+                                    {
+                                        Ok((f64::from(pt.x), f64::from(pt.y)))
+                                    } else if is_winlogon {
+                                        receiver_displays().map(|ds| {
+                                            ds.first()
+                                                .map(|d| (d.x + d.width * 0.5, d.y + d.height * 0.5))
+                                                .unwrap_or((0.0, 0.0))
+                                        })
+                                    } else {
+                                        Err(err)
+                                    }
+                                });
+                            let _ = reply.send(res);
+                        }
+                        DesktopCmd::Held { vk, tx } => {
+                            let held = unsafe { GetAsyncKeyState(i32::from(vk)) < 0 };
+                            let _ = tx.send(held);
+                        }
+                        DesktopCmd::Post { input, tx } => {
+                            crate::power::wake_display_throttled();
+                            let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+                            let res = if sent == 1 {
+                                Ok(())
+                            } else {
+                                let err = unsafe { GetLastError() };
+                                Err(anyhow::anyhow!(
+                                    "Windows service SendInput failed (Win32 {err})"
+                                ))
+                            };
+                            let _ = tx.send(res);
+                        }
+                    }
+                }
+                unsafe { CloseDesktop(hdesk) };
+            })?;
+        match ready_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(())) => Ok(Self {
+                name,
+                tx: Some(tx),
+                handle: Some(handle),
+            }),
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(e)
+            }
+            Err(_) => {
+                drop(tx);
+                let _ = handle.join();
+                bail!("service desktop worker thread startup timed out")
+            }
+        }
+    }
+
+    fn send(&self, cmd: DesktopCmd) -> Result<()> {
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("service desktop worker closed"))?
+            .send(cmd)
+            .map_err(|_| anyhow::anyhow!("service desktop worker stopped"))
+    }
+}
+
+impl Drop for DesktopActor {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn open_active_input_desktop() -> Result<(String, HDESK)> {
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const MIN_RIGHTS: u32 = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP;
+    let mut hdesk: HDESK = null_mut();
+    for attempt in 0..5 {
+        hdesk = unsafe { OpenInputDesktop(0, 0, MAXIMUM_ALLOWED) };
+        if hdesk.is_null() {
+            hdesk = unsafe { OpenInputDesktop(0, 0, MIN_RIGHTS) };
+        }
+        if !hdesk.is_null() {
+            break;
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    ensure!(
+        !hdesk.is_null(),
+        "OpenInputDesktop failed in service worker (Win32 {})",
+        unsafe { GetLastError() }
+    );
+    let name = match desktop_name(hdesk) {
+        Ok(n) => n,
+        Err(e) => {
+            unsafe { CloseDesktop(hdesk) };
+            return Err(e);
+        }
+    };
+    let allowed = name.eq_ignore_ascii_case("Default") || name.eq_ignore_ascii_case("Winlogon");
+    if !allowed {
+        unsafe { CloseDesktop(hdesk) };
+        bail!("unsupported interactive desktop for service input: {name}");
+    }
+    Ok((name, hdesk))
+}
+
 /// Elevated `LocalSystem` platform backend used exclusively inside `CrossflowInputService`'s
-/// interactive session worker (`crossflow.exe service-worker`). Dynamically follows the active
-/// Windows input desktop (`WinSta0\Default` <-> `WinSta0\Winlogon`) via `OpenInputDesktop` +
-/// `SetThreadDesktop` so remote mouse and keyboard control work across UAC prompts, elevated
-/// Administrator applications, and the Windows lock screen.
+/// interactive session worker (`crossflow.exe service-worker`). Spawns a clean per-desktop
+/// thread whenever the active input desktop transitions (`WinSta0\Default` <-> `WinSta0\Winlogon`)
+/// so `SetThreadDesktop` never hits `ERROR_BUSY (170)` and remote mouse/keyboard control work
+/// seamlessly across UAC prompts, elevated Administrator applications, and the Windows lock screen.
 struct NativeService {
-    attached: Mutex<Option<(String, isize)>>,
+    actor: Mutex<Option<DesktopActor>>,
     last_sync: Mutex<Option<Instant>>,
     cached_displays: Mutex<Option<(Instant, Vec<NativeDisplay>)>>,
 }
@@ -466,7 +649,7 @@ unsafe impl Send for NativeService {}
 impl NativeService {
     fn new() -> Self {
         Self {
-            attached: Mutex::new(None),
+            actor: Mutex::new(None),
             last_sync: Mutex::new(None),
             cached_displays: Mutex::new(None),
         }
@@ -479,71 +662,45 @@ impl NativeService {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some_and(|t| t.elapsed() < PLATFORM_CACHE_TTL)
+            && self
+                .actor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
         {
             return Ok(());
         }
-        self.sync_input_desktop()?;
+        let (name, hdesk) = open_active_input_desktop()?;
+        let mut guard = self.actor.lock().unwrap_or_else(|e| e.into_inner());
+        let same = guard
+            .as_ref()
+            .is_some_and(|cur| cur.name.eq_ignore_ascii_case(&name));
+        if same {
+            unsafe { CloseDesktop(hdesk) };
+            *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            return Ok(());
+        }
+        // Drop the old desktop actor first so its handle closes cleanly, then attach a
+        // brand-new thread to the new input desktop (Default <-> Winlogon).
+        *guard = None;
+        let fresh = DesktopActor::spawn(name, hdesk)?;
+        *guard = Some(fresh);
         *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         Ok(())
     }
 
-    fn sync_input_desktop(&self) -> Result<()> {
-        const RIGHTS: u32 = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP | 0x01FF;
-        let mut hdesk: HDESK = null_mut();
-        for _ in 0..3 {
-            hdesk = unsafe { OpenInputDesktop(0, 0, RIGHTS) };
-            if !hdesk.is_null() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        ensure!(
-            !hdesk.is_null(),
-            "OpenInputDesktop failed in service worker"
-        );
-        let name = match desktop_name(hdesk) {
-            Ok(n) => n,
-            Err(e) => {
-                unsafe { CloseDesktop(hdesk) };
-                return Err(e);
-            }
-        };
-        let allowed =
-            name.eq_ignore_ascii_case("Default") || name.eq_ignore_ascii_case("Winlogon");
-        if !allowed {
-            unsafe { CloseDesktop(hdesk) };
-            bail!("unsupported interactive desktop for service input");
-        }
-        let mut guard = self.attached.lock().unwrap_or_else(|e| e.into_inner());
-        let same = guard
-            .as_ref()
-            .is_some_and(|(cur, _)| cur.eq_ignore_ascii_case(&name));
-        if same {
-            unsafe { CloseDesktop(hdesk) };
-            return Ok(());
-        }
-        let ok = unsafe { SetThreadDesktop(hdesk) };
-        if ok == 0 {
-            unsafe { CloseDesktop(hdesk) };
-            bail!("SetThreadDesktop failed while switching to {name}");
-        }
-        if let Some((_, old_raw)) = guard.replace((name, hdesk as isize))
-            && old_raw != 0
+    fn call_actor<T>(&self, build: impl FnOnce(mpsc::SyncSender<T>) -> DesktopCmd) -> Result<T> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         {
-            unsafe { CloseDesktop(old_raw as HDESK) };
+            let guard = self.actor.lock().unwrap_or_else(|e| e.into_inner());
+            let actor = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("service desktop actor unavailable"))?;
+            actor.send(build(reply_tx))?;
         }
-        Ok(())
-    }
-}
-
-impl Drop for NativeService {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.attached.lock()
-            && let Some((_, raw)) = guard.take()
-            && raw != 0
-        {
-            unsafe { CloseDesktop(raw as HDESK) };
-        }
+        reply_rx
+            .recv_timeout(Duration::from_millis(200))
+            .map_err(|_| anyhow::anyhow!("service desktop actor timed out"))
     }
 }
 
@@ -568,8 +725,8 @@ impl Platform for NativeService {
         {
             return Ok(cached.clone());
         }
-        let _ = self.sync_input_desktop_throttled(false);
-        let fresh = receiver_displays()?;
+        self.sync_input_desktop_throttled(false)?;
+        let fresh = self.call_actor(DesktopCmd::Displays)??;
         *self
             .cached_displays
             .lock()
@@ -577,29 +734,29 @@ impl Platform for NativeService {
         Ok(fresh)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
-        let _ = self.sync_input_desktop_throttled(false);
-        super::cursor_position().map_err(anyhow::Error::msg)
+        self.sync_input_desktop_throttled(false)?;
+        self.call_actor(DesktopCmd::Cursor)?
     }
     fn held(&self, vk: u16) -> bool {
-        unsafe { GetAsyncKeyState(i32::from(vk)) < 0 }
+        if self.sync_input_desktop_throttled(false).is_err() {
+            return false;
+        }
+        self.call_actor(|tx| DesktopCmd::Held { vk, tx })
+            .unwrap_or(false)
     }
     fn key_vk(&self, scan: u16) -> u16 {
         unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
-        let _ = self.sync_input_desktop_throttled(false);
-        crate::power::wake_display_throttled();
-        let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
-        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1 {
+        self.sync_input_desktop_throttled(false)?;
+        if self.call_actor(|tx| DesktopCmd::Post { input, tx })?.is_ok() {
             return Ok(());
         }
-        // Desktop may have just transitioned (Default <-> Winlogon): resync and retry once.
-        let _ = self.sync_input_desktop_throttled(true);
-        ensure!(
-            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-            "Windows service input insertion failed"
-        );
-        Ok(())
+        // Desktop may have just transitioned (Default <-> Winlogon): resync onto a fresh
+        // desktop actor, wake the display, and retry once.
+        crate::power::wake_display_now();
+        self.sync_input_desktop_throttled(true)?;
+        self.call_actor(|tx| DesktopCmd::Post { input, tx })?
     }
 }
 

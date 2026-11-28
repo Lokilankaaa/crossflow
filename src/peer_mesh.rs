@@ -952,6 +952,17 @@ impl Drop for StatusEmitter {
 }
 
 
+fn local_desktop_accepts_user_capture() -> bool {
+    #[cfg(windows)]
+    {
+        crate::platform::windows::is_input_desktop_default()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 fn query_windows_service_flags() -> (bool, bool, bool) {
     #[cfg(windows)]
     {
@@ -1584,7 +1595,12 @@ pub fn run(
                 let mut local_displays_changed = false;
                 if last_display_refresh.elapsed() >= Duration::from_millis(1500) {
                     last_display_refresh = Instant::now();
-                    if let Ok(inv) = (platform.inventory)()
+                    let service_locked_desktop = native_io
+                        .as_ref()
+                        .is_some_and(|io| io.sink.is_service_backed())
+                        && !local_desktop_accepts_user_capture();
+                    if !service_locked_desktop
+                        && let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
                         && inv != local_displays
                     {
@@ -2300,6 +2316,7 @@ pub fn run(
                 let mut inbound_layout_updates: Vec<(String, u64, Vec<crate::session_metadata::SharedScreen>)> = Vec::new();
                 let mut inbound_display_updates: Vec<(String, Vec<Display>)> = Vec::new();
                 let mut revoke_outbound_from: Vec<String> = Vec::new();
+                let mut inbound_arm_failed = false;
 
                 for pid in peer_ids {
                     let Some(peer) = active_peers.get_mut(&pid) else {
@@ -2336,7 +2353,16 @@ pub fn run(
                                                     {
                                                         revoke_outbound_from.push(old_owner);
                                                     }
-                                                    let _ = io.sink.reset();
+                                                    if let Err(err) = io.sink.reset() {
+                                                        log.write(
+                                                            "mesh_inbound_arm_err",
+                                                            serde_json::json!({
+                                                                "peer": &pid[..pid.len().min(8)],
+                                                                "reason": format!("{err:#}"),
+                                                            }),
+                                                        );
+                                                        inbound_arm_failed = true;
+                                                    }
                                                     inbound_owner = Some(pid.clone());
                                                     remote_focus_active = true;
                                                     if remote_focus_state.0.as_deref()
@@ -2599,35 +2625,50 @@ pub fn run(
                                 if inbound_owner.is_some() {
                                     let _ = sink.reset();
                                 }
-                                match (platform.capture)(source.clone(), log.clone()) {
-                                    Ok(capture) => {
-                                        let last_activity = source.activity_counter();
-                                        native_io = Some(MeshNativeIo {
-                                            source,
-                                            capture: Some(capture),
-                                            sink,
-                                            last_activity,
-                                            last_sink_maintain: Instant::now(),
-                                            last_capture_retry: Instant::now(),
-                                            enabled_attempted: false,
-                                        });
-                                    }
-                                    Err(_) if sink.is_service_backed() => {
-                                        // Lock screen / secure desktop: keep elevated service sink
-                                        // alive so remote peers can still control and unlock!
-                                        let last_activity = source.activity_counter();
-                                        native_io = Some(MeshNativeIo {
-                                            source,
-                                            capture: None,
-                                            sink,
-                                            last_activity,
-                                            last_sink_maintain: Instant::now(),
-                                            last_capture_retry: Instant::now(),
-                                            enabled_attempted: false,
-                                        });
-                                    }
-                                    Err(_) => {
-                                        let _ = sink.shutdown();
+                                if sink.is_service_backed() && !local_desktop_accepts_user_capture() {
+                                    // Lock screen / secure desktop: keep elevated service sink
+                                    // active in receive-only mode until the user unlocks.
+                                    let last_activity = source.activity_counter();
+                                    native_io = Some(MeshNativeIo {
+                                        source,
+                                        capture: None,
+                                        sink,
+                                        last_activity,
+                                        last_sink_maintain: Instant::now(),
+                                        last_capture_retry: Instant::now(),
+                                        enabled_attempted: false,
+                                    });
+                                } else {
+                                    match (platform.capture)(source.clone(), log.clone()) {
+                                        Ok(capture) => {
+                                            let last_activity = source.activity_counter();
+                                            native_io = Some(MeshNativeIo {
+                                                source,
+                                                capture: Some(capture),
+                                                sink,
+                                                last_activity,
+                                                last_sink_maintain: Instant::now(),
+                                                last_capture_retry: Instant::now(),
+                                                enabled_attempted: false,
+                                            });
+                                        }
+                                        Err(_) if sink.is_service_backed() => {
+                                            // Lock screen / secure desktop: keep elevated service sink
+                                            // alive so remote peers can still control and unlock!
+                                            let last_activity = source.activity_counter();
+                                            native_io = Some(MeshNativeIo {
+                                                source,
+                                                capture: None,
+                                                sink,
+                                                last_activity,
+                                                last_sink_maintain: Instant::now(),
+                                                last_capture_retry: Instant::now(),
+                                                enabled_attempted: false,
+                                            });
+                                        }
+                                        Err(_) => {
+                                            let _ = sink.shutdown();
+                                        }
                                     }
                                 }
                             }
@@ -2661,11 +2702,16 @@ pub fn run(
                 }
 
                 // 7. Poll native capture, process custom hotkeys / QuickJump, route 1-hop frames!
-                let mut restart_native: Option<&'static str> = None;
+                let mut restart_native: Option<&'static str> = if inbound_arm_failed {
+                    Some("arm_reset_err")
+                } else {
+                    None
+                };
                 if let Some(ref mut io) = native_io {
                     // Retry starting capture if we are currently in receive-only service mode (e.g. after unlock)
                     if io.capture.is_none()
                         && io.last_capture_retry.elapsed() >= Duration::from_millis(1200)
+                        && local_desktop_accepts_user_capture()
                     {
                         io.last_capture_retry = Instant::now();
                         let rt = io.source.runtime();
@@ -3007,7 +3053,9 @@ pub fn run(
                         let _ = p.conn.queue_frame(&Frame::new(Kind::Pause));
                         let _ = p.conn.flush();
                     }
-                    inbound_owner = None;
+                    if restart_native != Some("arm_reset_err") {
+                        inbound_owner = None;
+                    }
                     if let Ok(inv) = (platform.inventory)()
                         && !inv.is_empty()
                         && inv != local_displays

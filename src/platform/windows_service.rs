@@ -517,26 +517,37 @@ impl Write for PipeWriter {
 /// Client-side connection from user-session `crossflow.exe peer` to the active
 /// `LocalSystem` `service-worker` named pipe in this interactive session.
 pub fn connect_service_pipe() -> Result<(PipeReader, PipeWriter)> {
+    const ERROR_PIPE_BUSY: u32 = 231;
     let pipe_name = pipe_name_for_session(current_session_id());
     let pipe_w = wide(&pipe_name);
-    if unsafe { WaitNamedPipeW(pipe_w.as_ptr(), 40) } == 0 {
-        bail!("CrossflowInputService pipe unavailable");
+    let mut handle: HANDLE = INVALID_HANDLE_VALUE;
+    let mut last_err: u32 = 0;
+    for attempt in 0..4 {
+        let _ = unsafe { WaitNamedPipeW(pipe_w.as_ptr(), 120) };
+        handle = unsafe {
+            CreateFileW(
+                pipe_w.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+            break;
+        }
+        last_err = unsafe { GetLastError() };
+        if attempt < 3 && (last_err == ERROR_PIPE_BUSY || last_err == 2) {
+            thread::sleep(Duration::from_millis(60));
+            continue;
+        }
+        break;
     }
-    let handle = unsafe {
-        CreateFileW(
-            pipe_w.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            null_mut(),
-        )
-    };
     ensure!(
         handle != INVALID_HANDLE_VALUE && !handle.is_null(),
-        "connect to CrossflowInputService pipe failed (Win32 {})",
-        unsafe { GetLastError() }
+        "connect to CrossflowInputService pipe failed (Win32 {last_err})"
     );
     let shared = Arc::new(SharedPipeHandle {
         handle,
@@ -693,6 +704,7 @@ fn wait_pipe_client(handle: HANDLE, stop: &AtomicBool) -> Result<bool> {
 /// injects input across both `WinSta0\Default` and `WinSta0\Winlogon` (UAC & Lock Screen),
 /// and guarantees full `release_owned()` cleanup whenever a client disconnects.
 pub fn run_service_worker(session_id: u32) -> Result<()> {
+    crate::power::configure_realtime_thread(true);
     let stop = Arc::new(AtomicBool::new(false));
     let pipe_name = pipe_name_for_session(session_id);
 
