@@ -2241,6 +2241,14 @@ pub fn run(
                             for pkt in coalesce_inbound_packets(packets) {
                                 match pkt {
                                     MeshPacket::Input(frame) => {
+                                        // Always wake a sleeping/black display immediately on remote
+                                        // cursor entry or input — even when `native_io` is temporarily
+                                        // down because macOS turned off its display during lock/sleep!
+                                        match frame.kind {
+                                            Kind::Arm => crate::power::wake_display_now(),
+                                            Kind::Pause => {}
+                                            _ => crate::power::wake_display_throttled(),
+                                        }
                                         if let Some(ref mut io) = native_io {
                                             match frame.kind {
                                                 Kind::Arm => {
@@ -2279,6 +2287,26 @@ pub fn run(
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            // Preserve pending inbound ownership while display wakes up
+                                            // so the newly started sink accepts motion seamlessly.
+                                            match frame.kind {
+                                                Kind::Arm => {
+                                                    if let Some(old_owner) = inbound_owner.take()
+                                                        && old_owner != pid
+                                                    {
+                                                        revoke_outbound_from.push(old_owner);
+                                                    }
+                                                    inbound_owner = Some(pid.clone());
+                                                }
+                                                Kind::Pause => {
+                                                    if inbound_owner.as_deref() == Some(pid.as_str())
+                                                    {
+                                                        inbound_owner = None;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
                                     MeshPacket::Control(ctrl) => match ctrl {
@@ -2293,6 +2321,11 @@ pub fn run(
                                             focus_device_id,
                                             focus_screen_id,
                                         } => {
+                                            if focus_device_id.as_deref()
+                                                == Some(local_device_id.as_str())
+                                            {
+                                                crate::power::wake_display_now();
+                                            }
                                             if active_outbound_target.is_none() {
                                                 remote_focus_state =
                                                     (focus_device_id, focus_screen_id);
@@ -2444,6 +2477,9 @@ pub fn run(
                             hotkey_engine.reset_modifiers();
                             let _ = hotkey_engine.drain_actions();
                             if let Ok(mut sink) = prepare_worker(&local_displays, log.clone()) {
+                                if inbound_owner.is_some() {
+                                    let _ = sink.reset();
+                                }
                                 match (platform.capture)(source.clone(), log.clone()) {
                                     Ok(capture) => {
                                         let last_activity = source.activity_counter();

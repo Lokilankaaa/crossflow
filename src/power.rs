@@ -75,6 +75,22 @@ impl Drop for KeepAwakeGuard {
     }
 }
 
+/// Immediately wakes a sleeping/black local display on control handoff (`Kind::Arm`).
+/// Uses a short 200ms debounce so burst reconnects don't spam `powerd`, while
+/// guaranteeing the display turns on immediately when the cursor enters this machine.
+pub fn wake_display_now() {
+    let now = now_ms();
+    let prev = LAST_WAKE_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 200 {
+        return;
+    }
+    LAST_WAKE_MS.store(now, Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    macos_impl::wake_display();
+    #[cfg(windows)]
+    windows_impl::wake_display();
+}
+
 /// Wakes a sleeping local display when remote mouse/keyboard input arrives.
 /// Rate-limited so calling on the 1000Hz injection hot path is essentially free.
 #[inline]
@@ -83,7 +99,7 @@ pub fn wake_display_throttled() {
         return;
     }
     #[cfg(target_os = "macos")]
-    macos_impl::wake_display_if_asleep();
+    macos_impl::wake_display();
     #[cfg(windows)]
     windows_impl::wake_display();
 }
@@ -91,10 +107,13 @@ pub fn wake_display_throttled() {
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use std::ffi::{c_char, c_void};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
     const K_IOPM_USER_ACTIVE_LOCAL: u32 = 0;
+
+    static LAST_USER_ACTIVITY_ID: AtomicU32 = AtomicU32::new(0);
 
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
@@ -104,12 +123,6 @@ mod macos_impl {
             encoding: u32,
         ) -> *mut c_void;
         fn CFRelease(cf: *const c_void);
-    }
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGMainDisplayID() -> u32;
-        fn CGDisplayIsAsleep(display: u32) -> u32;
     }
 
     #[link(name = "IOKit", kind = "framework")]
@@ -163,11 +176,11 @@ mod macos_impl {
         }
     }
 
-    pub fn wake_display_if_asleep() {
+    /// Declares local user activity unconditionally (matching `caffeinate -u`) so
+    /// Apple Silicon Macs with black/locked/dark-wake displays turn on immediately,
+    /// even when `CGDisplayIsAsleep(CGMainDisplayID())` misreports 0 or no active displays.
+    pub fn wake_display() {
         unsafe {
-            if CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
-                return;
-            }
             let reason = CFStringCreateWithCString(
                 std::ptr::null_mut(),
                 c"Crossflow remote input wake".as_ptr(),
@@ -176,8 +189,18 @@ mod macos_impl {
             if reason.is_null() {
                 return;
             }
-            let mut id: u32 = 0;
-            let _ = IOPMAssertionDeclareUserActivity(reason, K_IOPM_USER_ACTIVE_LOCAL, &mut id);
+            let mut id: u32 = LAST_USER_ACTIVITY_ID.load(Ordering::Relaxed);
+            if IOPMAssertionDeclareUserActivity(reason, K_IOPM_USER_ACTIVE_LOCAL, &mut id) == 0 {
+                LAST_USER_ACTIVITY_ID.store(id, Ordering::Relaxed);
+            } else {
+                // Retry with a fresh assertion slot if powerd retired the previous ID.
+                let mut fresh_id: u32 = 0;
+                if IOPMAssertionDeclareUserActivity(reason, K_IOPM_USER_ACTIVE_LOCAL, &mut fresh_id)
+                    == 0
+                {
+                    LAST_USER_ACTIVITY_ID.store(fresh_id, Ordering::Relaxed);
+                }
+            }
             CFRelease(reason);
         }
     }
