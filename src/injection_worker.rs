@@ -422,6 +422,7 @@ fn dispatch_request(
 pub struct WorkerProxy {
     child: Option<Child>,
     service_backed: bool,
+    on_close: Option<Box<dyn FnOnce() + Send>>,
     requests: Option<SyncSender<[u8; FRAME_LEN]>>,
     responses: Receiver<Message>,
     io_failed: Arc<AtomicBool>,
@@ -439,6 +440,7 @@ impl WorkerProxy {
         output: W,
         child: Option<Child>,
         service_backed: bool,
+        on_close: Option<Box<dyn FnOnce() + Send>>,
         ready_timeout: Duration,
     ) -> Result<Self>
     where
@@ -451,6 +453,7 @@ impl WorkerProxy {
         let mut proxy = Self {
             child,
             service_backed,
+            on_close,
             requests: Some(requests),
             responses,
             io_failed,
@@ -498,13 +501,36 @@ impl WorkerProxy {
         let mut child = command.spawn().context("start input worker")?;
         let stdout = child.stdout.take().context("worker stdout missing")?;
         let stdin = child.stdin.take().context("worker stdin missing")?;
-        Self::from_streams(stdout, stdin, Some(child), false, Duration::from_secs(3))
+        Self::from_streams(stdout, stdin, Some(child), false, None, Duration::from_secs(3))
     }
 
     #[cfg(windows)]
     pub fn try_connect_windows_service() -> Result<Self> {
-        let (reader, writer) = crate::platform::windows::service::connect_service_pipe()?;
-        Self::from_streams(reader, writer, None, true, Duration::from_millis(800))
+        let (reader, writer, closer) = crate::platform::windows::service::connect_service_pipe()?;
+        Self::from_streams(
+            reader,
+            writer,
+            None,
+            true,
+            Some(Box::new(move || closer.close())),
+            Duration::from_millis(800),
+        )
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn from_test_pipe(
+        reader: crate::platform::windows::service::PipeReader,
+        writer: crate::platform::windows::service::PipeWriter,
+        closer: crate::platform::windows::service::PipeCloser,
+    ) -> Result<Self> {
+        Self::from_streams(
+            reader,
+            writer,
+            None,
+            true,
+            Some(Box::new(move || closer.close())),
+            Duration::from_millis(800),
+        )
     }
 
     pub fn is_service_backed(&self) -> bool {
@@ -549,9 +575,13 @@ impl WorkerProxy {
 
     fn fail(&mut self) {
         self.terminal = true;
-        // Does not cancel a currently blocked write. The worker's independent
-        // deadline is still authoritative; Drop bounds the child exit wait.
+        // Does not cancel a currently blocked stdio write, but for Windows service
+        // pipes this immediately signals close_event + CancelIoEx so reader/writer
+        // threads exit and release the pipe handle instead of deadlocking reconnects.
         self.requests.take();
+        if let Some(close) = self.on_close.take() {
+            close();
+        }
     }
     fn rpc(&mut self, mut message: Message) -> Result<Message> {
         // A failed call, control, or heartbeat can never expose an older action's
@@ -704,6 +734,9 @@ impl Drop for WorkerProxy {
             eprintln!("Input worker shutdown acknowledgement unavailable; cleanup unconfirmed.");
         }
         self.requests.take();
+        if let Some(close) = self.on_close.take() {
+            close();
+        }
         let Some(child) = self.child.as_mut() else {
             return;
         };

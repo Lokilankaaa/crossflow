@@ -599,6 +599,19 @@ impl DesktopActor {
                                     } else {
                                         Err(err)
                                     }
+                                })
+                                .map(|pt| {
+                                    if is_winlogon
+                                        && let Ok(ds) = receiver_displays()
+                                        && !ds.iter().any(|d| contains(d, pt.0, pt.1))
+                                        && let Some(first) = ds.first()
+                                    {
+                                        return (
+                                            first.x + first.width * 0.5,
+                                            first.y + first.height * 0.5,
+                                        );
+                                    }
+                                    pt
                                 });
                             let _ = reply.send(res);
                         }
@@ -749,8 +762,12 @@ impl NativeService {
         }
         // Drop the old desktop actor first so its handle closes cleanly, then attach a
         // brand-new thread to the new input desktop (Default <-> Winlogon).
+        let prev = guard.as_ref().map(|a| a.name.clone()).unwrap_or_default();
         *guard = None;
-        let fresh = DesktopActor::spawn(name, hdesk)?;
+        let fresh = DesktopActor::spawn(name.clone(), hdesk)?;
+        super::service::append_service_log(&format!(
+            "desktop actor switched: '{prev}' -> '{name}'"
+        ));
         *guard = Some(fresh);
         *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         Ok(())
@@ -783,22 +800,42 @@ impl Platform for NativeService {
         self.sync_input_desktop_throttled(false)
     }
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
-        if let Some((t, cached)) = self
-            .cached_displays
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            && t.elapsed() < PLATFORM_CACHE_TTL
-        {
-            return Ok(cached.clone());
-        }
+        let cached_snapshot = {
+            let guard = self
+                .cached_displays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((t, cached)) = guard.as_ref() {
+                if t.elapsed() < PLATFORM_CACHE_TTL {
+                    return Ok(cached.clone());
+                }
+                Some(cached.clone())
+            } else {
+                None
+            }
+        };
         self.sync_input_desktop_throttled(false)?;
-        let fresh = self.call_actor(DesktopCmd::Displays)??;
-        *self
-            .cached_displays
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
-        Ok(fresh)
+        match self.call_actor(DesktopCmd::Displays) {
+            Ok(Ok(fresh)) => {
+                *self
+                    .cached_displays
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+                Ok(fresh)
+            }
+            Err(err) | Ok(Err(err)) => {
+                let on_winlogon = self
+                    .actor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|a| a.name.eq_ignore_ascii_case("Winlogon"));
+                if on_winlogon && let Some(prev) = cached_snapshot {
+                    return Ok(prev);
+                }
+                Err(err)
+            }
+        }
     }
     fn cursor(&self) -> Result<(f64, f64)> {
         self.sync_input_desktop_throttled(false)?;
