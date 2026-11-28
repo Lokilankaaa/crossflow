@@ -13,11 +13,13 @@ use std::{
     mem::size_of,
     ptr::null_mut,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
+    Foundation::{ERROR_ACCESS_DENIED, GetLastError},
     System::{
         RemoteDesktop::{
             WTS_CURRENT_SESSION, WTSActive, WTSConnectState, WTSFreeMemory,
@@ -317,7 +319,10 @@ fn desktop_ready() -> Result<()> {
     Ok(())
 }
 
+const PLATFORM_CACHE_TTL: Duration = Duration::from_millis(100);
+
 trait Platform: Send {
+    fn invalidate_cache(&self) {}
     fn ready(&self) -> Result<()>;
     fn displays(&self) -> Result<Vec<NativeDisplay>>;
     fn cursor(&self) -> Result<(f64, f64)>;
@@ -325,13 +330,55 @@ trait Platform: Send {
     fn key_vk(&self, scan: u16) -> u16;
     fn post(&mut self, input: INPUT) -> Result<()>;
 }
-struct Native;
+struct Native {
+    last_ready: Mutex<Option<Instant>>,
+    cached_displays: Mutex<Option<(Instant, Vec<NativeDisplay>)>>,
+}
+impl Native {
+    fn new() -> Self {
+        Self {
+            last_ready: Mutex::new(None),
+            cached_displays: Mutex::new(None),
+        }
+    }
+}
 impl Platform for Native {
+    fn invalidate_cache(&self) {
+        *self.last_ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
     fn ready(&self) -> Result<()> {
-        desktop_ready()
+        if self
+            .last_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| t.elapsed() < PLATFORM_CACHE_TTL)
+        {
+            return Ok(());
+        }
+        desktop_ready()?;
+        *self.last_ready.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Ok(())
     }
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
-        receiver_displays()
+        if let Some((t, cached)) = self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && t.elapsed() < PLATFORM_CACHE_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let fresh = receiver_displays()?;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
         super::cursor_position().map_err(anyhow::Error::msg)
@@ -347,10 +394,18 @@ impl Platform for Native {
         let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
         // One event per call avoids ambiguous partial batches. Even a successful
         // insertion does not establish foreground-app acceptance or visibility.
-        ensure!(
-            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-            "Windows input insertion failed; elevated apps and secure desktops are unsupported"
-        );
+        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } != 1 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_ACCESS_DENIED {
+                // Windows UIPI blocks Medium-IL SendInput when an elevated window
+                // (e.g. Task Manager or Admin console) has focus. Treat as a benign
+                // UIPI drop rather than crashing input-worker and tearing down sharing.
+                return Ok(());
+            }
+            bail!(
+                "Windows input insertion failed (Win32 {err}); elevated apps and secure desktops require Service Mode"
+            );
+        }
         Ok(())
     }
 }
@@ -361,15 +416,34 @@ impl Platform for Native {
 /// `SetThreadDesktop` so remote mouse and keyboard control work across UAC prompts, elevated
 /// Administrator applications, and the Windows lock screen.
 struct NativeService {
-    attached: std::sync::Mutex<Option<(String, isize)>>,
+    attached: Mutex<Option<(String, isize)>>,
+    last_sync: Mutex<Option<Instant>>,
+    cached_displays: Mutex<Option<(Instant, Vec<NativeDisplay>)>>,
 }
 unsafe impl Send for NativeService {}
 
 impl NativeService {
     fn new() -> Self {
         Self {
-            attached: std::sync::Mutex::new(None),
+            attached: Mutex::new(None),
+            last_sync: Mutex::new(None),
+            cached_displays: Mutex::new(None),
         }
+    }
+
+    fn sync_input_desktop_throttled(&self, force: bool) -> Result<()> {
+        if !force
+            && self
+                .last_sync
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|t| t.elapsed() < PLATFORM_CACHE_TTL)
+        {
+            return Ok(());
+        }
+        self.sync_input_desktop()?;
+        *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        Ok(())
     }
 
     fn sync_input_desktop(&self) -> Result<()> {
@@ -433,15 +507,36 @@ impl Drop for NativeService {
 }
 
 impl Platform for NativeService {
+    fn invalidate_cache(&self) {
+        *self.last_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
     fn ready(&self) -> Result<()> {
-        self.sync_input_desktop()
+        self.sync_input_desktop_throttled(false)
     }
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
-        let _ = self.sync_input_desktop();
-        receiver_displays()
+        if let Some((t, cached)) = self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && t.elapsed() < PLATFORM_CACHE_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let _ = self.sync_input_desktop_throttled(false);
+        let fresh = receiver_displays()?;
+        *self
+            .cached_displays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
-        let _ = self.sync_input_desktop();
+        let _ = self.sync_input_desktop_throttled(false);
         super::cursor_position().map_err(anyhow::Error::msg)
     }
     fn held(&self, vk: u16) -> bool {
@@ -451,9 +546,14 @@ impl Platform for NativeService {
         unsafe { MapVirtualKeyW(u32::from(scan), MAPVK_VSC_TO_VK_EX) as u16 }
     }
     fn post(&mut self, input: INPUT) -> Result<()> {
-        let _ = self.sync_input_desktop();
+        let _ = self.sync_input_desktop_throttled(false);
         crate::power::wake_display_throttled();
         let _dpi = DpiScope::physical().map_err(anyhow::Error::msg)?;
+        if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1 {
+            return Ok(());
+        }
+        // Desktop may have just transitioned (Default <-> Winlogon): resync and retry once.
+        let _ = self.sync_input_desktop_throttled(true);
         ensure!(
             unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
             "Windows service input insertion failed"
@@ -481,7 +581,7 @@ impl WindowsMouseSink {
             "mouse gain must be finite and positive"
         );
         let mut sink = Self {
-            platform: Box::new(Native),
+            platform: Box::new(Native::new()),
             emergency,
             gain,
             displays: Vec::new(),
@@ -559,17 +659,26 @@ impl WindowsMouseSink {
         let result = self.platform.post(input);
         self.finish(result)
     }
+    fn position_checked(&mut self, x: f64, y: f64, id: u32) -> Result<(f64, f64)> {
+        let packet = absolute(&self.displays, x, y, id);
+        let (input, point) = self.finish(packet)?;
+        self.send(input)?;
+        self.position = point;
+        Ok(point)
+    }
 }
 impl MouseSink for WindowsMouseSink {
     fn displays(&self) -> Result<Vec<NativeDisplay>> {
         self.platform.displays()
     }
     fn maintain(&mut self) -> Result<()> {
+        self.platform.invalidate_cache();
         self.checked()
     }
     fn reset(&mut self) -> Result<()> {
         self.failed = true;
         self.release_owned()?;
+        self.platform.invalidate_cache();
         ensure!(
             !self.emergency_local(),
             "local emergency requested input stop"
@@ -601,7 +710,7 @@ impl MouseSink for WindowsMouseSink {
                 "relative input leaves active display geometry"
             )));
         };
-        let result = self.position(x, y, id)?;
+        let result = self.position_checked(x, y, id)?;
         // Preserve fractional gain between relative packets even though the
         // native event targets one integral pixel.
         self.position = (x, y);
@@ -609,11 +718,7 @@ impl MouseSink for WindowsMouseSink {
     }
     fn position(&mut self, x: f64, y: f64, id: u32) -> Result<(f64, f64)> {
         self.checked()?;
-        let packet = absolute(&self.displays, x, y, id);
-        let (input, point) = self.finish(packet)?;
-        self.send(input)?;
-        self.position = point;
-        Ok(point)
+        self.position_checked(x, y, id)
     }
     fn button(&mut self, button: Button, down: bool) -> Result<()> {
         if !down && !self.buttons.contains(&button) {

@@ -1125,6 +1125,67 @@ fn active_transfer_snapshot(
     fallback
 }
 
+/// Keep full wired/direct-Ethernet motion rate (up to 1000 Hz), while pacing
+/// Wi-Fi / ZeroTier links to 125 Hz (8 ms) so high-polling gaming mice do not
+/// flood wireless airtime or overwhelm slower CPUs. Clicks, keys, scrolls, and
+/// edge crossings are never rate-limited.
+fn effective_motion_interval(
+    base: Duration,
+    peer_addr: SocketAddr,
+    local_channels: &[LocalChannel],
+) -> Duration {
+    if addr_channel_priority(peer_addr, local_channels) >= 2 {
+        base.max(Duration::from_millis(8))
+    } else {
+        base
+    }
+}
+
+/// Losslessly coalesce bursts of inbound cursor motion (common over Wi-Fi TCP
+/// aggregation) before invoking synchronous `input-worker` IPC, while preserving
+/// strict ordering across every discrete barrier (`Button`, `Key`, `Scroll`,
+/// `Arm`, `Pause`, display switches, and control packets).
+fn coalesce_inbound_packets(packets: Vec<MeshPacket>) -> Vec<MeshPacket> {
+    let mut out: Vec<MeshPacket> = Vec::with_capacity(packets.len());
+    for pkt in packets {
+        let merged = match (out.last_mut(), &pkt) {
+            (Some(MeshPacket::Input(prev)), MeshPacket::Input(curr))
+                if prev.kind == Kind::Move && curr.kind == Kind::Move =>
+            {
+                let nx = prev.x + curr.x;
+                let ny = prev.y + curr.y;
+                if nx.is_finite()
+                    && ny.is_finite()
+                    && nx.abs() <= 20_000.0
+                    && ny.abs() <= 20_000.0
+                {
+                    prev.x = nx;
+                    prev.y = ny;
+                    prev.t1_ns = curr.t1_ns;
+                    true
+                } else {
+                    false
+                }
+            }
+            (Some(MeshPacket::Input(prev)), MeshPacket::Input(curr))
+                if prev.kind == Kind::Position
+                    && curr.kind == Kind::Position
+                    && prev.display_id == curr.display_id =>
+            {
+                prev.x = curr.x;
+                prev.y = curr.y;
+                prev.t1_ns = curr.t1_ns;
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            out.push(pkt);
+        }
+    }
+    out
+}
+
 pub fn run(
     options: Options,
     writer: LogWriter,
@@ -1760,7 +1821,7 @@ pub fn run(
                                                 if p == 0 {
                                                     Duration::from_millis(600)
                                                 } else {
-                                                    Duration::from_millis(350)
+                                                    Duration::from_millis(1200)
                                                 },
                                             ))
                                         })
@@ -1844,7 +1905,7 @@ pub fn run(
                                         if addr_channel_priority(addr, &local_channels) == 0 {
                                             Duration::from_millis(600)
                                         } else {
-                                            Duration::from_millis(320)
+                                            Duration::from_millis(1200)
                                         };
                                     (addr, timeout)
                                 })
@@ -1932,7 +1993,7 @@ pub fn run(
                             .spawn(move || {
                                 match TcpStream::connect_timeout(
                                     &target,
-                                    Duration::from_millis(300),
+                                    Duration::from_millis(1200),
                                 )
                                 .map_err(anyhow::Error::from)
                                 .and_then(|stream| {
@@ -2143,7 +2204,7 @@ pub fn run(
                             if !packets.is_empty() {
                                 did_work = true;
                             }
-                            for pkt in packets {
+                            for pkt in coalesce_inbound_packets(packets) {
                                 match pkt {
                                     MeshPacket::Input(frame) => {
                                         if let Some(ref mut io) = native_io {
@@ -2179,6 +2240,7 @@ pub fn run(
                                                             );
                                                             let _ = io.sink.release_owned();
                                                             inbound_owner = None;
+                                                            revoke_outbound_from.push(pid.clone());
                                                         }
                                                     }
                                                 }
@@ -2616,9 +2678,26 @@ pub fn run(
                         }
 
                         // Drain outbound frames and route directly 1-hop to target peer!
+                        // Use full 1000 Hz on Wired/Direct Ethernet, adaptive 125 Hz + TCP
+                        // backpressure on Wi-Fi/ZeroTier, and batch socket flush per tick.
+                        let mut dirty_peers: Vec<String> = Vec::new();
                         let mut drained = 0usize;
                         while drained < 32 {
-                            let allow_motion = last_motion_send.elapsed() >= motion_interval;
+                            let motion_peer = active_outbound_target
+                                .as_deref()
+                                .and_then(|tid| active_peers.get(tid));
+                            let eff_interval = motion_peer
+                                .map(|p| {
+                                    effective_motion_interval(
+                                        motion_interval,
+                                        p.peer_addr,
+                                        &local_channels,
+                                    )
+                                })
+                                .unwrap_or(motion_interval);
+                            let tcp_ready = motion_peer.is_none_or(|p| p.conn.can_queue_motion());
+                            let allow_motion =
+                                tcp_ready && last_motion_send.elapsed() >= eff_interval;
                             let next = match io
                                 .source
                                 .next_mesh_frame_with_clock(|| log.ns(), allow_motion)
@@ -2647,7 +2726,9 @@ pub fn run(
                                     && let Some(old_peer) = active_peers.get_mut(&old_id)
                                 {
                                     let _ = old_peer.conn.queue_frame(&Frame::new(Kind::Pause));
-                                    let _ = old_peer.conn.flush();
+                                    if !dirty_peers.iter().any(|id| id == &old_id) {
+                                        dirty_peers.push(old_id);
+                                    }
                                 }
                                 if let Some(ref new_id) = target
                                     && let Some(new_peer) = active_peers.get(new_id)
@@ -2661,6 +2742,13 @@ pub fn run(
                                 && let Some(peer) = active_peers.get_mut(tid)
                             {
                                 let _ = peer.conn.queue_frame(&frame);
+                                if !dirty_peers.iter().any(|id| id == tid) {
+                                    dirty_peers.push(tid.clone());
+                                }
+                            }
+                        }
+                        for tid in dirty_peers {
+                            if let Some(peer) = active_peers.get_mut(&tid) {
                                 let _ = peer.conn.flush();
                             }
                         }
@@ -2668,7 +2756,7 @@ pub fn run(
 
                     // Keep input-worker heartbeat healthy (even when capture is paused on lock screen!)
                     if restart_native.is_none()
-                        && io.last_sink_maintain.elapsed() >= Duration::from_millis(15)
+                        && io.last_sink_maintain.elapsed() >= Duration::from_millis(25)
                     {
                         io.last_sink_maintain = Instant::now();
                         if let Err(err) = io.sink.maintain() {
@@ -3142,5 +3230,79 @@ mod tests {
         // Resetting back to default removes the override cleanly
         set_peer_input(&mut cfg, full_id, PeerInputProfile::default());
         assert!(cfg.peer_input.is_empty());
+    }
+
+    #[test]
+    fn effective_motion_interval_keeps_wired_1000hz_and_paces_wifi_125hz() {
+        let local = sample_channels();
+        let wired = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 2), 24800));
+        let wifi = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 188), 24800));
+        let zt = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 194, 59), 24800));
+        let base = Duration::from_millis(1);
+
+        assert_eq!(effective_motion_interval(base, wired, &local), base);
+        assert_eq!(
+            effective_motion_interval(base, wifi, &local),
+            Duration::from_millis(8)
+        );
+        assert_eq!(
+            effective_motion_interval(base, zt, &local),
+            Duration::from_millis(8)
+        );
+    }
+
+    #[test]
+    fn coalesce_inbound_packets_merges_motion_bursts_and_preserves_barriers() {
+        let mv = |x: f64, y: f64| {
+            let mut f = Frame::new(Kind::Move);
+            f.x = x;
+            f.y = y;
+            MeshPacket::Input(f)
+        };
+        let pos = |x: f64, y: f64, d: u32| {
+            let mut f = Frame::new(Kind::Position);
+            f.x = x;
+            f.y = y;
+            f.display_id = d;
+            MeshPacket::Input(f)
+        };
+        let btn = MeshPacket::Input(Frame::new(Kind::Button));
+        let ctrl = MeshPacket::Control(MeshControl::KeepAlive);
+
+        let out = coalesce_inbound_packets(vec![
+            mv(3.0, -2.0),
+            mv(7.0, 5.0),
+            btn,
+            pos(10.0, 20.0, 1),
+            pos(42.0, 84.0, 1),
+            pos(5.0, 6.0, 2),
+            ctrl,
+            mv(1.0, 1.0),
+        ]);
+        assert_eq!(out.len(), 6);
+        match &out[0] {
+            MeshPacket::Input(f) => {
+                assert_eq!(f.kind, Kind::Move);
+                assert_eq!((f.x, f.y), (10.0, 3.0));
+            }
+            _ => panic!("expected coalesced move"),
+        }
+        assert!(matches!(&out[1], MeshPacket::Input(f) if f.kind == Kind::Button));
+        match &out[2] {
+            MeshPacket::Input(f) => {
+                assert_eq!(f.kind, Kind::Position);
+                assert_eq!((f.x, f.y, f.display_id), (42.0, 84.0, 1));
+            }
+            _ => panic!("expected coalesced position on display 1"),
+        }
+        match &out[3] {
+            MeshPacket::Input(f) => {
+                assert_eq!(f.kind, Kind::Position);
+                assert_eq!((f.x, f.y, f.display_id), (5.0, 6.0, 2));
+            }
+            _ => panic!("expected separate position on display 2"),
+        }
+        assert!(matches!(&out[4], MeshPacket::Control(MeshControl::KeepAlive)));
+        assert!(matches!(&out[5], MeshPacket::Input(f) if f.kind == Kind::Move && f.x == 1.0));
     }
 }

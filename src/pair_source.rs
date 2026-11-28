@@ -857,7 +857,8 @@ mod tests {
     #[test]
     fn stale_capture_pauses_before_sending_even_the_arm() {
         let mut source = remote();
-        assert!(source.next_frame(30_000_003).is_err());
+        let expired = crate::input::INPUT_MAX_AGE_NS + 3;
+        assert!(source.next_frame(expired).is_err());
         assert!(!source.status().enabled);
         assert!(!source.status().remote_focus);
         assert_eq!(
@@ -868,8 +869,8 @@ mod tests {
         source.revoke().unwrap();
         assert!(source.status().failure.is_none());
         source.grant(2, 1).unwrap();
-        assert!(source.next_frame(30_000_004).unwrap().is_some()); // fresh Pause, no old input
-        assert!(source.next_frame(30_000_004).unwrap().is_none());
+        assert!(source.next_frame(expired + 1).unwrap().is_some()); // fresh Pause, no old input
+        assert!(source.next_frame(expired + 1).unwrap().is_none());
     }
     #[test]
     fn unexpected_queue_pause_is_visible_and_never_auto_rearms() {

@@ -28,10 +28,11 @@ use std::{
 pub const MESH_MAX_RECORD_CIPHERTEXT: usize = 64 * 1024;
 const TAG_FRAME: u8 = 1;
 const TAG_CONTROL: u8 = 2;
-const MAX_OUT_QUEUE: usize = 512;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_OUT_QUEUE: usize = 1024;
+const MAX_MOTION_BACKPRESSURE_QUEUE: usize = 8;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 pub const PEER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-pub const PEER_SILENCE_TIMEOUT: Duration = Duration::from_secs(9);
+pub const PEER_SILENCE_TIMEOUT: Duration = Duration::from_secs(18);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -269,6 +270,17 @@ impl MeshPeerConn {
 
     pub fn last_tx_elapsed(&self) -> Duration {
         self.last_tx.elapsed()
+    }
+
+    pub fn out_queue_len(&self) -> usize {
+        self.out_queue.len()
+    }
+
+    /// Returns false when TCP has queued unsent records so callers can hold
+    /// relative/absolute motion in `SharedSource` (lossless coalescing) while
+    /// still sending discrete clicks, keys, scrolls, and control packets.
+    pub fn can_queue_motion(&self) -> bool {
+        self.out_queue.len() < MAX_MOTION_BACKPRESSURE_QUEUE
     }
 
     fn queue_plaintext(&mut self, plaintext: &[u8]) -> Result<()> {
