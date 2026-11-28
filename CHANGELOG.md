@@ -10,6 +10,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.3-rc.3] - 2026-11-28 (Pre-release)
+
+### Fixed
+- **彻底修复 Windows 屏幕排列画布「拖不动 / 拖一下又拖不动」**：
+  - 将屏幕块底色与 `PointerPressedEvent` 从 WinUI 3 `ContentControl`（默认模板不渲染/不命中 `Background`）移至外层 `Border`，实现整块屏幕任意像素 100% 可抓住拖动，并置顶当前拖拽块。
+  - 调整 `Focus` 与 `CapturePointer` 顺序防止焦点切换误丢捕获；扩大边缘磁吸半径至 `24px`，松手轻微重叠时自动吸附至最近无重叠贴边位置；补齐 `lastLayoutSignature` 编号签名并增加 `700ms` 过期快照防弹回保护。
+- **彻底根治 Windows 本机微信打字时「候选框悬空、文字不上屏、Backspace 偶发失灵」**：
+  - 彻底删除 `read_caps_lock()` 中每 `350ms` 对前台应用调用的 `AttachThreadInput`，改为零副作用直接读取 `GetKeyState(VK_CAPITAL)`。
+  - Windows 本机打字期间停止每 `350ms` 向微信 IME 窗口同步发送 `SendMessageTimeoutW(WM_IME_CONTROL)`，仅在跨屏切换瞬间读取并同步一次完整输入法状态。
+- **连接中改变屏幕朝向 / 分辨率 / 插拔显示器实时热同步**：
+  - 修复 Windows `WM_DISPLAYCHANGE` 错误触发 `Shortcut::Stop` 锁死 `user_paused` 的问题，改为无感自动重启采集与注入。
+  - 新增 `MeshControl::DisplaysUpdate` 加密控制帧，连接状态下实时检测本机显示器变动并广播给所有节点热更新画布与路由表；若横竖屏切换导致屏幕间出现空隙或重叠，自动重新边缘吸合连通。
+- **修复 macOS 锁屏黑屏后移动鼠标过去未自动点亮屏幕**：
+  - 移除 `CGDisplayIsAsleep(CGMainDisplayID())` 误判跳过逻辑，改为复用 `IOPMAssertionID` 无条件声明 `IOPMAssertionDeclareUserActivity(kIOPMUserActiveLocal)`，并在收到 `Kind::Arm` / `FocusState` / 远端输入时立即点亮黑屏（即使 `native_io` 暂未重建也立即唤醒并在重建后自动承接控制权）。
+
+---
+
 ## [0.4.3-rc.2] - 2026-11-28 (Pre-release)
 
 ### Fixed
